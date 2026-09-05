@@ -74,10 +74,10 @@ reply = agent.chat("上海天气怎么样")                     # 直接对话
 | **Web 前端产品化 (`web/`)** | **React + TypeScript + Tailwind CSS + Vite 交互式控制台**：SSE 流式打字机、审批队列、信息面板；由 FastAPI 单端口托管 SPA | 已实现 |
 | 配置加载 (`core/config.py`) | .env 加载，密钥不进代码 | 已实现 |
 | 迁移体系 + Codec (`store/`) | schema 版本化演进，老库数据兼容 | 已实现 |
-| 凭证加密 + 租约 (`credential/`) | AES-GCM 落库加密 + 短租约 + 脱敏 | 已实现 |
-| Checkpoint/门禁 (`runtime/`) | 断点恢复 + 失败重试 + 完成前校验 | 已实现 |
-| 受控执行 (`execution/`) | 受管子进程 + 输出/超时/并发预算 | 已实现 |
-| 执行沙箱 (`execution/sandbox.py`) | 只读工作区 + 默认禁网 + 资源限制（POSIX rlimit / Windows Job Object） | 已实现 |
+| 凭证加密 + 租约 (`credential/`) | AES-GCM 落库加密 + 短租约 + 脱敏 | 独立能力（未接入主链） |
+| Checkpoint/门禁 (`runtime/`) | 断点恢复 + 失败重试 + 完成前校验 | 独立能力（未接入主链） |
+| 受控执行 (`execution/`) | 受管子进程 + 输出/超时/并发预算 | 独立能力（未接入主链） |
+| 执行沙箱 (`execution/sandbox.py`) | 只读工作区 + 默认禁网 + 资源限制（POSIX rlimit / Windows Job Object） | 独立能力（未接入主链） |
 | SDK 面 (`agent.py`) | build_agent() 一键装配；typed_reply(); pydantic_tool | 已实现 |
 | 记忆 (`memory/`) | 多作用域 + 候选确认 + 冲突消解 + 审计 | 已实现 |
 | MCP 客户端 (`mcp/`+`ts/mcp-client`) | TS SDK 连 MCP，工具先行审查再导入 | 已实现 |
@@ -85,6 +85,10 @@ reply = agent.chat("上海天气怎么样")                     # 直接对话
 | Git 集成 (`git/`) | revision 探测 + unified-diff 应用 + 合并门禁 | 已实现 |
 | Coding Agent (`coding_agent/`) | 需求→读代码→出 diff→门禁落地 | 已实现 |
 | 架构边界测试 (`tests/`) | AST 校验依赖单向 | 已实现 |
+
+> **接线实情**：标注「独立能力（未接入主链）」的模块（凭证加密 / Checkpoint·恢复 / 受控执行·沙箱）是
+> 已写好、有真实价值的**独立能力**，但尚未接进产品主路径（`build_agent`/HTTP/CLI）——它们不冒充已接入，
+> 也不删除（留给以后按需接线）。其余「已实现」的模块都在主链里真实生效。
 
 
 ## 工程化规范
@@ -162,14 +166,7 @@ warden coding "给 hello.py 加一个 greet 函数"   # 本地跑一个编码需
 - `chat` 触发审批时会提示"需要审批"，接着用 `warden approvals` 看、`warden approve/reject` 决定——审批门禁在命令行里也是闭环的。
 - 直接可执行也可：`python -m warden_agent.cli health`。
 
-### 4. 一键完整演示（RAG + 多 Agent）
-
-```powershell
-cd /d/warden-agent
-py -m warden_agent.demo_full
-```
-
-### 5. 端到端完整演示（L2 聪明 loop × L3 能力层）
+### 4. 端到端完整演示（L2 聪明 loop × L3 能力层）
 
 把「阶段规划 + 工具意图判断」（loop 深度③⑤，复杂任务阶段由模型生成、无触发信号由模型说明理由）
 与「RAG 引用 + 多 Agent 结构化交接 + 技能触发」（能力层）整条串起来，且工具触发词从描述自动提取（工具自解释）。

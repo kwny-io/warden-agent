@@ -210,10 +210,15 @@ def _normalize(mapping: dict[str, list[str]]) -> dict[str, list[str]]:
     return {k: [w.lower() for w in v] for k, v in mapping.items()}
 
 
-def _words(text: str) -> list[str]:
-    import re
+def _words(text: str) -> set[str]:
+    """拆"可匹配的词"，统一复用的 canonical 分词（英文词 + 中文相邻双字 + 滤泛词）。
 
-    return re.findall(r"[a-z0-9_]+", text)
+    对外语义与原来一致（一组可用于匹配的词）；收敛到 `tool.trigger.tokens()`，
+    不再单独实现一份（原版只匹配英文、漏中文，现补上）。
+    """
+    from warden_agent.tool.trigger import tokens as _trigger_tokens
+
+    return _trigger_tokens(text)
 
 
 __all__ = ["ToolIntentRouter", "IntentVerdict"]

@@ -23,8 +23,33 @@ from typing import Any
 
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel, ChatRequest, Message
-from warden_agent.policy.policy import Decision, PolicyEngine
+from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
 from warden_agent.tool.catalog import ToolCatalog
+
+
+def exec_tool(catalog: ToolCatalog, stability: Any, name: str,
+              arguments: dict[str, Any]) -> tuple[Any, str | None]:
+    """稳定地执行一个工具，返回 `(result, error)`；供 AgentLoop 与 AgentSession 共用。
+
+    - 不传 stability：就是裸的 `catalog.execute`，任何异常转成 `{Type}: {msg}` 字符串。
+    - 传了 stability（StableToolExecutor）：走"超时 + 指数退避重试 + 降级/熔断"管线，
+      让深层稳定性在产品路径（HTTP/流式）也生效，而不是只在 demo 的 AgentLoop 里。
+    这是两套主循环共用的"工具执行"单一来源（不再各自实现一遍）。
+    """
+    if stability is not None:
+        try:
+            spec = catalog.get(name)
+        except KeyError as e:
+            return None, f"{type(e).__name__}: {e}"
+        sres = stability.execute(spec, arguments)
+        if sres.degraded:
+            # 降级/熔断结果当成"可用的成功"返回（带 [降级]/[熔断] 标记）
+            return sres.result, None
+        return sres.result, sres.error
+    try:
+        return catalog.execute(name, arguments), None
+    except Exception as e:  # noqa: BLE001 - 工具错误要全部转为可恢复信息
+        return None, f"{type(e).__name__}: {e}"
 
 
 @dataclass
@@ -35,8 +60,7 @@ class AgentReply:
     messages: list[Message]  # 完整对话历史（可用于持久化/审计）
 
 
-class PolicyDenied(Exception):
-    """策略拒绝该次工具调用。"""
+# PolicyDenied 统一在 policy/policy.py 定义（loop 与 session 共用），此处不再重复定义。
 
 
 class AgentLoop:
@@ -219,23 +243,9 @@ class AgentLoop:
         而不是让异常直接击穿整个 loop——这就是"失败自恢复"能工作的前提。
 
         【工具稳定性层】若传入了 `stability`（StableToolExecutor），工具调用会先走它的
-        "超时 + 重试 + 降级"管线：超时不卡死、瞬时故障指数退避自动重试、可降级兜底。
-        looop 深度① 的下游（重试上限/放弃提示）拿到的仍是 `(result, error)`，无需改动。
+        "超时 + 重试 + 降级/熔断"管线。统一复用它和 AgentSession 共用的 `exec_tool` 单一来源。
         """
-        if self.stability is not None:
-            try:
-                spec = self.catalog.get(name)
-            except KeyError as e:
-                return None, f"{type(e).__name__}: {e}"
-            sres = self.stability.execute(spec, arguments)
-            if sres.degraded:
-                # 降级结果当成"成功"给模型/排优先级：它是可用的兜底产出（带 [降级] 标记）
-                return sres.result, None
-            return sres.result, sres.error
-        try:
-            return self.catalog.execute(name, arguments), None
-        except Exception as e:  # noqa: BLE001 - 工具错误要全部转为可恢复信息
-            return None, f"{type(e).__name__}: {e}"
+        return exec_tool(self.catalog, self.stability, name, arguments)
 
     # ---- 【loop 深度④】上下文管理：裁剪 + 摘要 ----
 
@@ -370,27 +380,12 @@ def _text_content(text: str) -> Any:
 
 
 def _tokens(text: str) -> set[str]:
-    """把一段话拆成"有意义的检索词"集合，用于记忆相关性判断。
+    """拆"有意义的检索词"集合，用于记忆相关性判断。
 
-    处理两种常见形态：
-      - 英文/数字：按空白/下划线拆成词(token)。
-      - 中文：整段连续汉字太粗(两个句子的汉字段不会重合)，所以额外产出
-        **相邻两字(bigram)**——这样"上海天气怎么样"与"用户常问上海天气"
-        能共享 "上海"/"天气" 等词，实现"按需取用"的相关性筛选。
-    空串/纯符号返回空集(没有可检索关键词)。
+    统一复用 `tool.trigger.tokens()`（英文词 + 中文相邻双字 + 滤太泛的通用词），
+    与 intent / skill 触发判断同一套分词，不重复实现。
+    中文 bigram 让"上海天气怎么样"与"用户常问上海天气"能共享词，实现按需取用。
     """
-    import re
-    s = text.strip()
-    if not s:
-        return set()
-    out: set[str] = set()
-    # 英文/数字词
-    for w in re.findall(r"[A-Za-z0-9_]+", s):
-        out.add(w.lower())
-    # 中文连续块 → 产出相邻两字
-    for run in re.findall(r"[\u4e00-\u9fff]+", s):
-        if len(run) == 1:
-            out.add(run)
-        else:
-            out.update(run[i:i + 2] for i in range(len(run) - 1))
-    return out
+    from warden_agent.tool.trigger import tokens as _trigger_tokens
+
+    return _trigger_tokens(text)

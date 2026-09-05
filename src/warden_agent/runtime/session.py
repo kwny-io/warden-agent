@@ -22,16 +22,16 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from warden_agent.core.run.status import AgentRun, RunStatus
+from warden_agent.loop.loop import exec_tool
 from warden_agent.model.model import AgentChatModel, ChatRequest, Message, ToolCall
-from warden_agent.policy.policy import Decision, PolicyEngine
+from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
 from warden_agent.store.base import RunStore
 from warden_agent.tool.catalog import ToolCatalog
 
 logger = logging.getLogger(__name__)
 
 
-class PolicyDenied(Exception):
-    """策略 DENY：该工具被永久禁止，任务直接失败。"""
+# PolicyDenied 统一在 policy/policy.py 定义（loop 与 session 共用），此处不再重复定义。
 
 
 class TypedOutputError(Exception):
@@ -79,6 +79,7 @@ class AgentSession:
         store: RunStore,
         system_prompt: str = "你是一个能使用工具的助手。",
         max_iterations: int = 10,
+        stability: Any = None,
     ) -> None:
         self.run_id = run_id
         self.model = model
@@ -87,6 +88,10 @@ class AgentSession:
         self.store = store
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
+        # 工具稳定性层（StableToolExecutor）：可选。给了它，这个会话里的工具调用
+        # 就走"超时+退避重试+降级/熔断"（与 AgentLoop 共用 exec_tool 单一来源），
+        # 让稳定性在产品路径(HTTP/流式/CLI)也生效。
+        self.stability = stability
 
         # 结构化输出目标（typed_reply 用）：类型化结果还原
         self._reply_type: Any = None
@@ -318,11 +323,8 @@ class AgentSession:
                         yield {"type": "needs_approval",
                                "approval": self._approval_dict(outcome.approval)}
                         return
-                    # 流式下也把工具结果落库（复用 _execute，携带 tool_call_id）
-                    result = self.catalog.execute(call.name, call.arguments)
-                    msg = Message(role="tool", content=str(result), tool_call=call)
-                    self.messages.append(msg)
-                    self.store.append_message(self.run_id, msg)
+                    # 流式下也把工具结果落库（复用 _execute，携带 tool_call_id；含稳定性+错误喂回）
+                    self._execute(call)
                 continue
 
             if response.content is not None:
@@ -374,11 +376,16 @@ class AgentSession:
         return self._advance()
 
     def _execute(self, call: ToolCall) -> None:
-        result = self.catalog.execute(call.name, call.arguments)
+        result, error = exec_tool(self.catalog, self.stability, call.name, call.arguments)
         # 关键：工具结果必须携带与 assistant.tool_calls[].id 一致的 call 引用，
         # 否则真实 API 要求"assistant 发起的 tool_call 必须一一被 tool 消息响应"，
         # 会报 400（mock 测不出这条，只有真实调用会暴露）。
-        msg = Message(role="tool", content=str(result), tool_call=call)
+        if error is not None:
+            # 工具失败 + 有稳定性层兜底仍失败 → 把错误喂回模型，让它自己纠正/换招
+            content = f"[工具 {call.name} 执行失败，请修正后重试] {error}"
+        else:
+            content = str(result)
+        msg = Message(role="tool", content=content, tool_call=call)
         self.messages.append(msg)
         self.store.append_message(self.run_id, msg)
 

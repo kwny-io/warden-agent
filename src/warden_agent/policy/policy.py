@@ -38,6 +38,14 @@ class PolicyResult:
     reason: str = ""
 
 
+class PolicyDenied(Exception):
+    """策略 DENY：该工具被永久禁止，任务直接失败。
+
+    统一放在这里（policy 层）：loop 和 session 都从这 import，不再各自定义一份，
+    避免"跨模块 `except PolicyDenied` 捕不到对方抛的"这种隐患。
+    """
+
+
 class PolicyEngine:
     """把多条 policy 合成一道门禁。取最严格的判定。"""
 

@@ -10,7 +10,7 @@
   tier 2  核心逻辑（logic）     : store, loop, runtime, memory, skill, credential,
                                  rag, execution, multiagent
   tier 3  能力汇编（facade）    : mcp, web, agent
-  tier 4  应用/演示（app）      : demo, demo_full
+  tier 4  应用/演示（app）      : demo
 
 规则：模块只能 import「层级秩 <= 自己」的模块（同层允许）。
 违反 = 低层反向依赖高层，例如 tool 不允许 import agent，model 不允许 import skill。
@@ -32,7 +32,7 @@ TIER: dict[str, int] = {
     "store": 2, "loop": 2, "runtime": 2, "memory": 2, "skill": 2,
     "credential": 2, "rag": 2, "execution": 2, "multiagent": 2,
     "mcp": 3, "web": 3, "agent": 3,
-    "demo": 4, "demo_full": 4,
+    "demo": 4,
 }
 
 # 允许"向上依赖一到两层"的特例（真实存在的合理依赖）
@@ -40,8 +40,8 @@ _ALLOWED_UP: set[tuple[str, str]] = {
     # 例：runtime.session 需要依赖上层能力？实际上它依赖的都是同层或下层。
 }
 
-# demo/demo_full 是应用层，向上没有更高层，天然合法；但它们可以依赖所有。
-_APP = {"demo", "demo_full"}
+# demo 是应用层，向上没有更高层，天然合法；但它可以依赖所有。
+_APP = {"demo"}
 
 
 def _module_tier(module: str) -> int:

@@ -123,6 +123,18 @@
     降级/默认关闭/loop 集成/熔断触发/熔断跳重试/半开恢复/半开失败再熔断/隔离)。全量测试
     **288 passed, 1 skipped**
 
+- **去重复/收敛堆砌(审查驱动的一轮重构)**:
+  - **统一 `PolicyDenied`** 到 `policy/policy.py`(loop/session 共用一份,消除跨模块 catch 不到隐患)。
+  - **分词器收敛 4→1**:`loop._tokens`/`intent._words` 委托到 `tool.trigger.tokens()`(英文词+中文双字+滤泛词),
+    intent 顺带补上中文识别(原版只匹配英文)。
+  - **删冗余 `demo_full.py`**(是 demo_e2e 的严格子集、无测试);README/test_architecture 同步移除。
+  - **两套主循环共享"工具执行"**:抽模块级 `exec_tool`(稳定性:超时/退避/降级/熔断 + 错误转字符串的单一来源),
+    `AgentLoop._safe_execute` 与 `AgentSession._execute/stream` 都走它——**HTTP/流式/CLI 产品路径首次吃到深层工具稳定性**,
+    工具失败改为喂回模型自纠(不再直接崩),保留 tool_call_id 配对/审批/持久化/流式。
+  - **诚实标注"独立能力/未接入主链"**:凭证加密、Checkpoint·恢复、受控执行·沙箱是已写好但未接产品主链的能力,
+    不再冒充"已实现",也不删除(留给以后接线),README 补说明。
+  - 全量测试 **287 passed, 2 skipped**
+
 ### 未实现(路线图,见 README)
 
 - T9 分层/契约测试(接口契约一致性、分层边界)
