@@ -1,7 +1,14 @@
 # Warden Agent
 
-> 一个可治理、可恢复、可部署、可对外服务的 Agent 运行时。
-> 目标：**让 AI 干活像银行转账一样可控——有状态、有边界、有门禁、能存档、能查账**。
+> 一套 **会思考、会自愈、扛得住** 的 Agent 运行时。
+> 让 AI 干活像银行转账一样可控：**有状态、有边界、有门禁、能存档、能查账。**
+
+[![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-288%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
+> **招牌一句**:给定一个复杂任务,它自己会**拆**、会**查**、会**写**、会**自愈**——
+> 不是"能聊天的助手",而是一个能自主规划、带引用检索、多 Agent 分工、扛得住故障的运行时。
 
 ## 三行接入（SDK 用法）
 
@@ -21,6 +28,26 @@ reply = agent.chat("上海天气怎么样")                     # 直接对话
 
 让 AI 干活的过程，要像银行转账一样：**有状态、有边界、有门禁、能存档、能查账。**
 
+## 接入你自己的模型（傻瓜式，零改源码）
+
+想让它用真实模型，**不用改任何源码**，只要在项目根目录放一份 `.env`：
+
+```bash
+# 复制 .env.example 为 .env，填一项即可
+DEEPSEEK_API_KEY=sk-你的key      # 或 OPENAI_API_KEY / ZHIPU_API_KEY / DASHSCOPE_API_KEY
+```
+
+- 已内置 **DeepSeek / OpenAI / 智谱 / 阿里百炼** 四家，填对应 key 就能跑（`provider="deepseek"` 等）。
+- **接任意 OpenAI 兼容 API**（自建网关 / Ollama / 硅基流动…），用通用 `custom`，照样只填 `.env`，不写代码：
+
+```bash
+WARDEN_API_KEY=你的key
+WARDEN_BASE_URL=https://你的兼容端点/v1
+WARDEN_MODEL=你的模型名
+```
+
+然后 `build_agent(provider="custom")`。不设任何 key → 走离线假模型（不花钱也能跑）。
+
 ## 重点（三条主线，先看这个再看下面的功能表）
 
 > 你真正在打磨的是一个**"会聪明干活、又扛得住真实世界"的 Agent 运行时**。下面所有模块
@@ -33,6 +60,57 @@ reply = agent.chat("上海天气怎么样")                     # 直接对话
 | **③ 稳定性** | 让 Agent "扛得住真实世界" | 超时护栏 · 指数退避重试 · 统一降级兜底 · **熔断保护** |
 
 **组合起来** = 聪明(loop) × 有本事(能力层) × 扛得住(稳定性)。下面的大表是这三条主线的落地清单。
+
+## 架构图
+
+```mermaid
+flowchart TB
+    subgraph L4["L4 界面层"]
+        UI["React 前端 (web/)"]
+        CLI["CLI (warden)"]
+        SDK["SDK (build_agent)"]
+    end
+
+    subgraph RT["运行时会话 (runtime/)"]
+        SESSION["AgentSession\n状态机 · 审批闭环 · 持久化 · 流式"]
+    end
+
+    subgraph L2["L2 核心循环 — 聪明度 (loop/)"]
+        LOOP["AgentLoop\n规划 → 执行 → 观察"]
+        PL["planner 阶段规划\n(模型生成阶段)"]
+        INT["intent 意图判断\n(模型说明理由)"]
+    end
+
+    subgraph STAB["工具稳定性层 (tool/stability)"]
+        SB["超时 · 指数退避 · 降级 · 熔断"]
+    end
+
+    subgraph L3["L3 能力层"]
+        TOOL["工具(自解释) · 技能(版本化)\n记忆 · RAG(引用) · 多Agent(交接/共享记忆/容错/并行)"]
+    end
+
+    subgraph L1["L1 地基"]
+        POL["policy 审批门禁 (DENY>ASK>ALLOW)"]
+        STORE["store SQLite / PostgreSQL + 审计"]
+    end
+
+    MODEL["模型层 (model/)\nDeepSeek · OpenAI · 智谱 · 百炼 · custom(任意兼容端点)"]
+
+    UI --> SESSION
+    CLI --> SESSION
+    SDK --> SESSION
+    SESSION -- "共享 exec_tool（单一来源）" --> LOOP
+    LOOP --> PL
+    LOOP --> INT
+    LOOP -- "每次工具调用" --> SB
+    SB --> TOOL
+    POL -- "调用前门禁" --> LOOP
+    SESSION -- "每步落库/恢复" --> STORE
+    LOOP --> MODEL
+```
+
+> 读法：外面三层是"用得上"(L4) → "可靠安全"(L1 地基)；中间 **AgentSession 把"脑与手"委托给 AgentLoop**,
+> 每次工具调用都过 **稳定性层**(超时/退避/降级/熔断)再进 **能力层**；模型可换成任意 OpenAI 兼容端点(custom,只填 `.env`)。
 
 ## 当前内容
 
@@ -98,6 +176,8 @@ reply = agent.chat("上海天气怎么样")                     # 直接对话
 - **静态检查**：`ruff`（`All checks passed`）
 - **测试**：`pytest`（**288 个测试全过**，覆盖状态机、工具、循环、DeepSeek、审批、恢复、HTTP 服务、SSE 流式、RAG、多 Agent、存储接口、迁移/codec、凭证加密+租约、Checkpoint/门禁、受控执行、Pydantic 工具、typed_reply、build_agent、记忆、技能、MCP、web 搜索、Git、架构边界、能力集成、多模型、配置加载、**认证/审计/健康检查**、**loop 阶段规划/意图判断、RAG 引用、多 Agent 结构化交接/共享记忆/容错降级/并行分派、技能触发/版本化、工具自解释、工具稳定性层(超时/退避/降级/熔断)、端到端演示**；Postgres 集成测试无库时自动跳过，MCP 集成测试无 node 时自动跳过，Git 集成测试无 git 时自动跳过）
 - **`.gitignore`**：自动忽略缓存、`.env`、密钥、数据库文件、日志
+- **CI**：`.github/workflows/ci.yml` 在每次 push 跑 `ruff` + `mypy --strict` + `pytest`（见顶部徽章）
+- **License**：MIT（见 [LICENSE](./LICENSE)）
 
 ## 怎么运行
 

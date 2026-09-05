@@ -135,6 +135,16 @@
     不再冒充"已实现",也不删除(留给以后接线),README 补说明。
   - 全量测试 **287 passed, 2 skipped**
 
+- **傻瓜式接入任意模型(配置文件面板式)**:
+  - `create_model` 新增 `custom` 通用 provider(`model/deepseek.py`):从 `WARDEN_API_KEY` /
+    `WARDEN_BASE_URL` / `WARDEN_MODEL` **零改源码**接入任意 OpenAI 兼容端点(自建网关 / Ollama /
+    硅基流动 / 任意私服);也支持 `create_model('custom', base_url=..., model=..., api_key=...)`
+    显式传参;缺 base_url 时给清晰提示。
+  - 内置四家(deepseek/openai/zhipu/bailian)仍各自读对应 `*_API_KEY`,不破坏。
+  - `.env.example` 加 custom 配法 + README 新增「接入你自己的模型(傻瓜式)」小节。
+  - 新增 `tests/test_deepseek.py` custom 用例(读环境变量/显式传参/缺 base_url 报错/未知厂商)。
+    全量测试 **292 passed, 1 skipped**
+
 ### 未实现(路线图,见 README)
 
 - T9 分层/契约测试(接口契约一致性、分层边界)

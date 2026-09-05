@@ -328,16 +328,39 @@ _PROVIDERS: dict[str, type[OpenAiCompatibleModel]] = {
 
 
 def create_model(provider: str, api_key: str | None = None, **kwargs: Any) -> OpenAiCompatibleModel:
-    """按厂商名创建一个模型实例。provider 支持 deepseek/openai/zhipu/bailian。
+    """按厂商名创建一个模型实例。
+
+    provider 支持 deepseek / openai / zhipu / bailian / custom。
+      - 内置四家：各自绑定 base_url 和默认 model，key 从对应环境变量读。
+      - custom：通用接入任意 OpenAI 兼容 API。全部从环境变量读（零改源码）：
+          WARDEN_API_KEY    -> API Key
+          WARDEN_BASE_URL   -> 兼容端点（如自建网关 / Ollama / 硅基流动）
+          WARDEN_MODEL      -> 模型名
+        也支持直接在 create_model 传 base_url / model 覆盖。
 
     用法：
         model = create_model("zhipu")          # 读 ZHIPU_API_KEY
         model = create_model("deepseek")       # 读 DEEPSEEK_API_KEY
+        model = create_model("custom")         # 读 WARDEN_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL
     """
+    if provider == "custom":
+        import os
+        key = api_key or os.environ.get("WARDEN_API_KEY")
+        base_url = kwargs.pop("base_url", os.environ.get("WARDEN_BASE_URL"))
+        model = kwargs.pop("model",
+                           os.environ.get("WARDEN_MODEL") or DEFAULT_DEEPSEEK_MODEL)
+        if not base_url:
+            raise ModelCallError(
+                "custom 接入需要 WARDEN_BASE_URL（OpenAI 兼容端点）。"
+                "可在 .env 里设 WARDEN_BASE_URL + WARDEN_MODEL + WARDEN_API_KEY，"
+                "或用 create_model('custom', base_url=..., model=..., api_key=...)。"
+            )
+        return OpenAiCompatibleModel(api_key=key, model=model, base_url=base_url, **kwargs)
     try:
         cls = _PROVIDERS[provider]
     except KeyError:
-        raise ModelCallError(f"未知厂商: {provider!r}，可选 {sorted(_PROVIDERS)}") from None
+        choices = sorted(_PROVIDERS) + ["custom"]
+        raise ModelCallError(f"未知厂商: {provider!r}，可选 {choices}") from None
     return cls(api_key=api_key, **kwargs)
 
 

@@ -12,6 +12,7 @@ from warden_agent.model.deepseek import (
     BailianModel,
     DeepSeekError,
     DeepSeekModel,
+    OpenAiCompatibleModel,
     OpenAIModel,
     ZhipuModel,
     _safe_json,
@@ -211,3 +212,37 @@ def test_assistant_tool_call_映射为完整tool_calls() -> None:
     assert email["tool_calls"][0]["id"] == "c9"
     assert email["tool_calls"][0]["function"]["name"] == "weather_get"  # 合法化
     assert '"city": "上海"' in email["tool_calls"][0]["function"]["arguments"]
+
+
+# ---------- custom 通用接入（傻瓜式接任意 OpenAI 兼容 API） ----------
+
+def test_create_model_custom_读环境变量(monkeypatch) -> None:
+    """custom: 从 WARDEN_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL 零改源码接入。"""
+    import warden_agent.model.deepseek as ds
+    monkeypatch.setenv("WARDEN_API_KEY", "k-c")
+    monkeypatch.setenv("WARDEN_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("WARDEN_MODEL", "my-llama")
+    m = create_model("custom")
+    assert isinstance(m, OpenAiCompatibleModel)
+    assert m.model == "my-llama"
+    assert "11434" in str(m._client.base_url)
+
+
+def test_create_model_custom_显式传参覆盖() -> None:
+    """custom: 也能直接传 base_url/model/api_key,不依赖环境变量。"""
+    m = create_model("custom", api_key="k",
+                     base_url="https://my-gateway.example.com/v1", model="gpt-x")
+    assert m.model == "gpt-x"
+    assert "my-gateway" in str(m._client.base_url)
+
+
+def test_create_model_custom_缺base_url报错(monkeypatch) -> None:
+    """custom: 没给 base_url 且没设 WARDEN_BASE_URL => 清晰报错,提示怎么配。"""
+    monkeypatch.delenv("WARDEN_BASE_URL", raising=False)
+    with pytest.raises(DeepSeekError):
+        create_model("custom", api_key="k")
+
+
+def test_create_model_custom_未知厂商仍报错() -> None:
+    with pytest.raises(DeepSeekError):
+        create_model("still-unknown", api_key="k")
