@@ -1,0 +1,22 @@
+# 构建镜像时不要把这些拷进容器（浪费体积 + 可能泄露密钥/数据）
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.db
+*.sqlite
+*.sqlite3
+local-tmp/
+*.log
+.env
+.git
+.gitignore
+docs/
+tests/
+# 前端构建产物与依赖不进镜像构建上下文（Dockerfile 阶段1 会用 node 重新 npm 装）
+web/node_modules/
+web/dist/
+ts/node_modules/

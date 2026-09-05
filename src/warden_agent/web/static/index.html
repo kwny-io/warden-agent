@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warden Agent Python · 演示控制台</title>
+<style>
+  :root { --bg:#0f1220; --panel:#1a1e30; --line:#2a2f45; --fg:#e6e8f0;
+          --accent:#4f8cff; --ok:#3ddc97; --warn:#ffc857; --danger:#ff5c5c; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:18px; margin:0; }
+  header .badge { font-size:12px; background:var(--accent); color:#fff; padding:2px 10px; border-radius:999px; }
+  .wrap { display:flex; gap:20px; padding:20px; max-width:1200px; margin:0 auto; }
+  .chat { flex:2; display:flex; flex-direction:column; gap:12px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .runbar { display:flex; gap:8px; align-items:center; }
+  .runbar input { flex:1; background:var(--bg); border:1px solid var(--line); color:var(--fg); padding:10px 12px; border-radius:8px; }
+  .runbar select { background:var(--bg); border:1px solid var(--line); color:var(--fg); padding:10px; border-radius:8px; }
+  .msgs { flex:1; min-height:320px; overflow:auto; display:flex; flex-direction:column; gap:8px; }
+  .msg { max-width:80%; padding:8px 12px; border-radius:10px; font-size:14px; line-height:1.5; white-space:pre-wrap; }
+  .msg.user { align-self:flex-end; background:var(--accent); color:#fff; }
+  .msg.assistant { align-self:flex-start; background:#2a2f45; }
+  .msg.tool { align-self:center; background:#24324d; color:#b8c6e0; font-size:12px; }
+  .msg.system { align-self:center; background:#2a2140; color:#b9a8e0; font-size:12px; }
+  .approval { align-self:center; background:#3a2f17; border:1px solid var(--warn); padding:10px 14px; border-radius:10px; font-size:13px; }
+  .approval button { margin:0 4px; padding:6px 14px; border:none; border-radius:6px; cursor:pointer; font-size:13px; }
+  .btn-ok { background:var(--ok); color:#06281a; }
+  .btn-no { background:var(--danger); color:#fff; }
+  .btn { background:var(--accent); color:#fff; border:none; padding:10px 18px; border-radius:8px; cursor:pointer; }
+  aside { flex:1; display:flex; flex-direction:column; gap:12px; }
+  aside h3 { margin:0 0 8px; font-size:14px; color:#9aa3c0; }
+  .approvals { display:flex; flex-direction:column; gap:8px; }
+  .apr { background:var(--bg); border:1px solid var(--line); padding:8px 10px; border-radius:8px; font-size:13px; }
+  .apr b { color:var(--warn); }
+  .log { background:#0b0e1a; font-family:monospace; font-size:12px; height:180px; overflow:auto; padding:8px; border-radius:8px; color:#7fdc8f; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧠 Warden Agent <span class="badge">Python 版 · 演示控制台</span></h1>
+  <span style="font-size:12px;color:#9aa3c0" id="modellabel"></span>
+</header>
+<div class="wrap">
+  <section class="chat">
+    <div class="panel runbar">
+      <input id="text" placeholder="说点什么，比如：查一下上海天气" onkeydown="if(event.key==='Enter')send()">
+      <button class="btn" onclick="send()">发送</button>
+    </div>
+    <div class="panel msgs" id="msgs"></div>
+  </section>
+  <aside>
+    <div class="panel">
+      <h3>审批队列</h3>
+      <div class="approvals" id="approvals">（暂无待审批）</div>
+    </div>
+    <div class="panel">
+      <h3>SSE 事件日志</h3>
+      <div class="log" id="log"></div>
+    </div>
+  </aside>
+</div>
+
+<script>
+const runId = "run-demo";
+const restBase = "";
+
+function log(msg) {
+  const el = document.getElementById("log");
+  el.textContent = msg + "\n" + el.textContent;
+}
+function addMsg(role, text) {
+  if (!text) return;
+  const box = document.getElementById("msgs");
+  const d = document.createElement("div");
+  d.className = "msg " + role;
+  d.textContent = role === "user" ? "你：" + text : text;
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+function showApproval(a) {
+  const box = document.getElementById("msgs");
+  const d = document.createElement("div");
+  d.className = "approval";
+  d.id = "approval-box";
+  d.innerHTML = `⚠️ 需要审批：<b>${escapeHtml(a.tool_name)}</b><br>参数：${escapeHtml(JSON.stringify(a.arguments))}<br>原因：${escapeHtml(a.reason)}
+    <button class="btn-ok" onclick="decide('approve')">✅ 批准</button>
+    <button class="btn-no" onclick="decide('reject')">🚫 拒绝</button>`;
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+function hideApproval() {
+  const el = document.getElementById("approval-box");
+  if (el) el.remove();
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+async function send() {
+  const input = document.getElementById("text");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  hideApproval();
+  addMsg("user", text);
+  await streamChat(text);
+}
+
+// 流式对话（SSE 打字机）：逐增量渲染，模型吐一个字前端就出一个字
+async function streamChat(text) {
+  // 创建一个空的 assistant 气泡，边收到增量边往里追加
+  const box = document.getElementById("msgs");
+  const bubble = document.createElement("div");
+  bubble.className = "msg assistant";
+  bubble.textContent = "";
+  box.appendChild(bubble);
+
+  try {
+    const r = await fetch(restBase + "/chat/stream/" + runId, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok || !r.body) {
+      const data = await r.json().catch(() => ({}));
+      bubble.textContent = "⚠️ " + (data.detail || r.status);
+      return;
+    }
+    // 用 ReadableStream 逐块读 SSE，按 "\n\n" 切出事件
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const line = raw.split("\n").find(l => l.startsWith("data: "));
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(6)); } catch (e) { continue; }
+        handleStreamEvent(ev, bubble);
+      }
+    }
+  } catch (e) {
+    bubble.textContent = "⚠️ 网络错误：" + e;
+  }
+}
+
+function handleStreamEvent(ev, bubble) {
+  switch (ev.type) {
+    case "delta":
+      bubble.textContent += ev.text;          // 打字机：增量追加
+      scrollBottom();
+      break;
+    case "tool":
+      bubble.textContent += "\n🔧 调用工具: " + ev.name;
+      scrollBottom();
+      break;
+    case "final":
+      bubble.textContent = ev.text;           // 最终文本替换（去掉临时内容）
+      scrollBottom();
+      break;
+    case "needs_approval":
+      bubble.remove();
+      showApproval(ev.approval);
+      break;
+    case "error":
+      bubble.textContent = "⚠️ " + (ev.message || "出错");
+      break;
+  }
+  log("→ " + JSON.stringify(ev));
+}
+
+function scrollBottom() {
+  const box = document.getElementById("msgs");
+  box.scrollTop = box.scrollHeight;
+}
+
+async function decide(action) {
+  hideApproval();
+  const r = await fetch(restBase + "/" + action + "/" + runId, { method: "POST" });
+  const data = await r.json();
+  if (!r.ok) { addMsg("assistant", "⚠️ " + (data.detail || "出错")); return; }
+  if (data.kind === "final") addMsg("assistant", data.text);
+  else if (data.kind === "needs_approval") showApproval(data.approval);
+}
+
+// 轮询审批队列 + SSE 日志
+async function refreshApprovals() {
+  const r = await fetch(restBase + "/approvals");
+  const list = await r.json();
+  const el = document.getElementById("approvals");
+  if (list.length === 0) { el.innerHTML = "（暂无待审批）"; return; }
+  el.innerHTML = "";
+  for (const a of list) {
+    const d = document.createElement("div");
+    d.className = "apr";
+    d.innerHTML = `run=<b>${escapeHtml(a.run_id)}</b> · 工具=<b>${escapeHtml(a.tool_name)}</b>`;
+    el.appendChild(d);
+  }
+}
+
+function openSSE() {
+  const es = new EventSource(restBase + "/events/" + runId);
+  es.onmessage = (ev) => log("← " + ev.data);
+  es.onerror = () => {};
+}
+
+// 看用的是真假模型（请求 /status 顺便读 header 不现实，直接固定文案）
+async function init() {
+  try { await fetch(restBase + "/status/" + runId); } catch (e) {}
+  setInterval(refreshApprovals, 2000);
+  refreshApprovals();
+  openSSE();
+}
+init();
+</script>
+</body>
+</html>

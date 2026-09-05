@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Node / 前端依赖（绝不提交 node_modules）
+node_modules/
+npm-debug.log*
+*.tsbuildinfo
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 运行产物（警惕：SQLite 数据库、日志、密钥）
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+local-tmp/
+*.log
+
+# 密钥——绝不能提交
+.env
+*.key
+*.pem
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 工具缓存（ZCode 计划存储等）
+.zcode/
