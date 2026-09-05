@@ -107,6 +107,22 @@
   - 新增 `tests`:技能版本化(5)、WORKSPACE 作用域(3)、多 Agent 容错/共享记忆/分派(6);
     全量测试 **270 passed, 1 skipped**
 
+- **工具调用全链路稳定性层**(新增 `tool/stability.py` + 接入 loop):
+  - **超时护栏**:给工具调用设硬时限,卡死的工具不再同步卡死整个 loop(工作线程 + deadline,
+    `future.result(timeout)`,到点返回超时信号并交还控制权)。
+  - **指数退避重试**:瞬时故障(超时/ConnectionError/OSError)按 `backoff_base*2^(n-1)` 指数退避
+    自动重试(上限 `backoff_max`),扛限流/抖动;pure(无副作用)工具额外可重试。
+  - **统一降级兜底**:重试耗尽配了 `fallback` → 返回带 `[降级]` 标记的兜底结果;否则返回错误串。
+  - **熔断保护(circuit breaker)**:连续失败达 `circuit_threshold` 次 → 短路期内直接返回 `[熔断]`
+    信号、不调不重试(不再空转打上游);冷却 `circuit_cooldown` 后**半开试探**一次,成功即关闭、
+    失败再打开;按工具名分桶隔离(一个工具挂了不连累别的)。默认 `threshold=0` 关闭。
+  - **对齐项目约定**:结果带标志(非异常抛出,同 execution/broker)、复用 `ToolSpec.pure` 可重试信号、
+    `StabilityConfig()` 默认全关(向后兼容,不配不改行为);`AgentLoop(..., stability=...)` 可选接入,
+    loop 深度① 下游零改动。
+  - 新增 `tests/test_tool_stability.py`(18 项:退避递增/重试成功/非瞬时不重试/pure 语义/超时不卡死/
+    降级/默认关闭/loop 集成/熔断触发/熔断跳重试/半开恢复/半开失败再熔断/隔离)。全量测试
+    **288 passed, 1 skipped**
+
 ### 未实现(路线图,见 README)
 
 - T9 分层/契约测试(接口契约一致性、分层边界)

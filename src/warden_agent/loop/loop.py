@@ -64,6 +64,7 @@ class AgentLoop:
         max_context_chars: int = 0,
         planner: Any = None,
         intent: Any = None,
+        stability: Any = None,
     ) -> None:
         self.model = model
         self.catalog = catalog
@@ -76,6 +77,10 @@ class AgentLoop:
         self.memory = memory  # 可选：记忆中枢(见 loop 深度②)
         from warden_agent.memory import MemoryScope
         self._memory_scope = memory_scope or MemoryScope.SESSION
+        # 【工具稳定性层】可选。None 则不启用（基础执行，向后兼容）。
+        # 传入一个 StableToolExecutor(StabilityConfig(...))，就能给工具调用加
+        # 超时 + 指数退避重试 + 降级兜底（见 tool/stability.py）。
+        self.stability = stability
         # 【loop 深度③】阶段规划器（可选）。None 则不拆阶段（基础 loop）。
         self.planner = planner
         # 【loop 深度⑤】工具意图路由器（可选）。None 则不做"调用前意图校验"（只防打转）。
@@ -212,7 +217,21 @@ class AgentLoop:
 
         把"未注册工具 / 参数不合法 / 工具内部异常"都统一转成可喂回模型的错误信息，
         而不是让异常直接击穿整个 loop——这就是"失败自恢复"能工作的前提。
+
+        【工具稳定性层】若传入了 `stability`（StableToolExecutor），工具调用会先走它的
+        "超时 + 重试 + 降级"管线：超时不卡死、瞬时故障指数退避自动重试、可降级兜底。
+        looop 深度① 的下游（重试上限/放弃提示）拿到的仍是 `(result, error)`，无需改动。
         """
+        if self.stability is not None:
+            try:
+                spec = self.catalog.get(name)
+            except KeyError as e:
+                return None, f"{type(e).__name__}: {e}"
+            sres = self.stability.execute(spec, arguments)
+            if sres.degraded:
+                # 降级结果当成"成功"给模型/排优先级：它是可用的兜底产出（带 [降级] 标记）
+                return sres.result, None
+            return sres.result, sres.error
         try:
             return self.catalog.execute(name, arguments), None
         except Exception as e:  # noqa: BLE001 - 工具错误要全部转为可恢复信息
