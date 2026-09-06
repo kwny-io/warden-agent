@@ -14,9 +14,16 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from typing import Any
 
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.model.model import Message, ToolCall
+
+
+def _now_iso() -> str:
+    """当前 UTC 时间的 ISO 字符串（秒级），与 SqliteStore 语义一致。"""
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 class PostgresStore:
@@ -67,15 +74,18 @@ class PostgresStore:
                     reason      TEXT NOT NULL
                 )
             """)
+            # 老库补列：会话最后活跃时间（对话列表展示用）
+            cur.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS updated_at TEXT")
         self.conn.commit()
 
     # ---- Run 状态 ----
     def save_run(self, run: AgentRun) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO runs (run_id, status) VALUES (%s, %s) "
-                "ON CONFLICT (run_id) DO UPDATE SET status = EXCLUDED.status",
-                (run.run_id, run.status.name),
+                "INSERT INTO runs (run_id, status, updated_at) VALUES (%s, %s, %s) "
+                "ON CONFLICT (run_id) DO UPDATE SET status = EXCLUDED.status, "
+                "updated_at = EXCLUDED.updated_at",
+                (run.run_id, run.status.name, _now_iso()),
             )
         self.conn.commit()
 
@@ -89,13 +99,61 @@ class PostgresStore:
         run.status = RunStatus[row[0]]
         return run
 
+    def delete_run(self, run_id: str) -> None:
+        """删除整个会话：对话、待审批、状态一并清掉（与 SqliteStore 语义一致）。"""
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM messages WHERE run_id = %s", (run_id,))
+            cur.execute("DELETE FROM pending_approvals WHERE run_id = %s", (run_id,))
+            cur.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
+        self.conn.commit()
+
+    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """列出会话概要（前端对话列表用）：按最近活跃排序，语义与 SqliteStore 一致。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.run_id,
+                       r.status,
+                       (SELECT COUNT(*) FROM messages m WHERE m.run_id = r.run_id) AS msg_count,
+                       (SELECT m.content FROM messages m
+                         WHERE m.run_id = r.run_id AND m.role = 'user'
+                         ORDER BY m.id LIMIT 1) AS title,
+                       (SELECT MAX(m.id) FROM messages m WHERE m.run_id = r.run_id) AS last_id,
+                       r.updated_at
+                FROM runs r
+                ORDER BY last_id DESC NULLS LAST
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "run_id": r[0],
+                "status": r[1],
+                "msg_count": r[2],
+                "title": ((r[3] or r[0]) or "")[:60],
+                "updated_at": r[5],
+            }
+            for r in rows
+        ]
+
     # ---- 对话消息 ----
     def append_message(self, run_id: str, message: Message) -> None:
+        """追加一条消息。入库前按会话 + 角色 + 内容 + 工具调用查重，完全相同的不重复落库。"""
         tool_json = (
             json.dumps(message.tool_call.to_dict())
             if message.tool_call else None
         )
         with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM messages "
+                "WHERE run_id = %s AND role = %s AND content = %s "
+                "AND COALESCE(tool_call, '') = COALESCE(%s, '') LIMIT 1",
+                (run_id, message.role, message.content, tool_json),
+            )
+            if cur.fetchone() is not None:
+                return  # 已有完全相同的一条，跳过
             cur.execute(
                 "INSERT INTO messages (run_id, role, content, tool_call) "
                 "VALUES (%s, %s, %s, %s)",

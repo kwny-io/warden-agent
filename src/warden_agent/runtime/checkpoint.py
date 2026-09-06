@@ -102,9 +102,14 @@ class CheckpointManager:
 class CheckpointStore:
     """Checkpoint 的持久化接口。任何存储实现它即可。"""
 
-    def save(self, checkpoint: Checkpoint) -> None: ...
-    def load(self, run_id: str) -> Checkpoint | None: ...
-    def list(self) -> list[Checkpoint]: ...
+    def save(self, checkpoint: Checkpoint) -> None:
+        raise NotImplementedError
+
+    def load(self, run_id: str) -> Checkpoint | None:
+        raise NotImplementedError
+
+    def list(self) -> list[Checkpoint]:
+        raise NotImplementedError
 
 
 class InMemoryCheckpointStore(CheckpointStore):

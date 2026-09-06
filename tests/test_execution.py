@@ -1,9 +1,7 @@
 """受控执行引擎测试：输出缓冲、超时预算、错误处理。"""
 from __future__ import annotations
 
-import subprocess
 import sys
-import textwrap
 
 import pytest
 

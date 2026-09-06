@@ -40,3 +40,4 @@ Thumbs.db
 
 # 工具缓存（ZCode 计划存储等）
 .zcode/
+.mimosa/

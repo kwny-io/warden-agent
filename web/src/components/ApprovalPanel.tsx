@@ -28,8 +28,11 @@ export default function ApprovalPanel() {
   const list = approvals ?? [];
 
   return (
-    <div className="rounded-xl border border-warden-line bg-warden-panel p-3">
-      <h3 className="text-sm font-medium text-warden-fg/80 mb-2">审批队列</h3>
+    <div className="wpanel p-3.5">
+      <h3 className="flex items-center gap-1.5 text-sm font-medium text-warden-fg mb-2">
+        <span className="w-2 h-2 rounded-full bg-warden-warn shadow-[0_0_8px_rgba(210,162,76,0.8)]" />
+        审批队列
+      </h3>
       {error && <p className="text-xs text-warden-danger">⚠️ {error}</p>}
       {list.length === 0 ? (
         <p className="text-xs text-warden-fg/50">（暂无待审批）</p>
@@ -38,7 +41,7 @@ export default function ApprovalPanel() {
           {list.map((a) => (
             <li
               key={a.run_id + a.approval_id}
-              className="rounded-lg border border-warden-line bg-warden-bg p-2 text-xs"
+              className="rounded-xl border border-white/[0.06] bg-black/20 p-2.5 text-xs"
             >
               <div className="text-warden-fg/80">
                 run=<span className="text-warden-warn">{a.run_id}</span>
@@ -47,7 +50,7 @@ export default function ApprovalPanel() {
                 工具=<span className="text-warden-accent">{a.tool_name}</span>
               </div>
               {a.reason && (
-                <div className="text-warden-fg/60 mt-0.5 break-words">原因：{a.reason}</div>
+                <div className="text-warden-fg/75 mt-0.5 break-words">原因：{a.reason}</div>
               )}
               <div className="flex gap-2 mt-1.5">
                 <button

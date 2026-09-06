@@ -24,6 +24,7 @@ ExecutionBroker 已经管住"怎么跑、能跑多久、输出多大、最多并
 
 from __future__ import annotations
 
+import contextlib
 import re
 import shutil
 import tempfile
@@ -136,7 +137,5 @@ def _copy_tree_readonly(src: Path, dst: Path) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
             # Windows 上设为只读属性；POSIX 上去掉写权限
-            try:
+            with contextlib.suppress(OSError):
                 target.chmod(target.stat().st_mode & 0o444)
-            except OSError:
-                pass

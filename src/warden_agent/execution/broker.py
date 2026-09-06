@@ -24,6 +24,10 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from warden_agent.execution._platform import ProcessLimiter
 
 
 class BoundedOutputBuffer:
@@ -64,8 +68,8 @@ class ExecutionBudget:
     资源限制（sandbox 用，跨平台语义）：
       - max_memory_mb   ：内存上限（MB）。POSIX 用 RLIMIT_AS；Windows 用 Job Object 进程内存上限。
       - max_cpu_seconds ：CPU 时间上限（秒）。POSIX 用 RLIMIT_CPU；Windows 用 Job Object job 时间。
-      - max_files       ：打开文件数上限。POSIX 用 RLIMIT_NOFILE；Windows 尽力而为（job 不直接限文件数，
-                          主要靠超时/输出截断兜底，见文档）。
+      - max_files       ：打开文件数上限。POSIX 用 RLIMIT_NOFILE；Windows 尽力而为
+                          （job 不直接限文件数，主要靠超时/输出截断兜底，见文档）。
       - max_processes   ：同时活动的子进程数上限（已有）。
     """
 
@@ -126,7 +130,7 @@ class ExecutionBroker:
         self.budget = budget or ExecutionBudget()
         self._active: list[ManagedProcess] = []
         self._lock = threading.Lock()
-        self._last_limiter = None  # 保持 Windows Job 句柄存活到进程结束
+        self._last_limiter: ProcessLimiter | None = None  # 保持 Windows Job 句柄存活到进程结束
 
     @property
     def active_processes(self) -> int:

@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from warden_agent.core.run.status import RunStatus
 from warden_agent.runtime.checkpoint import Checkpoint, CheckpointStore

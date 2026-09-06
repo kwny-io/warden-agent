@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from warden_agent import cli
 
 # 期望存在的子命令及其 handler

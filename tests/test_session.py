@@ -4,10 +4,10 @@ from pathlib import Path
 
 from tests.conftest import ScriptedModel, weather_tool
 
-from warden_agent.core.run.status import RunStatus
-from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, ToolCall
+from warden_agent.core.run.status import AgentRun, RunStatus
+from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyEngine, PolicyResult
-from warden_agent.runtime.session import AgentSession, NeedsApproval
+from warden_agent.runtime.session import AgentSession, FinalReply, NeedsApproval
 from warden_agent.store.sqlite import SqliteStore
 
 
@@ -165,5 +165,97 @@ def test_流式_stream逐增量产出事件() -> None:
     assert texts == ["你", "好", "！"]
     # 完成后会话处于终态
     assert sess.is_terminal()
+
+
+def test_会话完成后新消息可开启新一轮() -> None:
+    """回归：同一 run_id 多轮对话。第一轮完成后，第二条消息应重开执行周期，
+    而不是在状态机上撞 COMPLETED -> WAITING_APPROVAL 非法转换（UI 曾报 500）。"""
+    store = _store()
+    model = ScriptedModel([
+        ChatResponse(content="天晴。", finish_reason="stop"),        # 第一轮：直接回答
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="c2", name="weather.get", arguments={"city": "上海"})],
+            finish_reason="tool_calls"),                            # 第二轮：想调 ASK 工具
+        ChatResponse(content="已批准，执行完成。", finish_reason="stop"),  # 批准后：给结论
+    ])
+    sess = AgentSession(run_id="r-multi", model=model, catalog=weather_tool(),
+                        policy_engine=_policy(Decision.ASK), store=store)
+
+    first = sess.start("第一句")
+    assert isinstance(first, FinalReply)
+    assert sess.status() == RunStatus.COMPLETED
+
+    second = sess.start("第二句")
+    assert isinstance(second, NeedsApproval)  # 修复前：这里抛非法状态转换
+    assert sess.status() == RunStatus.WAITING_APPROVAL
+    final = sess.approve()
+    assert isinstance(final, FinalReply)
+    assert final.text == "已批准，执行完成。"
+    assert sess.status() == RunStatus.COMPLETED
+
+
+def test_流式会话完成后新消息可开启新一轮() -> None:
+    """回归：流式路径（/chat/stream）没有 _run_loop 的终态拦截，
+    第二条消息曾直接撞 COMPLETED -> WAITING_APPROVAL。"""
+    store = _store()
+    model = ScriptedModel([
+        ChatResponse(content="第一轮结束。", finish_reason="stop"),
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="c2", name="weather.get", arguments={"city": "上海"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content="第二轮结束。", finish_reason="stop"),
+    ])
+    sess = AgentSession(run_id="r-multi-stream", model=model, catalog=weather_tool(),
+                        policy_engine=_policy(Decision.ASK), store=store)
+    list(sess.stream("第一句"))
+    assert sess.is_terminal()
+
+    events = list(sess.stream("第二句"))
+    types = [e["type"] for e in events]
+    assert "needs_approval" in types  # 修复前：这里抛非法状态转换
+    final = sess.approve()
+    assert isinstance(final, FinalReply)
+    assert final.text == "第二轮结束。"
+
+
+def test_悬空工具调用的历史发给模型前自动补齐() -> None:
+    """回归：历史里 assistant(tool_call) 后面没有 tool 结果（曾被中断），
+    下一次调模型前应自动补一条同 id 的合成 tool 结果，否则真实 API 400。"""
+
+    class RecordingModel(AgentChatModel):
+        """记录收到的 messages，用于断言补齐结果。"""
+
+        def __init__(self, reply: ChatResponse) -> None:
+            self.reply = reply
+            self.seen: list[ChatRequest] = []
+
+        def chat(self, request: ChatRequest) -> ChatResponse:
+            self.seen.append(request)
+            return self.reply
+
+    store = _store()
+    # 伪造一段被中断的历史：user + assistant(tool_call)，没有 tool 结果
+    dangling = ToolCall(id="call-x", name="weather.get", arguments={"city": "上海"})
+    store.save_run(AgentRun("r-dangling"))
+    store.append_message("r-dangling", Message(role="user", content="查天气"))
+    store.append_message(
+        "r-dangling",
+        Message(role="assistant", content="[调用工具 weather.get]", tool_call=dangling),
+    )
+
+    model = RecordingModel(ChatResponse(content="好的。", finish_reason="stop"))
+    sess = AgentSession(run_id="r-dangling", model=model, catalog=weather_tool(),
+                        policy_engine=_policy(Decision.ALLOW), store=store)
+    final = sess.start("继续")
+    assert final.text == "好的。"  # type: ignore[attr-defined]
+
+    sent = model.seen[0].messages
+    idx_call = next(
+        i for i, m in enumerate(sent) if m.tool_call and m.tool_call.id == "call-x"
+    )
+    repair = sent[idx_call + 1]
+    assert repair.role == "tool"
+    assert repair.tool_call is not None and repair.tool_call.id == "call-x"
+    assert "中断" in repair.content
 
 

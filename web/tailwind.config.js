@@ -4,16 +4,18 @@ export default {
   theme: {
     extend: {
       colors: {
-        // 深色控制台主题，跟原演示控制台配色呼应
+        // 中性锌灰（ZCode 式）底 + 冷白 + 低饱和蓝强调
         warden: {
-          bg: "#0f1220",     // 页面底色
-          panel: "#1a1e30",  // 面板
-          line: "#2a2f45",   // 分隔线
-          fg: "#e6e8f0",     // 主文字
-          accent: "#4f8cff", // 强调蓝
-          ok: "#3ddc97",     // 成功绿
-          warn: "#ffc857",   // 警示黄
-          danger: "#ff5c5c", // 危险红
+          bg: "#101013",     // 全局底色（zinc-950 调）
+          midnight: "#0c0c0e", // 更深一层
+          panel: "#1c1c1f",  // 面板基色
+          line: "#2e2e33",   // 分隔线
+          fg: "#e4e4e7",     // 主文字（zinc-200）
+          accent: "#5e81ac", // 主强调：低饱和蓝
+          cyan: "#7fa3c4",   // 浅钢蓝（渐变搭档）
+          ok: "#569a8c",     // 成功 = 低饱和青绿
+          warn: "#c9a04a",   // 等待 / 警示 = 低饱和琥珀
+          danger: "#c96a5a", // 危险 = 低饱和红
         },
       },
     },

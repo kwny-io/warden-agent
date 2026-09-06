@@ -141,6 +141,8 @@ def main() -> None:
         git_workdir=os.environ.get("GIT_WORKDIR") or None,
         api_keys=api_keys,
         audit_store=audit_store,
+        model_id=("deepseek" if api_key else "fake"),
+        model_api_key=api_key,
     )
     port = int(os.environ.get("PORT", "8000"))
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)

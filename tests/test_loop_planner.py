@@ -1,9 +1,10 @@
 """loop 深度③ 阶段规划测试。"""
+from tests.conftest import ScriptedModel, weather_tool
+
 from warden_agent.loop.intent import ToolIntentRouter
 from warden_agent.loop.loop import AgentLoop
 from warden_agent.loop.planner import build_plan, is_complex, plan_as_context
-from tests.conftest import ScriptedModel, weather_tool
-from warden_agent.model.model import ChatResponse
+from warden_agent.model.model import ChatResponse, ToolCall
 
 # ---- Planner 本身 ----
 
@@ -117,8 +118,7 @@ def test_intent_误调时喂回提示而不执行() -> None:
     assert any("意图提示" in m for m in tool_msgs)
 
 
-def _tc(cid: str, name: str, args: dict) -> "ToolCall":
-    from warden_agent.model.model import ToolCall
+def _tc(cid: str, name: str, args: dict) -> ToolCall:
     return ToolCall(id=cid, name=name, arguments=args)
 
 

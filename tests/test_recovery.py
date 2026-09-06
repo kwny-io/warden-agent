@@ -4,7 +4,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from warden_agent.core.run.status import AgentRun, RunStatus
+from warden_agent.core.run.status import RunStatus
 from warden_agent.runtime.checkpoint import (
     Checkpoint,
     InMemoryCheckpointStore,

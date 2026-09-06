@@ -59,3 +59,25 @@ export interface HealthResult {
   status: string;
   checks: Array<{ name: string; ok: boolean; detail?: string }>;
 }
+
+// GET /runs 对话列表项
+export interface RunInfo {
+  run_id: string;
+  status: string;
+  msg_count: number;
+  title: string;
+  updated_at?: string | null; // 最后活跃时间（老数据可能为空）
+}
+
+// GET /models 模型信息
+export interface ModelInfo {
+  id: string;
+  name: string;
+  needs_key: boolean;
+  configured: boolean;
+}
+
+export interface ModelsInfo {
+  current: string;
+  models: ModelInfo[];
+}

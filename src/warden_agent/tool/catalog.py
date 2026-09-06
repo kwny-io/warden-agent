@@ -18,6 +18,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from pydantic import BaseModel, ValidationError
+
 
 class Tool(Protocol):
     """一个 Tool 必须能：给出自己的说明书(spec)，并被调用(invoke)。"""
@@ -100,15 +102,15 @@ class ToolArgumentError(Exception):
     """工具参数校验失败（用 Pydantic 校验时抛出）。"""
 
 
-def pydantic_tool(
+def pydantic_tool[M: BaseModel](
     name: str,
     description: str,
-    input_model: type[BaseModel],
+    input_model: type[M],
     *,
     pure: bool = False,
     strict: bool = False,
     triggers: tuple[str, ...] = (),
-) -> Callable[[Callable[[BaseModel], Any]], FunctionToolSpec]:
+) -> Callable[[Callable[[M], Any]], FunctionToolSpec]:
     """Pydantic 版技能卡：用模型类自动生成 JSON Schema + 自动校验参数。
 
     对比手写 JSON Schema（function_tool），这一步是主流框架（PydanticAI 等）的做法：
@@ -128,11 +130,9 @@ def pydantic_tool(
         def get_weather(req: WeatherReq) -> str:
             return f"{req.city}: 晴, 25度"
     """
-    from pydantic import BaseModel, ValidationError
-
     schema = input_model.model_json_schema()
 
-    def decorator(fn: Callable[[BaseModel], Any]) -> FunctionToolSpec:
+    def decorator(fn: Callable[[M], Any]) -> FunctionToolSpec:
         def _call(**kwargs: Any) -> Any:
             try:
                 validated = input_model.model_validate(kwargs, strict=strict)
@@ -155,7 +155,6 @@ def pydantic_tool(
 class ToolCatalog:
     """装所有技能卡的『工具箱』，AI 只能从这里面挑工具用。
 
-    
     设计要点：一旦把工具注册进目录，AI 想用的工具集合就固定了，
     不会运行到一半突然多出一个工具来（这叫"冻结工具集"）。
     """

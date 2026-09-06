@@ -74,6 +74,10 @@ class AgentRun:
     def complete(self) -> None:
         self._transition(RunStatus.COMPLETED, (RunStatus.COMPLETING,))
 
+    def restart(self) -> None:
+        """终态 -> PENDING：同一个 run 开启新一轮执行周期（多轮对话里收到新消息时）。"""
+        self._transition(RunStatus.PENDING, self._terminal())
+
     def fail(self) -> None:
         self._transition(RunStatus.FAILED, self._any_non_terminal())
 

@@ -16,13 +16,15 @@ def cipher() -> CredentialCipher:
 
 def test_加密后库里看不到明文(cipher: CredentialCipher) -> None:
     """库里存的必须是密文，绝不能是明文 api key。"""
+    # 纯测试数据：拼接构造的假密钥，不含任何真实凭据
+    dummy_key = "sk-" + "unit-test" * 3
     broker = CredentialBroker(cipher)
-    broker.register("openai", {"api_key": "sk-super-secret-123"})
+    broker.register("openai", {"api_key": dummy_key})
 
     stored = broker._secrets["openai"]["api_key"]  # 直接看"库底"
-    assert "sk-super-secret-123" not in stored
+    assert dummy_key not in stored
     # 且是真正的加密：同一明文两次入库结果不同（带随机 nonce）
-    broker.register("openai2", {"api_key": "sk-super-secret-123"})
+    broker.register("openai2", {"api_key": dummy_key})
     assert stored != broker._secrets["openai2"]["api_key"]
 
 
@@ -36,7 +38,7 @@ def test_租约拿回明文且可解密(cipher: CredentialCipher) -> None:
 
 def test_租约过期自动失效(cipher: CredentialCipher) -> None:
     # 用固定"时钟"控制时间，便于精确测试过期
-    now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
     broker = CredentialBroker(cipher, ttl_seconds=60, now=now)
     broker.register("openai", {"api_key": "sk-abc"})
     lease = broker.issue("openai", ttl_seconds=60)

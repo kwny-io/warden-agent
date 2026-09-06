@@ -15,8 +15,8 @@ from warden_agent.execution.broker import (
 )
 from warden_agent.execution.sandbox import (
     NetworkPolicy,
-    SandboxSpec,
     SandboxedExecutionBroker,
+    SandboxSpec,
 )
 
 __all__ = [

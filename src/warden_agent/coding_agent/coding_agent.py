@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from warden_agent.agent import build_agent
+from warden_agent.model.model import AgentChatModel
 from warden_agent.tool.catalog import ToolSpec, function_tool
 
 _MAX_READ_BYTES = 64 * 1024  # 单文件读取上限（防止把整个大文件灌给模型/tool）
@@ -37,9 +38,12 @@ def _make_code_tools(workdir: str) -> list[ToolSpec]:
 
     @function_tool(
         "code.list",
-        "列出 git 仓库 workdir 下某个子目录的文件/子目录（相对路径）。用于让 Agent 先看清仓库结构。",
+        "列出 git 仓库 workdir 下某个子目录的文件/子目录（相对路径）。"
+        "用于让 Agent 先看清仓库结构。",
         {"type": "object",
-         "properties": {"path": {"type": "string", "description": "相对 workdir 的目录路径；空或 '.' 表示根"}},
+         "properties": {
+             "path": {"type": "string",
+                      "description": "相对 workdir 的目录路径；空或 '.' 表示根"}},
          "required": ["path"]},
         pure=True,
     )
@@ -92,7 +96,7 @@ def run_coding_task(
     requirement: str,
     workdir: str,
     *,
-    provider=None,
+    provider: str | AgentChatModel | None = None,
     expected_base_commit: str | None = None,
     max_iterations: int = 15,
 ) -> CodingResult:

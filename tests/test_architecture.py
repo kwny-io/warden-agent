@@ -32,7 +32,7 @@ TIER: dict[str, int] = {
     "store": 2, "loop": 2, "runtime": 2, "memory": 2, "skill": 2,
     "credential": 2, "rag": 2, "execution": 2, "multiagent": 2,
     "mcp": 3, "web": 3, "agent": 3,
-    "demo": 4,
+    "demo": 4, "evals": 4,
 }
 
 # 允许"向上依赖一到两层"的特例（真实存在的合理依赖）

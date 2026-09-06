@@ -218,7 +218,6 @@ def test_assistant_tool_call_映射为完整tool_calls() -> None:
 
 def test_create_model_custom_读环境变量(monkeypatch) -> None:
     """custom: 从 WARDEN_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL 零改源码接入。"""
-    import warden_agent.model.deepseek as ds
     monkeypatch.setenv("WARDEN_API_KEY", "k-c")
     monkeypatch.setenv("WARDEN_BASE_URL", "http://localhost:11434/v1")
     monkeypatch.setenv("WARDEN_MODEL", "my-llama")

@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from warden_agent.core.run.status import AgentRun
 from warden_agent.model.model import Message
@@ -22,6 +22,10 @@ class RunStore(Protocol):
     def save_run(self, run: AgentRun) -> None: ...
 
     def load_run(self, run_id: str) -> AgentRun | None: ...
+
+    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]: ...
+
+    def delete_run(self, run_id: str) -> None: ...
 
     def append_message(self, run_id: str, message: Message) -> None: ...
 

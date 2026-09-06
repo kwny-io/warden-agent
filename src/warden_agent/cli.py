@@ -102,14 +102,15 @@ def _do_decision(action: str, run_id: str) -> None:
 
 def _cmd_stream(args: argparse.Namespace) -> None:
     try:
-        with _client() as c:
-            with c.stream("POST", f"/chat/stream/{args.run_id}", json={"text": args.text}) as resp:
-                if resp.status_code != 200:
-                    print(resp.text, file=sys.stderr)
-                    sys.exit(1)
-                for line in resp.iter_lines():
-                    if line.strip():
-                        print(line)
+        with _client() as c, c.stream(
+            "POST", f"/chat/stream/{args.run_id}", json={"text": args.text}
+        ) as resp:
+            if resp.status_code != 200:
+                print(resp.text, file=sys.stderr)
+                sys.exit(1)
+            for line in resp.iter_lines():
+                if line.strip():
+                    print(line)
     except httpx.HTTPError as e:
         _die(f"无法连接服务：{e}")
 

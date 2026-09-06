@@ -5,17 +5,14 @@
 
 from __future__ import annotations
 
-import platform
 import sys
 from pathlib import Path
 
-import pytest
-
-from warden_agent.execution.broker import ExecutionBroker, ExecutionBudget
+from warden_agent.execution.broker import ExecutionBudget
 from warden_agent.execution.sandbox import (
     NetworkPolicy,
-    SandboxSpec,
     SandboxedExecutionBroker,
+    SandboxSpec,
 )
 
 

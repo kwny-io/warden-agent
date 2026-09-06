@@ -4,7 +4,8 @@ r"""Unified diff（统一 diff）解析与逐 hunk 应用到工作区文件。
   - Hunk 头：`@@ -l,c +l,c @@`。
   - 行前缀：` ` = 上下文，`+` = 新增，`-` = 删除。—— 换行缺失标记 `\ No newline ...`。
   - 预算：max_files / max_lines / max_bytes，NUL 抛错，换行归一化 LF。
-  - 应用校验：逐 hunk 按 old line 数定位应用；加上"每文件预期 hash"校验（expectedHashes + expectedRevision）。
+  - 应用校验：逐 hunk 按 old line 数定位应用；加上"每文件预期 hash"校验
+    （expectedHashes + expectedRevision）。
 
 设计要点：只改动 patch 里明确列出的文件/行，绝不隐式改动其它地方，且应用前校验基准。
 """

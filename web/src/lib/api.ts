@@ -8,6 +8,8 @@ import type {
   ChatResponseOut,
   HealthResult,
   MemoryItem,
+  ModelsInfo,
+  RunInfo,
 } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -60,6 +62,34 @@ export const api = {
   /** 能力：GET /capabilities */
   capabilities(): Promise<Capabilities> {
     return request("/capabilities");
+  },
+
+  /** 对话记录：GET /messages/{run_id}（刷新后恢复聊天区） */
+  messages(runId: string): Promise<ChatMessage[]> {
+    return request(`/messages/${encodeURIComponent(runId)}`);
+  },
+
+  /** 对话列表：GET /runs（最近活跃优先） */
+  runs(): Promise<RunInfo[]> {
+    return request("/runs");
+  },
+
+  /** 删除会话：DELETE /runs/{run_id}（清掉状态/对话/审批记录） */
+  deleteRun(runId: string): Promise<{ ok: boolean }> {
+    return request(`/runs/${encodeURIComponent(runId)}`, { method: "DELETE" });
+  },
+
+  /** 可用模型列表 + 当前模型：GET /models */
+  models(): Promise<ModelsInfo> {
+    return request("/models");
+  },
+
+  /** 切换 / 导入模型：POST /models/select */
+  selectModel(id: string, apiKey?: string): Promise<{ ok: boolean; current: string }> {
+    return request("/models/select", {
+      method: "POST",
+      body: JSON.stringify({ id, api_key: apiKey || null }),
+    });
   },
 
   /** 记忆：GET /memory/{scope} */
@@ -118,4 +148,4 @@ export const api = {
   },
 };
 
-export type { Approval, Capabilities, ChatMessage, HealthResult, MemoryItem };
+export type { Approval, Capabilities, ChatMessage, HealthResult, MemoryItem, ModelsInfo, RunInfo };

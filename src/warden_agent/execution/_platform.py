@@ -20,8 +20,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import sys
 from dataclasses import dataclass, field
+from typing import Any
 
 from warden_agent.execution.broker import ExecutionBudget
 
@@ -34,7 +37,7 @@ class ProcessLimiter:
     _job         : Windows Job Object 句柄，保持存活直到进程结束（否则 GC 关闭失去限制）。
     """
 
-    popen_kwargs: dict = field(default_factory=dict)
+    popen_kwargs: dict[str, Any] = field(default_factory=dict)
     _job: object = None
 
     def attach(self, proc: object) -> None:
@@ -42,7 +45,7 @@ class ProcessLimiter:
         if self._job is not None:
             self._assign(proc_handle=getattr(proc, "_handle", None))
 
-    def _assign(self, proc_handle) -> None:  # pragma: no cover - 仅 Windows
+    def _assign(self, proc_handle: int | None) -> None:  # pragma: no cover - 仅 Windows
         raise NotImplementedError
 
     def __bool__(self) -> bool:
@@ -66,31 +69,26 @@ def make_limiter(budget: ExecutionBudget) -> ProcessLimiter | None:
 # ---------------- POSIX ----------------
 
 def _make_posix_limiter(budget: ExecutionBudget) -> ProcessLimiter:
-    import resource
+    # resource 是 POSIX 专属模块（Windows 无），动态加载以保持静态类型检查跨平台一致
+    resource = importlib.import_module("resource")
 
     def _preexec() -> None:
         if budget.max_memory_mb is not None:
             limit = budget.max_memory_mb * 1024 * 1024
-            try:
+            with contextlib.suppress(ValueError, OSError):
                 resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-            except (ValueError, OSError):
-                pass
         if budget.max_cpu_seconds is not None:
-            try:
+            with contextlib.suppress(ValueError, OSError):
                 resource.setrlimit(
                     resource.RLIMIT_CPU,
                     (budget.max_cpu_seconds, budget.max_cpu_seconds + 1),
                 )
-            except (ValueError, OSError):
-                pass
         if budget.max_files is not None:
-            try:
+            with contextlib.suppress(ValueError, OSError):
                 resource.setrlimit(
                     resource.RLIMIT_NOFILE,
                     (budget.max_files, budget.max_files),
                 )
-            except (ValueError, OSError):
-                pass
 
     return ProcessLimiter(popen_kwargs={"preexec_fn": _preexec})
 
@@ -100,23 +98,25 @@ def _make_posix_limiter(budget: ExecutionBudget) -> ProcessLimiter:
 class _WindowsLimiter(ProcessLimiter):
     """Windows Job Object 限流器。"""
 
-    def __init__(self, popen_kwargs: dict, job: object) -> None:  # pragma: no cover - 仅 Windows
+    def __init__(  # pragma: no cover - 仅 Windows
+        self, popen_kwargs: dict[str, Any], job: object
+    ) -> None:
         super().__init__(popen_kwargs=popen_kwargs, _job=job)
         self._assign_fn = None
 
-    def _assign(self, proc_handle) -> None:  # pragma: no cover - 仅 Windows
+    def _assign(self, proc_handle: int | None) -> None:  # pragma: no cover - 仅 Windows
         if proc_handle is None or self._job is None:
             return
         try:
-            import win32job
-
+            # pywin32 仅 Windows 可用，动态加载（入 job 失败不致命）
+            win32job = importlib.import_module("win32job")
             win32job.AssignProcessToJobObject(self._job, int(proc_handle))
         except Exception:  # noqa: BLE001 - 入 job 失败不致命
             pass
 
 
 def _make_win32_limiter(budget: ExecutionBudget) -> ProcessLimiter:  # pragma: no cover - 仅 Windows
-    import win32job
+    win32job = importlib.import_module("win32job")
 
     job = win32job.CreateJobObject(None, "warden-sandbox")
     info = win32job.QueryInformationJobObject(

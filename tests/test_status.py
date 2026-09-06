@@ -67,3 +67,20 @@ def test_失败可来自任意非终态() -> None:
     run.mark_queued()
     run.fail()
     assert run.status == RunStatus.FAILED
+
+
+def test_终态可重开新一轮() -> None:
+    """多轮对话：终态允许 restart 回到 PENDING，开启新的执行周期。"""
+    run = AgentRun("run-8")
+    run.mark_queued()
+    run.start()
+    run.begin_completing()
+    run.complete()
+    run.restart()
+    assert run.status == RunStatus.PENDING
+    # 重开后能正常再走一遍生命周期
+    run.mark_queued()
+    run.start()
+    assert run.status == RunStatus.RUNNING
+    with pytest.raises(IllegalStateTransition):
+        run.restart()  # 非终态不允许 restart

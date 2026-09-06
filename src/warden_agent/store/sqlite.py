@@ -20,11 +20,18 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.model.model import Message, ToolCall
 from warden_agent.store.codec import DEFAULT_CODEC_REGISTRY, VersionedCodecRegistry
+
+
+def _now_iso() -> str:
+    """当前 UTC 时间的 ISO 字符串（秒级），存库和展示都用它。"""
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 class SqliteStore:
@@ -92,6 +99,12 @@ class SqliteStore:
                 ("now",),
             )
         self.conn.commit()
+        # v2：runs 表加 updated_at（会话列表展示"最后活跃时间"用）。老库补列，已存在则跳过。
+        try:
+            self.conn.execute("ALTER TABLE runs ADD COLUMN updated_at TEXT")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # 列已存在
 
     def schema_version(self) -> int:
         row = self.conn.execute("SELECT version FROM __schema_version__").fetchone()
@@ -106,12 +119,13 @@ class SqliteStore:
 
     # ---- 保存 ----
     def save_run(self, run: AgentRun) -> None:
-        """把 Run 当前状态写进数据库（KEY 覆盖写）。"""
+        """把 Run 当前状态写进数据库（KEY 覆盖写），同时刷新最后活跃时间。"""
         with self._lock:
             self.conn.execute(
-                "INSERT INTO runs (run_id, status) VALUES (?, ?) "
-                "ON CONFLICT(run_id) DO UPDATE SET status = excluded.status",
-                (run.run_id, run.status.name),
+                "INSERT INTO runs (run_id, status, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET "
+                "status = excluded.status, updated_at = excluded.updated_at",
+                (run.run_id, run.status.name, _now_iso()),
             )
             self.conn.commit()
 
@@ -120,12 +134,23 @@ class SqliteStore:
 
         写入走版本化 codec：把 tool_call 编码成 "v<ver>:" + 内容，
         让未来结构变更时可对历史数据分别读取。
+
+        查重：入库前先按会话（run_id）+ 角色 + 内容 + 工具调用查一遍，
+        完全相同的消息不重复落库（用户重发同一句话 / 流重复结束时历史不会翻倍）。
         """
         tool_json = None
         if message.tool_call is not None:
             ver, encoded = self._codec.encode(None, message.tool_call.to_dict())
             tool_json = f"v{ver}:{encoded}"
         with self._lock:
+            dup = self.conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE run_id = ? AND role = ? AND content = ? "
+                "AND COALESCE(tool_call, '') = COALESCE(?, '') LIMIT 1",
+                (run_id, message.role, message.content, tool_json),
+            ).fetchone()
+            if dup is not None:
+                return  # 已有完全相同的一条，跳过
             self.conn.execute(
                 "INSERT INTO messages (run_id, role, content, tool_call) VALUES (?, ?, ?, ?)",
                 (run_id, message.role, message.content, tool_json),
@@ -158,6 +183,47 @@ class SqliteStore:
                     tool_call = None
             out.append(Message(role=role, content=content, tool_call=tool_call))
         return out
+
+    def delete_run(self, run_id: str) -> None:
+        """删除整个会话：对话、待审批、checkpoint、状态一并清掉。"""
+        with self._lock:
+            self.conn.execute("DELETE FROM messages WHERE run_id = ?", (run_id,))
+            self.conn.execute("DELETE FROM pending_approvals WHERE run_id = ?", (run_id,))
+            self.conn.execute("DELETE FROM checkpoints WHERE run_id = ?", (run_id,))
+            self.conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+            self.conn.commit()
+
+    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """列出会话概要（前端对话列表用）：按最近活跃排序。
+
+        title 取首条用户消息（没有消息的 run 回退用 run_id），msg_count 是对话条数。
+        """
+        rows = self.conn.execute(
+            """
+            SELECT r.run_id,
+                   r.status,
+                   (SELECT COUNT(*) FROM messages m WHERE m.run_id = r.run_id) AS msg_count,
+                   (SELECT m.content FROM messages m
+                     WHERE m.run_id = r.run_id AND m.role = 'user'
+                     ORDER BY m.id LIMIT 1) AS title,
+                   (SELECT MAX(m.id) FROM messages m WHERE m.run_id = r.run_id) AS last_id,
+                   r.updated_at
+            FROM runs r
+            ORDER BY last_id IS NULL, last_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "run_id": r[0],
+                "status": r[1],
+                "msg_count": r[2],
+                "title": (r[3] or r[0])[:60],
+                "updated_at": r[5],
+            }
+            for r in rows
+        ]
 
     def _decode_tool_call(self, raw: str) -> ToolCall | None:
         """按版本前缀解码 tool_call；无前缀的老数据按 v1 JSON 兜底。"""
@@ -263,7 +329,7 @@ class SqliteStore:
             "SELECT run_id, data FROM checkpoints ORDER BY run_id"
         ).fetchall()
         out: list[object] = []
-        for run_id, raw in rows:
+        for _run_id, raw in rows:
             cp = self._decode_checkpoint(raw)
             if cp is not None:
                 out.append(cp)

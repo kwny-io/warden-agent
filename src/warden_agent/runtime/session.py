@@ -67,6 +67,41 @@ class NeedsApproval:
 SessionOutcome = FinalReply | NeedsApproval
 
 
+def _ensure_tool_results(messages: list[Message]) -> list[Message]:
+    """补齐历史里"悬空"的工具调用后再发给模型（不动数据库里的原始记录）。
+
+    真实 API（DeepSeek/OpenAI）要求 assistant 的 tool_calls 后面必须紧跟
+    对应 tool_call_id 的 tool 结果，否则 400。历史里可能有被中断的调用
+    （比如曾异常退出在"记完工具调用、还没执行"之间），这里在请求层
+    给每个悬空调用补一条合成的 tool 结果。
+    """
+    out: list[Message] = []
+    pending: list[ToolCall] = []  # 还没等到结果的 tool_calls
+    for m in messages:
+        if m.role == "tool" and m.tool_call:
+            out.append(m)
+            for i, c in enumerate(pending):
+                if c.id == m.tool_call.id:
+                    pending.pop(i)
+                    break
+            continue
+        if pending:
+            # 后面跟的不是对应的 tool 结果 → 这批悬空调用永远等不到了，就地补齐
+            for c in pending:
+                out.append(Message(
+                    role="tool",
+                    content="[工具调用被中断，未获得结果]",
+                    tool_call=c,
+                ))
+            pending = []
+        out.append(m)
+        if m.role == "assistant" and m.tool_call:
+            pending.append(m.tool_call)
+    for c in pending:  # 历史末尾就悬着的情况
+        out.append(Message(role="tool", content="[工具调用被中断，未获得结果]", tool_call=c))
+    return out
+
+
 class AgentSession:
     """一次可恢复、可审批的 Agent 运行会话。"""
 
@@ -132,6 +167,11 @@ class AgentSession:
     # ---------- 对外主入口 ----------
     def start(self, user_text: str) -> SessionOutcome:
         """开始(或继续)处理一句用户指令，返回：最终回答 / 需要审批。"""
+        # 多轮对话：上一轮已结束（COMPLETED 等），新消息就开启新一轮执行周期
+        if self.run.is_terminal():
+            self.run.restart()
+            self._persist_run()
+
         if self.run.status in (RunStatus.PENDING, RunStatus.QUEUED):
             self.run.mark_queued()
             self.run.start()
@@ -154,6 +194,11 @@ class AgentSession:
         """
         self._reply_type = reply_type
         self._reply_schema = reply_type.model_json_schema()
+
+        # 多轮对话：上一轮已结束，新消息开启新一轮执行周期
+        if self.run.is_terminal():
+            self.run.restart()
+            self._persist_run()
 
         if self.run.status in (RunStatus.PENDING, RunStatus.QUEUED):
             self.run.mark_queued()
@@ -214,7 +259,7 @@ class AgentSession:
 
         for _ in range(self.max_iterations):
             response = self.model.chat(ChatRequest(
-                messages=self.messages,
+                messages=_ensure_tool_results(self.messages),
                 tools=[t.to_openai_schema() for t in self.catalog.all()],
                 structured_output=self._reply_schema,
             ))
@@ -279,6 +324,13 @@ class AgentSession:
     #   {"type":"needs_approval","approval":{...}}       需要审批
     def stream(self, user_text: str) -> Iterator[dict[str, Any]]:
         """以生成器方式处理一句用户指令，逐增量产出事件（配合 SSE 打字机）。"""
+        # 多轮对话：上一轮已结束（COMPLETED 等），新消息就开启新一轮执行周期。
+        # 注意：stream() 不走 _run_loop 的终态拦截，必须在这里先重开，
+        # 否则会在 wait_for_approval()/resume() 处撞上非法状态转换（UI 第二条消息报 500）。
+        if self.run.is_terminal():
+            self.run.restart()
+            self._persist_run()
+
         if self.run.status in (RunStatus.PENDING, RunStatus.QUEUED):
             self.run.mark_queued()
             self.run.start()
@@ -292,7 +344,7 @@ class AgentSession:
 
         for _ in range(self.max_iterations):
             response = self.model.chat(ChatRequest(
-                messages=self.messages,
+                messages=_ensure_tool_results(self.messages),
                 tools=[t.to_openai_schema() for t in self.catalog.all()],
                 stream=True,  # 流式：模型增量返回在 response.deltas 里
             ))

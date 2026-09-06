@@ -11,8 +11,9 @@
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from warden_agent.core.run.status import AgentRun
 from warden_agent.model.fake import FakeModel
@@ -20,7 +21,10 @@ from warden_agent.model.model import AgentChatModel, Message
 from warden_agent.policy.policy import PolicyEngine
 from warden_agent.runtime.session import AgentSession, FinalReply, NeedsApproval
 from warden_agent.store.base import RunStore
-from warden_agent.tool.catalog import ToolCatalog, ToolSpec
+from warden_agent.tool.catalog import ToolCatalog, ToolSpec, function_tool
+
+if TYPE_CHECKING:
+    from warden_agent.execution.sandbox import SandboxSpec
 
 
 class InMemoryRunStore:
@@ -102,6 +106,50 @@ class Agent:
         return self._new_session().run_typed(reply_type, user_text)
 
 
+def _make_sandbox_tool(spec: SandboxSpec) -> ToolSpec:
+    """构造受沙箱管控的 `shell.run` 工具（build_agent(sandbox=True) 的落点）。
+
+    安全语义全部来自 SandboxedExecutionBroker：只读工作区副本（改不到宿主）、
+    默认禁网（NetworkPolicy 语义层拒绝）、超时强杀与输出量预算（ExecutionBudget）。
+    """
+    from warden_agent.execution.sandbox import SandboxedExecutionBroker
+
+    broker = SandboxedExecutionBroker(spec=spec)
+
+    @function_tool(
+        "shell.run",
+        "在受控沙箱中执行一条 shell 命令：命令跑在只读工作区副本里（改不到原目录），"
+        "默认禁网（疑似联网的命令会被拒绝），超时与输出量受预算约束。"
+        "用于需要运行命令/脚本的任务。",
+        {"type": "object",
+         "properties": {
+             "command": {"type": "string",
+                          "description": "要执行的命令行，如 python stats.py"},
+             "workspace": {"type": "string",
+                            "description": "可选：拷入只读工作区的输入目录；缺省为空工作区"}},
+         "required": ["command"]},
+        pure=False,
+        triggers=("执行", "命令", "运行", "脚本", "shell", "run"),
+    )
+    def shell_run(command: str, workspace: str = "") -> str:
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return f"[拒绝] 命令解析失败: {e}"
+        if not argv:
+            return "[拒绝] 命令为空"
+        result = broker.execute(argv, workspace_input=workspace or None)
+        head = f"exit_code: {result.exit_code}"
+        if result.timed_out:
+            head += "（超时被强制终止）"
+        if result.stdout_truncated or result.stderr_truncated:
+            head += "（输出被截断）"
+        return (f"{head}\n--- stdout ---\n{result.stdout or '(空)'}\n"
+                f"--- stderr ---\n{result.stderr or '(空)'}")
+
+    return shell_run
+
+
 def augment_catalog(
     catalog: ToolCatalog,
     *,
@@ -111,6 +159,8 @@ def augment_catalog(
     mcp_server: str | None = None,
     git_workdir: str | None = None,
     memory_scope: Any = None,
+    sandbox: bool = False,
+    sandbox_spec: SandboxSpec | None = None,
 ) -> Any:
     """把 Memory / Skill / Web / MCP 的能力工具注册进目录（可复用给 HTTP 层）。
 
@@ -175,6 +225,13 @@ def augment_catalog(
             catalog.register(spec)
         extra["git_workdir"] = git_workdir
 
+    # 6. 沙箱（受控命令执行：只读副本 + 默认禁网 + 预算约束）
+    if sandbox:
+        from warden_agent.execution.sandbox import SandboxSpec
+
+        catalog.register(_make_sandbox_tool(sandbox_spec or SandboxSpec()))
+        extra["sandbox"] = True
+
     return extra
 
 
@@ -191,6 +248,8 @@ def build_agent(
     web: bool = False,
     mcp_server: str | None = None,
     git_workdir: str | None = None,
+    sandbox: bool = False,
+    sandbox_spec: SandboxSpec | None = None,
 ) -> Agent:
     """一键装配一个 Agent：模型 + 工具 + 策略 + 存储 +（可选）能力。
 
@@ -205,6 +264,8 @@ def build_agent(
       skills         dict{alias: SKILL.md} 或 目录路径 → 加载技能系统。
       web            True=启用 web.search / web.fetch。
       mcp_server     MCP server 启动命令（有 node 则导入其工具）。
+      sandbox        True=暴露受沙箱管控的 shell.run 工具（只读工作区副本 +
+                     默认禁网 + 超时/输出预算约束）；sandbox_spec 可自定义 SandboxSpec。
     """
     # 模型：字符串=厂商名走真实模型；有 chat 方法的对象=直接当模型实例；None=离线假模型
     model: AgentChatModel
@@ -226,6 +287,7 @@ def build_agent(
     augment_catalog(
         catalog, memory=memory, skills=skills, web=web,
         mcp_server=mcp_server, git_workdir=git_workdir,
+        sandbox=sandbox, sandbox_spec=sandbox_spec,
     )
 
     # 策略与存储

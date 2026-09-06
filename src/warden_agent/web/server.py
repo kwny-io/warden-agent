@@ -192,6 +192,13 @@ class ChatRequestIn(BaseModel):
     text: str
 
 
+class ModelSelectIn(BaseModel):
+    """POST /models/select 的请求体（模型切换 / 导入 API Key）。"""
+
+    id: str
+    api_key: str | None = None
+
+
 class ChatResponseOut(BaseModel):
     run_id: str
     status: str
@@ -238,6 +245,18 @@ class SessionRegistry:
                 self._sessions[run_id] = sess
             return sess
 
+    def remove(self, run_id: str) -> None:
+        """把会话从内存下线（删除会话时用，数据库由调用方清理）。"""
+        with self._lock:
+            self._sessions.pop(run_id, None)
+
+    def set_model(self, model: AgentChatModel) -> None:
+        """运行时切换模型：替换默认模型，并同步到所有已缓存的会话。"""
+        with self._lock:
+            self._model = model
+            for sess in self._sessions.values():
+                sess.model = model
+
 
 def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
     return [
@@ -264,6 +283,8 @@ def build_app(
     *,
     api_keys: Mapping[str, TrustedCaller] | None = None,
     audit_store: AuditStore | None = None,
+    model_id: str = "custom",
+    model_api_key: str | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
@@ -275,6 +296,7 @@ def build_app(
                     `Authorization: Bearer <key>`；None=本地开发开放（不鉴权）。
       audit_store ：审计后端（AuditStore 实现）。给出则开启审计，每请求记一条；
                     None=不落审计。
+      model_id / model_api_key：启动时的模型标识与密钥（/models 切换接口的初始状态）。
     """
     from warden_agent.agent import augment_catalog
 
@@ -288,6 +310,77 @@ def build_app(
     )
     registry = SessionRegistry(model, catalog, policy, store, system_prompt, extra)
     app = FastAPI(title="Warden Agent Python", version=API_VERSION)
+
+    # ---- 模型切换：傻瓜式接入的模型目录，/models 查询、/models/select 切换/导入 ----
+    from warden_agent.model.fake import FakeModel
+    from warden_agent.model import deepseek as _ds
+
+    model_catalog: dict[str, dict[str, Any]] = {
+        "fake": {
+            "name": "离线假模型（免费）",
+            "needs_key": False,
+            "make": lambda key=None: FakeModel(),
+        },
+        "deepseek": {
+            "name": "DeepSeek",
+            "needs_key": True,
+            "make": lambda key: _ds.DeepSeekModel(api_key=key),
+        },
+        "openai": {
+            "name": "OpenAI",
+            "needs_key": True,
+            "make": lambda key: _ds.OpenAIModel(api_key=key),
+        },
+        "zhipu": {
+            "name": "智谱 GLM",
+            "needs_key": True,
+            "make": lambda key: _ds.ZhipuModel(api_key=key),
+        },
+        "bailian": {
+            "name": "阿里百炼",
+            "needs_key": True,
+            "make": lambda key: _ds.BailianModel(api_key=key),
+        },
+    }
+    # 已导入的 API Key（内存态，重启失效；初始 key 由 build_app 参数带入）
+    imported_keys: dict[str, str] = {}
+    if model_api_key and model_id in model_catalog:
+        imported_keys[model_id] = model_api_key
+    current_model_id = model_id
+
+    @app.get("/models")
+    def models_view() -> dict[str, Any]:
+        """可用模型列表 + 当前使用的模型。"""
+        return {
+            "current": current_model_id,
+            "models": [
+                {
+                    "id": mid,
+                    "name": info["name"],
+                    "needs_key": info["needs_key"],
+                    "configured": (not info["needs_key"]) or mid in imported_keys,
+                }
+                for mid, info in model_catalog.items()
+            ],
+        }
+
+    @app.post("/models/select")
+    def models_select(body: ModelSelectIn) -> dict[str, Any]:
+        """切换模型；带 api_key 视为"导入"（Key 存内存，重启后回到启动配置）。"""
+        nonlocal current_model_id
+        info = model_catalog.get(body.id)
+        if info is None:
+            raise HTTPException(status_code=404, detail=f"未知模型: {body.id}")
+        key = body.api_key or imported_keys.get(body.id)
+        if info["needs_key"] and not key:
+            raise HTTPException(
+                status_code=400, detail=f"{info['name']} 需要先导入 API Key"
+            )
+        registry.set_model(info["make"](key))
+        if body.api_key:
+            imported_keys[body.id] = body.api_key
+        current_model_id = body.id
+        return {"ok": True, "current": current_model_id}
 
     # ---- T8 可观测性：指标定义（全局注册表，Prometheus 文本输出）----
     m = metrics()
@@ -487,6 +580,24 @@ def build_app(
     def status(run_id: str) -> dict[str, Any]:
         sess = registry.get(run_id)
         return {"run_id": run_id, "status": sess.status().name}
+
+    @app.get("/runs")
+    def runs() -> list[dict[str, Any]]:
+        """对话列表（前端侧栏可展开面板用）：最近活跃的会话 + 首条用户消息做标题。"""
+        return store.list_runs(limit=50)
+
+    @app.delete("/runs/{run_id}")
+    def delete_run(run_id: str) -> dict[str, Any]:
+        """删除会话：数据库（状态/对话/待审批/checkpoint）清空，内存会话下线。"""
+        registry.remove(run_id)
+        store.delete_run(run_id)
+        return {"ok": True, "run_id": run_id}
+
+    @app.get("/messages/{run_id}")
+    def messages(run_id: str) -> list[dict[str, Any]]:
+        """返回某会话的完整对话记录（前端刷新后恢复聊天区用）。"""
+        sess = registry.get(run_id)
+        return _serialize_messages(sess.messages)
 
     @app.get("/approvals")
     def approvals() -> list[dict[str, Any]]:
