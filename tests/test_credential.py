@@ -76,6 +76,11 @@ def test_篡改密文解密失败(cipher: CredentialCipher) -> None:
     broker = CredentialBroker(cipher)
     broker.register("openai", {"api_key": "sk-abc"})
     stored = broker._secrets["openai"]["api_key"]
-    tampered = "A" + stored[1:]  # 篡改密文首字符
+    # 取中间字符替换为"必定不同"的字符：nonce 随机，若固定改首字符为 "A"，
+    # 原首字符恰好是 "A" 时密文未变，解密不会抛错（概率 1/64，CI 曾踩中）。
+    mid = len(stored) // 2
+    replacement = "B" if stored[mid] != "B" else "C"
+    tampered = stored[:mid] + replacement + stored[mid + 1:]
+    assert tampered != stored
     with pytest.raises(Exception):
         cipher.decrypt(tampered)
