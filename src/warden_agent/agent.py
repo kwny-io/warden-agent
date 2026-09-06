@@ -52,6 +52,30 @@ class InMemoryRunStore:
     def load_messages(self, run_id: str) -> list[Message]:
         return list(self._messages.get(run_id, []))
 
+    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """列出会话概要（前端对话列表用）：按插入序取最近 limit 个。
+
+        字段形状与 SqliteStore.list_runs 对齐：title 取首条用户消息
+        （没有消息的 run 回退用 run_id），msg_count 是对话条数。
+        """
+        items = list(self._runs.items())[-limit:]
+        out: list[dict[str, Any]] = []
+        for run_id, run in items:
+            msgs = self._messages.get(run_id, [])
+            first_user = next((m.content for m in msgs if m.role == "user"), None)
+            out.append({
+                "run_id": run_id,
+                "status": run.status,
+                "msg_count": len(msgs),
+                "title": first_user or run_id,
+            })
+        return out
+
+    def delete_run(self, run_id: str) -> None:
+        self._runs.pop(run_id, None)
+        self._messages.pop(run_id, None)
+        self._pending.pop(run_id, None)
+
     def save_pending_approval(
         self,
         run_id: str,
@@ -292,7 +316,7 @@ def build_agent(
 
     # 策略与存储
     policy = policy_engine or PolicyEngine()
-    run_store: RunStore = store or InMemoryRunStore()
+    run_store: RunStore = store if store is not None else InMemoryRunStore()
 
     def make_session(run_id: str) -> AgentSession:
         return AgentSession(

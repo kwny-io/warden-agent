@@ -312,8 +312,8 @@ def build_app(
     app = FastAPI(title="Warden Agent Python", version=API_VERSION)
 
     # ---- 模型切换：傻瓜式接入的模型目录，/models 查询、/models/select 切换/导入 ----
-    from warden_agent.model.fake import FakeModel
     from warden_agent.model import deepseek as _ds
+    from warden_agent.model.fake import FakeModel
 
     model_catalog: dict[str, dict[str, Any]] = {
         "fake": {

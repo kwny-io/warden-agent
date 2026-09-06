@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-300%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-309%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -49,7 +49,7 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——300 项测试零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——309 项测试零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（6 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -398,7 +398,7 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**300 项测试全量通过**（1 项 Postgres 集成测试在无数据库环境下自动跳过），覆盖状态机、工具稳定性层、执行循环、审批、持久化恢复、HTTP 契约、SSE 流式、RAG、多 Agent、技能系统、记忆、MCP、Git、Coding Agent、沙箱接线、凭证加密、端到端演示等
+- **测试**：**309 项测试全量通过**（1 项 Postgres 集成测试在无数据库环境下自动跳过），覆盖状态机、工具稳定性层、执行循环、审批、持久化恢复、HTTP 契约、SSE 流式、RAG、多 Agent、技能系统、记忆、MCP、Git、Coding Agent、沙箱接线、凭证加密、端到端演示等
 - **Agent 评测**：内置黄金评测集（26 例，三类），通过率作为 CI 质量门禁
 - **类型检查**：`mypy --strict` 零错误（74 个源文件）
 - **静态检查**：`ruff` 零告警
