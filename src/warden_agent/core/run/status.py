@@ -37,8 +37,9 @@ class IllegalStateTransition(Exception):
 class AgentRun:
     """一次 Agent 任务及其状态。状态变化必须经过命名行为。"""
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, user_id: str = "") -> None:
         self.run_id = run_id
+        self.user_id = user_id  # 归属账号（中控台 USER_ID），用于多用户隔离
         self.status = RunStatus.PENDING
 
     # ---- 受控状态转换 ----

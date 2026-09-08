@@ -199,6 +199,12 @@ class ModelSelectIn(BaseModel):
     api_key: str | None = None
 
 
+class UserCreateIn(BaseModel):
+    """POST /users 的请求体（登记中控台用户）。"""
+
+    user_id: str
+
+
 class ChatResponseOut(BaseModel):
     run_id: str
     status: str
@@ -543,8 +549,10 @@ def build_app(
             return q
 
     @app.post("/chat/{run_id}")
-    def chat(run_id: str, body: ChatRequestIn) -> ChatResponseOut:
+    def chat(run_id: str, body: ChatRequestIn, user_id: str = "demo-user") -> ChatResponseOut:
         sess = registry.get(run_id)
+        if not sess.run.user_id:
+            sess.run.user_id = user_id  # 首次对话的会话归属当前用户
         try:
             outcome = sess.start(body.text)
         except Exception as e:  # 工具未注册 / 被 DENY 等
@@ -582,9 +590,40 @@ def build_app(
         return {"run_id": run_id, "status": sess.status().name}
 
     @app.get("/runs")
-    def runs() -> list[dict[str, Any]]:
-        """对话列表（前端侧栏可展开面板用）：最近活跃的会话 + 首条用户消息做标题。"""
-        return store.list_runs(limit=50)
+    def runs(user_id: str = "") -> list[dict[str, Any]]:
+        """对话列表：最近活跃的会话；带 user_id 时只返回该用户的。"""
+        return store.list_runs(limit=50, owner=user_id or None)
+
+    @app.post("/runs/{run_id}")
+    def create_run(run_id: str, user_id: str = "demo-user") -> dict[str, Any]:
+        """预创建会话：归属当前 USER_ID，立即可见于该用户的对话列表。幂等。
+
+        已存在的会话不改变归属。
+        """
+        store.create_user(user_id)
+        sess = registry.get(run_id)
+        if store.load_run(run_id) is None:
+            sess.run.user_id = user_id
+            store.save_run(sess.run)
+        return {
+            "run_id": run_id,
+            "status": sess.status().name,
+            "user_id": sess.run.user_id,
+        }
+
+    @app.get("/users")
+    def users_view() -> list[dict[str, Any]]:
+        """已登记的中控台用户。"""
+        return store.list_users()
+
+    @app.post("/users")
+    def users_create(body: UserCreateIn) -> dict[str, Any]:
+        """登记用户（幂等：已存在则不动）。"""
+        uid = body.user_id.strip()
+        if not uid:
+            raise HTTPException(status_code=400, detail="user_id 不能为空")
+        store.create_user(uid)
+        return {"ok": True, "user_id": uid}
 
     @app.delete("/runs/{run_id}")
     def delete_run(run_id: str) -> dict[str, Any]:
@@ -618,13 +657,34 @@ def build_app(
                 )
         return result
 
+    @app.post("/runs/{run_id}")
+    def create_run(run_id: str) -> dict[str, Any]:
+        """预创建会话：切换到新会话 ID 时立即可见于列表（首条消息前状态为 PENDING）。
+
+        幂等：会话已存在则直接返回现状，不重复建档。
+        """
+        sess = registry.get(run_id)
+        if store.load_run(run_id) is None:
+            store.save_run(sess.run)  # PENDING 记录入库，对话列表立即可见
+        return {"run_id": run_id, "status": sess.status().name}
+
+    @app.get("/approvals/history")
+    def approvals_history() -> list[dict[str, Any]]:
+        """审批决策历史（已批准 / 已拒绝，最新的在前）。"""
+        return store.list_approval_history(limit=20)
+
     @app.post("/approve/{run_id}")
     def approve(run_id: str) -> ChatResponseOut:
         sess = registry.get(run_id)
-        if sess.pending_approval() is None:
+        pending = sess.pending_approval()
+        if pending is None:
             raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
         m_approvals.inc(labels=("approve",))
         outcome = sess.approve()
+        store.record_approval_decision(
+            run_id, pending.approval_id, pending.tool_name,
+            pending.arguments, "approved",
+        )
         if isinstance(outcome, FinalReply):
             _bus(run_id).put({"event": "final", "text": outcome.text})
             return ChatResponseOut(
@@ -652,10 +712,15 @@ def build_app(
     @app.post("/reject/{run_id}")
     def reject(run_id: str) -> ChatResponseOut:
         sess = registry.get(run_id)
-        if sess.pending_approval() is None:
+        pending = sess.pending_approval()
+        if pending is None:
             raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
         m_approvals.inc(labels=("reject",))
         outcome = sess.reject()
+        store.record_approval_decision(
+            run_id, pending.approval_id, pending.tool_name,
+            pending.arguments, "rejected",
+        )
         if isinstance(outcome, FinalReply):
             _bus(run_id).put({"event": "final", "text": outcome.text})
             return ChatResponseOut(
@@ -680,10 +745,12 @@ def build_app(
         raise HTTPException(status_code=500, detail="未知结果类型")
 
     @app.post("/chat/stream/{run_id}")
-    def chat_stream(run_id: str, body: ChatRequestIn) -> StreamingResponse:
+    def chat_stream(run_id: str, body: ChatRequestIn, user_id: str = "demo-user") -> StreamingResponse:
         """流式对话（SSE 打字机）：模型边生成边把增量推给前端。
         前端拿到增量直接渲染，就能看到"逐字打出"的效果。"""
         sess = registry.get(run_id)
+        if not sess.run.user_id:
+            sess.run.user_id = user_id  # 首次对话的会话归属当前用户
 
         def generate() -> Any:
             try:

@@ -81,6 +81,19 @@ class SqliteStore:
                 run_id  TEXT PRIMARY KEY,
                 data    TEXT NOT NULL       -- 版本化 checkpoint JSON
             );
+            CREATE TABLE IF NOT EXISTS approval_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id      TEXT NOT NULL,
+                approval_id TEXT NOT NULL,
+                tool_name   TEXT NOT NULL,
+                arguments   TEXT,
+                decision    TEXT NOT NULL,     -- approved / rejected
+                created_at  TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                user_id    TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -105,6 +118,15 @@ class SqliteStore:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # v3：runs 表加 user_id（多用户隔离）。老库补列，并把无归属的历史会话归到 demo-user。
+        try:
+            self.conn.execute("ALTER TABLE runs ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+            self.conn.execute(
+                "UPDATE runs SET user_id = 'demo-user' WHERE user_id = ''"
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # 列已存在
 
     def schema_version(self) -> int:
         row = self.conn.execute("SELECT version FROM __schema_version__").fetchone()
@@ -122,10 +144,10 @@ class SqliteStore:
         """把 Run 当前状态写进数据库（KEY 覆盖写），同时刷新最后活跃时间。"""
         with self._lock:
             self.conn.execute(
-                "INSERT INTO runs (run_id, status, updated_at) VALUES (?, ?, ?) "
+                "INSERT INTO runs (run_id, status, user_id, updated_at) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET "
                 "status = excluded.status, updated_at = excluded.updated_at",
-                (run.run_id, run.status.name, _now_iso()),
+                (run.run_id, run.status.name, run.user_id, _now_iso()),
             )
             self.conn.commit()
 
@@ -160,10 +182,12 @@ class SqliteStore:
     # ---- 读取（恢复用）----
     def load_run(self, run_id: str) -> AgentRun | None:
         """读回某个 Run 的状态；不存在返回 None。"""
-        row = self.conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT status, user_id FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
         if row is None:
             return None
-        run = AgentRun(run_id)
+        run = AgentRun(run_id, user_id=row[1] or "")
         run.status = RunStatus[row[0]]  # 从名字恢复枚举
         return run
 
@@ -193,10 +217,43 @@ class SqliteStore:
             self.conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
             self.conn.commit()
 
-    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
-        """列出会话概要（前端对话列表用）：按最近活跃排序。
+    def record_approval_decision(
+        self,
+        run_id: str,
+        approval_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        decision: str,
+    ) -> None:
+        """记录一条审批决策（approved / rejected），供历史追溯。"""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO approval_history "
+                "(run_id, approval_id, tool_name, arguments, decision, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, approval_id, tool_name,
+                 json.dumps(arguments, ensure_ascii=False), decision, _now_iso()),
+            )
+            self.conn.commit()
+
+    def list_approval_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        """审批决策历史（最新的在前）。"""
+        rows = self.conn.execute(
+            "SELECT run_id, approval_id, tool_name, decision, created_at "
+            "FROM approval_history ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {"run_id": r[0], "approval_id": r[1], "tool_name": r[2],
+             "decision": r[3], "created_at": r[4]}
+            for r in rows
+        ]
+
+    def list_runs(self, limit: int = 50, owner: str | None = None) -> list[dict[str, Any]]:
+        """列出会话概要（前端会话列表用）：按最近活跃排序。
 
         title 取首条用户消息（没有消息的 run 回退用 run_id），msg_count 是对话条数。
+        owner 给定时在应用层按归属过滤（数据量小，避免动态拼 SQL）。
         """
         rows = self.conn.execute(
             """
@@ -207,23 +264,46 @@ class SqliteStore:
                      WHERE m.run_id = r.run_id AND m.role = 'user'
                      ORDER BY m.id LIMIT 1) AS title,
                    (SELECT MAX(m.id) FROM messages m WHERE m.run_id = r.run_id) AS last_id,
-                   r.updated_at
+                   r.updated_at,
+                   r.user_id
             FROM runs r
             ORDER BY last_id IS NULL, last_id DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-        return [
+        out = [
             {
                 "run_id": r[0],
                 "status": r[1],
                 "msg_count": r[2],
                 "title": (r[3] or r[0])[:60],
                 "updated_at": r[5],
+                "user_id": r[6],
             }
             for r in rows
         ]
+        if owner:
+            out = [r for r in out if r["user_id"] == owner]
+        return out
+
+    # ---- 用户（中控台账号）----
+    def create_user(self, user_id: str) -> None:
+        """登记一个中控台用户（幂等：已存在则不动）。"""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO users (user_id, created_at) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO NOTHING",
+                (user_id, _now_iso()),
+            )
+            self.conn.commit()
+
+    def list_users(self) -> list[dict[str, Any]]:
+        """已登记的用户列表（按创建时间）。"""
+        rows = self.conn.execute(
+            "SELECT user_id, created_at FROM users ORDER BY created_at"
+        ).fetchall()
+        return [{"user_id": r[0], "created_at": r[1]} for r in rows]
 
     def _decode_tool_call(self, raw: str) -> ToolCall | None:
         """按版本前缀解码 tool_call；无前缀的老数据按 v1 JSON 兜底。"""

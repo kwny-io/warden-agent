@@ -27,6 +27,17 @@ class RunStore(Protocol):
 
     def delete_run(self, run_id: str) -> None: ...
 
+    def record_approval_decision(
+        self,
+        run_id: str,
+        approval_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        decision: str,
+    ) -> None: ...
+
+    def list_approval_history(self, limit: int = 20) -> list[dict[str, Any]]: ...
+
     def append_message(self, run_id: str, message: Message) -> None: ...
 
     def load_messages(self, run_id: str) -> list[Message]: ...

@@ -95,6 +95,26 @@ async def test_重复消息不重复入库() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_run预创建会话幂等() -> None:
+    """切换即建档：POST /runs/{id} 让新会话立刻出现在列表里；重复调用幂等。"""
+    client = await _client_with(
+        [ChatResponse(content="你好！", finish_reason="stop")], PolicyEngine())
+    assert (await client.get("/runs")).json() == []
+
+    r1 = await client.post("/runs/new-run")
+    assert r1.json()["run_id"] == "new-run"
+    assert r1.json()["status"] == "PENDING"
+    assert r1.json()["user_id"] == "demo-user"  # 默认归属
+    runs = (await client.get("/runs")).json()
+    assert any(r["run_id"] == "new-run" and r["status"] == "PENDING" for r in runs)
+    # 幂等：再建一次不报错、不重复
+    r2 = await client.post("/runs/new-run")
+    assert r2.json()["status"] == "PENDING"
+    assert len([r for r in (await client.get("/runs")).json() if r["run_id"] == "new-run"]) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_delete_run删除会话() -> None:
     """对话列表删除：DELETE 后 /runs 不再出现，消息一并清空。"""
     client = await _client_with(
@@ -153,6 +173,12 @@ async def test_chat_遇到审批_返回needs_approval并列出() -> None:
     assert final.json()["kind"] == "final"
     assert final.json()["text"] == "天晴。"
     assert (await client.get("/approvals")).json() == []
+    # 决策历史：批准过的要有记录
+    history = (await client.get("/approvals/history")).json()
+    item = next(h for h in history if h["run_id"] == "run-2")
+    assert item["decision"] == "approved"
+    assert item["tool_name"] == "weather.get"
+    assert item["created_at"]
     await client.aclose()
 
 
