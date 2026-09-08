@@ -245,3 +245,42 @@ def test_create_model_custom_缺base_url报错(monkeypatch) -> None:
 def test_create_model_custom_未知厂商仍报错() -> None:
     with pytest.raises(DeepSeekError):
         create_model("still-unknown", api_key="k")
+
+
+class FakeStreamCompletions:
+    """模拟流式 create：返回逐段产出的 chunk 迭代器，并记录调用参数。"""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.last_kwargs = None
+
+    def create(self, **kwargs):
+        self.last_kwargs = kwargs
+        return iter(self.chunks)
+
+
+def _stream_chunk(content=None, tool_calls=None, finish_reason=None):
+    delta = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)])
+
+
+def test_chat_stream_iter_逐段实时产出增量并汇总done():
+    """真流式生成器：delta 逐段产出（边生成边吐，不是攒一坨），
+    流结束时产出 done 事件，携带完整 content / finish_reason。"""
+    chunks = [
+        _stream_chunk(content="你好"),
+        _stream_chunk(content="，世界"),
+        _stream_chunk(finish_reason="stop"),
+    ]
+    m = create_model("custom", api_key="k", base_url="http://x/v1", model="m")
+    fake = FakeStreamCompletions(chunks)
+    m._client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
+
+    events = list(m.chat_stream_iter(ChatRequest(messages=[Message(role="user", content="hi")])))
+    assert [e["type"] for e in events] == ["delta", "delta", "done"]
+    assert events[0]["text"] == "你好"
+    done = events[-1]["response"]
+    assert done.content == "你好，世界"
+    assert done.finish_reason == "stop"
+    # 流式开关确实打开了
+    assert fake.last_kwargs.get("stream") is True

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from typing import Any
 
 from warden_agent.model.model import (
@@ -85,6 +86,13 @@ class OpenAiCompatibleModel(AgentChatModel):
 
     # ================= 统一接口入口 =================
     def chat(self, request: ChatRequest) -> ChatResponse:
+        kwargs = self._build_kwargs(request)
+        if request.stream:
+            return self._chat_stream(kwargs)
+        return self._chat_once(kwargs)
+
+    def _build_kwargs(self, request: ChatRequest) -> dict[str, Any]:
+        """组装发往 OpenAI 兼容端点的参数（chat / chat_stream_iter 共用）。"""
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": self._messages_to_openai(request.messages),
@@ -110,9 +118,7 @@ class OpenAiCompatibleModel(AgentChatModel):
                     "schema": request.structured_output,
                 },
             }
-        if request.stream:
-            return self._chat_stream(kwargs)
-        return self._chat_once(kwargs)
+        return kwargs
 
     # ================= 非流式：一次返回 =================
     def _chat_once(self, kwargs: dict[str, Any]) -> ChatResponse:
@@ -182,6 +188,70 @@ class OpenAiCompatibleModel(AgentChatModel):
             deltas=deltas,
             usage=usage,
         )
+
+    # ================= 真流式：生成器，边收 chunk 边产出增量 =================
+    def chat_stream_iter(self, request: ChatRequest) -> Iterator[dict[str, Any]]:
+        """真流式生成器：模型每吐一段就立刻 yield，不等整段生成完。
+
+        产出格式：
+          {"type": "delta", "text": "..."}   —— 一小段增量文字
+          {"type": "done",  "response": ChatResponse} —— 流结束，
+            response 里带完整的 content / tool_calls / finish_reason（供会话循环续跑）。
+        """
+        kwargs = self._build_kwargs(request)
+        deltas: list[str] = []
+        tool_acc: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        usage = None
+        try:
+            stream = self._client.chat.completions.create(**kwargs, stream=True)
+            for chunk in stream:
+                if not chunk.choices:
+                    if getattr(chunk, "usage", None):
+                        usage = self._parse_usage(chunk.usage)
+                    continue
+                delta = chunk.choices[0].delta
+                finish_reason = chunk.choices[0].finish_reason or finish_reason
+                if delta and delta.content:
+                    deltas.append(delta.content)
+                    # 关键差异：收到就立刻往外吐，而不是攒到最后
+                    yield {"type": "delta", "text": delta.content}
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        acc = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc.id:
+                            acc["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            acc["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            acc["arguments"] += tc.function.arguments
+                if getattr(chunk, "usage", None):
+                    usage = self._parse_usage(chunk.usage)
+        except Exception as e:
+            raise ModelCallError(f"流式模型调用失败: {e}") from e
+
+        content = "".join(deltas) if deltas else None
+        tool_calls: list[ToolCall] | None = None
+        if tool_acc:
+            tool_calls = [
+                ToolCall(
+                    id=acc["id"] or f"call_{i}",
+                    name=self._unmap_name(acc["name"]),
+                    arguments=_safe_json(acc.get("arguments", "") or "{}"),
+                )
+                for i, acc in sorted(tool_acc.items())
+            ]
+        yield {
+            "type": "done",
+            "response": ChatResponse(
+                content=content,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason or ("tool_calls" if tool_calls else "stop"),
+                deltas=deltas,
+                usage=usage,
+            ),
+        }
 
     # ================= 翻译：统一消息 -> OpenAI 消息 =================
     def _messages_to_openai(self, messages: list[Message]) -> list[dict[str, Any]]:

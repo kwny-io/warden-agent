@@ -343,15 +343,25 @@ class AgentSession:
         yield {"type": "start"}
 
         for _ in range(self.max_iterations):
-            response = self.model.chat(ChatRequest(
+            request = ChatRequest(
                 messages=_ensure_tool_results(self.messages),
                 tools=[t.to_openai_schema() for t in self.catalog.all()],
                 stream=True,  # 流式：模型增量返回在 response.deltas 里
-            ))
-
-            # 模型正在生成的文字：逐个增量往外推（打字机核心）
-            for delta in response.deltas:
-                yield {"type": "delta", "text": delta}
+            )
+            response: ChatResponse | None = None
+            if hasattr(self.model, "chat_stream_iter"):
+                # 真流式：模型边生成边吐增量，立刻透传给前端（打字机）
+                for ev in self.model.chat_stream_iter(request):
+                    if ev["type"] == "delta":
+                        yield {"type": "delta", "text": ev["text"]}
+                    else:  # done
+                        response = ev["response"]
+            else:
+                # 老实现（假模型/脚本模型）：一次性返回，靠 response.deltas 补增量
+                response = self.model.chat(request)
+                for delta in response.deltas or []:
+                    yield {"type": "delta", "text": delta}
+            assert response is not None
 
             if response.tool_calls:
                 for call in response.tool_calls:
