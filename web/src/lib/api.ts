@@ -3,6 +3,7 @@
 
 import type {
   Approval,
+  ApprovalHistoryItem,
   Capabilities,
   ChatMessage,
   ChatResponseOut,
@@ -10,6 +11,7 @@ import type {
   MemoryItem,
   ModelsInfo,
   RunInfo,
+  UserInfo,
 } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -32,8 +34,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   /** 非流式对话：POST /chat/{run_id} */
-  chat(runId: string, text: string): Promise<ChatResponseOut> {
-    return request(`/chat/${encodeURIComponent(runId)}`, {
+  chat(runId: string, text: string, userId?: string): Promise<ChatResponseOut> {
+    const q = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+    return request(`/chat/${encodeURIComponent(runId)}${q}`, {
       method: "POST",
       body: JSON.stringify({ text }),
     });
@@ -69,9 +72,34 @@ export const api = {
     return request(`/messages/${encodeURIComponent(runId)}`);
   },
 
-  /** 对话列表：GET /runs（最近活跃优先） */
-  runs(): Promise<RunInfo[]> {
-    return request("/runs");
+  /** 对话列表：GET /runs?user_id=（最近活跃优先；带 user_id 只看该用户的） */
+  runs(userId?: string): Promise<RunInfo[]> {
+    const q = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+    return request(`/runs${q}`);
+  },
+
+  /** 预创建会话：POST /runs/{run_id}?user_id=（幂等，归属当前用户） */
+  createRun(runId: string, userId?: string): Promise<{ run_id: string; status: string; user_id?: string }> {
+    const q = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+    return request(`/runs/${encodeURIComponent(runId)}${q}`, { method: "POST" });
+  },
+
+  /** 中控台用户列表：GET /users */
+  users(): Promise<UserInfo[]> {
+    return request("/users");
+  },
+
+  /** 登记用户：POST /users（幂等） */
+  createUser(userId: string): Promise<{ ok: boolean; user_id: string }> {
+    return request("/users", {
+      method: "POST",
+      body: JSON.stringify({ user_id: userId }),
+    });
+  },
+
+  /** 审批决策历史：GET /approvals/history（最新在前） */
+  approvalHistory(): Promise<ApprovalHistoryItem[]> {
+    return request("/approvals/history");
   },
 
   /** 删除会话：DELETE /runs/{run_id}（清掉状态/对话/审批记录） */
@@ -107,8 +135,10 @@ export const api = {
     runId: string,
     text: string,
     onEvent: (ev: import("./types").StreamEvent) => void,
+    userId?: string,
   ): Promise<void> {
-    const res = await fetch(`/chat/stream/${encodeURIComponent(runId)}`, {
+    const q = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+    const res = await fetch(`/chat/stream/${encodeURIComponent(runId)}${q}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
@@ -148,4 +178,4 @@ export const api = {
   },
 };
 
-export type { Approval, Capabilities, ChatMessage, HealthResult, MemoryItem, ModelsInfo, RunInfo };
+export type { Approval, ApprovalHistoryItem, Capabilities, ChatMessage, HealthResult, MemoryItem, ModelsInfo, RunInfo };

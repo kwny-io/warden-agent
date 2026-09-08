@@ -2,7 +2,7 @@
 // 并支持批准/拒绝（也按 run_id 走 /approve、/reject）。
 
 import { useCallback } from "react";
-import type { Approval } from "../lib/types";
+import type { Approval, ApprovalHistoryItem } from "../lib/types";
 import { usePolling } from "../lib/usePolling";
 import { api } from "../lib/api";
 
@@ -11,6 +11,12 @@ export default function ApprovalPanel() {
     () => api.approvals(),
     2000,
   );
+  // 审批决策历史（已批准/已拒绝），5s 轮询
+  const { data: history } = usePolling<ApprovalHistoryItem[]>(
+    () => api.approvalHistory(),
+    5000,
+  );
+  const historyList = history ?? [];
 
   const act = useCallback(
     async (runId: string, action: "approve" | "reject") => {
@@ -69,6 +75,23 @@ export default function ApprovalPanel() {
             </li>
           ))}
         </ul>
+      )}
+
+      {/* 决策历史：已批准 / 已拒绝的记录（最新在前，最多显示 5 条） */}
+      {historyList.length > 0 && (
+        <div className="mt-2 pt-2 border-t border-white/[0.06]">
+          <p className="text-[10px] text-warden-fg/40 mb-1">最近决策</p>
+          <ul className="flex flex-col gap-1">
+            {historyList.slice(0, 5).map((h, i) => (
+              <li key={i} className="text-[10px] text-zinc-500 truncate">
+                <span className={h.decision === "approved" ? "text-warden-ok" : "text-warden-danger"}>
+                  {h.decision === "approved" ? "✓已批准" : "✗已拒绝"}
+                </span>{" "}
+                <span className="font-mono">{h.tool_name}</span> · {h.run_id}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );

@@ -81,3 +81,18 @@ export interface ModelsInfo {
   current: string;
   models: ModelInfo[];
 }
+
+// GET /users 中控台用户
+export interface UserInfo {
+  user_id: string;
+  created_at: string;
+}
+
+// GET /approvals/history 审批决策历史项
+export interface ApprovalHistoryItem {
+  run_id: string;
+  approval_id: string;
+  tool_name: string;
+  decision: string; // approved / rejected
+  created_at: string;
+}

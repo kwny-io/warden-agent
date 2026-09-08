@@ -1,7 +1,7 @@
 // ConversationList：左侧对话栏——历史对话一览，点条目切换会话。
 // 5s 轮询 /runs；带最后活跃时间戳和状态彩点。
 
-import { type MouseEvent as ReactMouseEvent } from "react";
+import { useState, type MouseEvent as ReactMouseEvent } from "react";
 import type { RunInfo } from "../lib/types";
 import { usePolling } from "../lib/usePolling";
 import { api } from "../lib/api";
@@ -25,20 +25,48 @@ function fmtTime(iso?: string | null): string {
 }
 
 export default function ConversationList({
+  userId,
   activeRunId,
   onSwitch,
-  onNew,
   onCollapse,
+  createOpen,
+  onOpenCreate,
+  onCreateDone,
   onDeleted,
 }: {
+  userId: string; // 当前中控台账号，对话列表按它过滤
   activeRunId: string;
   onSwitch: (runId: string) => void;
-  onNew: () => void;
   onCollapse: () => void;
+  createOpen: boolean; // 创建输入行是否展开（左栏按钮 / 顶栏 ＋ 共用）
+  onOpenCreate: () => void;
+  onCreateDone: () => void;
   onDeleted: (deletedId: string, remaining: RunInfo[]) => void;
 }) {
-  const { data, refresh } = usePolling<RunInfo[]>(() => api.runs(), 5000);
+  const { data, refresh } = usePolling<RunInfo[]>(
+    () => api.runs(userId),
+    5000,
+    userId, // 换账号立刻重拉并清空旧列表
+  );
   const runs = data ?? [];
+  const [newId, setNewId] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // 创建会话：用用户输入的 ID 建档（幂等接口），成功后切换过去
+  const create = async () => {
+    const id = newId.trim();
+    if (!id || busy) return;
+    setBusy(true);
+    try {
+      await api.createRun(id);
+      refresh();
+      onSwitch(id);
+      setNewId("");
+      onCreateDone();
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const remove = async (e: ReactMouseEvent, r: RunInfo) => {
     e.stopPropagation(); // 别触发切换会话
@@ -73,11 +101,32 @@ export default function ConversationList({
         </div>
 
       <button
-        onClick={onNew}
+        onClick={onOpenCreate}
         className="btn-sheen shrink-0 rounded-lg border border-warden-accent/40 px-3 py-2 text-sm text-warden-fg hover:border-warden-accent/80 transition"
       >
         ＋ 新对话
       </button>
+
+      {/* 创建输入行：自己输入会话 ID，点「创建」建档并切换 */}
+      {createOpen && (
+        <div className="shrink-0 flex gap-1">
+          <input
+            autoFocus
+            value={newId}
+            onChange={(e) => setNewId(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && create()}
+            placeholder="输入 USER_ID…"
+            className="flex-1 min-w-0 bg-black/30 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono outline-none focus:border-warden-accent/70"
+          />
+          <button
+            onClick={create}
+            disabled={busy || !newId.trim()}
+            className="px-2.5 rounded-lg border border-warden-accent/50 text-xs text-warden-accent hover:bg-warden-accent/10 disabled:opacity-40 transition"
+          >
+            创建
+          </button>
+        </div>
+      )}
 
       <div className="flex-1 min-h-0 overflow-y-auto flex flex-col pr-0.5">
         {runs.length === 0 && (

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { api } from "./lib/api";
 import ChatView from "./components/ChatView";
 import ApprovalPanel from "./components/ApprovalPanel";
 import InfoPanel from "./components/InfoPanel";
@@ -10,26 +11,52 @@ const LEFT_DEFAULT = 240;
 const RIGHT_DEFAULT = 256;
 
 export default function App() {
-  // 默认 run_id；用户在侧栏或顶部可改
+  // 当前中控台账号（USER_ID）：整个控制台以它的视角展示对话
+  const [userId, setUserId] = useState(
+    () => localStorage.getItem("warden.userId") || "demo-user",
+  );
+  const [userIdInput, setUserIdInput] = useState(userId);
+  // 当前 run_id（对话）；用户在顶栏输入 USER_ID + ＋ 创建/切换账号
   const [runId, setRunId] = useState("run-demo");
-  const [runIdInput, setRunIdInput] = useState(runId);
   const [approvalTick, setApprovalTick] = useState(0);
-  // 两侧栏宽度（px），0 = 已收起。拖拽手柄改宽，顶栏 ☰ / 信息 按钮收放
-  const [leftWidth, setLeftWidth] = useState(LEFT_DEFAULT);
-  const [rightWidth, setRightWidth] = useState(RIGHT_DEFAULT);
+  // 布局：左对话栏折叠状态；右信息栏三栏常驻，按钮可弹跳收起/展开
+  const [leftWidth, setLeftWidth] = useState(240);
+  const [rightWidth, setRightWidth] = useState(256);
   const [dragging, setDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ side: "left" | "right" } | null>(null);
 
+  // 换账号时确保它已登记（幂等），对话框归属到它名下
+  useEffect(() => {
+    api.createUser(userId).catch(() => {});
+  }, [userId]);
+
+  const applyUser = async () => {
+    const id = userIdInput.trim();
+    if (!id || id === userId) return;
+    try {
+      await api.createUser(id); // 幂等：存在即切换，不存在即创建
+      localStorage.setItem("warden.userId", id);
+      setUserId(id);
+      setApprovalTick((t) => t + 1);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const toggleRight = () => setRightWidth((w) => (w === 0 ? RIGHT_DEFAULT : 0));
+
   const switchRun = (id?: string) => {
-    const next = (id ?? runIdInput).trim() || "run-demo";
-    setRunIdInput(next);
+    const next = (id ?? "run-demo").trim() || "run-demo";
     setRunId(next);
     setApprovalTick((t) => t + 1);
   };
 
-  const newConversation = () => {
-    switchRun(`run-${Date.now().toString(36)}`);
+  // 新对话创建流程：展开左栏并打开创建输入行（ID 由用户输入，不再随机生成）
+  const [createOpen, setCreateOpen] = useState(false);
+  const openCreate = () => {
+    setLeftWidth(LEFT_DEFAULT);
+    setCreateOpen(true);
   };
 
   // 拖拽调宽：按下后监听 window 的 mousemove/mouseup
@@ -88,22 +115,27 @@ export default function App() {
             Agent 运行时
           </span>
           <div className="ml-auto flex items-center gap-2 text-sm">
-            <span className="text-warden-fg/50 text-xs hidden sm:inline">run_id</span>
+            <span className="text-warden-fg/50 text-xs hidden sm:inline">USER_ID</span>
             <input
-              value={runIdInput}
-              onChange={(e) => setRunIdInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && switchRun()}
+              value={userIdInput}
+              onChange={(e) => setUserIdInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && applyUser()}
               className="w-40 sm:w-44 bg-black/30 border border-slate-600/50 rounded-full px-3 py-1.5 font-mono text-xs outline-none focus:border-warden-accent/70 transition"
-              placeholder="run-demo"
+              placeholder="demo-user"
             />
             <button
-              onClick={() => switchRun()}
-              className="btn-sheen px-3.5 py-1.5 rounded-full border border-slate-600/50 text-xs text-warden-fg/70 hover:text-warden-fg hover:border-slate-500 transition"
+              onClick={applyUser}
+              title={userIdInput === userId ? "当前账号" : "创建 / 切换到该 USER_ID"}
+              className={`btn-sheen w-8 h-8 rounded-full border text-base leading-none transition ${
+                userIdInput === userId
+                  ? "border-warden-accent/70 text-warden-accent bg-warden-accent/10"
+                  : "border-slate-600/50 text-warden-fg/70 hover:text-warden-fg hover:border-slate-500"
+              }`}
             >
-              切换
+              ＋
             </button>
             <button
-              onClick={() => setRightWidth((w) => (w === 0 ? RIGHT_DEFAULT : 0))}
+              onClick={toggleRight}
               title="信息栏"
               className={`btn-sheen px-3 py-1.5 rounded-full border text-xs transition ${
                 rightWidth > 0
@@ -132,12 +164,18 @@ export default function App() {
           style={{ width: leftWidth }}
         >
           <ConversationList
+            userId={userId}
             activeRunId={runId}
             onSwitch={(id) => switchRun(id)}
-            onNew={newConversation}
-            onCollapse={() => setLeftWidth(0)}
+            onCollapse={() => {
+              setLeftWidth(0);
+              setCreateOpen(false);
+            }}
+            createOpen={createOpen}
+            onOpenCreate={openCreate}
+            onCreateDone={() => setCreateOpen(false)}
             onDeleted={(deletedId, remaining) => {
-              // 删掉的是当前会话 → 切到列表里剩下的第一个，没有就开新会话
+              // 删掉的是当前会话 → 切到该账号剩下的第一个，没有就开个新 ID
               if (deletedId === runId) {
                 switchRun(remaining[0]?.run_id ?? `run-${Date.now().toString(36)}`);
               }
@@ -163,6 +201,7 @@ export default function App() {
         <main className="flex-1 min-w-0 min-h-0 flex">
           <ChatView
             runId={runId}
+            userId={userId}
             onApprovalAction={() => setApprovalTick((t) => t + 1)}
             onToggleRail={() =>
               setLeftWidth((w) => (w === 0 ? LEFT_DEFAULT : 0))

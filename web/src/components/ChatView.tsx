@@ -28,11 +28,13 @@ const SUGGESTIONS = ["查一下上海天气", "帮我算 23 × 47", "记住我�
 
 export default function ChatView({
   runId,
+  userId,
   onApprovalAction,
   onToggleRail,
   railOpen,
 }: {
   runId: string;
+  userId: string; // 当前中控台账号：新会话归属它
   onApprovalAction: () => void;
   onToggleRail: () => void;
   railOpen: boolean;
@@ -164,6 +166,17 @@ export default function ChatView({
     }
   };
 
+  // 审批动作容错：409 = 该审批已在别处处理过（如右栏队列），静默清掉过期气泡
+  const handleApprovalError = (e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("没有等待审批")) {
+      setMsgs((prev) => prev.filter((m) => !m.approval));
+      onApprovalAction();
+    } else {
+      setError(msg);
+    }
+  };
+
   const doApprove = async (approvalId: string) => {
     try {
       // 后端 /approve/{run_id} 按会话 run 批准（当前 runId 即该会话）
@@ -175,7 +188,7 @@ export default function ChatView({
       if (r.text) push({ id: nextId(), role: "assistant", text: r.text });
       onApprovalAction();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      handleApprovalError(e);
     }
   };
 
@@ -188,7 +201,7 @@ export default function ChatView({
       if (r.text) push({ id: nextId(), role: "assistant", text: r.text });
       onApprovalAction();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      handleApprovalError(e);
     }
   };
 
@@ -201,7 +214,7 @@ export default function ChatView({
     push({ id: nextId(), role: "user", text });
     setBusy(true);
     try {
-      await api.streamChat(runId, text, handleStreamEvent);
+      await api.streamChat(runId, text, handleStreamEvent, userId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

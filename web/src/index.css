@@ -25,6 +25,11 @@ body {
   height: 100%;
 }
 
+/* 所有可点按钮悬停显示手型光标 */
+button:not(:disabled) {
+  cursor: pointer;
+}
+
 /* 细滚动条 */
 *::-webkit-scrollbar {
   width: 8px;
