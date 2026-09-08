@@ -58,7 +58,7 @@ export default function InfoPanel({ runId }: { runId: string }) {
         <div className="mt-1 flex items-center gap-2">
           <span className={`text-sm font-medium ${statusColor}`}>{runStatus || "…"}</span>
         </div>
-        <div className="mt-1 text-xs text-warden-fg/70 font-mono break-all">{runId}</div>
+        <div className="mt-1 text-xs text-warden-fg/80 font-mono break-all">{runId}</div>
       </div>
 
       {/* 能力 */}
@@ -83,7 +83,7 @@ export default function InfoPanel({ runId }: { runId: string }) {
               {shownTools.map((t) => (
                 <span
                   key={t}
-                  className="px-1.5 py-0.5 rounded border border-zinc-700 bg-zinc-800/70 text-[10px] font-mono text-zinc-300"
+                  className="px-1.5 py-0.5 rounded border border-zinc-700 bg-zinc-800/70 text-[11px] font-mono text-zinc-200"
                 >
                   {t}
                 </span>
@@ -92,7 +92,7 @@ export default function InfoPanel({ runId }: { runId: string }) {
             {caps.tools.length > 6 && (
               <button
                 onClick={() => setToolsOpen((v) => !v)}
-                className="text-[10px] text-warden-accent hover:underline"
+                className="text-[11px] text-warden-accent hover:underline"
               >
                 {toolsOpen ? "收起" : `展开全部 (${caps.tools.length})`}
               </button>
@@ -112,7 +112,7 @@ export default function InfoPanel({ runId }: { runId: string }) {
         ) : (
           <ul className="flex flex-col gap-1.5">
             {memories.map((m) => (
-              <li key={m.key} className="text-xs text-warden-fg/85">
+              <li key={m.key} className="text-xs leading-relaxed text-warden-fg/85">
                 <span className="text-warden-accent">{m.key}</span>：{m.text}
               </li>
             ))}

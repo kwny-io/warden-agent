@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./lib/api";
 import ChatView from "./components/ChatView";
 import ApprovalPanel from "./components/ApprovalPanel";
@@ -16,8 +16,9 @@ export default function App() {
     () => localStorage.getItem("warden.userId") || "demo-user",
   );
   const [userIdInput, setUserIdInput] = useState(userId);
-  // 当前 run_id（对话）；用户在顶栏输入 USER_ID + ＋ 创建/切换账号
-  const [runId, setRunId] = useState("run-demo");
+  // 当前 run_id（对话）；每次打开页面都从全新会话开始（多账号下避免串号），
+  // 历史对话从左栏列表一键找回
+  const [runId, setRunId] = useState(() => `run-${Date.now().toString(36)}`);
   const [approvalTick, setApprovalTick] = useState(0);
   // 布局：左对话栏折叠状态；右信息栏三栏常驻，按钮可弹跳收起/展开
   const [leftWidth, setLeftWidth] = useState(240);
@@ -31,13 +32,33 @@ export default function App() {
     api.createUser(userId).catch(() => {});
   }, [userId]);
 
-  const applyUser = async () => {
-    const id = userIdInput.trim();
-    if (!id || id === userId) return;
+  // USER_ID 历史下拉：从数据库 users 表读取创建过的 ID，点选填入输入框
+  const [userListOpen, setUserListOpen] = useState(false);
+  const [knownUsers, setKnownUsers] = useState<string[]>([]);
+  const refreshUsers = useCallback(() => {
+    api.users().then((list) => setKnownUsers(list.map((u) => u.user_id))).catch(() => {});
+  }, []);
+  useEffect(() => {
+    refreshUsers();
+  }, [refreshUsers, userId]);
+
+  // 切换账号后：聊天区切到全新会话，避免看到别的账号的对话（首次挂载除外）
+  const prevUserId = useRef(userId);
+  useEffect(() => {
+    if (prevUserId.current !== userId) {
+      prevUserId.current = userId;
+      setRunId(`run-${Date.now().toString(36)}`);
+      setApprovalTick((t) => t + 1);
+    }
+  }, [userId]);
+
+  const applyUser = async (id?: string) => {
+    const next = (id ?? userIdInput).trim();
+    if (!next || next === userId) return;
     try {
-      await api.createUser(id); // 幂等：存在即切换，不存在即创建
-      localStorage.setItem("warden.userId", id);
-      setUserId(id);
+      await api.createUser(next); // 幂等：存在即切换，不存在即创建
+      localStorage.setItem("warden.userId", next);
+      setUserId(next);
       setApprovalTick((t) => t + 1);
     } catch (e) {
       console.error(e);
@@ -47,7 +68,7 @@ export default function App() {
   const toggleRight = () => setRightWidth((w) => (w === 0 ? RIGHT_DEFAULT : 0));
 
   const switchRun = (id?: string) => {
-    const next = (id ?? "run-demo").trim() || "run-demo";
+    const next = (id ?? `run-${Date.now().toString(36)}`).trim();
     setRunId(next);
     setApprovalTick((t) => t + 1);
   };
@@ -72,8 +93,10 @@ export default function App() {
       const box = containerRef.current?.getBoundingClientRect();
       if (!d || !box) return;
       const raw = d.side === "left" ? e.clientX - box.left : box.right - e.clientX;
-      // 0（收起）～ 默认宽（三栏布局）连续可调；贴近边缘 24px 内吸附归零
-      const w = raw < 24 ? 0 : Math.min(raw, d.side === "left" ? LEFT_DEFAULT : RIGHT_DEFAULT);
+      // 上限按容器宽度的百分比封顶：大屏够宽，小屏自动收缩不会被裁切；
+      // 这样对话框既能拉大（侧栏收窄收起）也能拉小（侧栏变宽）
+      const maxW = Math.max(box.width * (d.side === "left" ? 0.38 : 0.45), 180);
+      const w = raw < 24 ? 0 : Math.min(raw, maxW);
       if (d.side === "left") setLeftWidth(w);
       else setRightWidth(w);
     };
@@ -95,7 +118,7 @@ export default function App() {
     <div className="h-full flex flex-col text-warden-fg">
       {/* 悬浮顶栏 */}
       <div className="px-4 pt-4 shrink-0">
-        <header className="mx-auto max-w-7xl rounded-2xl border border-white/[0.06] bg-white/[0.03] backdrop-blur-xl px-4 py-2.5 flex items-center gap-3 shadow-lg shadow-black/30">
+        <header className="relative z-20 mx-auto max-w-7xl rounded-2xl border border-white/[0.06] bg-white/[0.03] backdrop-blur-xl px-4 py-2.5 flex items-center gap-3 shadow-lg shadow-black/30">
           <button
             onClick={() => setLeftWidth((w) => (w === 0 ? LEFT_DEFAULT : 0))}
             title="对话列表"
@@ -123,17 +146,50 @@ export default function App() {
               className="w-40 sm:w-44 bg-black/30 border border-slate-600/50 rounded-full px-3 py-1.5 font-mono text-xs outline-none focus:border-warden-accent/70 transition"
               placeholder="demo-user"
             />
-            <button
-              onClick={applyUser}
-              title={userIdInput === userId ? "当前账号" : "创建 / 切换到该 USER_ID"}
-              className={`btn-sheen w-8 h-8 rounded-full border text-base leading-none transition ${
-                userIdInput === userId
-                  ? "border-warden-accent/70 text-warden-accent bg-warden-accent/10"
-                  : "border-slate-600/50 text-warden-fg/70 hover:text-warden-fg hover:border-slate-500"
-              }`}
-            >
-              ＋
-            </button>
+            {/* 切换按钮：点开展开已创建的 USER_ID 列表，选中即切换（可与信息按钮同排弹性布局） */}
+            <div className="relative">
+              <button
+                onClick={() => {
+                  refreshUsers();
+                  setUserListOpen((v) => !v);
+                }}
+                title="切换 USER_ID"
+                className={`btn-sheen px-3 py-1.5 rounded-full border text-xs transition ${
+                  userListOpen
+                    ? "border-warden-accent/70 text-zinc-100"
+                    : "border-slate-600/50 text-warden-fg/70 hover:text-warden-fg hover:border-slate-500"
+                }`}
+              >
+                切换 <span className="inline-block text-[10px]">{userListOpen ? "»" : "«"}</span>
+              </button>
+              {/* ID 列表：点选即切换 */}
+              {userListOpen && (
+                <div className="absolute right-0 top-full mt-1 w-48 rounded-xl border border-white/[0.07] bg-[#141416]/95 backdrop-blur-xl shadow-xl shadow-black/40 z-50 max-h-56 overflow-y-auto">
+                  {knownUsers.length === 0 && (
+                    <p className="px-3 py-2 text-xs text-zinc-500">（还没有创建过）</p>
+                  )}
+                  {knownUsers.map((u) => (
+                    <button
+                      key={u}
+                      onClick={() => {
+                        applyUser(u);
+                        setUserListOpen(false);
+                      }}
+                      className={`w-full text-left px-3 py-1.5 text-xs font-mono transition ${
+                        u === userId
+                          ? "text-warden-accent bg-warden-accent/10"
+                          : "text-zinc-300 hover:bg-white/[0.06]"
+                      }`}
+                    >
+                      {u}
+                      {u === userId && (
+                        <span className="float-right text-[10px] text-warden-ok">当前</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <button
               onClick={toggleRight}
               title="信息栏"
@@ -156,9 +212,9 @@ export default function App() {
           dragging ? "select-none" : ""
         } ${bothCollapsed ? "max-w-none" : "max-w-7xl"}`}
       >
-        {/* 左：对话栏（wrapper 用 flex，让内层面板撑满与聊天框齐高） */}
+        {/* 左：对话栏（wrapper 用 flex + 显式 stretch，保证面板与聊天框齐高；宽度按容器百分比封顶） */}
         <div
-          className={`hidden md:flex shrink-0 min-h-0 overflow-hidden transition-[width] duration-300 ease-out ${
+          className={`hidden md:flex shrink-0 self-stretch min-h-0 overflow-hidden transition-[width] duration-300 ease-out max-w-[38%] ${
             dragging ? "transition-none" : ""
           }`}
           style={{ width: leftWidth }}
@@ -210,7 +266,7 @@ export default function App() {
           />
         </main>
 
-        {/* 右：信息栏 */}
+        {/* 右：信息栏（显式 stretch 齐高 + 百分比封顶防裁切） */}
         {rightWidth > 0 && (
           <div
             onMouseDown={() => startDrag("right")}
@@ -226,12 +282,12 @@ export default function App() {
           />
         )}
         <aside
-          className={`shrink-0 min-h-0 overflow-hidden transition-[width] duration-300 ease-out ${
+          className={`flex shrink-0 self-stretch min-h-0 flex-col overflow-hidden transition-[width] duration-300 ease-out max-w-[45%] ${
             dragging ? "transition-none" : ""
           }`}
           style={{ width: rightWidth }}
         >
-          <div className="w-full min-w-[236px] h-full flex flex-col gap-3 overflow-y-auto pr-1">
+          <div className="w-full flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-1">
             <ApprovalPanel key={approvalTick} />
             <InfoPanel runId={runId} />
             <ModelPanel />

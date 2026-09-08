@@ -47,7 +47,7 @@ export default function ApprovalPanel() {
           {list.map((a) => (
             <li
               key={a.run_id + a.approval_id}
-              className="rounded-xl border border-white/[0.06] bg-black/20 p-2.5 text-xs"
+              className="rounded-xl border border-white/[0.06] bg-black/20 p-2.5 text-[13px] leading-relaxed"
             >
               <div className="text-warden-fg/80">
                 run=<span className="text-warden-warn">{a.run_id}</span>
@@ -80,10 +80,10 @@ export default function ApprovalPanel() {
       {/* 决策历史：已批准 / 已拒绝的记录（最新在前，最多显示 5 条） */}
       {historyList.length > 0 && (
         <div className="mt-2 pt-2 border-t border-white/[0.06]">
-          <p className="text-[10px] text-warden-fg/40 mb-1">最近决策</p>
+          <p className="text-[11px] text-warden-fg/50 mb-1">最近决策</p>
           <ul className="flex flex-col gap-1">
             {historyList.slice(0, 5).map((h, i) => (
-              <li key={i} className="text-[10px] text-zinc-500 truncate">
+              <li key={i} className="text-[11px] text-zinc-400 truncate">
                 <span className={h.decision === "approved" ? "text-warden-ok" : "text-warden-danger"}>
                   {h.decision === "approved" ? "✓已批准" : "✗已拒绝"}
                 </span>{" "}

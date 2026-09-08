@@ -68,14 +68,14 @@ export default function ModelPanel() {
                   }`}
                 />
                 <span
-                  className={`text-xs flex-1 truncate ${
+                  className={`text-[13px] flex-1 truncate ${
                     isCurrent ? "text-zinc-100 font-medium" : "text-zinc-400"
                   }`}
                 >
                   {m.name}
                 </span>
                 {!m.configured && (
-                  <span className="text-[10px] text-warden-warn/80">未导入</span>
+                  <span className="text-[11px] text-warden-warn/80">未导入</span>
                 )}
                 {!isCurrent && (
                   <button
@@ -87,7 +87,7 @@ export default function ModelPanel() {
                   </button>
                 )}
                 {isCurrent && (
-                  <span className="text-[10px] text-warden-ok">使用中</span>
+                  <span className="text-[11px] text-warden-ok">使用中</span>
                 )}
               </div>
 

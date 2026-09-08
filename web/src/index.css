@@ -10,13 +10,17 @@ body,
 
 body {
   margin: 0;
-  /* ZCode 式中性锌灰底 + 极淡的中性网格 */
-  background-color: #101013;
+  /* 战术终端：slate-900 底 + 极淡的蓝色战术网格 */
+  background-color: #0f172a;
   background-image:
-    linear-gradient(rgba(148, 163, 184, 0.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(148, 163, 184, 0.04) 1px, transparent 1px);
+    linear-gradient(rgba(94, 129, 172, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(94, 129, 172, 0.05) 1px, transparent 1px);
   background-size: 40px 40px;
-  color: #e4e4e7;
+  color: #e2e8f0;
+  /* 深底抗锯齿：消除字体发虚 */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 #root {

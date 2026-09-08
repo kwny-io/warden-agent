@@ -116,12 +116,12 @@ export default function ConversationList({
             onChange={(e) => setNewId(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && create()}
             placeholder="输入 USER_ID…"
-            className="flex-1 min-w-0 bg-black/30 border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-mono outline-none focus:border-warden-accent/70"
+            className="flex-1 min-w-0 bg-black/30 border border-white/10 rounded-lg px-2.5 py-1.5 text-[13px] font-mono outline-none focus:border-warden-accent/70"
           />
           <button
             onClick={create}
             disabled={busy || !newId.trim()}
-            className="px-2.5 rounded-lg border border-warden-accent/50 text-xs text-warden-accent hover:bg-warden-accent/10 disabled:opacity-40 transition"
+            className="px-2.5 rounded-lg border border-warden-accent/50 text-[13px] text-warden-accent hover:bg-warden-accent/10 disabled:opacity-40 transition"
           >
             创建
           </button>
@@ -153,14 +153,14 @@ export default function ConversationList({
                       }`}
                     />
                     <span
-                      className={`text-xs truncate flex-1 ${
+                      className={`text-[13px] truncate flex-1 ${
                         active ? "text-warden-fg" : "text-warden-fg/70"
                       }`}
                     >
                       {r.title || r.run_id}
                     </span>
                   </div>
-                  <div className="mt-0.5 pl-3 text-[10px] font-mono text-warden-fg/30 truncate">
+                  <div className="mt-1 pl-3 text-[11px] font-mono text-warden-fg/40 leading-relaxed truncate">
                     {fmtTime(r.updated_at) || "—"} · {r.msg_count} 条 · {r.run_id}
                   </div>
                   {/* 分割线：两边浅中间深的渐变 */}
