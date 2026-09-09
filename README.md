@@ -298,7 +298,7 @@ agent = build_agent(provider=model)
 python -m warden_agent.web.run_server
 ```
 
-- `http://127.0.0.1:8000/` —— 内置 React 控制台（SSE 流式对话 + 审批队列 + 状态面板）
+- `http://127.0.0.1:8000/` —— 内置 React 控制台：**三栏可拖拽战术终端**（对话列表 ⇄ SSE 真流式对话 ⇄ 治理信息栏）、多账号 USER_ID 隔离、会话管理与删除、审批队列与决策历史、模型运行时热切换
 - `http://127.0.0.1:8000/docs` —— 交互式 API 文档
 
 | 方法 | 路径 | 说明 |
@@ -306,8 +306,13 @@ python -m warden_agent.web.run_server
 | POST | `/chat/{run_id}` | 同步对话，返回最终回答或审批请求 |
 | POST | `/chat/stream/{run_id}` | SSE 流式对话 |
 | GET | `/events/{run_id}` | SSE 事件流订阅 |
+| GET / POST | `/runs` · `/runs/{run_id}` | 会话列表（按账号过滤）、预创建会话（幂等） |
+| DELETE | `/runs/{run_id}` | 删除会话（状态 / 对话 / 待审批一并清除） |
+| GET / POST | `/users` | 中控台账号（USER_ID）登记与查询 |
 | GET | `/status/{run_id}` | 会话状态查询 |
 | GET / POST | `/approvals` · `/approve/{run_id}` · `/reject/{run_id}` | 审批队列与决策 |
+| GET | `/approvals/history` | 审批决策历史（删除会话不清除，留审计） |
+| GET | `/models` · POST `/models/select` | 可用模型清单与运行时热切换（支持导入 API Key） |
 | GET | `/capabilities` · `/memory/{scope}` | 能力清单与记忆查询 |
 | GET | `/health/live` · `/health/ready` · `/metrics` | 存活/就绪探针与指标 |
 | GET | `/audit` | 审计轨迹（需认证） |
@@ -383,7 +388,8 @@ python -m warden_agent.demo_e2e                                                 
 | Web 搜索 / 抓取（`web/search.py`） | 多 provider 可插拔，URL 策略管控 | 已实现 |
 | Git 集成（`git/`） | revision 探测、unified-diff 应用、合并门禁 | 已实现 |
 | Coding Agent（`coding_agent/`） | 需求 → 读代码 → 生成 diff → 门禁落地 | 已实现 |
-| Web 控制台（`web/`） | React + TypeScript + Tailwind + Vite：SSE 流式、审批队列、状态面板；FastAPI 单端口托管 | 已实现 |
+| Web 控制台（`web/`） | React + TypeScript + Tailwind + Vite：三栏可拖拽战术终端（对话列表 / SSE 真流式对话 / 治理信息栏），多账号 USER_ID 隔离，会话管理与删除，审批队列与决策历史；FastAPI 单端口托管 | 已实现 |
+| 模型热切换（`web/server.py`） | `/models` 运行时切换模型（fake / deepseek / openai / zhipu / bailian），支持导入 API Key，全会话即时生效 | 已实现 |
 | 配置加载（`core/config.py`） | `.env` 加载，密钥不进代码 | 已实现 |
 | SDK 面（`agent.py`） | `build_agent` 一键装配、`typed_reply` 结构化输出、pydantic 工具 | 已实现 |
 | 架构边界测试（`tests/`） | AST 校验模块依赖单向 | 已实现 |
