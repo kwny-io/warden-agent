@@ -149,11 +149,34 @@ class AgentSession:
                 arguments=arguments,
                 reason=reason,
             )
-            self._gated = ToolCall(id=approval_id, name=tool_name, arguments=arguments)
+            # 从历史里找回被挂起的"原始" tool_call（模型返回的 id 必须原样保留）：
+            # 它是最后一条 assistant(tool_call)，且尚未出现配对的 tool 结果。
+            # 找不回才退回用审批单号重建。
+            original: ToolCall | None = None
+            answered = {
+                m.tool_call.id for m in self.messages if m.role == "tool" and m.tool_call
+            }
+            for m in reversed(self.messages):
+                if (
+                    m.role == "assistant"
+                    and m.tool_call
+                    and m.tool_call.name == tool_name
+                    and m.tool_call.id not in answered
+                ):
+                    original = m.tool_call
+                    break
+            self._gated = ToolCall(
+                id=(original.id if original else approval_id),
+                name=tool_name,
+                arguments=(original.arguments if original else arguments),
+            )
 
         # 若消息里没有系统指令且会话刚建，补一条
         if not any(m.role == "system" for m in self.messages):
-            self.messages.append(Message(role="system", content=system_prompt))
+            # 必须插在最前面：恢复历史时若追加到末尾，
+            # 会出现 [user, assistant(tool_call), system, tool] 这种
+            # system 拆散工具调用配对的序列，真实 API 直接 400
+            self.messages.insert(0, Message(role="system", content=system_prompt))
 
     # ---------- 持久化辅助 ----------
     def _persist_run(self) -> None:
