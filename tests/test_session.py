@@ -218,6 +218,54 @@ def test_流式会话完成后新消息可开启新一轮() -> None:
     assert final.text == "第二轮结束。"
 
 
+def test_重启恢复后审批_消息序列合法() -> None:
+    """回归：崩溃重启恢复会话时，system 应插在最前面（而不是追加到末尾），
+    批准后发给模型的历史才是合法序列——否则 system 拆散 tool_call 配对，真实 API 400。"""
+
+    class RecordingModel(AgentChatModel):
+        def __init__(self, reply: ChatResponse) -> None:
+            self.reply = reply
+            self.seen: list[ChatRequest] = []
+
+        def chat(self, request: ChatRequest) -> ChatResponse:
+            self.seen.append(request)
+            return self.reply
+
+    store = _store()
+    # 模拟断电残留：run 停在 WAITING_APPROVAL，库里只有 user + assistant(tool_call)，
+    # 没有 tool 结果，也没有 system（system 每次启动才在内存补）
+    run = AgentRun("r-sys")
+    run.mark_queued()
+    run.start()
+    run.wait_for_approval()
+    store.save_run(run)
+    store.save_pending_approval("r-sys", "appr-1", "weather.get", {"city": "上海"}, "需审批")
+    store.append_message("r-sys", Message(role="user", content="查天气"))
+    store.append_message(
+        "r-sys",
+        Message(role="assistant", content="[调用工具 weather.get]",
+                tool_call=ToolCall(id="c9", name="weather.get", arguments={"city": "上海"})),
+    )
+
+    model = RecordingModel(ChatResponse(content="已删除。", finish_reason="stop"))
+    sess = AgentSession(run_id="r-sys", model=model, catalog=weather_tool(),
+                        policy_engine=_policy(Decision.ALLOW), store=store)
+    final = sess.approve()
+    assert final.text == "已删除。"  # type: ignore[attr-defined]
+
+    sent = model.seen[0].messages
+    # system 必须在最前面（回归点：修复前被追加到末尾）
+    assert sent[0].role == "system"
+    # tool 结果紧跟 assistant(tool_call)，中间没有别的角色拆散配对
+    pairs = [(m.role, (m.tool_call.id if m.tool_call else None)) for m in sent]
+    assert pairs == [
+        ("system", None),
+        ("user", None),
+        ("assistant", "c9"),
+        ("tool", "c9"),
+    ]
+
+
 def test_悬空工具调用的历史发给模型前自动补齐() -> None:
     """回归：历史里 assistant(tool_call) 后面没有 tool 结果（曾被中断），
     下一次调模型前应自动补一条同 id 的合成 tool 结果，否则真实 API 400。"""
