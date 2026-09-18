@@ -7,15 +7,21 @@
 可选环境变量（不设则用假模型，不花真实费用）：
     DEEPSEEK_API_KEY=sk-xxx         启用真实 DeepSeek
     PORT=8000                       端口（默认 8000）
-    WARDEN_API_KEY=sk-xxx            给 API 设一个密钥 → 开启认证（Bearer）
-                                    未设置=本地开发开放，不鉴权
+    WARDEN_HOST=127.0.0.1           监听地址（默认只本机；容器里要设 0.0.0.0）
+    WARDEN_API_KEY=sk-xxx           **访问密钥（对外部署必须设）** → 开启 Bearer 鉴权
+    WARDEN_ALLOW_ANON=1             **仅本机开发**：显式声明接受"无鉴权"
     WARDEN_AUDIT=1                   开启审计（写进 SQLite 审计表，重启不丢）
     GIT_WORKDIR=path                指定 git 仓库目录 → 注册 git.apply_patch 工具
     SKILLS_DIR=path                 启用技能系统（SKILL.md 目录）
     MCP_SERVER=cmd                  启用 MCP（需 node）
 
+鉴权是 **fail-closed** 的：既没有 `WARDEN_API_KEY`、也没有显式 `WARDEN_ALLOW_ANON=1`
+时**拒绝启动**；监听非本机地址（如 0.0.0.0）时若无鉴权，同样拒绝启动。
+理由：`/approve` 和 `/reject` 是"人工审批"这道闸门的入口——如果接口本身无鉴权，
+调用方就能批准自己的高危操作，门禁形同虚设。
+
 启动后：
-    - 打开 http://127.0.0.1:8000/docs 可看交互式 API 文档（阶段13 起需带 Bearer key）
+    - 打开 http://127.0.0.1:8000/docs 可看交互式 API 文档（设了 WARDEN_API_KEY 后需带 Bearer key）
     - POST /chat/run-1  送一句话给 Agent
     - GET  /approvals   看等待审批的请求
     - POST /approve/run-1 / /reject/run-1  处理审批
@@ -26,6 +32,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import uvicorn
@@ -81,30 +88,71 @@ def _build_policy() -> PolicyEngine:
     return engine
 
 
-def _api_keys_from_env() -> dict[str, TrustedCaller] | None:
-    """从环境变量 WARDEN_API_KEY 读取 API Key → TrustedCaller 映射。
+class AuthConfigError(RuntimeError):
+    """鉴权配置缺失。fail-closed：宁可起不来，也不要无鉴权地对外服务。"""
 
-    未设置该变量返回 None（= 本地开发开放，不鉴权）。设了则把"谁拿着这个 key"
-    解析成一个 TrustedCaller（tenant/service/principal）。
+
+def is_loopback_host(host: str) -> bool:
+    """是否只监听本机。"""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | None, str]:
+    """决定鉴权模式，返回 (api_keys, mode)。
+
+    mode：
+      "bearer"   —— 配了 `WARDEN_API_KEY`，开启 Bearer 鉴权（生产必须）
+      "anon-dev" —— 未配 key，但**显式**设了 `WARDEN_ALLOW_ANON=1`，声明接受无鉴权
+
+    既没有 key、也没有显式声明 → 抛 `AuthConfigError`（拒绝启动）。
+    这是刻意的 fail-closed：无鉴权时任何人都能调 `/audit`（读全部审计）、
+    以及 `/approve`（批准高危操作）——审批门禁会被自己人绕过。
     """
-    key = os.environ.get("WARDEN_API_KEY")
-    if not key:
-        return None
-    # 一个 key 对应一个"服务调用者"身份；多 key 场景可扩展成 WARDEN_API_KEYS=csv
-    return {
-        key: TrustedCaller(
-            tenant_id="local",
-            principal_type="service",
-            principal_id="api-client",
-            product_id="http",
+    key = env.get("WARDEN_API_KEY")
+    if key:
+        # 一个 key 对应一个"服务调用者"身份；多 key 场景可扩展成 WARDEN_API_KEYS=csv
+        return {
+            key: TrustedCaller(
+                tenant_id="local",
+                principal_type="service",
+                principal_id="api-client",
+                product_id="http",
+            )
+        }, "bearer"
+    if env.get("WARDEN_ALLOW_ANON", "").strip().lower() in ("1", "true", "yes"):
+        return None, "anon-dev"
+    raise AuthConfigError(
+        "未设置 WARDEN_API_KEY —— 拒绝启动（fail-closed）。\n"
+        "  · 对外 / 容器部署：必须设置 WARDEN_API_KEY=<强随机串>\n"
+        "  · 仅本机开发：显式设 WARDEN_ALLOW_ANON=1 表示接受无鉴权"
+    )
+
+
+def ensure_listen_is_safe(host: str, auth_mode: str) -> None:
+    """校验"监听地址 × 鉴权模式"这个组合是否安全。不安全则抛 AuthConfigError。
+
+    单独抽出来是为了可测：main() 里只负责把异常变成退出码。
+    """
+    if auth_mode != "bearer" and not is_loopback_host(host):
+        raise AuthConfigError(
+            f"WARDEN_HOST={host} 是对外监听地址，但未开启鉴权 —— 拒绝启动。"
+            "请设置 WARDEN_API_KEY，或把 WARDEN_HOST 改回 127.0.0.1。"
         )
-    }
+
+
+def _db_path() -> str:
+    """SQLite 存档路径。
+
+    容器里用 `WARDEN_DB_PATH` 指向可写卷 —— rootfs 设成只读（read_only: true）时，
+    写 WORKDIR 会失败，必须显式给一个挂载卷里的路径。
+    """
+    return os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
 
 
 def main() -> None:
     load_env()  # 先读 .env（可选），密钥从环境变量取，不硬编码
     setup_logging()
-    store = SqliteStore("warden-agent-local.db")  # 存档文件（已被 .gitignore 忽略）
+    store = SqliteStore(_db_path())  # 存档文件（已被 .gitignore 忽略）
 
     # 模型：有 key 用真 DeepSeek，否则用假模型（离线可跑）
     model: AgentChatModel
@@ -116,16 +164,31 @@ def main() -> None:
         model = FakeModel()
         logger.info("未设置 DEEPSEEK_API_KEY，使用离线假模型（设置 key 可接真实 DeepSeek）")
 
-    # 阶段13：认证 + 审计。WARDEN_API_KEY 非空才开认证；WARDEN_AUDIT=1 开审计
-    api_keys = _api_keys_from_env()
-    if api_keys:
+    # 鉴权（fail-closed）。监听地址与鉴权要一起决定：对外监听却不鉴权 = 直接拒绝启动。
+    host = os.environ.get("WARDEN_HOST", "127.0.0.1")
+    try:
+        api_keys, auth_mode = resolve_auth(os.environ)
+    except AuthConfigError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
+
+    try:
+        ensure_listen_is_safe(host, auth_mode)
+    except AuthConfigError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
+
+    if auth_mode == "bearer":
         logger.info("已开启 API 鉴权（请求需带 Authorization: Bearer <key>）")
     else:
-        logger.warning("未设置 WARDEN_API_KEY，未启用鉴权（本地开发开放）")
+        logger.warning(
+            "WARDEN_ALLOW_ANON=1：未启用鉴权，且只监听本机 %s（开发用）。"
+            "对外暴露端口前必须设置 WARDEN_API_KEY。", host,
+        )
 
     audit_store: Any = None
     if os.environ.get("WARDEN_AUDIT") in ("1", "true", "yes"):
-        audit_store = SqliteAuditStore("warden-agent-local.db")
+        audit_store = SqliteAuditStore(_db_path())
         logger.info("已开启审计（写入 SQLite audit_log 表）")
 
     app = build_app(
@@ -148,7 +211,7 @@ def main() -> None:
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)
     logger.info("OpenAPI 文档:  http://127.0.0.1:%s/docs", port)
     logger.info("健康检查:      /health/live  /health/ready")
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

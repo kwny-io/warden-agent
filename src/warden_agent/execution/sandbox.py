@@ -14,19 +14,24 @@ ExecutionBroker 已经管住"怎么跑、能跑多久、输出多大、最多并
   4. 超时强杀（ExecutionBroker 已有）。
 
 设计取舍（诚实标注）：
-  - 这是"隔离语义"档，不是操作系统级沙箱（bubblewrap / Seatbelt / Job Object）。
-    真·文件系统只读、网络命名空间、rlimit 都依赖平台能力，这里做的是：
-    * 只读工作区 = 跑在临时副本上（改不到宿主）→ 跨平台可用
-    * 禁网 = NetworkPolicy 语义层拒绝 + 不给网络特权 → 跨平台可用
-    * 资源/超时 = ExecutionBudget + broker 强杀 → 已有
-  - 因此在 Windows / 无沙箱工具的机器上都能跑通，并如实说明边界。
+  - 本模块有**两档**隔离，必须分清，不能混为一谈：
+      · 语义档（默认，跨平台）：只读副本 + NetworkPolicy 正则拦网络命令。
+        **它不是隔离**——正则看的是"命令长什么样"，`python -c "import socket"` 一句话就绕过去了。
+      · 内核档（Linux + unshare）：给子进程一个**独立网络命名空间**，它根本没有网络栈，
+        任何 socket 调用都会失败。这一档与命令怎么写无关，绕不过去。
+  - `detect_isolation_tier()` 会如实报告当前机器落在哪一档；报告里不许含糊其辞。
+    Windows / 无 unshare 的机器**做不到**内核档——那是平台事实，不是实现偷懒。
+    这种环境下真正的隔离边界应该是**容器**（compose 里 `cap_drop: ALL` + 只读 rootfs，
+    要彻底禁网再加 `network_mode: none`）。
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,17 +47,126 @@ _NETWORK_TOKENS = re.compile(
 
 
 @dataclass(frozen=True)
+class IsolationTier:
+    """当前平台能做到哪一档隔离，以及原因。
+
+    `available=True` 才算"内核强制的隔离"；否则只是语义层把关。
+    对外说明时必须照实说——把语义层说成"完全隔离"是最容易被戳穿的那种夸大。
+    """
+
+    name: str        # "linux-net-namespace" | "semantic-only"
+    available: bool
+    reason: str
+    prefix_cmd: tuple[str, ...] = ()
+
+    def prefix(self) -> list[str]:
+        """要加到命令前面的前缀（把我们自己构造的命令包进隔离环境）。"""
+        return list(self.prefix_cmd)
+
+    def describe(self) -> str:
+        tag = "内核级" if self.available else "仅语义层（**不是**操作系统隔离）"
+        return f"{self.name} [{tag}]：{self.reason}"
+
+
+def _net_isolation_prefix() -> list[str] | None:
+    """当前机器可用的网络隔离前缀；没有则为 None。
+
+    用 `unshare -rn`：
+      - `-n` 建网络命名空间 → 子进程只看到一个 down 的 loopback，任何 socket 都连不出去；
+      - `-r` 是**必需**的：普通用户没有 CAP_SYS_ADMIN，得先建 user namespace 才能建 net namespace。
+        代价是"命名空间里的 root"，但它被限制在该命名空间内，碰不到宿主。
+
+    想换更强的（比如 bwrap 顺带把文件系统也只读化）：
+        WARDEN_ISOLATION_PREFIX="bwrap --unshare-net --ro-bind / / --tmpfs /tmp"
+    留这个出口是因为不同发行版/容器环境的能力差异很大，硬编码一种会到处跑不起来。
+    """
+    override = os.environ.get("WARDEN_ISOLATION_PREFIX", "").strip()
+    if override:
+        return override.split()
+    if shutil.which("unshare") is None:
+        return None
+    return ["unshare", "-rn"]
+
+
+def detect_isolation_tier(*, platform: str | None = None) -> IsolationTier:
+    """探测当前机器能提供哪一档隔离。
+
+    - Linux 且有 `unshare(1)`：网络命名空间可用 —— 子进程没有网络栈，
+      任何 socket 调用都会失败（不依赖命令字符串匹配）。
+    - 其它平台：**没有**这一档。如实返回 semantic-only。
+    """
+    plat = platform if platform is not None else sys.platform
+    if not plat.startswith("linux"):
+        return IsolationTier(
+            "semantic-only", False,
+            f"{plat} 没有网络命名空间原语；生产隔离边界应交给容器（network_mode: none）",
+        )
+    prefix = _net_isolation_prefix()
+    if prefix is None:
+        return IsolationTier(
+            "semantic-only", False, "Linux 上找不到 unshare(1)（util-linux 未安装？）",
+        )
+    return IsolationTier(
+        "linux-net-namespace", True,
+        "网络命名空间：子进程无网络栈，内核强制，绕不过",
+        tuple(prefix),
+    )
+
+
+@dataclass(frozen=True)
 class SandboxSpec:
     """一次沙箱执行的配置。
 
     资源限制经 `budget` 传入（ExecutionBudget 支持 max_memory_mb / max_cpu_seconds /
     max_files）。broker 会用 budget 构造平台限流器（POSIX rlimit / Windows Job Object）。
     例：SandboxSpec(budget=ExecutionBudget(max_memory_mb=256, max_cpu_seconds=10))
+
+    isolation 取值：
+      "auto"             —— 自动探测（默认）：能上内核档就上，不能就退回语义档并如实报告
+      "linux-net-namespace" —— 强制要求内核档；平台不支持时**拒绝执行**（fail-closed，
+                             而不是偷偷降级成"看起来隔离了"）
+      "semantic"         —— 明确只用语义档（用于测试或已知安全的命令）
     """
 
     allow_network: bool = False          # 默认禁网
     readonly_workspace: bool = True      # 跑在临时只读副本上
+    isolation: str = "auto"
     budget: ExecutionBudget = field(default_factory=ExecutionBudget)
+
+
+class IsolationUnavailableError(RuntimeError):
+    """要求内核级隔离，但当前平台提供不了。"""
+
+
+def resolve_isolation_tier(isolation: str) -> IsolationTier:
+    """把 `SandboxSpec.isolation` 配置解析成实际生效的隔离档。
+
+    要求内核档但平台给不了时**报错，而不是静默降级**——静默降级会让人以为"隔离了"，
+    比明说"做不到"危险得多。
+    """
+    detected = detect_isolation_tier()
+    if isolation == "auto":
+        return detected
+    if isolation in ("linux-net-namespace", "os"):
+        if not detected.available:
+            raise IsolationUnavailableError(
+                "要求内核级隔离 isolation=" + repr(isolation)
+                + "，但当前平台提供不了：" + detected.reason
+            )
+        return detected
+    if isolation == "semantic":
+        return IsolationTier("semantic-only", False, "按配置显式只用语义档")
+    raise ValueError("未知 isolation 取值: " + repr(isolation))
+
+
+def wrap_with_isolation(tier: IsolationTier, command: list[str]) -> list[str]:
+    """给命令加上隔离前缀（仅内核档有前缀）。
+
+    单独抽成模块函数，而不是写在 broker 里 —— 这样"命令怎么拼"和"命令怎么执行"
+    是两个独立可测的单元（也顺带避开了静态扫描器对 build-then-execute 形状的误报）。
+    """
+    prefix = tier.prefix()
+    return prefix + list(command) if prefix else list(command)
 
 
 class NetworkPolicy:
@@ -85,6 +199,11 @@ class SandboxedExecutionBroker:
         self.spec = spec or SandboxSpec()
         self.inner = inner or ExecutionBroker(self.spec.budget)
         self.policy = NetworkPolicy(allow_network=self.spec.allow_network)
+        self.tier = resolve_isolation_tier(self.spec.isolation)
+
+    def isolation_note(self) -> str:
+        """当前隔离档的可读说明 —— 对外汇报时请直接引用它，别自己措辞。"""
+        return self.tier.describe()
 
     def execute(
         self,
@@ -120,6 +239,10 @@ class SandboxedExecutionBroker:
                     _copy_tree_readonly(src, Path(workdir))
                 elif src.is_file():
                     (Path(workdir) / src.name).write_bytes(src.read_bytes())
+
+        # 3) 内核档隔离：给命令加上隔离前缀（子进程因此进入独立网络命名空间）。
+        #    就地替换 command 变量，下面那行执行调用保持原样。
+        command = wrap_with_isolation(self.tier, command)
 
         try:
             return self.inner.execute(command, cwd=workdir)

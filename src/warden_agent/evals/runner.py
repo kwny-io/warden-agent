@@ -15,10 +15,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from warden_agent.loop.intent import ToolIntentRouter
 from warden_agent.loop.loop import AgentLoop, AgentReply
 from warden_agent.model.model import AgentChatModel, ChatResponse, ToolCall
+from warden_agent.policy.policy import (
+    Decision,
+    Policy,
+    PolicyDenied,
+    PolicyEngine,
+    PolicyResult,
+)
 from warden_agent.skill import SkillCatalog, SkillPackageParser
 from warden_agent.skill.trigger import SkillTriggerRouter
 from warden_agent.tool.catalog import ToolCatalog, function_tool
@@ -241,10 +249,27 @@ def run_skill_evals() -> list[CaseResult]:
     return out
 
 
-# ---------------- 类别三：端到端任务（脚本化模型驱动真实循环） ----------------
+# ---------------- 类别三：端到端循环能力（脚本化模型驱动真实 AgentLoop） ----------------
+#
+# ⚠️ **先划清边界（必读）**：这一类的模型是**脚本化的**（按剧本返回固定响应），
+#    所以它测的是 **harness（循环本身）的能力**——失败自愈、防打转、意图门禁、
+#    策略门禁、迭代上限收口、轨迹不变量。它**测不了"模型好不好"**：
+#    提示注入、幻觉、指令遵循这些都需要真实模型；脚本模型照着剧本走，
+#    拿它测注入只是自欺（一定要写的话，那是"剧场测试"）。
+#    模型能力评测要另配 `--mode real`（尚未实现）。
+#
+# 断言落在**轨迹与决策**上，不是"回答非空"——后者等于没测。
+
+_HINT_PREFIX = "[意图提示]"
+_LOOP_BREAK_HINT = "[注意] 你已调用过"
+
 
 class _ScriptedModel(AgentChatModel):
-    """按剧本走的确定性模型（与 tests/conftest.ScriptedModel 同思路）。"""
+    """按剧本走的确定性模型（与 tests/conftest.ScriptedModel 同思路）。
+
+    剧本演完还继续被调用 = 用例本身写错了（说明循环没在该停的地方停），
+    所以这里直接抛断言错误，而不是悄悄返回空响应。
+    """
 
     def __init__(self, script: list[ChatResponse]) -> None:
         self.script = list(script)
@@ -258,6 +283,54 @@ class _ScriptedModel(AgentChatModel):
         return resp
 
 
+@dataclass(frozen=True)
+class _TraceStep:
+    """从对话记录里还原出的一步工具调用。"""
+
+    name: str
+    arguments: dict[str, Any]
+    is_hint: bool   # True = 被门禁拦下、只喂回提醒，**没有真的执行**
+    body: str       # 工具结果正文（或提醒文案）
+
+
+def _trace(reply: AgentReply) -> list[_TraceStep]:
+    """把"tool 角色 + 带 tool_call"的消息还原成调用轨迹（按发生顺序）。
+
+    说明：意图拦截、防打转提示也会以 tool 角色喂回，靠文案前缀区分
+    "真的执行了" 与 "只提醒"——这两者在能力上完全不同，不能混为一谈。
+    """
+    steps: list[_TraceStep] = []
+    for m in reply.messages:
+        if m.role != "tool" or m.tool_call is None:
+            continue
+        steps.append(_TraceStep(
+            name=m.tool_call.name,
+            arguments=dict(m.tool_call.arguments),
+            is_hint=m.content.startswith((_HINT_PREFIX, _LOOP_BREAK_HINT)),
+            body=m.content,
+        ))
+    return steps
+
+
+def _executed(trace: list[_TraceStep]) -> list[_TraceStep]:
+    """只保留真正执行的步骤（排除门禁提示）。"""
+    return [s for s in trace if not s.is_hint]
+
+
+def _describe(trace: list[_TraceStep]) -> str:
+    """把轨迹渲染成一行，便于失败时看清发生了什么。"""
+    if not trace:
+        return "(无工具调用)"
+    return " → ".join(
+        f"{s.name}{'(门禁提示,未执行)' if s.is_hint else ''}" for s in trace
+    )
+
+
+def _case(name: str, ok: bool, expected: str, actual: str) -> CaseResult:
+    return CaseResult(category="e2e", name=name, passed=ok,
+                      expected=expected, actual=actual)
+
+
 def _e2e_catalog() -> ToolCatalog:
     @function_tool(
         "weather.get", "获取某个城市的实时天气与气温",
@@ -268,51 +341,85 @@ def _e2e_catalog() -> ToolCatalog:
     def get_weather(city: str) -> str:
         return f"{city}: 晴, 25度"
 
+    @function_tool(
+        "boom.run", "总是抛异常的工具（用于验证 harness 不被打穿）",
+        {"type": "object", "properties": {}, "required": []},
+        pure=False,
+    )
+    def boom() -> str:
+        raise RuntimeError("工具内部炸了")
+
     catalog = ToolCatalog()
     catalog.register(get_weather)
+    catalog.register(boom)
     return catalog
 
 
-def _run_e2e_case(name: str, responses: list[ChatResponse], user_text: str,
-                  *, intent: bool = False) -> tuple[CaseResult, AgentReply]:
-    """跑一个端到端用例，返回 (判定, AgentReply) 供进一步断言。"""
+def _drive(
+    responses: list[ChatResponse],
+    user_text: str,
+    *,
+    intent: bool = False,
+    policy: PolicyEngine | None = None,
+    max_iterations: int = 10,
+) -> tuple[AgentReply | None, list[_TraceStep], Exception | None]:
+    """跑一次真实 AgentLoop，返回 (回复, 轨迹, 异常)。
+
+    异常不吞：有些能力边界（策略 DENY、迭代上限）**就是**抛异常，必须能断言到。
+    """
     catalog = _e2e_catalog()
     loop = AgentLoop(
         model=_ScriptedModel(responses),
         catalog=catalog,
+        policy_engine=policy,
+        max_iterations=max_iterations,
         intent=ToolIntentRouter(catalog) if intent else None,
     )
-    reply = loop.run(user_text)
-    passed = bool(reply.text) and len(reply.text) > 0
-    return CaseResult(
-        category="e2e", name=name, passed=passed,
-        expected="非空回答", actual=reply.text or "(空)",
-    ), reply
+    try:
+        reply = loop.run(user_text)
+    except Exception as exc:  # noqa: BLE001 —— 有意捕获：断言的就是这些异常
+        return None, [], exc
+    return reply, _trace(reply), None
+
+
+def _deny_tool(tool_name: str) -> Policy:
+    """构造一条"拒绝指定工具"的策略。"""
+    def _policy(name: str, arguments: dict[str, object]) -> PolicyResult:
+        if name == tool_name:
+            return PolicyResult(Decision.DENY, f"动作 {name!r} 被策略禁止")
+        return PolicyResult(Decision.ALLOW)
+    return _policy
 
 
 def run_e2e_evals() -> list[CaseResult]:
     out: list[CaseResult] = []
 
-    # 1. 单工具任务：调一次工具 → 汇总回答
-    res, reply = _run_e2e_case(
-        "单工具任务",
+    # 1. 单工具任务：调一次工具 → 用工具结果汇总回答
+    reply, trace, err = _drive(
         [ChatResponse(content=None, finish_reason="tool_calls",
                       tool_calls=[ToolCall(id="1", name="weather.get",
                                            arguments={"city": "上海"})]),
          ChatResponse(content="上海今天晴,25度")],
         "上海天气怎么样")
-    ok = res.passed and "晴" in (reply.text or "")
-    out.append(CaseResult(res.category, res.name, ok, res.expected, res.actual))
+    ex = _executed(trace)
+    out.append(_case(
+        "单工具任务",
+        err is None and len(ex) == 1 and ex[0].name == "weather.get"
+        and ex[0].arguments.get("city") == "上海"
+        and "晴" in (reply.text if reply else ""),
+        "恰好执行 1 次 weather.get(city=上海)，且回答含'晴'",
+        f"{_describe(trace)}｜回答={reply.text if reply else err!r}"))
 
-    # 2. 无工具直答
-    out.append(_run_e2e_case(
-        "直接回答",
-        [ChatResponse(content="你好呀,我是 Warden")],
-        "你好")[0])
+    # 2. 无工具直答：不该凭空调工具
+    reply, trace, err = _drive([ChatResponse(content="你好呀,我是 Warden")], "你好")
+    out.append(_case(
+        "直接回答不调工具",
+        err is None and len(_executed(trace)) == 0 and bool(reply and reply.text),
+        "不执行任何工具，直接给出回答",
+        f"{_describe(trace)}｜回答={reply.text if reply else err!r}"))
 
-    # 3. 多步任务：连续两次工具调用再汇总
-    res, reply = _run_e2e_case(
-        "多步任务",
+    # 3. 多步任务：参数与顺序都要对
+    reply, trace, err = _drive(
         [ChatResponse(content=None, finish_reason="tool_calls",
                       tool_calls=[ToolCall(id="1", name="weather.get",
                                            arguments={"city": "上海"})]),
@@ -321,38 +428,47 @@ def run_e2e_evals() -> list[CaseResult]:
                                            arguments={"city": "北京"})]),
          ChatResponse(content="上海晴,北京也晴")],
         "对比上海和北京的天气")
-    ok = res.passed and "北京" in (reply.text or "")
-    out.append(CaseResult(res.category, res.name, ok, res.expected, res.actual))
+    cities = [s.arguments.get("city") for s in _executed(trace)]
+    out.append(_case(
+        "多步任务顺序与参数保真",
+        err is None and cities == ["上海", "北京"],
+        "按顺序执行 weather.get(上海) → weather.get(北京)",
+        f"实际参数序列={cities}｜{_describe(trace)}"))
 
-    # 4. 失败自愈：先调不存在的工具 → 错误喂回 → 模型纠错换正确工具
-    res, reply = _run_e2e_case(
-        "失败自愈",
+    # 4. 失败自愈：未注册工具不击穿，错误喂回后模型换工具
+    reply, trace, err = _drive(
         [ChatResponse(content=None, finish_reason="tool_calls",
-                      tool_calls=[ToolCall(id="1", name="nope.tool",
-                                           arguments={})]),
+                      tool_calls=[ToolCall(id="1", name="nope.tool", arguments={})]),
          ChatResponse(content=None, finish_reason="tool_calls",
                       tool_calls=[ToolCall(id="2", name="weather.get",
                                            arguments={"city": "上海"})]),
          ChatResponse(content="查到了:上海晴")],
         "上海天气怎么样")
-    ok = res.passed and "晴" in (reply.text or "")
-    out.append(CaseResult(res.category, res.name, ok, res.expected, res.actual))
+    out.append(_case(
+        "失败自愈（未注册工具）",
+        err is None and bool(trace) and trace[0].name == "nope.tool"
+        and "执行失败" in trace[0].body
+        and any(s.name == "weather.get" for s in _executed(trace))
+        and "晴" in (reply.text if reply else ""),
+        "首调失败→错误喂回→换 weather.get 成功，全程不崩",
+        f"{_describe(trace)}｜首个错误={trace[0].body[:40] if trace else '(无)'}"))
 
-    # 5. 意图提示：误调被路由器拦下 → 模型改为直答
-    res, reply = _run_e2e_case(
-        "意图提示防误调",
+    # 5. 意图门禁：信号不足的调用被拦下（只提示、不执行）
+    reply, trace, err = _drive(
         [ChatResponse(content=None, finish_reason="tool_calls",
                       tool_calls=[ToolCall(id="1", name="weather.get",
                                            arguments={"city": "公司"})]),
          ChatResponse(content="年假是 5 天")],
         "公司年假有几天", intent=True)
-    hint_seen = any("意图" in (m.content or "") for m in reply.messages)
-    ok = res.passed and hint_seen and "5 天" in (reply.text or "")
-    out.append(CaseResult(res.category, res.name, ok, res.expected, res.actual))
+    out.append(_case(
+        "意图门禁拦下误调",
+        err is None and len(trace) == 1 and trace[0].is_hint
+        and len(_executed(trace)) == 0 and "5 天" in (reply.text if reply else ""),
+        "该调用被拦为'提示'（未执行），模型改为直接回答",
+        f"{_describe(trace)}｜回答={reply.text if reply else err!r}"))
 
-    # 6. 防打转：同一成功调用原样重发 → 提示换策略 → 模型直答
-    res, reply = _run_e2e_case(
-        "防打转",
+    # 6. 防打转：同一调用重复发送被判定为打转（提示，而非再执行一遍）
+    reply, trace, err = _drive(
         [ChatResponse(content=None, finish_reason="tool_calls",
                       tool_calls=[ToolCall(id="1", name="weather.get",
                                            arguments={"city": "上海"})]),
@@ -361,8 +477,75 @@ def run_e2e_evals() -> list[CaseResult]:
                                            arguments={"city": "上海"})]),
          ChatResponse(content="还是上海晴,不用再查了")],
         "上海天气怎么样")
-    ok = res.passed and "不用再查" in (reply.text or "")
-    out.append(CaseResult(res.category, res.name, ok, res.expected, res.actual))
+    out.append(_case(
+        "防打转（重复调用不重复执行）",
+        err is None and len(_executed(trace)) == 1 and len(trace) == 2
+        and trace[1].is_hint and "不用再查" in (reply.text if reply else ""),
+        "同一调用只执行 1 次，第二次转为打转提示",
+        f"{_describe(trace)}｜回答={reply.text if reply else err!r}"))
+
+    # 7. 工具内部异常不击穿 harness
+    reply, trace, err = _drive(
+        [ChatResponse(content=None, finish_reason="tool_calls",
+                      tool_calls=[ToolCall(id="1", name="boom.run", arguments={})]),
+         ChatResponse(content=None, finish_reason="tool_calls",
+                      tool_calls=[ToolCall(id="2", name="weather.get",
+                                           arguments={"city": "上海"})]),
+         ChatResponse(content="绕过异常,查到上海晴")],
+        "上海天气怎么样")
+    out.append(_case(
+        "工具内部异常不击穿",
+        err is None and bool(trace) and trace[0].name == "boom.run"
+        and "失败" in trace[0].body
+        and any(s.name == "weather.get" for s in _executed(trace)),
+        "抛异常的工具被转成错误喂回，循环继续并完成任务",
+        f"{_describe(trace)}｜异常={(err or '无')}"))
+
+    # 8. 策略门禁 DENY 生效（fail-closed）：被禁的工具**不能**被执行
+    policy = PolicyEngine()
+    policy.add(_deny_tool("weather.get"))
+    reply, trace, err = _drive(
+        [ChatResponse(content=None, finish_reason="tool_calls",
+                      tool_calls=[ToolCall(id="1", name="weather.get",
+                                           arguments={"city": "上海"})]),
+         ChatResponse(content="被拒了")],
+        "上海天气怎么样", policy=policy)
+    out.append(_case(
+        "策略 DENY 不执行（fail-closed）",
+        isinstance(err, PolicyDenied) and len(_executed(trace)) == 0,
+        "被策略禁止的工具不被执行（抛 PolicyDenied）",
+        f"异常={type(err).__name__ if err else '无'}｜{_describe(trace)}"))
+
+    # 9. 迭代上限收口：模型一直要调工具时按上限停住，不无限循环
+    reply, trace, err = _drive(
+        [ChatResponse(content=None, finish_reason="tool_calls",
+                      tool_calls=[ToolCall(id=str(i), name="weather.get",
+                                           arguments={"city": f"城{i}"})])
+         for i in range(1, 4)],
+        "查三个城市", max_iterations=3)
+    out.append(_case(
+        "迭代上限收口",
+        isinstance(err, RuntimeError) and "上限" in str(err),
+        "迭代达到 max_iterations 时报错收口（不无限循环）",
+        f"异常={(err or '无')}｜{_describe(trace)}"))
+
+    # 10. 轨迹配对不变量：每个 tool_call 恰好一条结果（重复配对会让真实 API 报 400）
+    reply, trace, err = _drive(
+        [ChatResponse(content=None, finish_reason="tool_calls",
+                      tool_calls=[ToolCall(id="1", name="weather.get",
+                                           arguments={"city": "上海"})]),
+         ChatResponse(content=None, finish_reason="tool_calls",
+                      tool_calls=[ToolCall(id="2", name="weather.get",
+                                           arguments={"city": "北京"})]),
+         ChatResponse(content="都晴")],
+        "对比上海北京")
+    ids = [m.tool_call.id for m in (reply.messages if reply else [])
+           if m.role == "tool" and m.tool_call is not None]
+    out.append(_case(
+        "轨迹配对不变量",
+        err is None and len(ids) == len(set(ids)) and all(ids),
+        "每个 tool_call_id 恰好出现一次（不重复、不为空）",
+        f"tool_call_id 序列={ids}"))
 
     return out
 

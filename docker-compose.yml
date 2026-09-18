@@ -1,34 +1,61 @@
-# Warden Agent Python —— 一键部署 (服务 + PostgreSQL)
+# Warden Agent Python —— 一键部署（应用服务）
 #
 # 用法：
-#   docker compose up --build
-# 会同时起：
-#   - app   ：Agent HTTP/SSE 服务 (http://localhost:8000/docs)
-#   - db    ：PostgreSQL 存储（数据存到命名卷，重启不丢）
+#   WARDEN_API_KEY=$(python -c "import secrets;print(secrets.token_urlsafe(32))") \
+#     docker compose up --build
 #
-# 想接真实模型：在同目录 `docker compose.env` 或下面加 DEEPSEEK_API_KEY。
-# 想用 Postgres 存储：目前 run_server 默认用 SQLite；要用 PG，把 app 的启动
-# 改成一个读 PG 的入口（见 store/postgres.py），或在代码里传 PostgresStore。
+# 两个必须注意的点（都是"能不能真的用起来"的坑）：
+#
+# 1) 鉴权是强制的。本文件用 `${WARDEN_API_KEY:?}` 让 compose 在**没设 key 时直接报错**，
+#    而不是起一个无鉴权的服务。原因：`/approve`、`/reject` 是人工审批闸门的入口，
+#    接口无鉴权 = 调用方可以自己批准自己的高危操作，门禁形同虚设。
+#
+# 2) 容器内必须监听 0.0.0.0（`WARDEN_HOST`），否则发布端口转发不到容器网卡，外部连不上。
+#    而"对外监听"与"无鉴权"不允许共存 —— 所以 1) 和 2) 必须一起满足：
+#    `run_server` 里对此有 fail-closed 校验（对外监听 + 无鉴权 → 拒绝启动）。
+#
+# 存储：默认 SQLite，落在 app-data 卷（rootfs 设为只读，写 /app 会失败）。
+# 想换 PostgreSQL：在应用里传 PostgresStore（见 src/warden_agent/store/postgres.py），
+# 并把下面注释掉的 db 服务打开。现在 db 服务是**注释掉的**——留着它会起一个"没人连"的
+# 数据库，比不起更误导，所以改成显式 opt-in。
 
 services:
   app:
     build: .
+    # 只发布到宿主机回环，默认不给局域网。要对外改成 "8000:8000"，并确保 WARDEN_API_KEY 已设。
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      # - DEEPSEEK_API_KEY=sk-xxx   # 取消注释接真实 DeepSeek
       - PORT=8000
-    depends_on:
-      - db
-
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: warden
-      POSTGRES_PASSWORD: warden-secret
-      POSTGRES_DB: warden
+      # 容器内对外监听（发布端口才能通）；鉴权由下面的 key 保证
+      - WARDEN_HOST=0.0.0.0
+      # 没设就直接报错，不给你起一个裸奔的服务
+      - WARDEN_API_KEY=${WARDEN_API_KEY:?必须先设置 WARDEN_API_KEY（示例见本文件顶部）}
+      - WARDEN_AUDIT=1
+      - WARDEN_DB_PATH=/data/warden.db
+      # 接真实模型时取消注释（不设则用离线假模型，可完整跑通链路）
+      # - DEEPSEEK_API_KEY=sk-xxx
     volumes:
-      - pg-data:/var/lib/postgresql/data
+      - app-data:/data
+    # ---- 纵深防御（容器层）----
+    read_only: true                # rootfs 只读：跑起来后改不动镜像内容
+    tmpfs:
+      - /tmp                       # 只读 rootfs 下给临时目录一个可写 tmpfs
+    cap_drop:
+      - ALL                        # 丢掉全部 Linux capabilities
+    security_opt:
+      - no-new-privileges:true     # 禁止通过 setuid 提权
+    restart: unless-stopped
+
+  # db:
+  #   image: postgres:16
+  #   environment:
+  #     POSTGRES_USER: warden
+  #     POSTGRES_PASSWORD: warden-secret
+  #     POSTGRES_DB: warden
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
 
 volumes:
-  pg-data:
+  app-data:
+  # pg-data:

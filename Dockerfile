@@ -23,7 +23,9 @@ RUN npm run build
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    WARDEN_HOST=0.0.0.0 \
+    WARDEN_DB_PATH=/data/warden.db
 
 WORKDIR /app
 
@@ -37,7 +39,20 @@ COPY src ./src
 # 拷贝前端构建产物到 /app/web/dist（server.py 用仓库相对路径自动找到并托管）
 COPY --from=web-build /build/dist ./web/dist
 
+# 非 root 运行（最小权限）：容器逃逸时能拿到的权限越小越好，成本几乎为零
+RUN useradd --create-home --uid 10001 warden \
+    && mkdir -p /data \
+    && chown -R warden:warden /data
+USER warden
+
 EXPOSE 8000
 
-# 默认启动 HTTP/SSE 服务（有 DEEPSEEK_API_KEY 就用真模型，否则假模型）
+# 存活探针：编排层据此判断"要不要重启"。不查依赖（依赖问题由 /health/ready 表达）。
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import os,urllib.request,sys; \
+p='http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health/live'; \
+sys.exit(0 if urllib.request.urlopen(p, timeout=2).status == 200 else 1)"
+
+# 默认启动 HTTP/SSE 服务。注意：WARDEN_HOST=0.0.0.0 是对外监听，
+# 因此**必须**提供 WARDEN_API_KEY，否则 run_server 会 fail-closed 拒绝启动。
 CMD ["python", "-m", "warden_agent.web.run_server"]

@@ -23,7 +23,7 @@ from typing import Any, cast
 
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.loop.loop import exec_tool
-from warden_agent.model.model import AgentChatModel, ChatRequest, Message, ToolCall
+from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
 from warden_agent.store.base import RunStore
 from warden_agent.tool.catalog import ToolCatalog

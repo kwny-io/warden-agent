@@ -88,7 +88,9 @@ class PostgresStore:
             # 老库补列：会话最后活跃时间（对话列表展示用）
             cur.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS updated_at TEXT")
             # 老库补列：会话归属用户（多用户隔离）
-            cur.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''")
+            cur.execute(
+                "ALTER TABLE runs ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''"
+            )
             # 用户表（中控台账号）
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (

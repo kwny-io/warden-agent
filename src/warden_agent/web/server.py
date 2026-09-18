@@ -657,17 +657,6 @@ def build_app(
                 )
         return result
 
-    @app.post("/runs/{run_id}")
-    def create_run(run_id: str) -> dict[str, Any]:
-        """预创建会话：切换到新会话 ID 时立即可见于列表（首条消息前状态为 PENDING）。
-
-        幂等：会话已存在则直接返回现状，不重复建档。
-        """
-        sess = registry.get(run_id)
-        if store.load_run(run_id) is None:
-            store.save_run(sess.run)  # PENDING 记录入库，对话列表立即可见
-        return {"run_id": run_id, "status": sess.status().name}
-
     @app.get("/approvals/history")
     def approvals_history() -> list[dict[str, Any]]:
         """审批决策历史（已批准 / 已拒绝，最新的在前）。"""
@@ -745,7 +734,9 @@ def build_app(
         raise HTTPException(status_code=500, detail="未知结果类型")
 
     @app.post("/chat/stream/{run_id}")
-    def chat_stream(run_id: str, body: ChatRequestIn, user_id: str = "demo-user") -> StreamingResponse:
+    def chat_stream(
+        run_id: str, body: ChatRequestIn, user_id: str = "demo-user"
+    ) -> StreamingResponse:
         """流式对话（SSE 打字机）：模型边生成边把增量推给前端。
         前端拿到增量直接渲染，就能看到"逐字打出"的效果。"""
         sess = registry.get(run_id)

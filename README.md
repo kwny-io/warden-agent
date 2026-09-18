@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-309%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-379%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -44,18 +44,22 @@
 
 多数实现把重试与容错写在业务代码里；Warden 将其下沉为运行时的统一层，作用域是**每一次
 工具调用**：超时护栏（卡死不停摆）→ 指数退避重试（扛瞬时故障与限流）→ 统一降级兜底
-（重试耗尽走 fallback）→ 熔断保护（连续失败自动短路，冷却后半开试探）。它与审批门禁一样，
-是调用前后必经的管卡，不是可选的示例代码。
+（重试耗尽走 fallback）→ 熔断保护（连续失败自动短路，冷却后半开试探）。
+
+> **当前状态：独立模块（未接入主链路）。** 实现与测试齐备（`tests/test_tool_stability.py`），
+> 但 `build_agent` / HTTP / CLI 的工具调用**尚未经过它**——全仓只有 `loop/loop.py` 的注释提到
+> 接入方式（给工具执行器传一个 `StableToolExecutor(StabilityConfig(...))`）。要让它真正生效，
+> 需要在工具执行链路上显式接线。
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——309 项测试零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——379 项测试零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（6 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
 - **确定性多 Agent 分派**：并行 / 串行由显式依赖决定，不依赖模型自由发挥，结果离线可复现
 - **AST 架构边界测试**：分层依赖的单向性由测试守护，架构不靠自觉
-- **mypy --strict 全量零错误**：77 个源文件在严格模式下通过类型检查
+- **mypy --strict 全量零错误**：79 个源文件在严格模式下通过类型检查
 
 ### ⑤ 能力"注册即路由"——自解释的工具与技能
 
@@ -66,11 +70,18 @@
 
 ### ⑥ 纵深防御——从策略层到执行层到存储层
 
+- **接入层（fail-closed）**：启动时既没有 `WARDEN_API_KEY`、也没有显式 `WARDEN_ALLOW_ANON=1`
+  → **拒绝启动**；监听非本机地址却不带鉴权 → 同样拒绝启动。因为 `/approve`、`/reject` 是
+  人工审批闸门的入口，接口无鉴权时调用方就能自己批准自己的高危操作。
 - **策略层**：审批门禁决定"能不能调"
 - **边界层**：工具 workdir 边界校验（防路径穿越）、Web 检索 URL 策略决定"能碰到哪"
-- **执行层**：沙箱——只读工作区 + 默认禁网 + 资源限制（POSIX rlimit / Windows Job Object），
-  经 `build_agent(sandbox=True)` 接入主链，暴露受控的 `shell.run` 工具
-- **存储层**（独立模块）：凭证 AES-GCM 落库加密 + 短租约 + 脱敏
+- **执行层**：沙箱分两档，**不混为一谈**——语义档（只读副本 + NetworkPolicy 正则，跨平台）；
+  内核档（Linux + `unshare -rn` 网络命名空间，子进程根本没有网络栈）。要求内核档而平台给不了时
+  **报错而不是静默降级**；`isolation_note()` 如实报出当前是哪一档。
+  资源限制经 POSIX rlimit / Windows Job Object，`build_agent(sandbox=True)` 暴露受控 `shell.run`。
+- **存储层**（独立模块）：凭证 AES-GCM 加密 + 短租约 + 脱敏（密钥保存在进程内，未落库）
+- **容器层**：`Dockerfile` 多阶段构建 + **非 root 运行** + `HEALTHCHECK`；
+  `docker-compose.yml` 里 `read_only` / `cap_drop: ALL` / `no-new-privileges` / 只发布到回环
 
 ### ⑦ 模型无关——"大脑"可整体替换，治理与循环才是资产
 
@@ -206,7 +217,7 @@ flowchart TB
     SESSION -- "共享 exec_tool（单一来源）" --> LOOP
     LOOP --> PL
     LOOP --> INT
-    LOOP -- "每次工具调用" --> SB
+    LOOP -. "稳定层接入点（独立模块，未接线）" .-> SB
     SB --> TOOL
     POL -- "调用前门禁" --> LOOP
     SESSION -- "每步落库/恢复" --> STORE
@@ -214,8 +225,10 @@ flowchart TB
 ```
 
 层次说明：L4 提供三种等价接入形态（SDK / CLI / Web）；运行时会话 `AgentSession` 负责状态机、
-审批闭环与持久化，并将规划执行委托给 `AgentLoop`；每次工具调用均先通过稳定性层
-（超时 / 退避 / 降级 / 熔断）再进入能力层；审批门禁与持久化作为地基贯穿全程。
+审批闭环与持久化，并与 `AgentLoop` **共享 `exec_tool`（工具执行的单一来源）**。注意：**会话侧
+自带循环，不走 `AgentLoop` 的规划 / 意图路径**——那条路径由 demo、评测与多 Agent 使用。
+**工具稳定性层（超时 / 退避 / 降级 / 熔断）是独立模块，尚未接入调用链**；审批门禁与持久化
+作为地基贯穿全程。
 模型层面向 OpenAI 兼容协议抽象，可整体替换为任意兼容端点。
 
 ## 快速开始
@@ -318,8 +331,14 @@ python -m warden_agent.web.run_server
 | GET | `/audit` | 审计轨迹（需认证） |
 
 服务契约：统一版本头（`X-Warden-Api-Version`）、`Idempotency-Key` 请求幂等、
-problem+json 统一错误码。可选开关（环境变量）：`WARDEN_API_KEY`（Bearer 认证）、
-`WARDEN_AUDIT=1`（审计账本）、`GIT_WORKDIR`（将指定仓库暴露为 `git.apply_patch` 门禁工具）。
+problem+json 统一错误码。环境变量：`WARDEN_API_KEY`（Bearer 认证，**对外部署必须设**）、
+`WARDEN_HOST`（默认 `127.0.0.1` 只本机；容器里设 `0.0.0.0`）、`WARDEN_AUDIT=1`（审计账本）、
+`WARDEN_DB_PATH`（SQLite 路径；rootfs 只读时指向挂载卷）、`GIT_WORKDIR`（将指定仓库暴露为
+`git.apply_patch` 门禁工具）。
+
+**鉴权是 fail-closed 的**：没设 `WARDEN_API_KEY` 又没显式 `WARDEN_ALLOW_ANON=1` → 拒绝启动；
+对外监听（如 `0.0.0.0`）却不带鉴权 → 也拒绝启动。本机开发想省事就显式写
+`WARDEN_ALLOW_ANON=1`，让"无鉴权"成为一个**被写出来的决定**，而不是默认状态。
 
 ### CLI
 
@@ -393,20 +412,23 @@ python -m warden_agent.demo_e2e                                                 
 | 配置加载（`core/config.py`） | `.env` 加载，密钥不进代码 | 已实现 |
 | SDK 面（`agent.py`） | `build_agent` 一键装配、`typed_reply` 结构化输出、pydantic 工具 | 已实现 |
 | 架构边界测试（`tests/`） | AST 校验模块依赖单向 | 已实现 |
-| 凭证加密 + 租约（`credential/`） | AES-GCM 落库加密、短租约、脱敏 | 独立模块 |
+| 工具稳定性层（`tool/stability.py`） | 超时护栏 / 指数退避 / 降级兜底 / 熔断；需显式接入工具执行器 | 独立模块 |
+| 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏（密钥存进程内） | 独立模块 |
 | Checkpoint / 门禁（`runtime/`） | 断点恢复、失败重试、完成前校验 | 独立模块 |
 | 受控执行（`execution/`） | 受管子进程、输出 / 超时 / 并发预算，经沙箱工具接入主链 | 已实现 |
-| 执行沙箱（`execution/sandbox.py`） | 只读工作区、默认禁网、资源限制；`build_agent(sandbox=True)` 暴露受控 `shell.run` 工具 | 已实现 |
-| Agent 评测集（`evals/`） | 三类黄金集：意图路由 12 例 / 技能触发 8 例 / 端到端任务 6 例；`python -m warden_agent.evals` 出报告，可作 CI 门禁 | 已实现 |
+| 执行沙箱（`execution/sandbox.py`） | **两档，必须分清**：语义档（只读副本 + NetworkPolicy 正则，跨平台但要明白**它不是安全边界**）；内核档（Linux + `unshare -rn` 网络命名空间，子进程无网络栈、绕不过）。`build_agent(sandbox=True)` 暴露受控 `shell.run` 工具；`isolation_note()` 如实报出当前档位 | 已实现 |
+| Agent 评测集（`evals/`） | 三类黄金集共 **30 例**：意图路由 12 / 技能触发 8 / **循环能力 10**。第三类断言落在**轨迹与决策**上（失败自愈、防打转、意图门禁、策略 DENY、迭代上限、参数保真、配对不变量），不是"回答非空"；`python -m warden_agent.evals` 出报告，可作 CI 门禁 | 已实现 |
+| 检索质量评测（`rag/eval.py`） | 标注问答集算 **top-1 / recall@k / MRR**，把 RAG 从"看着能用"变成有数字：`python -m warden_agent.rag.eval`（离线词频嵌入实测 top-1 85.7% / recall@3 100% / MRR 0.905） | 已实现 |
 
 > **状态标注**：标注「独立模块」的组件已完成实现并通过测试，具备独立价值，但尚未接入产品
 > 主链路（`build_agent` / HTTP / CLI）。文档与实际行为保持一致——已接入主链路的模块均真实生效。
 
 ## 工程质量
 
-- **测试**：**309 项测试全量通过**（1 项 Postgres 集成测试在无数据库环境下自动跳过），覆盖状态机、工具稳定性层、执行循环、审批、持久化恢复、HTTP 契约、SSE 流式、RAG、多 Agent、技能系统、记忆、MCP、Git、Coding Agent、沙箱接线、凭证加密、端到端演示等
-- **Agent 评测**：内置黄金评测集（26 例，三类），通过率作为 CI 质量门禁
-- **类型检查**：`mypy --strict` 零错误（74 个源文件）
+- **测试**：**379 项测试全量通过**（1 项 Postgres 集成测试在无数据库环境下自动跳过），覆盖状态机、工具稳定性层、执行循环、审批、持久化恢复、HTTP 契约、SSE 流式、RAG 与检索质量、多 Agent、技能系统、记忆、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、凭证加密、端到端演示等
+- **Agent 评测**：内置黄金评测集（30 例，三类），通过率作为 CI 质量门禁
+- **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告（离线词频嵌入，实测 **top-1 85.7% / recall@3 100% / MRR 0.905**）；换真语义嵌入只需配三个环境变量，同一套标注集可对比
+- **类型检查**：`mypy --strict` 零错误（79 个源文件）
 - **静态检查**：`ruff` 零告警
 - **架构守护**：架构边界测试以 AST 校验分层依赖单向，防止层级倒挂
 - **CI**：`ci.yml` 在每次 push 与 PR 时运行 `ruff` + `mypy --strict` + `pytest`

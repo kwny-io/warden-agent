@@ -25,7 +25,10 @@ def test_评测集全类别达到阈值() -> None:
 def test_黄金集规模符合预期() -> None:
     report = run_all()
     counts = {s.category: s.total for s in report.summaries()}
-    assert counts == {"intent": 12, "skill": 8, "e2e": 6}
+    # e2e 从 6 扩到 10：原来的断言只判"回答非空"，等于没测；
+    # 现在断在**轨迹与决策**上（失败自愈 / 防打转 / 意图门禁 / 策略 DENY /
+    # 迭代上限收口 / 参数保真 / 配对不变量）。
+    assert counts == {"intent": 12, "skill": 8, "e2e": 10}
 
 
 def test_报告渲染包含类别与整体通过率() -> None:

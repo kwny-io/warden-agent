@@ -33,7 +33,8 @@ from warden_agent.model.deepseek import DeepSeekModel
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, ToolCall
 from warden_agent.multiagent.supervisor import build_supervisor, make_handoff
-from warden_agent.rag.knowledge import VectorStore, make_knowledge_tool
+from warden_agent.rag.corpus import POLICY_CORPUS
+from warden_agent.rag.knowledge import VectorStore, embedder_from_env, make_knowledge_tool
 from warden_agent.skill import SkillCatalog, SkillPackageParser
 from warden_agent.skill.trigger import SkillTriggerRouter
 from warden_agent.tool.catalog import ToolCatalog, ToolSpec
@@ -149,27 +150,23 @@ def _build_offline_supervisor() -> AgentLoop:
 
 
 
-def _build_knowledge() -> tuple[VectorStore, ToolSpec]:
-    """建一个带来源引用的 RAG 知识库 + 检索工具。"""
-    store = VectorStore()
-    store.add(
-        "公司的报销流程：先填报销单，再交直属经理审批，最后由财务打款。报销需附发票。",
-        source="员工手册.pdf",
-    )
-    store.add(
-        "公司的年假制度：正式员工每年 15 天年假，需提前一周在系统申请。",
-        source="员工手册.pdf",
-    )
-    store.add(
-        "公司的考勤制度：工作日 9:00-18:00，弹性上下班，每日至少 8 小时。",
-        source="考勤制度.md",
-    )
-    return store, make_knowledge_tool(store)
+def _build_knowledge() -> tuple[VectorStore, ToolSpec, str]:
+    """建一个带来源引用的 RAG 知识库 + 检索工具。
+
+    语料直接复用 `rag/eval.py` 的 `POLICY_CORPUS`（单一事实源）——这样 demo 检索的
+    就是**评测集测过的那批数据**，不会出现"demo 很准、评测很差"的两套账。
+    返回 (store, 检索工具, 嵌入器名)，嵌入器名要打印出来：离线词频嵌入 ≠ 语义检索。
+    """
+    embedder, embedder_name = embedder_from_env(os.environ)
+    store = VectorStore(embedder=embedder)
+    for source, text in POLICY_CORPUS:
+        store.add(text, source=source)
+    return store, make_knowledge_tool(store), embedder_name
 
 
 def _build_agent_catalog() -> ToolCatalog:
     """主管子 Agent 共用的工具箱：知识检索 + 天气 + 技能触发。"""
-    _store, knowledge_tool = _build_knowledge()
+    _store, knowledge_tool, _embedder_name = _build_knowledge()
     catalog = ToolCatalog()
     catalog.register(knowledge_tool)
 
@@ -285,10 +282,13 @@ def _guided_demo() -> None:
     _line("    提示信息：" + (v2.message if v2.action == "hint" else v2.reason))
 
     _section("L3 · RAG 引用（可溯源）")
-    store, kt = _build_knowledge()
+    store, kt, embedder_name = _build_knowledge()
     cat = ToolCatalog()
     cat.register(kt)
-    for q in ("公司年假制度是怎样的", "报销怎么走流程"):
+    # 必须写出用的是哪种嵌入：离线词频嵌入是**词面匹配**，不等于语义检索。
+    _line(f"嵌入器：{embedder_name}"
+          f"（搜索质量见 python -m warden_agent.rag.eval）")
+    for q in ("公司年假制度是怎样的", "报销怎么走流程", "出差住酒店能报多少钱"):
         out = cat.execute("knowledge.search", {"query": q})
         _line(f"Q: {q}")
         _line("  ⇣ " + str(out).replace("\n", "\n  "))

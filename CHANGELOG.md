@@ -5,6 +5,105 @@
 
 ---
 
+## 2026-09-18
+
+### 已提交
+
+- **修复 dev 分支的静态检查红灯**:`mypy --strict` **11 → 0**、`ruff` **4 → 0**（此前 CI 只覆盖
+  `master`,`dev` 上的红灯无人拦截）。
+  - 删除 `web/server.py` 中**重复定义的 `create_run` 路由**（第 660 行的旧版本从未生效；
+    同时消除 mypy `no-redef` 与 ruff `F811`）。
+  - `runtime/session.py` 补齐 `ChatResponse` 导入（修 `F821` / `name-defined`）。
+  - `web/search.py` 收口 IP 类型标注:`ipaddress._BaseAddress`（私有 API）→
+    `IPv4Address | IPv6Address`,并为 `resolver` 参数补全注解（修 6 + 2 个 mypy 错）。
+  - `store/postgres.py` 超长行折行（修 `E501`）。
+- **补全 `InMemoryRunStore` 对 `RunStore` 接口的实现**。它此前**缺少
+  `record_approval_decision` 与 `list_approval_history` 两个方法**,与自身 docstring
+  「完全实现 RunStore 接口」不符——这正是 `agent.py` 那条 mypy 报错的根因
+  （用 `cast` 只能掩盖真问题,不能解决它）。
+  - 同时给 `list_runs` 补上 `owner` 参数（多用户过滤）,`RunStore` Protocol 也补上 `owner`。
+    此前 `web/server.py` 调用 `list_runs(limit=50, owner=...)`,一旦换用内存存储会 `TypeError`。
+- **CI 覆盖所有分支**:`push.branches` 由 `[master]` 改为 `["**"]`,避免工作分支的回归再次
+  无人拦截。
+- **README 与代码对齐**（只改陈述,不改行为）:
+  - **工具稳定性层**:删去「是调用前后必经的管卡,不是可选的示例代码」,如实标注
+    **独立模块、尚未接入调用链**（全仓只有 `loop/loop.py` 的注释提到接入方式）。
+  - **架构层次说明**:删去「将规划执行委托给 `AgentLoop`」——会话侧自带循环,与 `AgentLoop`
+    **共享 `exec_tool`** 但不走其规划 / 意图路径;架构图中该依赖改为虚线「接入点（未接线）」。
+  - **凭证**:删去「落库加密」——密钥保存在进程内 `dict`,未落库。
+  - **数字对齐**:测试 309 → **325 passed / 1 skipped**（共 326 项）;源文件数 74 → **77**
+    （`mypy` 实测）。
+
+### 尚未实现（路线图）
+
+- **工具稳定性层接入主链路**（给工具执行器显式传入 `StableToolExecutor`）。
+- **会话路径复用 `AgentLoop` 的规划 / 意图路径**（目前规划 / 意图 / 记忆自动召回只在
+  demo / 评测 / 多 Agent 中生效）。
+- 凭证加密**落库**（当前仅进程内）。
+- `web/search.py` 的 SSRF 加固（私有段 / 元数据主机名 / 传统 IP 简写 / DNS rebinding 校验）
+  **尚未接入真实联网 provider**（当前内置 provider 均离线）。
+
+---
+
+## 2026-09-18（第二批：加固落地）
+
+### 已提交
+
+- **鉴权改为 fail-closed（入口层）**。原来不设 `WARDEN_API_KEY` 就静默开放全部接口——
+  而 `/approve`、`/reject` 是人工审批闸门的入口，接口无鉴权时调用方可以自己批准自己的
+  高危操作，门禁形同虚设。现在：
+  - `resolve_auth()`：没 key 又没显式 `WARDEN_ALLOW_ANON=1` → **拒绝启动**；
+  - `ensure_listen_is_safe()`：对外监听（如 `0.0.0.0`）却不带鉴权 → 也拒绝启动；
+  - 空字符串的 key 不算 key（避免 `.env` 里留个空值就悄悄裸奔）。
+  `build_app(api_keys=None)` 的"显式开放"语义保留不变（那是应用层，入口层负责把关）。
+- **修 Docker 部署连不上的问题**：容器内 uvicorn 原先绑 `127.0.0.1`，发布端口转发不到容器网卡。
+  现在用 `WARDEN_HOST` 控制（容器里给 `0.0.0.0`），并因为"对外监听"与"无鉴权"不允许共存，
+  由上面的 fail-closed 校验兜住。
+- **容器加固**：`Dockerfile` 加**非 root 用户**与 `HEALTHCHECK`；`docker-compose.yml` 加
+  `read_only` / `cap_drop: ALL` / `no-new-privileges` / 只发布到回环 / `${WARDEN_API_KEY:?}` 强制设 key。
+  另外把 PostgreSQL 服务注释掉——它本来就没人连，起一个这样的服务比不起更误导（改用
+  `PostgresStore` 时再打开）。新增 `WARDEN_DB_PATH` 以支持只读 rootfs。
+- **执行沙箱：把"隔离"分档，并让它可以被验证**（`execution/sandbox.py`）。
+  - 语义档（跨平台）：只读副本 + NetworkPolicy 正则——**它不是安全边界**，
+    新增测试 `test_语义层拦不住_socket_一句话就绕过去` 用可执行证据说明这一点。
+  - 内核档（Linux + `unshare -rn`）：子进程进入独立网络命名空间，没有任何网络栈；
+    新增测试 `test_内核档下网络调用真的失败` 跑真实 socket 连接并断言失败
+    （仅 Linux 执行，CI 的 ubuntu 上会真的跑）。
+  - `resolve_isolation_tier()`：要求内核档而平台给不了时**报错，不静默降级**；
+    `isolation_note()` 如实报出当前档位。前缀可用 `WARDEN_ISOLATION_PREFIX` 覆盖
+    （想换 bwrap 等更强方案时用）。
+- **评测升级为"循环能力评测"**（`evals/runner.py`）。原先 e2e 的判定是
+  `bool(reply.text) and len(reply.text) > 0`（等于没测）。现在 6 例 → **10 例**，断言落在
+  **轨迹与决策**上：单工具参数保真、多步顺序、失败自愈、意图门禁、防打转、工具异常不击穿、
+  策略 DENY 不执行、迭代上限收口、tool_call_id 配对不变量。
+  并在模块 docstring 里写明边界：**脚本模型测的是 harness 能力，不是模型能力**；
+  提示注入那类必须用真实模型，拿脚本模型测只是剧场。
+- **RAG 去玩具化**（`rag/`）。三件事：
+  1. **定位到真因**：新增检索质量评测 `rag/eval.py`（标注问答集 → top-1 / recall@k / MRR），
+     一测就发现"查'报销'检索不到报销那段"**不是语义问题，是哈希碰撞**。
+     实测 dim=256 → top-1 14.3%；**dim 提到 4096 → top-1 85.7% / recall@3 100% / MRR 0.905**。
+  2. **修 `source_id` 不唯一**：同一份文档下的多个条款会生成相同 source_id，引用无法区分；
+     现在带全局块序号（`员工手册.pdf#2`）。
+  3. **补真语义嵌入接口**：`openai_compatible_embedder()` + `embedder_from_env()`
+     （配 3 个环境变量即切换），并把当前嵌入器**名字**打到 demo 与报告里——
+     避免在词频嵌入下宣称"语义检索"。
+     哈希算法 MD5 → SHA-256（此处只用于分桶，MD5 不算漏洞，但没必要给扫描器留告警）。
+- **删除遗留物** `timeline_callback.py`（改 git 提交时间的脚本，无任何引用）。
+- **测试**：325 → **379 项**；源码 77 → 79 个文件；评测集 26 → 30 例。
+
+### 尚未实现（路线图）
+
+- **工具稳定性层接入主链路**（给工具执行器显式传入 `StableToolExecutor`）。
+- **会话路径复用 `AgentLoop` 的规划 / 意图路径**（目前只在 demo / 评测 / 多 Agent 中生效）。
+- 凭证加密**落库**（当前仅进程内）。
+- **模型能力评测**（`evals --mode real`）：用真实模型测提示注入抵抗、指令遵循、幻觉率——
+  这些用脚本模型测不了。
+- **检索升级到语义 + 重排**：现在有了评测集，接真语义嵌入后可直接对比数字；
+  再往后是混合检索（BM25 + 向量）与 reranker。
+- 内核档隔离的**文件系统**维度（当前只隔离网络；文件系统仍靠只读副本 + 容器边界）。
+
+---
+
 ## 2026-09-04
 
 ### 已提交

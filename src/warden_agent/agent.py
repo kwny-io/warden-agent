@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from warden_agent.core.run.status import AgentRun
@@ -27,6 +28,11 @@ if TYPE_CHECKING:
     from warden_agent.execution.sandbox import SandboxSpec
 
 
+def _now_iso() -> str:
+    """当前 UTC 时间的 ISO 字符串（秒级）。与 store/sqlite.py 的同名工具保持一致。"""
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
 class InMemoryRunStore:
     """进程内 RunStore（不落盘），方便 build_agent 开箱即用。
 
@@ -38,6 +44,7 @@ class InMemoryRunStore:
         self._runs: dict[str, AgentRun] = {}
         self._messages: dict[str, list[Message]] = {}
         self._pending: dict[str, tuple[str, str, dict[str, object], str]] = {}
+        self._approval_history: list[dict[str, Any]] = []
 
     def save_run(self, run: AgentRun) -> None:
         self._runs[run.run_id] = run
@@ -52,13 +59,18 @@ class InMemoryRunStore:
     def load_messages(self, run_id: str) -> list[Message]:
         return list(self._messages.get(run_id, []))
 
-    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 50, owner: str | None = None) -> list[dict[str, Any]]:
         """列出会话概要（前端对话列表用）：按插入序取最近 limit 个。
 
         字段形状与 SqliteStore.list_runs 对齐：title 取首条用户消息
         （没有消息的 run 回退用 run_id），msg_count 是对话条数。
+        owner 给定时按归属过滤，语义与 SqliteStore 一致。
         """
-        items = list(self._runs.items())[-limit:]
+        items = [
+            (rid, run)
+            for rid, run in self._runs.items()
+            if owner is None or run.user_id == owner
+        ][-limit:]
         out: list[dict[str, Any]] = []
         for run_id, run in items:
             msgs = self._messages.get(run_id, [])
@@ -93,6 +105,27 @@ class InMemoryRunStore:
 
     def clear_pending_approval(self, run_id: str) -> None:
         self._pending.pop(run_id, None)
+
+    def record_approval_decision(
+        self,
+        run_id: str,
+        approval_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        decision: str,
+    ) -> None:
+        """记录一条审批决策（approved / rejected），供历史追溯。"""
+        self._approval_history.append({
+            "run_id": run_id,
+            "approval_id": approval_id,
+            "tool_name": tool_name,
+            "decision": decision,
+            "created_at": _now_iso(),
+        })
+
+    def list_approval_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        """审批决策历史（最新的在前）。字段形状与 SqliteStore 对齐。"""
+        return list(reversed(self._approval_history[-limit:]))
 
 
 class Agent:
