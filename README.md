@@ -76,9 +76,13 @@
 - **策略层**：审批门禁决定"能不能调"
 - **边界层**：工具 workdir 边界校验（防路径穿越）、Web 检索 URL 策略决定"能碰到哪"
 - **执行层**：沙箱分两档，**不混为一谈**——语义档（只读副本 + NetworkPolicy 正则，跨平台）；
-  内核档（Linux + `unshare -rn` 网络命名空间，子进程根本没有网络栈）。要求内核档而平台给不了时
-  **报错而不是静默降级**；`isolation_note()` 如实报出当前是哪一档。
-  资源限制经 POSIX rlimit / Windows Job Object，`build_agent(sandbox=True)` 暴露受控 `shell.run`。
+  内核档（Linux + `unshare -rn` 网络命名空间，子进程根本没有网络栈）。
+  档位探测是**功能性的**：真的试跑一次命名空间，而不是查 `unshare` 在不在——
+  **"有这个二进制" ≠ "有权用它"**（默认 Docker 容器里会 `Operation not permitted`，
+  实测确认）。给不了就**如实降级**并提示 `需 --cap-add SYS_ADMIN`，绝不谎报"已隔离"。
+  `isolation_note()` 报出当前档位；资源限制经 POSIX rlimit / Windows Job Object。
+  ⚠️ **内核档与容器边界默认互斥**：容器里要用内核档就得加 `SYS_ADMIN`，那会削弱容器本身。
+  所以是二选一——用容器当边界（推荐），或用内核档跑在宿主/CI 上。
 - **存储层**（独立模块）：凭证 AES-GCM 加密 + 短租约 + 脱敏（密钥保存在进程内，未落库）
 - **容器层**：`Dockerfile` 多阶段构建 + **非 root 运行** + `HEALTHCHECK`；
   `docker-compose.yml` 里 `read_only` / `cap_drop: ALL` / `no-new-privileges` / 只发布到回环
@@ -416,7 +420,7 @@ python -m warden_agent.demo_e2e                                                 
 | 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏（密钥存进程内） | 独立模块 |
 | Checkpoint / 门禁（`runtime/`） | 断点恢复、失败重试、完成前校验 | 独立模块 |
 | 受控执行（`execution/`） | 受管子进程、输出 / 超时 / 并发预算，经沙箱工具接入主链 | 已实现 |
-| 执行沙箱（`execution/sandbox.py`） | **两档，必须分清**：语义档（只读副本 + NetworkPolicy 正则，跨平台但要明白**它不是安全边界**）；内核档（Linux + `unshare -rn` 网络命名空间，子进程无网络栈、绕不过）。`build_agent(sandbox=True)` 暴露受控 `shell.run` 工具；`isolation_note()` 如实报出当前档位 | 已实现 |
+| 执行沙箱（`execution/sandbox.py`） | **两档，必须分清**：语义档（只读副本 + NetworkPolicy 正则，跨平台但要明白**它不是安全边界**）；内核档（Linux + `unshare -rn` 网络命名空间，子进程无网络栈、绕不过）。档位探测是**功能性的**（有 `unshare` 不等于有权用）。**已在 WSL2 与容器实测**：`unshare -rn` 下 `eth0` 消失、连接 `ENETUNREACH` | 已实现 |
 | Agent 评测集（`evals/`） | 三类黄金集共 **30 例**：意图路由 12 / 技能触发 8 / **循环能力 10**。第三类断言落在**轨迹与决策**上（失败自愈、防打转、意图门禁、策略 DENY、迭代上限、参数保真、配对不变量），不是"回答非空"；`python -m warden_agent.evals` 出报告，可作 CI 门禁 | 已实现 |
 | 检索质量评测（`rag/eval.py`） | 标注问答集算 **top-1 / recall@k / MRR**，把 RAG 从"看着能用"变成有数字：`python -m warden_agent.rag.eval`（离线词频嵌入实测 top-1 85.7% / recall@3 100% / MRR 0.905） | 已实现 |
 

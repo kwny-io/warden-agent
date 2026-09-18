@@ -104,6 +104,52 @@
 
 ---
 
+## 2026-09-18（第三批：真机实测发现并修掉两个真 bug）
+
+这一批全部来自**在真实 Linux / 容器里跑一遍**——不跑就发现不了。
+
+### 已提交
+
+- **Dockerfile 根本构建不出来（已修）**。根因是层缓存写法踩坑：`pip install .` 那一层
+  只 `COPY pyproject.toml`，而 `pyproject.toml` 里有 `readme = "README.md"`，
+  hatchling 生成元数据时直接 `OSError: Readme file does not exist: README.md`。
+  **也就是说容器路径从未真正跑通过**（这也解释了之前发现的 compose 端口绑定 bug 为什么没人察觉）。
+  修法：连 `README.md` 一起拷；把"只装运行依赖"和"装本项目自身"拆成两步，
+  层缓存的意图保住；新增 `ARG PIP_INDEX_URL`，国内网络可传 pip 镜像，且不把镜像地址烧进镜像。
+- **隔离档探测改为「功能探测」而非「查文件是否存在」**。原来只用 `shutil.which("unshare")` 判断——
+  但**"有这个二进制" ≠ "有权用它"**：在默认 Docker 容器里 `unshare -rn` 会
+  `Operation not permitted`（实测）。只看路径就会汇报成"已隔离"，实际什么都没隔离。
+  现在会真的试跑一次 `unshare -rn true`，失败则**如实降级到语义档**，并给出可操作提示
+  （`需 --cap-add SYS_ADMIN`）。**宁可少报一档，不谎报一档。**
+- **修掉一个测试的「假通过」**。内核档那条测试原本断言"stdout 里没有 CONNECTED"——
+  可万一 `unshare` 因权限失败，探针压根没跑、stdout 为空，这种断言照样绿。
+  现在要求：① 退出码为 0（隔离环境真的起来了）② 打印出明确的 `RESULT=BLOCKED` 标记。
+
+### 实测记录（这些数字是跑出来的，不是推断）
+
+| 环境 | 结论 |
+|---|---|
+| WSL2 / Linux 6.6.87 | `unshare -rn` 后 `ip -o link show` **只剩 lo**，eth0 消失 → 命名空间确实建立 |
+| 容器（默认档） | `unshare -rn` → `Operation not permitted`；档位探测**如实报** semantic-only |
+| 容器（`--cap-add SYS_ADMIN`） | `IFACES=eth0,lo` → `IFACES=lo`；连接 `ok` → `fail 101 (ENETUNREACH)` |
+
+**一个重要结论**：内核档隔离与容器边界**默认互斥**——在容器里用内核档需要
+`--cap-add SYS_ADMIN`，而那本身会削弱容器的隔离。所以**二选一**：
+要么用容器当边界（推荐，`network_mode: none` + 只读 rootfs），
+要么用内核档跑在宿主/CI 上。别以为两者能简单叠加。
+
+### 尚未实现（路线图）
+
+- **本地未能完整构建镜像**：容器到 PyPI / 清华镜像的 HTTPS 下载均超时
+  （容器能连通 `1.1.1.1:80`，但 pip 拉包超时——疑似 Windows 上配了 localhost 代理、
+  未镜像进 WSL NAT；WSL 也提示过这一点）。修法二选一：把代理配置透给构建
+  （`--build-arg HTTP_PROXY/HTTPS_PROXY`），或改用 `networkingMode=mirrored`。
+  **注意：Dockerfile 的语法/依赖 bug 已修并验证越过该步；剩下的纯粹是网络环境问题。**
+- 内核档**只隔离网络**，不隔离 /proc 视图（`--mount-proc` 需要 PID namespace，
+  会与"超时强杀"的进程管理语义冲突，故刻意不加）。
+
+---
+
 ## 2026-09-04
 
 ### 已提交

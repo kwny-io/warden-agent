@@ -31,8 +31,10 @@ import contextlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,6 +81,19 @@ def _net_isolation_prefix() -> list[str] | None:
     想换更强的（比如 bwrap 顺带把文件系统也只读化）：
         WARDEN_ISOLATION_PREFIX="bwrap --unshare-net --ro-bind / / --tmpfs /tmp"
     留这个出口是因为不同发行版/容器环境的能力差异很大，硬编码一种会到处跑不起来。
+
+    **实测记录（Linux 6.6.87 / WSL2）**：`unshare -rn` 下 `ip -o link show` 只剩 `lo`，
+    eth0 消失 —— 网络命名空间确实建立。但注意下面这个残留问题。
+
+    ⚠️ **已知残留：`/proc` 没有重建。** 只加 `-rn` 时，子进程仍挂在**外层**的 /proc 上，
+    于是 `ls /sys/class/net`、`/proc/net/dev` 可能读到外层网卡（而 `ip link` 走 netlink，
+    反映的是真实的新命名空间）。也就是说这一档**只隔离网络，不隔离 /proc 视图**——
+    既是信息暴露，也会让程序读到自相矛盾的网络状态。
+    想重建 /proc 需要 `--mount-proc`，但它要求同时创建 PID namespace（实测单独用会
+    `mount /proc failed: Operation not permitted`），而 PID namespace + `--fork` 会把目标
+    进程变成 PID 1，与我们"超时强杀"的进程管理语义相互干扰——**所以这里刻意不加**，
+    宁可少隔离一层、也不要把可预期性搭进去。
+    **要完整边界就用容器**（`network_mode: none` + 只读 rootfs），那才是这类需求的正确答案。
     """
     override = os.environ.get("WARDEN_ISOLATION_PREFIX", "").strip()
     if override:
@@ -88,12 +103,34 @@ def _net_isolation_prefix() -> list[str] | None:
     return ["unshare", "-rn"]
 
 
-def detect_isolation_tier(*, platform: str | None = None) -> IsolationTier:
+def _probe_namespace(prefix: list[str]) -> bool:
+    """**功能探测**：这套前缀真的能建起命名空间吗？
+
+    为什么不能只看 `shutil.which("unshare")`：**"有这个二进制" ≠ "有权用它"**。
+    在默认的 Docker 容器里（seccomp + capability 默认档）`unshare -rn` 会直接
+    `Operation not permitted`——实测确认过。若只按路径判断，就会汇报成"已隔离"，
+    而实际什么都没隔离。宁可少报一档，也不要谎报一档。
+    """
+    try:
+        proc = subprocess.run(
+            [*prefix, "true"], capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def detect_isolation_tier(
+    *,
+    platform: str | None = None,
+    probe: Callable[[list[str]], bool] | None = None,
+) -> IsolationTier:
     """探测当前机器能提供哪一档隔离。
 
-    - Linux 且有 `unshare(1)`：网络命名空间可用 —— 子进程没有网络栈，
-      任何 socket 调用都会失败（不依赖命令字符串匹配）。
-    - 其它平台：**没有**这一档。如实返回 semantic-only。
+    - Linux 且有 `unshare(1)` **且真的能建起命名空间**：返回内核档；
+    - 其它情况（含"有 unshare 但没权限"，例如默认 Docker 容器）：如实返回 semantic-only。
+
+    `probe` 可注入，便于测试（默认走真实功能探测）。
     """
     plat = platform if platform is not None else sys.platform
     if not plat.startswith("linux"):
@@ -105,6 +142,13 @@ def detect_isolation_tier(*, platform: str | None = None) -> IsolationTier:
     if prefix is None:
         return IsolationTier(
             "semantic-only", False, "Linux 上找不到 unshare(1)（util-linux 未安装？）",
+        )
+    actual_probe = probe if probe is not None else _probe_namespace
+    if not actual_probe(prefix):
+        return IsolationTier(
+            "semantic-only", False,
+            "有 unshare(1) 但当前环境不允许创建命名空间（默认 Docker 容器会拦；"
+            "需 --cap-add SYS_ADMIN）",
         )
     return IsolationTier(
         "linux-net-namespace", True,

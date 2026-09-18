@@ -22,6 +22,9 @@ RUN npm run build
 # ---------- 阶段 2：Python 后端 + 托管前端构建产物 ----------
 FROM python:3.12-slim
 
+# 构建时可指定 pip 源（默认官方源；国内网络可传 --build-arg PIP_INDEX_URL=<镜像地址>）
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     WARDEN_HOST=0.0.0.0 \
@@ -29,12 +32,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 先只装依赖（利用 Docker 层缓存，改代码不用重装依赖）
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir ".[postgres]"
+# 先只装**运行依赖**（不含本项目自身），这样改业务代码时这一层命中缓存、不用重装依赖。
+#
+# ⚠️ 必须连 README.md 一起拷：pyproject.toml 里写了 readme = "README.md"，
+#    缺它 hatchling 在生成元数据时会直接 `OSError: Readme file does not exist`。
+#    （原版 Dockerfile 只拷 pyproject.toml，所以镜像**构建不出来**——
+#      容器路径其实从未真正跑通过。）
+COPY pyproject.toml README.md ./
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
+    $(python -c "import tomllib; p = tomllib.load(open('pyproject.toml','rb'))['project']; print(' '.join(p['dependencies'] + p['optional-dependencies']['postgres']))")
 
-# 拷贝后端源码
+# 再拷源码并安装本项目自身。--no-deps：依赖上面已装好，不重复装、也不再依赖网络上的依赖解析。
 COPY src ./src
+RUN pip install --no-cache-dir --no-deps --index-url "${PIP_INDEX_URL}" .
 
 # 拷贝前端构建产物到 /app/web/dist（server.py 用仓库相对路径自动找到并托管）
 COPY --from=web-build /build/dist ./web/dist

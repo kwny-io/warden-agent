@@ -53,26 +53,39 @@ def test_非linux平台如实报告没有内核档(plat: str) -> None:
     assert "容器" in tier.reason
 
 
-def test_linux但缺unshare时也如实报告(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_linux且缺unshare时也如实报告(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sb.shutil, "which", lambda _name: None)
     tier = detect_isolation_tier(platform="linux")
     assert tier.available is False
     assert "unshare" in tier.reason
 
 
-def test_linux且有unshare时提供内核档(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_linux且有unshare且真能用时才给内核档(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sb.shutil, "which", lambda _name: "/usr/bin/unshare")
-    tier = detect_isolation_tier(platform="linux")
+    tier = detect_isolation_tier(platform="linux", probe=lambda _p: True)
     assert tier.available is True
     assert tier.name == "linux-net-namespace"
     # -r 不能少：普通用户得先建 user namespace 才能建 net namespace
     assert tier.prefix() == ["unshare", "-rn"]
 
 
+def test_有unshare但没权限时如实降级到语义档(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**"有这个二进制" ≠ "有权用它"**。
+
+    默认 Docker 容器里 `unshare -rn` 会 `Operation not permitted`（实测过）。
+    若只看路径就汇报"已隔离"，那是在说谎；所以探测必须是功能性的。
+    """
+    monkeypatch.setattr(sb.shutil, "which", lambda _name: "/usr/bin/unshare")
+    tier = detect_isolation_tier(platform="linux", probe=lambda _p: False)
+    assert tier.available is False
+    assert tier.name == "semantic-only"
+    assert "SYS_ADMIN" in tier.reason  # 得给出可操作的线索，不是干巴巴一句"不支持"
+
+
 def test_前缀可被环境变量覆盖(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WARDEN_ISOLATION_PREFIX", "bwrap --unshare-net")
     monkeypatch.setattr(sb.shutil, "which", lambda _name: "/usr/bin/unshare")
-    tier = detect_isolation_tier(platform="linux")
+    tier = detect_isolation_tier(platform="linux", probe=lambda _p: True)
     assert tier.prefix() == ["bwrap", "--unshare-net"]
 
 
@@ -156,18 +169,25 @@ def test_broker会如实报出当前档位() -> None:
     reason=f"当前平台没有内核档：{_DETECTED.reason}",
 )
 def test_内核档下网络调用真的失败() -> None:
-    """在内核档里跑一次真实 socket 连接，必须失败。
+    """在内核档里跑一次真实 socket 连接，必须**明确报告被阻断**。
 
-    这条用**行为**证明隔离生效，而不是靠断言风格位（那种测试换个 flag 就绿）。
+    断言刻意不写成"没有 CONNECTED"——那是**假通过**：万一 `unshare` 因权限失败，
+    探针根本没跑起来、stdout 为空，那种断言照样绿。所以这里要求两件事：
+    ① 退出码为 0（说明隔离环境起来了、python 真的跑到了）；
+    ② 打印出 BLOCKED 标记（说明连接是被阻断的，而不是压根没执行）。
     """
     broker = SandboxedExecutionBroker(spec=SandboxSpec(isolation="os"))
     probe = [
         sys.executable, "-c",
         "import socket\n"
-        "s = socket.socket()\n"
-        "s.settimeout(3)\n"
-        "s.connect(('1.1.1.1', 80))\n"
-        "print('CONNECTED')\n",
+        "try:\n"
+        "    s = socket.socket(); s.settimeout(3); s.connect(('1.1.1.1', 80))\n"
+        "    print('RESULT=CONNECTED')\n"
+        "except OSError as e:\n"
+        "    print('RESULT=BLOCKED', e.errno)\n",
     ]
     result = broker.execute(probe)
-    assert "CONNECTED" not in (result.stdout or "")
+    assert result.exit_code == 0, f"隔离环境没起来：{result.stderr!r}"
+    assert "RESULT=BLOCKED" in (result.stdout or ""), (
+        f"预期连接被阻断，实际 stdout={result.stdout!r}"
+    )
