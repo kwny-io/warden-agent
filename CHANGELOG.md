@@ -138,13 +138,30 @@
 要么用容器当边界（推荐，`network_mode: none` + 只读 rootfs），
 要么用内核档跑在宿主/CI 上。别以为两者能简单叠加。
 
+### 构建与容器实测（全部通过）
+
+重跑构建**成功**。此前那次 pip 拉包超时是**瞬时故障**：Docker Desktop 刚启动、
+它自带的代理桥（`http.docker.internal:3128`）还没就绪。
+
+> **更正**：本文件上一版把原因写成"疑似 Windows localhost 代理未镜像进 WSL NAT"，
+> 那是**错的**。实查结果：宿主系统代理开着（`127.0.0.1:7897`），而 Docker Desktop
+> 本身就提供代理桥，宿主代理能透进容器；容器内 DNS 解析到 `198.18.0.50`（代理的
+> fake-ip 段），`https://pypi.org/simple/` 正常可达。所以既不是"梯子没关"，
+> 也不是"代理没透进去"——只是时机问题。
+
+在真实镜像上逐项验证：
+
+| 检查项 | 结果 |
+|---|---|
+| 运行用户 | `uid=10001(warden)` —— 非 root ✅ |
+| 不设 `WARDEN_API_KEY` 启动 | 拒绝启动、退出码 2、给出可操作提示 ✅ |
+| `/health/live` | 200（公开，免认证）✅ |
+| `/audit` 不带 key / 错 key | 401 / 401 ✅ |
+| `/audit` 带正确 Bearer | 200 ✅ |
+| `HEALTHCHECK` | `healthy` ✅ |
+
 ### 尚未实现（路线图）
 
-- **本地未能完整构建镜像**：容器到 PyPI / 清华镜像的 HTTPS 下载均超时
-  （容器能连通 `1.1.1.1:80`，但 pip 拉包超时——疑似 Windows 上配了 localhost 代理、
-  未镜像进 WSL NAT；WSL 也提示过这一点）。修法二选一：把代理配置透给构建
-  （`--build-arg HTTP_PROXY/HTTPS_PROXY`），或改用 `networkingMode=mirrored`。
-  **注意：Dockerfile 的语法/依赖 bug 已修并验证越过该步；剩下的纯粹是网络环境问题。**
 - 内核档**只隔离网络**，不隔离 /proc 视图（`--mount-proc` 需要 PID namespace，
   会与"超时强杀"的进程管理语义冲突，故刻意不加）。
 
