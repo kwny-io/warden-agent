@@ -5,6 +5,45 @@
 
 ---
 
+## 2026-09-19（把"实现了但没接线"接上）
+
+### 已提交
+
+- **工具稳定性层接入产品路径**（这是本轮最大的一处"说了没做到"）。此前 `exec_tool` 与
+  `AgentSession` 都接受 `stability`，但 **`build_agent` / `build_app` 从没构造或传过它**，
+  全仓只有一句注释提到它 —— 所以"每次工具调用必经的管卡"当时并不成立。
+  现在：给 `build_agent` 与 `build_app` 加 `stability` 参数（`None`/`False`/`True`/
+  `StabilityConfig`/执行器实例都接受），`run_server` **默认开启**（`WARDEN_STABILITY=0` 关）。
+  解析逻辑放在 `tool/stability.py` 的 `build_stability_executor`，避免 SDK 面与产品面互相依赖。
+  **重试是安全的**：稳定性层按 `ToolSpec.pure` 判定，非纯工具只对瞬时错误重试，
+  不会把 `fs.delete` 这类操作重放。
+  新增 5 条行为测试（`tests/test_agent_stability_wiring.py`），含**一条走 HTTP 的**，
+  证明接的是产品路径而不只是 SDK 门面。
+- **语义嵌入端点加 URL 守卫**。`openai_compatible_embedder` 此前会向配置的任意地址发请求 ——
+  这是标准的 SSRF 面。现在：只允许 http/https；**校验解析后的每一个 IP**，拒绝环回 /
+  私有 / 链路本地 / 保留 / 多播 / 未指定；构造时就校验一次（fail fast），每次请求前再校验
+  一次（防 DNS rebinding）。**有意不支持"本机嵌入服务"**（Ollama / 本地 vLLM 走 localhost）
+  ——允许环回就等于把这个接口变成 SSRF 原语；需要本地嵌入时请直接注入自己的 `Embedder`。
+  新增 7 条**离线确定性**测试（用 monkeypatch 注入解析结果，不查真 DNS），含防重绑定与
+  "多解析结果里有一个内网就整体拒绝"。
+- **前端支持 Bearer 鉴权**。此前前端**完全不发 `Authorization` 头** —— 一旦设了
+  `WARDEN_API_KEY`，控制台就整体不可用（这是真实缺口）。现在 `api.ts` 统一附加请求头
+  （非流式与 SSE 两条路径都覆盖），key 存 localStorage，顶栏加了一个 `KEY` 输入框
+  （password 类型遮显，回车/失焦即生效）。已重建前端并**截图确认渲染正常**。
+- **React 控制台完成首次实际打开验证**：界面正常，且连的是真实数据（左侧 5 条历史会话带
+  时间戳与消息数、能力列表、模型列表显示 DeepSeek 使用中、审批历史显示一条已批准的
+  `fs.delete`）。此前"能构建进镜像但没点过界面"的存疑状态解除。
+
+### 尚未实现（路线图）
+
+- **RecoveryController 缺一个可执行入口**：`runtime/recovery.py` 只做"读 checkpoint 并分组为
+  resume / retry / skip / await_human"的**判断**，没接 worker / 守护进程，也没有 CLI 命令。
+- **规划 / 意图路由 / 记忆自动召回仍不在 HTTP / CLI 路径上**：会话侧 `AgentSession` 自带循环，
+  与 `AgentLoop` 只共享 `exec_tool`；"会思考"那条路径目前由 demo、评测与多 Agent 使用。
+- **凭证加密的密钥仍存进程内、未落库**。
+
+---
+
 ## 2026-09-18
 
 ### 已提交

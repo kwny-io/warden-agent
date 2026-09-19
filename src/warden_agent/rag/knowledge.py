@@ -16,10 +16,13 @@ RAG 的完整流程（三句话）：
 """
 from __future__ import annotations
 
+import ipaddress
 import math
 import re
+import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from warden_agent.tool.catalog import ToolSpec, function_tool
 
@@ -97,12 +100,53 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b, strict=True))
 
 
+def _is_public_addr(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """公网地址判定：私有 / 环回 / 链路本地 / 保留 / 多播 / 未指定 都不算公网。"""
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def _require_public_http_url(url: str) -> None:
+    """发请求前的 URL 守卫：只允许 http/https，且**解析后的地址必须是公网**。
+
+    为什么必须校验"解析后的 IP"而不是只看域名：只校验域名挡不住 DNS rebinding
+    ——域名看着完全正常，却解析到 `127.0.0.1` 或 `169.254.169.254`（云元数据）这类地址。
+    任何"由配置驱动的服务端出站请求"都该过这一关，嵌入端点也不例外。
+
+    ⚠️ 与 `web/search.py` 的 `WebUrlPolicy` 规则一致，但**不能共用实现**：
+    架构分层规则不允许 `rag`（秩 2）依赖 `web`（秩 3）。规则若有变化，两处都要改。
+
+    **有意不支持"本机嵌入服务"**（Ollama / 本地 vLLM 走 localhost）：允许环回就等于
+    把这个接口变成 SSRF 原语。需要本地嵌入时，请直接注入自己的 `Embedder` 可调用对象
+    （`VectorStore(embedder=...)` 本来就支持），让"要连本机"成为一个**显式决定**。
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"嵌入端点必须是 http/https：{url!r}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"嵌入端点缺少主机名：{url!r}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as e:
+        raise ValueError(f"嵌入端点域名无法解析：{host!r}（{e}）") from e
+    for info in infos:
+        addr = ipaddress.ip_address(str(info[4][0]))
+        if not _is_public_addr(addr):
+            raise ValueError(
+                f"嵌入端点解析到非公网地址 {addr}（host={host!r}）—— 已拒绝请求"
+            )
+
+
 def openai_compatible_embedder(
     *, base_url: str, api_key: str, model: str, timeout_s: float = 30.0,
 ) -> Embedder:
     """**真·语义嵌入**：调用 OpenAI 兼容的 `/embeddings` 端点。
 
-    任何兼容端点都行（OpenAI / 智谱 / 百炼 / vLLM / Ollama 的兼容层 / 自建网关）。
+    任何兼容端点都行（OpenAI / 智谱 / 百炼 / 自建网关），但**必须是公网地址**：
+    构造时先校验一次（配置错就尽早报错），每次请求前再校验一次（防 DNS rebinding）。
     返回的向量做 L2 归一化，以便复用下面的点积当余弦。
 
     ⚠️ 它需要网络和 key，所以**不在默认路径上**：默认仍是离线词频嵌入，
@@ -111,8 +155,10 @@ def openai_compatible_embedder(
     import httpx
 
     url = base_url.rstrip("/") + "/embeddings"
+    _require_public_http_url(url)  # 尽早失败：别等第一次检索才发现配置有问题
 
     def _embed(text: str) -> list[float]:
+        _require_public_http_url(url)  # 再校验一次：DNS 可能在两次之间被换掉
         resp = httpx.post(
             url,
             headers={"Authorization": f"Bearer {api_key}"},

@@ -250,4 +250,47 @@ class StableToolExecutor:
         return bool(is_pure and self.config.retryable_pure)
 
 
-__all__ = ["StabilityConfig", "StableResult", "StableToolExecutor"]
+# 工具稳定性层的"生产默认值"：保守，只做**防卡死 + 抗瞬时故障**，不激进重试。
+#
+# 关键点：重试对**有副作用**的工具是危险的（`fs.delete` 重试 = 删两次）。这里依赖
+# 上面的 `pure` 判定 —— 非 pure 工具只对瞬时错误（Timeout / 连接类 / OSError）
+# 重试，逻辑错误不重放。所以开这套默认值不会导致"删两次"。
+DEFAULT_STABILITY_CONFIG = StabilityConfig(
+    timeout_seconds=30.0,   # 单次调用硬时限，防工具卡死拖住整个会话
+    max_attempts=2,         # 只多试一次，避免放大瞬时故障
+    backoff_base=0.5,
+    backoff_max=4.0,
+    circuit_threshold=5,    # 连续失败 5 次 → 短路，不再反复打一个已经坏掉的工具
+    circuit_cooldown=30.0,  # 冷却 30 秒后半开试一次
+)
+
+
+def build_stability_executor(
+    spec: bool | StabilityConfig | StableToolExecutor | None,
+) -> StableToolExecutor | None:
+    """把「要不要开稳定性层」的多种写法统一解析成执行器。
+
+    - None / False       → None：工具直接执行，行为与以前**完全一致**（默认）
+    - True               → `DEFAULT_STABILITY_CONFIG`
+    - StabilityConfig    → 按给定配置构造
+    - StableToolExecutor → 原样返回（便于测试注入替身）
+
+    放在本模块而不是 `agent.py`：`build_agent`（SDK 面）和 `web/build_app`（产品面）
+    都要用它，放这里可避免两者互相依赖。
+    """
+    if spec is None or spec is False:
+        return None
+    if spec is True:
+        return StableToolExecutor(DEFAULT_STABILITY_CONFIG)
+    if isinstance(spec, StabilityConfig):
+        return StableToolExecutor(spec)
+    return spec
+
+
+__all__ = [
+    "DEFAULT_STABILITY_CONFIG",
+    "StabilityConfig",
+    "StableResult",
+    "StableToolExecutor",
+    "build_stability_executor",
+]

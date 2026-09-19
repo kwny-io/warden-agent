@@ -49,6 +49,7 @@ from warden_agent.policy.policy import PolicyEngine
 from warden_agent.runtime.session import AgentSession, FinalReply, NeedsApproval
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog
+from warden_agent.tool.stability import build_stability_executor
 from warden_agent.web.audit import AuditLogger, AuditStore
 from warden_agent.web.auth import (
     ApiKeyAuthenticator,
@@ -225,12 +226,14 @@ class SessionRegistry:
         store: SqliteStore,
         system_prompt: str = "你是一个能使用工具的助手。",
         extra: dict[str, Any] | None = None,
+        stability: Any = None,
     ) -> None:
         self._model = model
         self._catalog = catalog
         self._policy = policy
         self._store = store
         self._system_prompt = system_prompt
+        self._stability = stability
         self.extra = extra or {}  # 额外能力（如 memory_service / skill_catalog）
         self._sessions: dict[str, AgentSession] = {}
         self._lock = threading.Lock()
@@ -247,6 +250,7 @@ class SessionRegistry:
                     policy_engine=self._policy,
                     store=self._store,
                     system_prompt=self._system_prompt,
+                    stability=self._stability,
                 )
                 self._sessions[run_id] = sess
             return sess
@@ -291,6 +295,7 @@ def build_app(
     audit_store: AuditStore | None = None,
     model_id: str = "custom",
     model_api_key: str | None = None,
+    stability: Any = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
@@ -314,7 +319,10 @@ def build_app(
         mcp_server=mcp_server,
         git_workdir=git_workdir,
     )
-    registry = SessionRegistry(model, catalog, policy, store, system_prompt, extra)
+    registry = SessionRegistry(
+        model, catalog, policy, store, system_prompt, extra,
+        stability=build_stability_executor(stability),
+    )
     app = FastAPI(title="Warden Agent Python", version=API_VERSION)
 
     # ---- 模型切换：傻瓜式接入的模型目录，/models 查询、/models/select 切换/导入 ----

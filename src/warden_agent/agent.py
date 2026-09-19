@@ -23,6 +23,11 @@ from warden_agent.policy.policy import PolicyEngine
 from warden_agent.runtime.session import AgentSession, FinalReply, NeedsApproval
 from warden_agent.store.base import RunStore
 from warden_agent.tool.catalog import ToolCatalog, ToolSpec, function_tool
+from warden_agent.tool.stability import (
+    StabilityConfig,
+    StableToolExecutor,
+    build_stability_executor,
+)
 
 if TYPE_CHECKING:
     from warden_agent.execution.sandbox import SandboxSpec
@@ -307,6 +312,7 @@ def build_agent(
     git_workdir: str | None = None,
     sandbox: bool = False,
     sandbox_spec: SandboxSpec | None = None,
+    stability: bool | StabilityConfig | StableToolExecutor | None = None,
 ) -> Agent:
     """一键装配一个 Agent：模型 + 工具 + 策略 + 存储 +（可选）能力。
 
@@ -360,6 +366,7 @@ def build_agent(
             store=run_store,
             system_prompt=system_prompt,
             max_iterations=max_iterations,
+            stability=build_stability_executor(stability),
         )
 
     return Agent(make_session)

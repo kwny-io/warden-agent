@@ -14,10 +14,46 @@ import type {
   UserInfo,
 } from "./types";
 
+// ---- 访问密钥（WARDEN_API_KEY）----
+//
+// 服务端设了 WARDEN_API_KEY 之后，所有业务接口都要带 `Authorization: Bearer <key>`。
+// 控制台把 key 存在 localStorage（只在本机浏览器，不落服务端），刷新后仍有效。
+// 没设 key 时保持"不带 Authorization"——无鉴权模式下后端也不看这个头。
+const API_KEY_STORAGE = "warden.apiKey";
+
+export function getApiKey(): string {
+  try {
+    return localStorage.getItem(API_KEY_STORAGE) || "";
+  } catch {
+    return ""; // 隐私模式等场景下 localStorage 可能不可用
+  }
+}
+
+export function setApiKey(key: string): void {
+  const v = key.trim();
+  try {
+    if (v) localStorage.setItem(API_KEY_STORAGE, v);
+    else localStorage.removeItem(API_KEY_STORAGE);
+  } catch {
+    /* 存不下就只好只在本次会话生效 */
+  }
+}
+
+/** 统一请求头：有访问密钥就带上。 */
+function authHeaders(extra?: HeadersInit): HeadersInit {
+  const key = getApiKey();
+  return {
+    "Content-Type": "application/json",
+    ...(key ? { Authorization: `Bearer ${key}` } : {}),
+    ...(extra || {}),
+  };
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
     ...init,
+    // headers 放在 ...init 之后：否则调用方传了 headers 就会把 Authorization 覆盖掉
+    headers: authHeaders(init?.headers),
   });
   if (!res.ok) {
     let detail = res.statusText;
@@ -140,7 +176,7 @@ export const api = {
     const q = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
     const res = await fetch(`/chat/stream/${encodeURIComponent(runId)}${q}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify({ text }),
     });
     if (!res.ok || !res.body) {

@@ -231,7 +231,10 @@ flowchart TB
 层次说明：L4 提供三种等价接入形态（SDK / CLI / Web）；运行时会话 `AgentSession` 负责状态机、
 审批闭环与持久化，并与 `AgentLoop` **共享 `exec_tool`（工具执行的单一来源）**。注意：**会话侧
 自带循环，不走 `AgentLoop` 的规划 / 意图路径**——那条路径由 demo、评测与多 Agent 使用。
-**工具稳定性层（超时 / 退避 / 降级 / 熔断）是独立模块，尚未接入调用链**；审批门禁与持久化
+**工具稳定性层（超时 / 退避 / 降级 / 熔断）已接入工具执行链**：`build_agent` 与
+`build_app` 都可传 `stability`，产品入口 `run_server` **默认开启**（`WARDEN_STABILITY=0` 可关）。
+它按 `ToolSpec.pure` 判定 —— **非纯工具只对瞬时错误重试**，不会把有副作用的操作
+（如 `fs.delete`）重放。审批门禁与持久化
 作为地基贯穿全程。
 模型层面向 OpenAI 兼容协议抽象，可整体替换为任意兼容端点。
 
@@ -411,18 +414,18 @@ python -m warden_agent.demo_e2e                                                 
 | Web 搜索 / 抓取（`web/search.py`） | 多 provider 可插拔，URL 策略管控 | 已实现 |
 | Git 集成（`git/`） | revision 探测、unified-diff 应用、合并门禁 | 已实现 |
 | Coding Agent（`coding_agent/`） | 需求 → 读代码 → 生成 diff → 门禁落地 | 已实现 |
-| Web 控制台（`web/`） | React + TypeScript + Tailwind + Vite：三栏可拖拽战术终端（对话列表 / SSE 真流式对话 / 治理信息栏），多账号 USER_ID 隔离，会话管理与删除，审批队列与决策历史；FastAPI 单端口托管 | 已实现 |
+| Web 控制台（`web/`） | React + TypeScript + Tailwind + Vite：三栏可拖拽战术终端（对话列表 / SSE 真流式对话 / 治理信息栏），多账号 USER_ID 隔离，会话管理与删除，审批队列与决策历史；**顶栏可填访问密钥（Bearer），与 `WARDEN_API_KEY` 鉴权共存**；FastAPI 单端口托管 | 已实现 |
 | 模型热切换（`web/server.py`） | `/models` 运行时切换模型（fake / deepseek / openai / zhipu / bailian），支持导入 API Key，全会话即时生效 | 已实现 |
 | 配置加载（`core/config.py`） | `.env` 加载，密钥不进代码 | 已实现 |
 | SDK 面（`agent.py`） | `build_agent` 一键装配、`typed_reply` 结构化输出、pydantic 工具 | 已实现 |
 | 架构边界测试（`tests/`） | AST 校验模块依赖单向 | 已实现 |
-| 工具稳定性层（`tool/stability.py`） | 超时护栏 / 指数退避 / 降级兜底 / 熔断；需显式接入工具执行器 | 独立模块 |
+| 工具稳定性层（`tool/stability.py`） | 超时护栏 / 指数退避 / 降级兜底 / 熔断；**已接线**：`build_agent` / `build_app` 均可传，产品入口默认开启（`WARDEN_STABILITY=0` 关）。按 `pure` 判定，非纯工具只对瞬时错误重试 | 已实现 |
 | 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏（密钥存进程内） | 独立模块 |
 | Checkpoint / 门禁（`runtime/`） | 断点恢复、失败重试、完成前校验 | 独立模块 |
 | 受控执行（`execution/`） | 受管子进程、输出 / 超时 / 并发预算，经沙箱工具接入主链 | 已实现 |
 | 执行沙箱（`execution/sandbox.py`） | **两档，必须分清**：语义档（只读副本 + NetworkPolicy 正则，跨平台但要明白**它不是安全边界**）；内核档（Linux + `unshare -rn` 网络命名空间，子进程无网络栈、绕不过）。档位探测是**功能性的**（有 `unshare` 不等于有权用）。**已在 WSL2 与容器实测**：`unshare -rn` 下 `eth0` 消失、连接 `ENETUNREACH` | 已实现 |
 | Agent 评测集（`evals/`） | 三类黄金集共 **30 例**：意图路由 12 / 技能触发 8 / **循环能力 10**。第三类断言落在**轨迹与决策**上（失败自愈、防打转、意图门禁、策略 DENY、迭代上限、参数保真、配对不变量），不是"回答非空"；`python -m warden_agent.evals` 出报告，可作 CI 门禁 | 已实现 |
-| 检索质量评测（`rag/eval.py`） | 标注问答集算 **top-1 / recall@k / MRR**，把 RAG 从"看着能用"变成有数字：`python -m warden_agent.rag.eval`（离线词频嵌入实测 top-1 85.7% / recall@3 100% / MRR 0.905） | 已实现 |
+| 检索质量评测（`rag/eval.py`） | 标注问答集算 **top-1 / recall@k / MRR**，把 RAG 从"看着能用"变成有数字：`python -m warden_agent.rag.eval`（离线词频嵌入实测 top-1 85.7% / recall@3 100% / MRR 0.905）；语义嵌入端点**强制公网地址**（拒环回/私有/保留，解析后校验防 DNS rebinding） | 已实现 |
 
 > **状态标注**：标注「独立模块」的组件已完成实现并通过测试，具备独立价值，但尚未接入产品
 > 主链路（`build_agent` / HTTP / CLI）。文档与实际行为保持一致——已接入主链路的模块均真实生效。

@@ -11,6 +11,7 @@
     WARDEN_API_KEY=sk-xxx           **访问密钥（对外部署必须设）** → 开启 Bearer 鉴权
     WARDEN_ALLOW_ANON=1             **仅本机开发**：显式声明接受"无鉴权"
     WARDEN_AUDIT=1                   开启审计（写进 SQLite 审计表，重启不丢）
+    WARDEN_STABILITY=0              关闭工具稳定性层（**默认开启**：超时 + 退避重试 + 熔断）
     GIT_WORKDIR=path                指定 git 仓库目录 → 注册 git.apply_patch 工具
     SKILLS_DIR=path                 启用技能系统（SKILL.md 目录）
     MCP_SERVER=cmd                  启用 MCP（需 node）
@@ -140,6 +141,19 @@ def ensure_listen_is_safe(host: str, auth_mode: str) -> None:
         )
 
 
+def _stability_from_env(env: Mapping[str, str]) -> bool:
+    """工具稳定性层是否开启。**产品路径默认开启**，`WARDEN_STABILITY=0` 可关。
+
+    为什么默认开：没有它，一个卡住的工具会拖住整个会话；有了它，"防卡死 + 抗瞬时故障 +
+    熔断"这三件事统一兜在工具调用这一层，不用每个工具自己写。想"原样执行、不做任何
+    重试"时（例如审计复现）显式关掉即可。
+    重试是安全的：稳定性层按 `ToolSpec.pure` 判定，**非纯工具只对瞬时错误重试**，
+    不会把 `fs.delete` 这类有副作用的操作重放。
+    """
+    off = ("0", "false", "no", "off")
+    return env.get("WARDEN_STABILITY", "1").strip().lower() not in off
+
+
 def _db_path() -> str:
     """SQLite 存档路径。
 
@@ -206,6 +220,7 @@ def main() -> None:
         audit_store=audit_store,
         model_id=("deepseek" if api_key else "fake"),
         model_api_key=api_key,
+        stability=_stability_from_env(os.environ),
     )
     port = int(os.environ.get("PORT", "8000"))
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)

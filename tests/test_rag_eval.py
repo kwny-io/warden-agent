@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from warden_agent.rag.corpus import POLICY_CORPUS
 from warden_agent.rag.eval import RETRIEVAL_CASES, CaseOutcome, RetrievalReport, evaluate
 from warden_agent.rag.knowledge import (
@@ -18,6 +20,7 @@ from warden_agent.rag.knowledge import (
     embedder_from_env,
     hash_embedder,
     make_knowledge_tool,
+    openai_compatible_embedder,
 )
 from warden_agent.tool.catalog import ToolCatalog
 
@@ -125,13 +128,27 @@ def test_默认是离线词频嵌入() -> None:
     assert name == "offline-term-frequency"
 
 
-def test_配齐环境变量才切语义嵌入() -> None:
+def test_配齐环境变量才切语义嵌入(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 构造时就要求"公网地址"，所以这里注入一个公网解析结果（保持测试离线）
+    monkeypatch.setattr(
+        "warden_agent.rag.knowledge.socket.getaddrinfo",
+        _fake_resolution("93.184.216.34"),
+    )
     _embedder, name = embedder_from_env({
-        "WARDEN_EMBED_BASE_URL": "https://example.invalid/v1",
+        "WARDEN_EMBED_BASE_URL": "https://embed.example.com/v1",
         "WARDEN_EMBED_API_KEY": "sk-x",
         "WARDEN_EMBED_MODEL": "text-embedding-3-small",
     })
     assert name.startswith("semantic:")
+
+
+def test_嵌入端点解析不了时构造即失败_不拖到第一次检索() -> None:
+    """.invalid 这类域名解析不了 → 构造就报错（fail fast），而不是检索时才炸。"""
+    with pytest.raises(ValueError) as ei:
+        openai_compatible_embedder(
+            base_url="https://example.invalid/v1", api_key="k", model="m",
+        )
+    assert "无法解析" in str(ei.value)
 
 
 def test_只配一部分仍走离线_不半吊子切换() -> None:
@@ -156,3 +173,74 @@ def test_嵌入向量是归一化的_所以点积即余弦() -> None:
 def test_未归一化输入只是点积_记录这个前提() -> None:
     """[0.3,0.4] 的模是 0.5，所以自比是 0.25 而不是 1 —— 记录前提，防误用。"""
     assert abs(cosine_similarity([0.3, 0.4], [0.3, 0.4]) - 0.25) < 1e-9
+
+
+# ---------------- 嵌入端点的 URL 守卫（服务端出站请求的安全底线） ----------------
+#
+# 这些用例全部**离线确定性**：只解析字面量 IP（走 syscall，不需要 DNS），
+# 或者用 monkeypatch 注入解析结果，不去真的查域名。
+
+
+def _fake_resolution(ip: str):
+    """伪造 getaddrinfo 返回值（AF_INET 的 sockaddr 形状）。"""
+    return lambda _host, _port: [(2, 1, 6, "", (ip, 0))]  # type: ignore[return-value]
+
+
+def test_嵌入端点只允许http和https() -> None:
+    with pytest.raises(ValueError):
+        openai_compatible_embedder(base_url="file:///etc/passwd", api_key="k", model="m")
+
+
+def test_嵌入端点缺少主机名被拒() -> None:
+    with pytest.raises(ValueError):
+        openai_compatible_embedder(base_url="http:///v1", api_key="k", model="m")
+
+
+@pytest.mark.parametrize("bad", [
+    "http://127.0.0.1:8080/v1",      # 环回
+    "http://[::1]:8080/v1",          # IPv6 环回
+    "http://10.0.0.5/v1",            # 私有
+    "http://192.168.1.10/v1",        # 私有
+    "http://169.254.169.254/v1",     # 云元数据端点（链路本地）
+    "http://0.0.0.0/v1",             # 未指定
+])
+def test_嵌入端点拒绝本机与内网地址(bad: str) -> None:
+    with pytest.raises(ValueError):
+        openai_compatible_embedder(base_url=bad, api_key="k", model="m")
+
+
+def test_公网域名放行(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "warden_agent.rag.knowledge.socket.getaddrinfo",
+        _fake_resolution("93.184.216.34"),
+    )
+    openai_compatible_embedder(
+        base_url="https://embed.example.com/v1", api_key="k", model="m",
+    )
+
+
+def test_域名解析到内网时拒绝_防DNS重绑定(monkeypatch: pytest.MonkeyPatch) -> None:
+    """域名看着完全正常，却解析到内网 —— 只校验域名的实现会在这里被绕过。"""
+    monkeypatch.setattr(
+        "warden_agent.rag.knowledge.socket.getaddrinfo",
+        _fake_resolution("10.0.0.9"),
+    )
+    with pytest.raises(ValueError) as ei:
+        openai_compatible_embedder(
+            base_url="https://looks-public.example.com/v1", api_key="k", model="m",
+        )
+    assert "非公网地址" in str(ei.value)
+
+
+def test_多解析结果里有一个内网就整体拒绝(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "warden_agent.rag.knowledge.socket.getaddrinfo",
+        lambda _h, _p: [
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+            (2, 1, 6, "", ("192.168.0.7", 0)),
+        ],
+    )
+    with pytest.raises(ValueError):
+        openai_compatible_embedder(
+            base_url="https://mixed.example.com/v1", api_key="k", model="m",
+        )

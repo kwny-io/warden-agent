@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "./lib/api";
+import { api, getApiKey, setApiKey } from "./lib/api";
 import ChatView from "./components/ChatView";
 import ApprovalPanel from "./components/ApprovalPanel";
 import InfoPanel from "./components/InfoPanel";
@@ -16,6 +16,9 @@ export default function App() {
     () => localStorage.getItem("warden.userId") || "demo-user",
   );
   const [userIdInput, setUserIdInput] = useState(userId);
+  // 访问密钥：服务端设了 WARDEN_API_KEY 时业务接口都要带 Bearer，这里填。
+  // 存在 localStorage（只在本机浏览器），留空表示服务端未开鉴权。
+  const [apiKeyInput, setApiKeyInput] = useState(() => getApiKey());
   // 当前 run_id（对话）；每次打开页面都从全新会话开始（多账号下避免串号），
   // 历史对话从左栏列表一键找回
   const [runId, setRunId] = useState(() => `run-${Date.now().toString(36)}`);
@@ -145,6 +148,19 @@ export default function App() {
               onKeyDown={(e) => e.key === "Enter" && applyUser()}
               className="w-40 sm:w-44 bg-black/30 border border-slate-600/50 rounded-full px-3 py-1.5 font-mono text-xs outline-none focus:border-warden-accent/70 transition"
               placeholder="demo-user"
+            />
+            {/* 访问密钥：服务端设了 WARDEN_API_KEY 时必填；留空即"服务端没开鉴权"。
+                用 password 类型遮显；回车或失焦即写入 localStorage，后续请求自动带 Bearer。 */}
+            <span className="text-warden-fg/50 text-xs hidden sm:inline">KEY</span>
+            <input
+              type="password"
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && setApiKey(apiKeyInput)}
+              onBlur={() => setApiKey(apiKeyInput)}
+              title="服务端设了 WARDEN_API_KEY 时填这里；留空表示服务端未开鉴权"
+              className="w-28 sm:w-32 bg-black/30 border border-slate-600/50 rounded-full px-3 py-1.5 font-mono text-xs outline-none focus:border-warden-accent/70 transition"
+              placeholder="API KEY"
             />
             {/* 切换按钮：点开展开已创建的 USER_ID 列表，选中即切换（可与信息按钮同排弹性布局） */}
             <div className="relative">
