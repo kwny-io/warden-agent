@@ -40,6 +40,8 @@ import uvicorn
 
 from warden_agent.core.config import load_env
 from warden_agent.core.logging_setup import get_logger, setup_logging
+from warden_agent.loop.intent import ToolIntentRouter
+from warden_agent.loop.planner import ModelPlanner
 from warden_agent.model.deepseek import DeepSeekModel
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel
@@ -51,6 +53,9 @@ from warden_agent.web.auth import TrustedCaller
 from warden_agent.web.server import build_app
 
 logger = get_logger("run_server")
+
+# 上下文裁剪阈值（用字符数近似 token）：约 60k 字符 —— 够长会话用，又不至于把上下文撑爆
+DEFAULT_MAX_CONTEXT_CHARS = 60000
 
 
 def _build_catalog() -> ToolCatalog:
@@ -163,6 +168,31 @@ def _db_path() -> str:
     return os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
 
 
+def _cognition_from_env(
+    env: Mapping[str, str], catalog: ToolCatalog, model: AgentChatModel,
+) -> tuple[Any, Any, int]:
+    """按环境变量决定认知能力开关，返回 `(planner, intent, max_context_chars)`。
+
+    产品路径的默认值（按"是否多花钱/是否只赚不赔"来定）：
+
+      · **意图路由**：`ToolIntentRouter` 纯离线确定性、不让模型多跑一次 → **默认开**。
+        调用前校验"该不该调"，疑似误调就提示模型而不是直接执行。
+      - **上下文裁剪**：防长会话把上下文撑爆，纯收益 → **默认开**（阈值可覆盖）。
+      · **阶段规划**：`ModelPlanner` 会为复杂任务**多花一次模型调用** → **默认关**，
+        要开就设 `WARDEN_PLANNER=1`（值得，因为复杂任务本来就贵）。
+    """
+    intent = ToolIntentRouter(catalog)
+    on = ("1", "true", "yes", "on")
+    planner = (
+        ModelPlanner(model)
+        if env.get("WARDEN_PLANNER", "").strip().lower() in on
+        else None
+    )
+    raw = env.get("WARDEN_MAX_CONTEXT_CHARS", "").strip()
+    limit = int(raw) if raw.isdigit() else DEFAULT_MAX_CONTEXT_CHARS
+    return planner, intent, limit
+
+
 def main() -> None:
     load_env()  # 先读 .env（可选），密钥从环境变量取，不硬编码
     setup_logging()
@@ -205,9 +235,17 @@ def main() -> None:
         audit_store = SqliteAuditStore(_db_path())
         logger.info("已开启审计（写入 SQLite audit_log 表）")
 
+    catalog = _build_catalog()
+    planner, intent, ctx_chars = _cognition_from_env(os.environ, catalog, model)
+    logger.info(
+        "认知能力：意图路由=%s｜阶段规划=%s｜上下文裁剪=%s 字符",
+        "开" if intent is not None else "关",
+        "开" if planner is not None else "关（设 WARDEN_PLANNER=1 可开）",
+        ctx_chars or "不裁剪",
+    )
     app = build_app(
         model=model,
-        catalog=_build_catalog(),
+        catalog=catalog,
         policy=_build_policy(),
         store=store,
         # 默认启用记忆与 Web 搜索（离线可跑）；技能/MCP/Git 按环境变量开启
@@ -221,6 +259,9 @@ def main() -> None:
         model_id=("deepseek" if api_key else "fake"),
         model_api_key=api_key,
         stability=_stability_from_env(os.environ),
+        planner=planner,
+        intent=intent,
+        max_context_chars=ctx_chars,
     )
     port = int(os.environ.get("PORT", "8000"))
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)

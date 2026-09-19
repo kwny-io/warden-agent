@@ -21,6 +21,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from warden_agent.loop.cognition import (
+    intent_hint,
+    manage_context,
+    plan_context,
+    recall_context,
+)
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel, ChatRequest, Message
 from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
@@ -114,16 +120,15 @@ class AgentLoop:
         """处理一句用户指令，返回最终回答。"""
         # 1. 组装对话：系统指令 + 用户这句话 + 可用的技能卡（+ 相关记忆上下文）
         messages: list[Message] = [Message(role="system", content=self.system_prompt)]
-        # 【loop 深度②】取用端：按当前问题检索相关记忆,注入上下文(按需取用)
-        memory_context = self._recall_context(user_text)
+        # 【loop 深度②③】记忆按需取用 + 阶段规划。
+        # 与会话侧（AgentSession / 产品路径）**共用同一份实现**，见 loop/cognition.py——
+        # 否则"产品路径"和"demo 路径"的认知行为会各走各的。
+        memory_context = recall_context(self.memory, self.memory_scope, user_text)
         if memory_context:
             messages.append(Message(role="system", content=memory_context))
-        # 【loop 深度③】阶段规划：先判断复杂度,复杂则拆阶段,渐进注入当前阶段目标
-        plan = None
-        if self.planner is not None:
-            plan = self.planner.build(user_text)
-            if plan is not None and getattr(plan, "is_complex", False):
-                messages.append(Message(role="system", content=self.planner.context(plan, 0)))
+        planned = plan_context(self.planner, user_text)
+        if planned:
+            messages.append(Message(role="system", content=planned))
         messages.append(Message(role="user", content=user_text))
         tools = [t.to_openai_schema() for t in self.catalog.all()]
 
@@ -161,14 +166,12 @@ class AgentLoop:
                     # intent 路由器校验"这个请求真的需要调这个工具吗"。
                     # 若判定为"疑似误调",把提醒喂回模型让它确认/改选,而不是立即执行一个
                     # 可能多余的调用。这是"预防性"的;真正的拒绝仍由上面的审批门禁负责。
-                    if self.intent is not None:
-                        tool_schema = self._schema_of(call.name)
-                        iv = self.intent.relay(call.name, tool_schema, user_text, " ".join(
-                            m.content for m in messages if m.content))
-                        if iv.action == "hint":
-                            messages.append(Message(role="tool", content=iv.message,
-                                                    tool_call=call))
-                            continue
+                    hint = intent_hint(
+                        self.intent, self._schema_of(call.name), call, user_text, messages,
+                    )
+                    if hint is not None:
+                        messages.append(Message(role="tool", content=hint, tool_call=call))
+                        continue
 
                     # 【loop 深度①】工具调用失败自恢复：
                     # 尝试执行；失败不崩溃，把错误喂回模型让它自己纠正。
@@ -250,77 +253,14 @@ class AgentLoop:
     # ---- 【loop 深度④】上下文管理：裁剪 + 摘要 ----
 
     def _manage_context(self, messages: list[Message]) -> list[Message]:
-        """对话太长时压缩上下文：裁掉早期历史并留一句摘要，只保留最近窗口 + 所有 system。
-
-        阈值 `max_context_chars` 为 0 表示不裁剪(原样返回)。
-        用字符数近似 token 量。裁剪只动"历史对话"(assistant/user/tool 交错的老部分)，
-        system 提示始终保留；最近 `_KEEP_RECENT` 条完整保留，保证能正常收尾。
-        """
-        if self.max_context_chars <= 0:
-            return messages
-        total = sum(len(m.content or "") for m in messages)
-        if total <= self.max_context_chars:
-            return messages
-        output: list[Message] = [m for m in messages if m.role == "system"]
-        trimmed: list[Message] = []
-        recent: list[Message] = []
-        # 从最早的"非 system"开始留最近 _KEEP_RECENT 条作为 recent,其余算 trimmed
-        history = [m for m in messages if m.role != "system"]
-        trim_n = max(len(history) - _KEEP_RECENT, 0)
-        trimmed = history[:trim_n]
-        recent = history[trim_n:]
-        if trimmed:
-            output.append(Message(
-                role="system",
-                content="[早期对话摘要] " + self._summarize(trimmed),
-            ))
-        output.extend(recent)
-        return output
-
-    @staticmethod
-    def _summarize(msgs: list[Message]) -> str:
-        """轻量摘要：把裁剪掉的早期历史里 assistant 的话提炼成一句要点。
-
-        这是拿"被裁的内容里最像结论的话"拼的简版摘要；真实系统可换成模型生成摘要。
-        """
-        parts = [
-            m.content for m in msgs
-            if m.role == "assistant" and not m.content.startswith("[调用工具")
-        ][-3:]
-        parts = [p for p in parts if p and p.strip()]
-        if not parts:
-            return "早期交互"
-        body = " | ".join(p.strip() for p in parts)
-        return f"先后谈及: {body}"
+        """上下文裁剪：与会话侧共用 `cognition.manage_context`（一套实现，两个调用方）。"""
+        return manage_context(messages, self.max_context_chars)
 
     # ---- 【loop 深度②】记忆：按需取用 + 取舍写入 ----
 
     def _recall_context(self, user_text: str) -> str:
-        """按当前问题检索相关记忆，返回可注入系统提示的记忆上下文。
-
-        【取舍】不是全量塞记忆，而是按 `user_text` 与每条记忆做**关键词重叠**判断，
-        只把"和当前问题相关"的记忆拼成一段注入；不相关的丢弃(省 token、不干扰)。
-        没命中就返回空串(不注入)。
-        """
-        if self.memory is None:
-            return ""
-        try:
-            # 取本作用域下所有仍有效的记忆(不依赖 memory 那块粗粒度子串匹配)
-            items = self.memory.recall(self.memory_scope())
-        except Exception:  # noqa: BLE001 - 记忆不可用绝不拖垮主循环
-            return ""
-        q_tokens = _tokens(user_text)
-        if not q_tokens:
-            return ""
-        # 只保留与当前问题有"关键词重叠"的条目
-        hits = [
-            it for it in items
-            if _tokens(it.content.text) & q_tokens
-        ]
-        if not hits:
-            return ""
-        lines = "\n".join(f"- [{it.key}] {it.content.text}" for it in hits)
-        return f"[你的记忆,供参考]\n{lines}"
+        """按当前问题检索相关记忆（与会话侧共用 `cognition.recall_context`）。"""
+        return recall_context(self.memory, self.memory_scope, user_text)
 
     def memory_scope(self) -> Any:
         """返回记忆作用域(构造时设定,默认 SESSION)。"""
@@ -360,9 +300,6 @@ def build_default_loop(catalog: ToolCatalog) -> AgentLoop:
 
 # ---- loop 深度② 记忆辅助（模块级，避开循环导入）----
 
-# loop 深度④：上下文裁剪时,最近保留的消息条数(保证能正常收尾)
-_KEEP_RECENT = 6
-
 
 def _default_memory_key(text: str) -> str:
     """给一条要记的记忆生成一个"可读键"：取前 N 个不含空白的字符。
@@ -377,15 +314,3 @@ def _text_content(text: str) -> Any:
     """把文本包成 MemoryContent（延迟导入，避免顶层循环导入）。"""
     from warden_agent.memory import MemoryContent
     return MemoryContent(text=text)
-
-
-def _tokens(text: str) -> set[str]:
-    """拆"有意义的检索词"集合，用于记忆相关性判断。
-
-    统一复用 `tool.trigger.tokens()`（英文词 + 中文相邻双字 + 滤太泛的通用词），
-    与 intent / skill 触发判断同一套分词，不重复实现。
-    中文 bigram 让"上海天气怎么样"与"用户常问上海天气"能共享词，实现按需取用。
-    """
-    from warden_agent.tool.trigger import tokens as _trigger_tokens
-
-    return _trigger_tokens(text)

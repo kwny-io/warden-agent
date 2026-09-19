@@ -227,6 +227,9 @@ class SessionRegistry:
         system_prompt: str = "你是一个能使用工具的助手。",
         extra: dict[str, Any] | None = None,
         stability: Any = None,
+        planner: Any = None,
+        intent: Any = None,
+        max_context_chars: int = 0,
     ) -> None:
         self._model = model
         self._catalog = catalog
@@ -234,6 +237,9 @@ class SessionRegistry:
         self._store = store
         self._system_prompt = system_prompt
         self._stability = stability
+        self._planner = planner
+        self._intent = intent
+        self._max_context_chars = max_context_chars
         self.extra = extra or {}  # 额外能力（如 memory_service / skill_catalog）
         self._sessions: dict[str, AgentSession] = {}
         self._lock = threading.Lock()
@@ -251,6 +257,13 @@ class SessionRegistry:
                     store=self._store,
                     system_prompt=self._system_prompt,
                     stability=self._stability,
+                    # 认知能力：与 AgentLoop 共用 loop/cognition.py 同一实现，
+                    # 所以"记忆按需取用 / 阶段规划 / 意图路由 / 上下文裁剪"在产品路径也生效
+                    planner=self._planner,
+                    intent=self._intent,
+                    memory=self.extra.get("memory_service"),
+                    memory_scope=self.extra.get("memory_scope"),
+                    max_context_chars=self._max_context_chars,
                 )
                 self._sessions[run_id] = sess
             return sess
@@ -296,6 +309,9 @@ def build_app(
     model_id: str = "custom",
     model_api_key: str | None = None,
     stability: Any = None,
+    planner: Any = None,
+    intent: Any = None,
+    max_context_chars: int = 0,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
@@ -322,6 +338,9 @@ def build_app(
     registry = SessionRegistry(
         model, catalog, policy, store, system_prompt, extra,
         stability=build_stability_executor(stability),
+        planner=planner,
+        intent=intent,
+        max_context_chars=max_context_chars,
     )
     app = FastAPI(title="Warden Agent Python", version=API_VERSION)
 

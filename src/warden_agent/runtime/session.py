@@ -22,6 +22,12 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from warden_agent.core.run.status import AgentRun, RunStatus
+from warden_agent.loop.cognition import (
+    intent_hint,
+    manage_context,
+    plan_context,
+    recall_context,
+)
 from warden_agent.loop.loop import exec_tool
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
@@ -115,6 +121,11 @@ class AgentSession:
         system_prompt: str = "你是一个能使用工具的助手。",
         max_iterations: int = 10,
         stability: Any = None,
+        planner: Any = None,
+        intent: Any = None,
+        memory: Any = None,
+        memory_scope: Any = None,
+        max_context_chars: int = 0,
     ) -> None:
         self.run_id = run_id
         self.model = model
@@ -127,6 +138,16 @@ class AgentSession:
         # 就走"超时+退避重试+降级/熔断"（与 AgentLoop 共用 exec_tool 单一来源），
         # 让稳定性在产品路径(HTTP/流式/CLI)也生效。
         self.stability = stability
+        # 认知能力（与会话侧和 demo 侧的 AgentLoop **共用 loop/cognition.py 同一份实现**）：
+        #   planner          阶段规划：复杂任务拆阶段，注入当前阶段目标
+        #   intent           意图路由：调用前校验"该不该调"，疑似误调则提示而非执行
+        #   memory/scope     记忆按需取用：按关键词重叠注入相关记忆
+        #   max_context_chars 上下文裁剪阈值（0 = 不裁剪）
+        self.planner = planner
+        self.intent = intent
+        self.memory = memory
+        self._memory_scope = memory_scope
+        self.max_context_chars = max_context_chars
 
         # 结构化输出目标（typed_reply 用）：类型化结果还原
         self._reply_type: Any = None
@@ -274,6 +295,50 @@ class AgentSession:
         """类型化推进：循环跑完，最终内容校验还原成 reply_type 对象返回。"""
         return self._run_loop(self._finalize_typed)
 
+    def _last_user_text(self) -> str:
+        """取当前这一轮的用户输入（各入口都会把它 append 进 messages）。"""
+        for m in reversed(self.messages):
+            if m.role == "user" and m.content:
+                return m.content
+        return ""
+
+    def _tool_schema(self, name: str) -> dict[str, Any]:
+        """取工具说明书（供意图路由器识别触发信号）；未注册返回空 dict。"""
+        try:
+            spec = self.catalog.get(name)
+        except KeyError:
+            return {}
+        return {"description": spec.description, "parameters": spec.parameters_schema}
+
+    def _request_messages(self) -> list[Message]:
+        """构造本次发给模型的消息：system + 记忆上下文 + 阶段计划 + 历史（并裁剪）。
+
+        记忆 / 计划是**每次请求临时注入**的，**不写进 `self.messages`** —— 否则会被
+        持久化，恢复会话时重复叠加。上下文裁剪同理：只作用于本次请求，不改存档。
+
+        这几步与 AgentLoop 共用 `loop/cognition.py` 的同一份实现，所以"认知能力"
+        在产品路径（HTTP / CLI / 流式）上是真实生效的，不再是 demo 专属。
+        """
+        history = _ensure_tool_results(self.messages)
+        user_text = self._last_user_text()
+        extra: list[Message] = []
+        mem = recall_context(self.memory, self._memory_scope, user_text)
+        if mem:
+            extra.append(Message(role="system", content=mem))
+        plan = plan_context(self.planner, user_text)
+        if plan:
+            extra.append(Message(role="system", content=plan))
+        # 注入在**首条 system 之后**，不要把 system 提示顶到最末尾
+        combined = history[:1] + extra + history[1:] if extra and history else history
+        return manage_context(combined, self.max_context_chars)
+
+    def _cognition_hint(self, call: ToolCall) -> str | None:
+        """调用前的意图校验：疑似误调时返回要喂回模型的提醒文案（与 AgentLoop 同一实现）。"""
+        return intent_hint(
+            self.intent, self._tool_schema(call.name), call,
+            self._last_user_text(), self.messages,
+        )
+
     def _run_loop(self, on_content: Callable[[str], Any]) -> Any:
         """循环骨架：模型调用 → 工具/审批 → 到最终内容交给 on_content。"""
         if self.run.status in (RunStatus.COMPLETED, RunStatus.FAILED,
@@ -282,7 +347,7 @@ class AgentSession:
 
         for _ in range(self.max_iterations):
             response = self.model.chat(ChatRequest(
-                messages=_ensure_tool_results(self.messages),
+                messages=self._request_messages(),
                 tools=[t.to_openai_schema() for t in self.catalog.all()],
                 structured_output=self._reply_schema,
             ))
@@ -302,6 +367,13 @@ class AgentSession:
                         )
                     if verdict.decision == Decision.ASK:
                         return self._hold_for_approval(call, verdict.reason)
+                    # 【认知】调用前的意图校验：疑似误调就提示模型，不执行
+                    hint = self._cognition_hint(call)
+                    if hint is not None:
+                        hint_msg = Message(role="tool", content=hint, tool_call=call)
+                        self.messages.append(hint_msg)
+                        self.store.append_message(self.run_id, hint_msg)
+                        continue
                     self._execute(call)
                 continue  # 本批工具都执行完，回到循环让模型再想
 
@@ -367,7 +439,7 @@ class AgentSession:
 
         for _ in range(self.max_iterations):
             request = ChatRequest(
-                messages=_ensure_tool_results(self.messages),
+                messages=self._request_messages(),
                 tools=[t.to_openai_schema() for t in self.catalog.all()],
                 stream=True,  # 流式：模型增量返回在 response.deltas 里
             )
@@ -408,6 +480,14 @@ class AgentSession:
                         yield {"type": "needs_approval",
                                "approval": self._approval_dict(outcome.approval)}
                         return
+                    # 【认知】调用前的意图校验（与上面非流式路径同一实现）
+                    hint = self._cognition_hint(call)
+                    if hint is not None:
+                        hint_msg = Message(role="tool", content=hint, tool_call=call)
+                        self.messages.append(hint_msg)
+                        self.store.append_message(self.run_id, hint_msg)
+                        yield {"type": "tool_hint", "name": call.name, "text": hint}
+                        continue
                     # 流式下也把工具结果落库（复用 _execute，携带 tool_call_id；含稳定性+错误喂回）
                     self._execute(call)
                 continue

@@ -234,6 +234,8 @@ def augment_catalog(
 
     extra: dict[str, Any] = {}
     scope = memory_scope or MemoryScope.SESSION
+    # 作用域也放进 extra：会话侧要做"记忆按需取用"（自动召回）时需要它
+    extra["memory_scope"] = scope
 
     # 1. 记忆
     if memory:
@@ -313,6 +315,9 @@ def build_agent(
     sandbox: bool = False,
     sandbox_spec: SandboxSpec | None = None,
     stability: bool | StabilityConfig | StableToolExecutor | None = None,
+    planner: Any = None,
+    intent: Any = None,
+    max_context_chars: int = 0,
 ) -> Agent:
     """一键装配一个 Agent：模型 + 工具 + 策略 + 存储 +（可选）能力。
 
@@ -347,7 +352,7 @@ def build_agent(
                  else [(s.name, s) for s in tools])
         for _name, spec in items:
             catalog.register(spec)  # spec 是已生成的技能卡实例（见 pydantic_tool/function_tool）
-    augment_catalog(
+    extra = augment_catalog(
         catalog, memory=memory, skills=skills, web=web,
         mcp_server=mcp_server, git_workdir=git_workdir,
         sandbox=sandbox, sandbox_spec=sandbox_spec,
@@ -367,6 +372,11 @@ def build_agent(
             system_prompt=system_prompt,
             max_iterations=max_iterations,
             stability=build_stability_executor(stability),
+            planner=planner,
+            intent=intent,
+            memory=extra.get("memory_service"),
+            memory_scope=extra.get("memory_scope"),
+            max_context_chars=max_context_chars,
         )
 
     return Agent(make_session)
