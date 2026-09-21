@@ -15,6 +15,10 @@
     直接抛 `RunNotResumable` —— 自动续跑等于绕过人工审批闸门。
   - **已完成/已取消的 Run 不重跑**，否则是重复执行。
   - 重试次数记在 Checkpoint 上（`attempts`），到上限就判终态，防无限重试。
+  - **同一 run 同一时刻只由一方驱动**：多副本下两边的恢复计划会同时包含同一个 run，
+    没有闸门就会两边一起写、最后**后写覆盖前写**且不报错。所以每个 run 驱动前先抢
+    Run 级锁（见 `runtime/locking.py`），抢不到记为 `held_by_other` 并跳过本轮。
+    这把锁是**租约式**的：持有者崩了不必人工解锁，租约到期即可被别的副本接手。
 """
 
 from __future__ import annotations
@@ -25,6 +29,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from warden_agent.runtime.checkpoint import Checkpoint
+from warden_agent.runtime.locking import (
+    InProcessRunLock,
+    RunLease,
+    RunLock,
+    new_owner_id,
+)
 from warden_agent.runtime.recovery import RecoveryController
 from warden_agent.runtime.session import AgentSession, NeedsApproval, RunNotResumable
 
@@ -47,6 +57,8 @@ class RecoveryWorker:
     - `session_factory` ：`run_id -> AgentSession`，由 `build_agent(...).session_factory`
                           或 `SessionRegistry.get` 提供
     - `max_attempts_per_run`：重试上限，默认沿用 controller 的配置
+    - `lock` / `owner` / `lock_ttl_seconds`：Run 级锁（多副本必传 `SqlRunLock`，
+      见 `runtime/locking.py`）。不传则是进程内锁，单副本行为与历史一致。
 
     重试计数由会话侧负责（`AgentSession.resume()` 在 FAILED 分支把 attempts +1
     并随存档点写回），所以这里只做"到上限就不再重试"的判断，不重复计数。
@@ -58,10 +70,18 @@ class RecoveryWorker:
         session_factory: Callable[[str], AgentSession],
         *,
         max_attempts_per_run: int | None = None,
+        lock: RunLock | None = None,
+        owner: str | None = None,
+        lock_ttl_seconds: int | None = None,
     ) -> None:
         self.controller = controller
         self.session_factory = session_factory
         self.max_attempts = max_attempts_per_run or controller.max_attempts_per_run
+        # Run 级锁：多副本下防止同一个 run 被两个副本同时驱动（会"后写覆盖前写"）。
+        # 不传 = 进程内锁，单副本行为与历史一致；多副本要传 SqlRunLock（见 runtime/locking.py）。
+        self._lock: RunLock = lock if lock is not None else InProcessRunLock()
+        self.owner = owner or new_owner_id()
+        self.lock_ttl = lock_ttl_seconds
 
     # ---- 跑一轮 ----
     def run_once(self) -> list[WorkerAction]:
@@ -106,7 +126,26 @@ class RecoveryWorker:
 
     # ---- 内部 ----
     def _drive(self, cp: Checkpoint, kind: str) -> WorkerAction:
-        """让某个 run 从存档点继续。逐个隔离：一个失败不影响其余。"""
+        """让某个 run 从存档点继续。逐个隔离：一个失败不影响其余。
+
+        驱动前先抢 Run 级锁：多副本下同一个 run 可能同时出现在两边的恢复计划里，
+        没有这把锁就会两边一起写，最后**后写覆盖前写**、且不报错。抢不到就如实记为
+        `held_by_other`（说明别的副本正在处理它），本轮跳过。
+
+        用 `RunLease` 而不是裸 acquire/release：它带**后台心跳续租**，所以"单次恢复跑得比锁
+        TTL 还久"也不会让租约中途过期、被别的副本接管（否则又变成并发驱动）。
+        `with` 同时保证成功 / 失败 / 抛错都会停心跳并释放——只靠租约自然过期来释放，
+        会把一次失败放大成"这个 run 卡到 TTL 才可能重试"。
+        """
+        with RunLease(self._lock, cp.run_id, self.owner, self.lock_ttl) as lease:
+            if not lease.acquired:
+                holder = self._lock.owner_of(cp.run_id) or "unknown"
+                return WorkerAction(
+                    cp.run_id, "held_by_other", f"已被 {holder} 驱动中，本轮跳过"
+                )
+            return self._drive_locked(cp, kind)
+
+    def _drive_locked(self, cp: Checkpoint, kind: str) -> WorkerAction:
         try:
             session = self.session_factory(cp.run_id)
             outcome = session.resume()

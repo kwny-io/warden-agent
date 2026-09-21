@@ -46,17 +46,25 @@ import uvicorn
 
 from warden_agent.core.config import load_env
 from warden_agent.core.logging_setup import get_logger, setup_logging
+from warden_agent.core.settings import (
+    describe,
+    env_flag,
+    unknown_warden_variables,
+    validate_env,
+)
 from warden_agent.loop.intent import ToolIntentRouter
 from warden_agent.loop.planner import ModelPlanner
 from warden_agent.model.deepseek import DeepSeekModel
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel
 from warden_agent.policy.policy import PolicyEngine, ask_when_tool_in
+from warden_agent.runtime.locking import run_lock_for
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog, function_tool
 from warden_agent.web.audit import SqliteAuditStore
 from warden_agent.web.auth import TrustedCaller
 from warden_agent.web.coordination import coordination_for
+from warden_agent.web.outbound import outbound_from_env
 from warden_agent.web.ratelimit import limiter_from_env
 from warden_agent.web.search import providers_from_env
 from warden_agent.web.server import build_app
@@ -219,14 +227,15 @@ def _stability_from_env(env: Mapping[str, str]) -> bool:
 
 
 def _shared_state_from_env(env: Mapping[str, str]) -> bool:
-    """是否把协调状态（幂等 / 事件流 / 限流计数）放进共享存储。
+    """是否把协调状态（幂等 / 事件流 / 限流计数 / Run 锁）放进共享存储。
 
     `WARDEN_SHARED_STATE=1` 开启 —— **多副本部署必须开**，否则每个副本各算一份：
     同一 Idempotency-Key 打到不同副本会重复执行、SSE 事件收不到、限流总额度翻倍。
     单副本默认关（进程内实现更快、无轮询）。
+
+    解析统一走 `core.settings.env_flag`，避免同一个变量出现多个解析口径。
     """
-    on = ("1", "true", "yes", "on")
-    return env.get("WARDEN_SHARED_STATE", "").strip().lower() in on
+    return env_flag(env.get("WARDEN_SHARED_STATE"))
 
 
 def _db_path() -> str:
@@ -277,6 +286,21 @@ def main() -> None:
     else:
         model = FakeModel()
         logger.info("未设置 DEEPSEEK_API_KEY，使用离线假模型（设置 key 可接真实 DeepSeek）")
+
+    # 配置面校验（fail-fast）：格式写错、或把 WARDEN_* 拼错，都在启动时暴露，
+    # 而不是悄悄按默认值跑——与"鉴权 fail-closed"同一个取向。
+    env_errors = validate_env(os.environ)
+    if env_errors:
+        for message in env_errors:
+            logger.error("配置错误：%s", message)
+        raise SystemExit(2)
+    for suspect in unknown_warden_variables(os.environ):
+        logger.warning(
+            "环境变量 %s 未被识别——是不是拼错了？它不会生效（清单见 core/settings.py 或文档 15）",
+            suspect,
+        )
+    # 生效配置全量清单（敏感值已打码），排查问题时开 DEBUG 即可看到
+    logger.debug("生效配置：\n%s", "\n".join(describe(os.environ)))
 
     # 鉴权（fail-closed）。监听地址与鉴权要一起决定：对外监听却不鉴权 = 直接拒绝启动。
     host = os.environ.get("WARDEN_HOST", "127.0.0.1")
@@ -364,6 +388,29 @@ def main() -> None:
         "开" if planner is not None else "关（设 WARDEN_PLANNER=1 可开）",
         ctx_chars or "不裁剪",
     )
+    # 出站闸门：单次请求的超时/体积上限只界定"一次"，不界定"多少次"。
+    # 计数与入站限流共用同一套存储接缝 → 多副本下把 store 换成存储实现，限额才是全局的。
+    try:
+        outbound = outbound_from_env(os.environ, store=coordination[2])
+    except ValueError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
+    _oc = outbound.config
+    logger.info(
+        "出站限速：全局 %s/%ss｜单 host %s/%ss｜并发 %s%s"
+        "（WARDEN_OUTBOUND_* 可调）",
+        _oc.max_requests, _oc.window_seconds,
+        _oc.host_max_requests, _oc.host_window_seconds,
+        _oc.max_concurrency,
+        f"｜日配额 {_oc.daily_quota}" if _oc.daily_quota else "｜日配额不限",
+    )
+    # Run 级锁：多副本下同一个环绕开"两个副本同时驱动"（会后写覆盖前写）。
+    # 与协调状态共用同一个开关：开了 WARDEN_SHARED_STATE 就用存储里的共享锁。
+    run_lock = run_lock_for(store, shared=shared_state)
+    logger.info(
+        "Run 锁：%s（HTTP 对话 / 审批路径；抢不到返回 423，让客户端稍后重试）",
+        type(run_lock).__name__,
+    )
     app = build_app(
         model=model,
         catalog=catalog,
@@ -388,6 +435,8 @@ def main() -> None:
         max_context_chars=ctx_chars,
         rate_limiter=limiter,
         shared_state=shared_state,
+        outbound_limiter=outbound,
+        run_lock=run_lock,
     )
     port = int(os.environ.get("PORT", "8000"))
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)

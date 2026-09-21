@@ -74,13 +74,22 @@ def test_network_policy_对象判断() -> None:
 
 
 def test_带资源限制_普通命令可执行() -> None:
-    """给 budget 设内存/CPU 限制，普通命令仍能正常跑（Windows 走 Job Object）。"""
+    """给 budget 设内存/CPU 限制，普通命令仍能正常跑（Windows 走 Job Object）。
+
+    ⚠️ 这里刻意用 `sys._base_executable`（venv 背后的**真**解释器），而不是 `sys.executable`：
+    Windows 上 venv 里的 python.exe 只是个**转发器**，它还要自己再拉起真解释器；而一旦转发器
+    被放进 Job Object（本测试正是要验证的路径），这个子进程创建就会失败，报
+    `Unable to create process using ...`（exit 101）。已实测：真解释器与 cmd 都正常，只有转发器
+    不行，且与"设了哪个具体限制"无关 —— 只要进程被放进 Job Object 就会中。这是 Windows 的既有
+    行为（应用层沙箱的已知边界，已写进 `execution/_platform.py` 的说明），不是本项目的 bug；
+    但测试不该被它误伤，所以取真解释器路径来测"带限制的普通命令仍可执行"这件事本身。
+    """
     from warden_agent.execution.broker import ExecutionBudget
 
     spec = SandboxSpec(budget=ExecutionBudget(
         timeout_seconds=10, max_memory_mb=512, max_cpu_seconds=30))
     broker = SandboxedExecutionBroker(spec=spec)
-    cmd = [sys.executable, "-c", "print('limited-ok')"]
+    cmd = [getattr(sys, "_base_executable", sys.executable), "-c", "print('limited-ok')"]
     r = broker.execute(cmd)
     assert r.exit_code == 0
     assert "limited-ok" in r.stdout

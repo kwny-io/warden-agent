@@ -17,6 +17,11 @@ dependencies = [
     "openai>=1.30",
     "pydantic>=2.0",
     "cryptography>=42",
+    # Windows 沙箱的资源限制走 Windows Job Object（见 execution/_platform.py 的
+    # _make_win32_limiter），需要 pywin32 提供的 win32job。此前没声明——
+    # 系统里恰好装着才没暴露；照 lock 从零装的环境里会直接 ModuleNotFoundError。
+    # 只对 Windows 生效，Linux/macOS 不会装它（POSIX 走 resource.setrlimit，标准库自带）。
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

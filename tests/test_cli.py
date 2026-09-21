@@ -19,6 +19,9 @@ _EXPECTED = {
     "caps": "_cmd_caps",
     "coding": "_cmd_coding",
     "recover": "_cmd_recover",
+    "backup": "_cmd_backup",
+    "restore": "_cmd_restore",
+    "stuck": "_cmd_stuck",
 }
 
 
@@ -35,6 +38,27 @@ def test_命令行可解析() -> None:
 
 def test_default_base_url() -> None:
     assert cli.DEFAULT_BASE.startswith("http://127.0.0.1")
+
+
+def test_服务地址用WARDEN_SERVER_URL覆盖() -> None:
+    assert cli.default_base_url({"WARDEN_SERVER_URL": "http://10.0.0.5:9000"}) == (
+        "http://10.0.0.5:9000"
+    )
+
+
+def test_服务地址不读模型端点变量() -> None:
+    """回归：`WARDEN_BASE_URL` 是 custom 模型的端点，**不能**被 CLI 当服务地址用。
+
+    曾经同名 → 配了自建模型网关后，`warden chat` 会把请求发到那个模型网关上去。
+    """
+    assert cli.default_base_url({"WARDEN_BASE_URL": "https://my-llm-gw.example.com/v1"}) == (
+        "http://127.0.0.1:8000"
+    )
+    # 两个都设时，只有 WARDEN_SERVER_URL 生效
+    both = cli.default_base_url(
+        {"WARDEN_SERVER_URL": "http://srv:8000", "WARDEN_BASE_URL": "https://gw/v1"}
+    )
+    assert both == "http://srv:8000"
 
 
 def test_client_trust_env_false() -> None:

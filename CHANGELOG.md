@@ -5,12 +5,250 @@
 
 ---
 
+## 2026-09-21（第八批：出站限速与配额）
+
+### 本轮改动（工作区，尚未 commit）
+
+- **给"Agent 主动往外发请求"补上总量闸门**。此前 `web.fetch` 只有**单次请求**的边界
+  （超时 10s / 响应体 200KB / 跳转 3 次），而它们只界定"一次"，不界定"多少次"：
+  模型一轮抓 50 个链接、并发用户相乘、高频打同一站点被 429、按次计费的检索 API 被失控
+  循环跑光配额——四类事故一个都拦不住。新增 `web/outbound.py` 的四道闸：
+  1. **全局速率**：默认每 60 秒 120 次（`WARDEN_OUTBOUND_LIMIT`）；
+  2. **单 host 速率**：默认每 60 秒 20 次（`WARDEN_OUTBOUND_HOST_LIMIT`），对单个站点保持礼貌；
+  3. **并发上限**：默认 8（`WARDEN_OUTBOUND_MAX_CONCURRENCY`），进程内信号量、不阻塞等待；
+  4. **日配额**：默认**不限**（`WARDEN_OUTBOUND_DAILY_QUOTA=N` 开启）——硬性停机上限应由运维
+     显式决定，与"Agent 能不能出网"同一个取向。
+- **接在唯一的收口点上**：`make_web_tools`（`web/search.py`）——搜索与抓取都从这里出网，
+  所以现在与将来的 provider 一并受管；`augment_catalog` / `build_agent` / `build_app` /
+  `run_server` 透传。
+- **顺序：URL 策略先于出站闸门**。被策略拒掉的 URL（内网/环回/元数据地址）**不消耗配额**——
+  拒绝不等于"发出去了"；顺序反了会让内网 URL 把配额刷爆。
+- **离线 provider 不占配额**：`LocalMockSearchProvider` 补上 `requires_network = False`
+  （与 `LocalMockFetchProvider` 对齐），所以演示与测试完全不受影响。
+- **被限流返回可读文本而不是抛异常**（`[限流] ...`）：工具不该因配额用尽把会话循环打崩，
+  把"现在不行"交回给模型判断。
+- **计数复用入站限流那套存储接缝**（`RateLimitStore`）→ 多副本下把 store 换成存储实现，
+  出站限额才是**全局**的；否则实际额度 ≈ 配置 × 副本数（并发信号量天然是进程内的，已文档化）。
+- 新增 20 条测试（`tests/test_outbound_limit.py`）：四道闸各自的行为、窗口过期恢复、
+  **单 host 不串到别家**、`release` 幂等（不会把信号量越还越多）、**多线程不串号**、
+  共享存储下两个"副本"共用额度 + **进程内不共享的对照组**、离线 provider 不占配额、
+  联网抓取被限速且 provider 未被真的二次调用、**策略先行的顺序保证**、环境变量解析与报错。
+
+- **修掉两处"一个变量名干两件事"（都是会静默出错的那种）**：
+  1. **`WARDEN_API_KEY`** 同时被 **HTTP 鉴权**（`web/run_server.py`）和 **`custom` 模型的 API Key**
+     （`model/deepseek.py`）读取 —— 于是"用 `WARDEN_API_KEY` 开鉴权 + 用 custom 接自建网关"时，
+     模型会把**服务端的鉴权密钥**当成模型 key 发给那个第三方网关。现在模型侧改用
+     **`WARDEN_MODEL_API_KEY`**，`WARDEN_API_KEY` 只做鉴权。
+  2. **`WARDEN_BASE_URL`** 同时被 **CLI 的服务地址**（`cli.py`）和 **`custom` 模型的端点**读取 ——
+     配了自建模型网关之后，`warden chat` 会把请求发到**模型网关**上去。现在 CLI 改用
+     **`WARDEN_SERVER_URL`**，`WARDEN_BASE_URL` 只做模型端点。
+  - 顺带修掉一个**会泄密**的隐患：`custom` 此前会回落到 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` ——
+    等于"我把 custom 指向了某第三方网关、却忘了配 key"时，**把厂商密钥发给那个第三方**。现在
+    custom 的 key 必须显式配置（本机网关/Ollama 填 `not-needed` 这类占位串即可），缺失时给出可操作的报错。
+  - `.env.example` 里 `WARDEN_API_KEY` 原本**被赋值两次**（第 13 行鉴权、第 77 行当模型 key），
+    后写的会**静默覆盖**鉴权密钥；且模板里预填了一个公开可见的 key（等于人人知道你的密钥）。
+    现已改为注释 + 明确指引。
+  - 新增 6 条回归测试（`tests/test_deepseek.py` ×4：不读鉴权密钥 / 不回落其他厂商密钥 /
+    占位串可用；`tests/test_cli.py` ×2：`WARDEN_SERVER_URL` 生效 / 不读 `WARDEN_BASE_URL`）。
+
+- **配置面有了单一事实源 + 可执行的守卫（企业级推进第 1 项）**。此前环境变量读取散在
+  **8 个文件、24 处**，而 `core/config.py` 只有 34 行（仅 `load_env`）——没有任何地方声明
+  "这个变量干什么、谁有权读"。这正是本批两个"同名两用"bug 的**根因**（`WARDEN_API_KEY`、
+  `WARDEN_BASE_URL`）。新增 `core/settings.py`：
+  - `ENV_SPECS` 登记全部 **37 个**变量：用途 / 归属模块 / **允许读它的模块** / 默认值 / 类型 / 是否敏感；
+  - `validate_env()`：启动时校验格式（写错**拒绝启动**，与鉴权 fail-closed 同一取向）；
+  - `unknown_warden_variables()`：揪出**拼错的** `WARDEN_*`（如 `WARDEN_RATELIMIT`）并告警——
+    原先会被静默忽略、悄悄用默认值，是最难查的一类问题；
+  - `describe()`：DEBUG 级打印生效配置（敏感值打码）。
+  - **关键是让它可执行**：新增 `tests/test_config_surface.py`，用 AST 扫描源码断言
+    ①代码读的每个变量都已登记；②**读它的模块 ⊆ 声明的 consumers**（这条就是"同名两用"的
+    拦截点——实测把 `cli.py` 改成读 `WARDEN_BASE_URL`，守卫立刻红并指出越权模块）；
+    ③登记了却没人读也要报（拼错/废弃）。没有这三条，注册表就只是文档。
+  - 顺带把 `web/outbound.py` 的两个变量读取改成字面量形式，让守卫能完整覆盖。
+  - 新增 12 条测试；端到端验证：`WARDEN_RATE_LIMIT=abc` → 退出码 2 + 可操作报错；
+    `WARDEN_RATELIMIT=10/60` → 服务正常启动 + 明确告警。
+  - **尚未做**：各模块的读取仍各自 `env.get(...)`（只是被守卫看着），还没统一改走类型化访问器。
+
+- **静态审查 PostgreSQL 实现，发现一个"只在 PG 上炸"的真问题并修掉**。起因是推进"企业级"
+  的第 2 项时发现：项目声称"存储可换 PostgreSQL"，但 `tests/test_store_interface.py` 对 PG 是
+  `skipif` 跳过、CI 里也没有 PG 容器 —— **PostgresStore 从未被自动化验证过**。在真起一个库之前，
+  先做能离线做的静态审查，结果查出：
+  - **连接的"毒丸"问题（真 bug）**：`psycopg.connect(...)` 默认 `autocommit=False`，
+    而该文件里**没有任何 `rollback()`**。PG 的语义是——事务内任一语句报错后，整个事务进入
+    aborted 状态，**此后所有语句（含读、含 `/health/ready` 探针）全部失败**，直到有人回滚。
+    也就是说：**一次坏写就能把这条连接废掉，而且不会自愈**。SQLite 没有这个语义
+    （错的只是那一条语句），所以这个坑只在 PG 上暴露——正是"从未验证"所掩盖的那类问题。
+    修法：连接改 `autocommit=True`（错误不再污染连接；读也不再长期占 idle-in-transaction），
+    需要原子性的多语句写入改用显式事务块 `with self.conn.transaction():`（psycopg3 在 autocommit
+    下也支持）。已给 `delete_run`（五条 DELETE 必须同生共死）与 `append_message`（查重+插入）
+    补上事务块。
+  - 其余静态项核对通过：三个 store 实现都齐了 `RunStore` 的 **19 个**协议方法；
+    `PostgresStore` 也齐了凭证保管库的 8 个方法（缺了会**静默**退回进程内保管库）；
+    每个 `ON CONFLICT (列)` 的目标列都有主键/唯一约束；SQL 全部用 `%s` 占位符。
+  - 新增 `tests/test_postgres_contract.py`（8 条**纯静态**契约检查：autocommit、ON CONFLICT 的
+    唯一约束、多语句事务块、占位符风格、两套协议的方法完整性、租约过期索引）。
+    **实测有牙齿**：撤掉 `autocommit=True`、撤掉 `delete_run` 的事务块，对应检查都立刻变红。
+  - ⚠️ **边界（别夸大）**：静态检查只能证明"代码写成这样"，**不能替代真跑一遍**——
+    SQL 语义、类型转换、并发行为仍需真实数据库验证（推进项 2 仍待做）。
+
+- **在真实 PostgreSQL 上跑通了**（推进项 2 的实质部分）。起了一个 `postgres:16-alpine`（PG 16.15），
+  把上一个条目里静态审查出的「毒丸连接」以及**从未被跑过的 PG 路径**全部实测了一遍：
+  - **对照实验证明那个 bug 是真的**：用修复前的配置（`autocommit=False`）走「一条失败语句 → 后续查询」，
+    连接确实被污染、后续查询全部被拒（`current transaction is aborted, commands ignored until end of
+    transaction block`）；修复后（`autocommit=True`）同一序列完全正常。**静态审查的结论由此有了实测背书。**
+  - 实测通过：`RunStore` 全量协议方法（run / 消息含工具调用 / 待审批 / 审批历史 / 存档点 /
+    `list_runs` 含 owner 过滤 / 用户表）、共享状态三件套（幂等 UPSERT、事件 `BIGSERIAL` 自增与增量读、
+    限流窗口计数与滚动 —— 那段 `CASE WHEN` UPSERT 没写错）、凭证保管库（密文往返、租约往返含时间戳精度、
+    过期惰性清理、删除）、`delete_run` 五张表全清（事务块）、`append_message` 查重。
+  - 端到端：`as_vault(PostgresStore)` **确实被认成保管库**（否则会静默退回进程内、以为落库其实没落），
+    `CredentialBroker` 加密落 PG 后**换一个新 broker（模拟重启）仍能取回明文**，且库里没有明文。
+  - 新增 `tests/test_postgres_integration.py`（**11 条真库集成测试**，含那条对照实验）。
+    连接参数可用 `WARDEN_TEST_PG_*` 环境变量覆盖（方便挂到 CI 的 service container）。
+    **没起 PG 时整体自动跳过**（已实测：11 skip、0 failed），所以 CI 保持绿。
+  - 测试数因此分两套：**无 PG = 591 passed / 13 skipped；起了 PG = 603 passed / 1 skipped**。
+  - ⚠️ **仍未做**：把 PG service 加进 GitHub Actions（本地验证 ≠ CI 验证；这条要靠 push 后才能确认）。
+
+- **依赖锁定（企业级推进第 3 项）**。新增 `uv.lock`（48 个包全部固定版本）；CI 改为
+  `uv sync --frozen` + `uv run --frozen ...`。**`--frozen` 是关键**：lock 与 pyproject 不一致时
+  CI 直接失败，而不是"本地悄悄装到别的版本、CI 才挂"。本地已实测：按 lock 从零建一个隔离环境
+  （101 个包），在该环境里 ruff / mypy / pytest 三项全过（**603 passed / 1 skipped**，与系统环境一致）。
+  - **锁版本立刻抓出一个未声明的依赖**：`execution/_platform.py` 的 Windows 资源限制走 Windows
+    Job Object，需要 pywin32 提供的 `win32job`，但 `pyproject.toml` 里**没声明**——系统 Python 里
+    恰好装着它，才一直没暴露；照 lock 从零装的环境里 `test_sandbox.py` 两条直接
+    `ModuleNotFoundError`。更要紧的是 `make_limiter` 是**无保护调用**（只捕获 `FileNotFoundError`），
+    所以干净环境下跑"带资源限制的沙箱命令"会**硬失败**。已修：加
+    `pywin32>=306; sys_platform == 'win32'`（只对 Windows 生效；POSIX 走标准库 `resource.setrlimit`，
+    不受影响）。
+  - **顺带查出一个 Windows 平台边界（如实记录，不是本项目 bug）**：venv 里的 `python.exe` 是个
+    **转发器**，它自己还要再拉起真解释器；一旦转发器被放进 Job Object，这个子进程创建就失败
+    （`Unable to create process using ...`，exit 101）。用四条命令隔离验证过：真解释器 ✅、
+    `cmd` 内建命令 ✅、venv 转发器 ❌；且**与设了哪个具体限制无关**（连 `max_files` 这种不设 flag 的
+    也中）——只要进程被放进 Job Object 就会中。影响面：Windows 上若应用跑在 venv 里，
+    沙箱执行"venv 的 python"会失败；真解释器与普通可执行文件不受影响。已写进
+    `execution/_platform.py`、README 与测试注释；测试改用 `sys._base_executable`（venv 背后的真解释器）
+    以免被该边界误伤。
+  - 验证：系统环境与 frozen 环境都是 **603 passed / 1 skipped**（PG 在跑时）+ ruff / mypy 全绿。
+
+- **Run 级分布式锁（企业级推进第 4 项）**。多副本下"同一个 run 被两个副本同时驱动"一直没有闸门：
+  同一个 `run_id` 若同时出现在两边的一份恢复计划里，两边都会去写状态与消息，结果是
+  **后写覆盖前写**（历史分叉或丢失，且不报错）。此前项目对这件事的说法只是"建议做会话粘性"，
+  等于把正确性交给部署方自觉。现在：
+  - 新增 `runtime/locking.py`：`RunLock` 协议 + `InProcessRunLock`（单副本默认，行为不变）
+    + `SqlRunLock`（多副本，复用 `RunStore` 所在库，新增 `run_locks` 表）+ `run_lock_for(store, shared=)`。
+  - **取锁是单条原子语句**：`INSERT ... ON CONFLICT(run_id) DO UPDATE ... WHERE expires_at <= now`
+    —— 键空闲或租约过期时可被接管，再读回核对 `(owner, expires_at)` 确认归属。
+    SQLite 与 PostgreSQL 语义一致（已在两者上分别验证）。
+  - **租约式而不是硬锁**：带 TTL，持有者崩了**不必人工解锁**，到期即可被别的副本接手——
+    这对"崩溃恢复"场景是必须的，否则一次宕机就永久锁死一个 run。`release` 只删自己的锁
+    （非持有者释放无效），`renew` 只能续自己的且未过期的锁。
+  - **接进 `RecoveryWorker`**：每个 run 驱动前先抢锁，抢不到记为 `held_by_other` 并跳过本轮
+    （不再"两边一起写"）；`finally` 里释放，**失败路径也释放**（否则一次失败要等租约过期才能重试）。
+    `warden recover --apply` 会据 `WARDEN_SHARED_STATE` 选共享锁还是进程内锁。
+  - 新增 16 条测试（`tests/test_run_lock.py`）：锁语义（互斥 / 同 owner 幂等 / 过期接管 /
+    续租与误释放边界 / owner 标识）、**跨 store 实例互斥**（模拟两个副本）、装配回落与告警、
+    worker 集成（抢不到不驱动、跑完释放、失败也释放）。
+  - 真库验证（PG 16.15）：`run_locks` 表在 PostgreSQL 上互斥与接管行为正确；
+    并做了一条**并发抢占测试——8 个"副本"各用独立连接同时抢同一把锁，恰好一个赢家**
+    （`test_postgres_integration.py`，共 13 条真库测试）。
+  - ⚠️ **仍未做的部分（如实标注）**：**HTTP 对话路径（`/chat/{run_id}`）没有接这把锁**——
+    同一 run 被两个副本同时 `chat` 仍会后写覆盖前写。所以对外多副本**仍建议做粘性路由**，
+    或把 Run 锁接进会话驱动路径（接口已备好）。这一点已写进 `docs/deployment-boundaries.md`。
+  - 顺带：新增 `core.settings.env_flag()` 统一布尔开关解析（原先 `WARDEN_SHARED_STATE` 的解析
+    散在两处）——结果**配置面守卫立刻抓到我自己**：先写成 `env_flag(env, name)` 导致变量名
+    不是字面量、AST 扫不到读取点；改成 `env_flag(env.get("X"))` 后守卫又指出 `cli.py` 读该变量
+    未在登记表里授权。两处都按守卫要求改正（详见 `9-排查日志.md`）。
+
+- **Run 锁接进 HTTP 路径（补上第 4 项里如实标注的那个缺口）**。上一轮只接了无人值守的
+  `RecoveryWorker`，并明确标注"HTTP 对话路径尚未接锁、对外多副本仍建议粘性路由"。现在补上：
+  - `/chat/{run_id}`、`/chat/stream/{run_id}`、`/approve/{run_id}`、`/reject/{run_id}`
+    四个会**推进会话状态**的端点都先抢 Run 锁；抢不到返回 **423 Locked**，客户端稍后重试。
+  - 为什么用 423 而不是 409：**409 在本服务里已被用来表示"没有待审批的请求"**，语义会撞车。
+  - **每请求一个 owner**（不是每副本一个）是刻意的：同进程内两个并发请求驱动同一个 run
+    同样属于并发写，也必须被挡住——同 owner 重复取锁是允许的（那是给重入用的），
+    所以不能复用。
+  - **流式**请求在返回 `StreamingResponse` 之前取锁，整段 SSE 走完（含客户端断开触发
+    `GeneratorExit`）才在 `finally` 里释放——提前释放等于开门让人并发写。
+  - `run_server` 按 `WARDEN_SHARED_STATE` 自动选共享锁；启动日志与 `/capabilities`
+    都会报出**当前用的是哪种锁**（进程内锁在多副本下等于没锁，运维必须能一眼看到）。
+  - 新增 9 条测试（`tests/test_run_lock_http.py`）：顺序请求不受影响、被占用时 423、
+    释放后可通过、请求结束/失败都要释放锁、审批路径受保护、流式取锁与释放的时序、
+    两个 app 共享存储（= 两个副本）互斥。
+  - ⚠️ **仍然存在的窗口（如实标注）**：单次驱动若**超过锁的 TTL**（默认 600 秒），
+    另一个副本可以接管，于是又出现并发驱动。按"单次驱动最长耗时"设 TTL，或改用带心跳的
+    续租循环（`RunLock.renew()` 已提供，但**没有内置后台心跳线程**）。
+    文档里同步把"粘性路由"从"正确性必需"降级为"体验建议"。
+
+- **运维面起步（企业级推进第 5 项）**。此前"运维面基本是空的"是评估里剩下最大的一块空白——
+  尤其一个具体洞：**Run 进入 `WAITING_APPROVAL` 之后不会自己动**（没超时 / 没重试 / 没通知），
+  线上没人盯就一直挂着。本轮补上三件事：
+  - **挂起告警**：新增运行时的 `stuck_awaiting_human()`——找出"等人工处理超过阈值"的 Run。
+    入口两条：CLI `warden stuck --older-than-min 60`（**有输出即需人管，退出码 3**，
+    可直接接 cron / 监控）与 `GET /alerts/stuck?older_than_min=60`（认证模式下按归属收敛，
+    与其它列表接口同口径）。⚠️ 口径如实标注：等待时长用 Run 的**最后活动时间**近似、只会**低估**——
+    "报警了"可信、"没报警"不等于没挂久；要精确需在进入等待时单独记时间戳（未做）。
+  - **备份 / 恢复**：新增备份模块 + CLI `warden backup` / `warden restore`。
+    SQLite 用标准库的**在线备份 API** 做一致性快照（不推荐 `cp`：可能拷到"半个事务"的中间态），
+    备份后**立刻做完整性校验**；恢复是破坏性操作，所以目标库存在时**默认拒绝、必须显式 `--force`**，
+    且恢复前先校验备份确实是健康的 SQLite 库。**并写了自动化演练测试**：造数据 → 备份 →
+    破坏原库 → 恢复 → 逐项验数据（这才是"备份能用"的可信证据，只测"文件生成了"没有意义）。
+    PostgreSQL 走 `pg_dump` / `pg_restore`（本机没装该客户端，所以**没进代码**，写进了运维手册）。
+  - **运维手册** `docs/operations.md`：巡检清单、告警接法、备份节奏、**恢复操作顺序**、
+    升级 / 回滚步骤（含"新版能读老库、老版读不了新库"的 schema 兼容说明）、多副本检查清单、
+    密钥轮换注意（换凭证密钥会导致存量密文解不开）、以及一张"已知边界"表。
+  - 新增 **24 条测试**：备份恢复 11 条（含恢复演练、不覆盖已有备份、坏备份当场识破、
+    备份期间写入仍一致）、挂起告警 13 条（含阈值边界、拿不到时间戳宁可报出来、归属过滤、
+    CLI 退出码 3、HTTP 端点）。
+  - **仍未做（如实标注）**：挂起时长的精确时间戳、告警规则库、SLO / 错误预算、链路追踪、
+    灰度发布与自动回滚。手册第八节把边界列全了。
+
+- **把两处"如实标注的剩余窗口"也关掉了**（上一轮明确写进文档的两个缺口）：
+  - **Run 锁的 TTL 窗口 → 用后台心跳续租关掉**。锁是租约式的（好处：持有者崩了不必人工解锁），
+    代价是**单次驱动若比 TTL 还长**，租约中途过期、别的副本就能接管——于是又变成并发驱动。
+    新增 `RunLease`（`runtime/locking.py`）：取锁后起一个守护线程，每 **TTL/3** 续一次租；
+    `stop()` 停心跳并释放，幂等。CPU 开销可忽略（默认 600s TTL → 每 200s 一次续租）。
+    - **续租失败会被察觉而不是静默**：`lost` 置真 + 打警告 + 可选回调，并**停止续租**
+      （不假装还持有）——"我们可能已经不是在独占驱动"必须报出来。
+    - 流式路径要用**手动 `start()` / `stop()`**：锁在端点里取（抢不到就地 423），
+      但要活到 SSE 流结束才释放；worker 用 `with` 即可。
+    - 新增 7 条测试，含一条**对照组**（没有心跳时确实会被接管，证明问题真实存在）
+      与一条**端到端**（worker 驱动 0.9s 而 TTL 只有 0.6s，另一个副本全程抢不到）。
+  - **挂起时长从"近似"变"精确"**。此前告警用 Run 的最后活动时间算"等了多久"，
+    若该 run 在等待期间被别的操作碰过就会被刷新、从而**低估**（该报的挂起被漏掉）。
+    现在 `pending_approvals` 增加 `created_at`（进入等待审批那一刻），告警**优先**用它；
+    `WAITING_INTERACTION` 这类没有待审批记录的仍退回近似，并通过 `StuckRun.source`
+    （`approval` / `last_activity` / `unknown`）**如实标明这个数是怎么来的**，
+    CLI 文本与 HTTP 响应都会带上，人不必猜。老库走 `ALTER TABLE ADD COLUMN` 迁移，
+    历史行 `created_at` 为 NULL → 自动退回近似（行为不变）。
+    - 新增 5 条测试 + 1 条真库测试（后者顺带覆盖了"表已存在时补列"的迁移路径）。
+- **CI 加真实 PostgreSQL service**（`.github/workflows/ci.yml`）：起 `postgres:16-alpine`
+  （trust 认证 + `warden` 库 + 健康检查），并用 `WARDEN_TEST_PG_*` 环境变量指过去。
+  这样"存储可换 PostgreSQL"从**声称支持**变成**在 CI 里被验证**——此前 PG 集成测试是被
+  `skipif` 跳过的，等于那段代码从未在自动化环境跑过。
+  ⚠️ **这一条我无法在本地验证**（GitHub Actions 只能在推上去之后才跑）：本地能确认的是
+  "同样的命令在本机真库上跑通"（667 passed / 1 skipped），CI 侧要等 push 后的结果。
+
+### 尚未实现（路线图）
+
+- **真实搜索 provider 仍未实现**：`web.search` 依旧是离线 mock。检索 API（Tavily / Brave /
+  阿里云 IQS 等）都要第三方 key；这次拿到的 DeepSeek key 是**对话模型**的，不提供搜索接口，
+  补不了这一项。接口（`WebSearchProvider`）、URL 策略、出站闸门都已就位，补一个类即可接入。
+- **抓取仍是去标签的粗提取**：没有 Readability 那类正文抽取，也拿不到 JS 渲染的 SPA 页面
+  （需要 headless 浏览器）。
+- **出站配额没有按调用者/按 Run 细分**：当前是进程级（全局 + host + 日配额），
+  没有"每个用户每天最多 N 次"这种维度——多租户下若要按人计量需另加 key 维度。
+
+### 验证
+
+- `pytest` → **654 passed, 1 skipped**（新增 20 + 6 + 12 + 8 + 16 + 9 + 24 条；PG 在跑时）
+- `mypy --strict` → 87 个源文件零错误；`ruff` → 全绿
+- 真实 DeepSeek 端到端实测（chat / 工具调用 / 流式 / SDK 会话恢复）通过，用的是临时环境变量，
+  未写入任何文件
+
+---
+
 ## 2026-09-21（第七批：凭证密文与租约落库）
 
-### 本轮改动（在工作区，尚未 commit）
-
-> ⚠️ 说明：本批与第三～六批的改动目前都还在工作区（`git log` 停在第二批 `e76db3e`）。
-> 下面第三节标注的"已提交"是当时写下时的口吻，实际状态以 `git status` 为准。
+### 已提交（`b69ed78`，与第三～六批合并为一条）
 
 - **凭证的"加密"终于兑现**。此前 `CredentialCipher` 的 AES-GCM 是真的，但加解密的密文与租约
   都活在 `CredentialBroker` 进程内的一个 dict 里——**进程一退凭证就没了**，`register` 过的

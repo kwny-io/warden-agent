@@ -47,6 +47,12 @@ from warden_agent.credential.broker import CredentialBroker, SecretRedactor, def
 from warden_agent.credential.vault import DEPLOYMENT_SCOPE, as_vault
 from warden_agent.model.model import AgentChatModel, Message
 from warden_agent.policy.policy import PolicyEngine
+from warden_agent.runtime.locking import (
+    InProcessRunLock,
+    RunLease,
+    RunLock,
+    new_owner_id,
+)
 from warden_agent.runtime.session import AgentSession, FinalReply, NeedsApproval
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog
@@ -67,6 +73,7 @@ from warden_agent.web.coordination import (
     coordination_for,
 )
 from warden_agent.web.health import HealthResult, liveness, readiness
+from warden_agent.web.outbound import OutboundLimiter
 from warden_agent.web.ratelimit import RateLimiter, client_key
 
 logger = logging.getLogger(__name__)
@@ -417,6 +424,8 @@ def build_app(
     shared_state: bool = False,
     idempotency_store: IdempotencyStore | None = None,
     event_bus: EventBus | None = None,
+    outbound_limiter: OutboundLimiter | None = None,
+    run_lock: RunLock | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
@@ -444,6 +453,7 @@ def build_app(
         web=web,
         mcp_server=mcp_server,
         git_workdir=git_workdir,
+        outbound_limiter=outbound_limiter,
     )
     registry = SessionRegistry(
         model, catalog, policy, store, system_prompt, extra,
@@ -456,6 +466,36 @@ def build_app(
         checkpoint_store=_checkpoint_store_for(store),
     )
     app = FastAPI(title="Warden Agent Python", version=API_VERSION)
+
+    # ---- Run 级锁：同一会话同一时刻只允许一方驱动 ----
+    # 多副本下两个副本同时处理同一个 run 会"后写覆盖前写"（历史分叉或丢失，且不报错）。
+    # 抢不到就回 423，让客户端稍后重试，而不是两边一起写。
+    # 默认进程内锁（单副本行为不变）；多副本由 run_server 传 SqlRunLock。
+    _run_lock: RunLock = run_lock if run_lock is not None else InProcessRunLock()
+
+    def _acquire_run(run_id: str) -> RunLease:
+        """为**本次请求**取 Run 租约；抢不到抛 423。返回的 lease 由调用方 `stop()`。
+
+        为什么返回 `RunLease` 而不是 owner 字符串：租约带**后台心跳续租**，所以"这次请求
+        跑得比锁 TTL 还久"（模型+工具很慢、或 SSE 流很长）不会让租约中途过期被接管。
+        流式路径必须手动 `start()` / `stop()`——锁在端点里取，但要到 SSE 流结束才释放。
+
+        这里用**每请求一个 owner**（而不是"每副本一个"）是刻意的：同一进程内两个并发请求
+        驱动同一个 run，同样属于并发写，也必须被挡住——所以不能复用同一个 owner
+        （同 owner 重复取锁是允许的，那是给重入用的）。
+        """
+        lease = RunLease(_run_lock, run_id, new_owner_id())
+        if not lease.start():
+            holder = _run_lock.owner_of(run_id) or "另一个副本"
+            raise HTTPException(
+                status_code=423,
+                detail=(
+                    f"会话 {run_id} 正在被 {holder} 处理中，请稍后重试"
+                    "（同一会话同一时刻只允许一方驱动，避免并发写互相覆盖）"
+                ),
+            )
+        return lease
+
 
     # ---- 模型切换：傻瓜式接入的模型目录，/models 查询、/models/select 切换/导入 ----
     from warden_agent.model import deepseek as _ds
@@ -733,6 +773,44 @@ def build_app(
         owner = caller.user_id if caller is not None else None
         return _plan_to_dict(plan, owner, _owner_of)
 
+    @app.get("/alerts/stuck")
+    def alerts_stuck(request: Request, older_than_min: float = 60.0) -> dict[str, Any]:
+        """**等待人工处理超时**的 Run —— 给监控/告警用。
+
+        为什么需要它：Run 进入 `WAITING_APPROVAL` 之后不会有任何动静（没有超时、没有重试、
+        没有通知），线上没人盯就一直挂着。这个端点把"挂太久了"变成可被定时抓取的事实：
+        返回非空列表就该有人去看。认证模式下只暴露调用者自己名下的 Run。
+
+        ⚠️ 口径："等了多久"用 Run 的最后活动时间近似（不是"进入等待那一刻"），所以只会**低估**、
+        不会虚报——"报了警"是可信的；"没报警"不等于一定没挂久。
+        """
+        from warden_agent.runtime.alerting import stuck_awaiting_human
+
+        cp_store = _checkpoint_store_for(store)
+        if cp_store is None:
+            raise HTTPException(status_code=501, detail="当前存储不支持存档点")
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        owner = caller.user_id if caller is not None else None
+        stuck = stuck_awaiting_human(
+            store, cp_store, older_than_seconds=older_than_min * 60.0, owner=owner
+        )
+        return {
+            "older_than_min": older_than_min,
+            "count": len(stuck),
+            "runs": [
+                {
+                    "run_id": s.run_id,
+                    "status": s.status,
+                    "waiting_seconds": s.waiting_seconds,
+                    "detail": s.detail,
+                    # 时长算自哪里：approval=精确（进入等待审批的时刻）；
+                    # last_activity=近似（只会低估）；unknown=拿不到
+                    "source": s.source,
+                }
+                for s in stuck
+            ],
+        }
+
     # 首页：返回可视化演示控制台（HTML），让服务"看得见"。
     # T10 起优先返回 React 构建产物（web/dist）；若未构建则回退到旧版静态 index.html。
     _dist_html: str | None = None
@@ -778,40 +856,47 @@ def build_app(
     def chat(
         run_id: str, body: ChatRequestIn, request: Request, user_id: str = "demo-user"
     ) -> ChatResponseOut:
-        sess = registry.get(run_id)
-        if not sess.run.user_id:
-            # 首轮对话建立归属：认证模式下身份来自凭证（user_id 参数被忽略）
-            sess.run.user_id = _identity(request, user_id)
+        lease = _acquire_run(run_id)
         try:
-            outcome = sess.start(body.text)
-        except Exception as e:  # 工具未注册 / 被 DENY 等
-            logger.exception("chat 失败 run=%s", run_id)
-            bus.publish(run_id, {"event": "error", "message": str(e)})
-            raise HTTPException(status_code=400, detail=str(e)) from e
+            sess = registry.get(run_id)
+            if not sess.run.user_id:
+                # 首轮对话建立归属：认证模式下身份来自凭证（user_id 参数被忽略）
+                sess.run.user_id = _identity(request, user_id)
+            try:
+                outcome = sess.start(body.text)
+            except Exception as e:  # 工具未注册 / 被 DENY 等
+                logger.exception("chat 失败 run=%s", run_id)
+                bus.publish(run_id, {"event": "error", "message": str(e)})
+                raise HTTPException(status_code=400, detail=str(e)) from e
 
-        if isinstance(outcome, FinalReply):
-            bus.publish(run_id, {"event": "final", "text": outcome.text})
-            return ChatResponseOut(
-                run_id=run_id,
-                status=sess.status().name,
-                kind="final",
-                text=outcome.text,
-                messages=_serialize_messages(outcome.messages),
-            )
-        if isinstance(outcome, NeedsApproval):
-            bus.publish(run_id, {"event": "needs_approval", "approval": outcome.approval.tool_name})
-            return ChatResponseOut(
-                run_id=run_id,
-                status=sess.status().name,
-                kind="needs_approval",
-                approval={
-                    "approval_id": outcome.approval.approval_id,
-                    "tool_name": outcome.approval.tool_name,
-                    "arguments": outcome.approval.arguments,
-                    "reason": outcome.approval.reason,
-                },
-            )
-        raise HTTPException(status_code=500, detail="未知结果类型")
+            if isinstance(outcome, FinalReply):
+                bus.publish(run_id, {"event": "final", "text": outcome.text})
+                return ChatResponseOut(
+                    run_id=run_id,
+                    status=sess.status().name,
+                    kind="final",
+                    text=outcome.text,
+                    messages=_serialize_messages(outcome.messages),
+                )
+            if isinstance(outcome, NeedsApproval):
+                bus.publish(
+                    run_id,
+                    {"event": "needs_approval", "approval": outcome.approval.tool_name},
+                )
+                return ChatResponseOut(
+                    run_id=run_id,
+                    status=sess.status().name,
+                    kind="needs_approval",
+                    approval={
+                        "approval_id": outcome.approval.approval_id,
+                        "tool_name": outcome.approval.tool_name,
+                        "arguments": outcome.approval.arguments,
+                        "reason": outcome.approval.reason,
+                    },
+                )
+            raise HTTPException(status_code=500, detail="未知结果类型")
+        finally:
+            lease.stop()
 
     @app.get("/status/{run_id}")
     def status(run_id: str) -> dict[str, Any]:
@@ -926,52 +1011,44 @@ def build_app(
 
     @app.post("/approve/{run_id}")
     def approve(run_id: str) -> ChatResponseOut:
-        sess = registry.get(run_id)
-        pending = sess.pending_approval()
-        if pending is None:
-            raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
-        m_approvals.inc(labels=("approve",))
-        outcome = sess.approve()
-        store.record_approval_decision(
-            run_id, pending.approval_id, pending.tool_name,
-            pending.arguments, "approved",
-        )
-        if isinstance(outcome, FinalReply):
-            bus.publish(run_id, {"event": "final", "text": outcome.text})
-            return ChatResponseOut(
-                run_id=run_id,
-                status=sess.status().name,
-                kind="final",
-                text=outcome.text,
-                messages=_serialize_messages(outcome.messages),
+        lease = _acquire_run(run_id)
+        try:
+            sess = registry.get(run_id)
+            pending = sess.pending_approval()
+            if pending is None:
+                raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
+            m_approvals.inc(labels=("approve",))
+            outcome = sess.approve()
+            store.record_approval_decision(
+                run_id, pending.approval_id, pending.tool_name,
+                pending.arguments, "approved",
             )
-        if isinstance(outcome, NeedsApproval):
-            # 审批一个后又遇到下一个审批
-            return ChatResponseOut(
-                run_id=run_id,
-                status=sess.status().name,
-                kind="needs_approval",
-                approval={
-                    "approval_id": outcome.approval.approval_id,
-                    "tool_name": outcome.approval.tool_name,
-                    "arguments": outcome.approval.arguments,
-                    "reason": outcome.approval.reason,
-                },
-            )
-        raise HTTPException(status_code=500, detail="未知结果类型")
+            return _outcome_response(run_id, sess, outcome)
+        finally:
+            lease.stop()
 
     @app.post("/reject/{run_id}")
     def reject(run_id: str) -> ChatResponseOut:
-        sess = registry.get(run_id)
-        pending = sess.pending_approval()
-        if pending is None:
-            raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
-        m_approvals.inc(labels=("reject",))
-        outcome = sess.reject()
-        store.record_approval_decision(
-            run_id, pending.approval_id, pending.tool_name,
-            pending.arguments, "rejected",
-        )
+        lease = _acquire_run(run_id)
+        try:
+            sess = registry.get(run_id)
+            pending = sess.pending_approval()
+            if pending is None:
+                raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
+            m_approvals.inc(labels=("reject",))
+            outcome = sess.reject()
+            store.record_approval_decision(
+                run_id, pending.approval_id, pending.tool_name,
+                pending.arguments, "rejected",
+            )
+            return _outcome_response(run_id, sess, outcome)
+        finally:
+            lease.stop()
+
+    def _outcome_response(
+        run_id: str, sess: AgentSession, outcome: FinalReply | NeedsApproval
+    ) -> ChatResponseOut:
+        """把会话结果（最终回答 / 又遇到审批）转成响应。approve 与 reject 共用。"""
         if isinstance(outcome, FinalReply):
             bus.publish(run_id, {"event": "final", "text": outcome.text})
             return ChatResponseOut(
@@ -1001,6 +1078,10 @@ def build_app(
     ) -> StreamingResponse:
         """流式对话（SSE 打字机）：模型边生成边把增量推给前端。
         前端拿到增量直接渲染，就能看到"逐字打出"的效果。"""
+        # 流式用**手动 start/stop** 的租约：锁在端点里取（抢不到就地 423），
+        # 但必须活到 SSE 流结束——所以释放放在生成器的 finally 里，而不是端点作用域。
+        # 租约自带心跳续租，所以"流很久"也不会中途过期被接管。
+        lease = _acquire_run(run_id)
         sess = registry.get(run_id)
         if not sess.run.user_id:
             sess.run.user_id = user_id  # 首次对话的会话归属当前用户
@@ -1014,6 +1095,10 @@ def build_app(
                 logger.exception("流式 chat 失败 run=%s", run_id)
                 err = {"type": "error", "message": str(e)}
                 yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+            finally:
+                # 流结束（含客户端断开触发 GeneratorExit）才释放：
+                # 整段流式期间都在驱动这个 run，提前释放等于开门让人并发写。
+                lease.stop()
 
         # 关键响应头：no-cache 防止代理缓冲；X-Accel-Buffering 关掉 nginx 缓冲，
         # 否则增量会被攒住不实时发出（部署必配）。
@@ -1072,6 +1157,8 @@ def build_app(
                 # RAG：报出嵌入器名，避免"词频嵌入被当成语义检索"
                 "knowledge_embedder": registry.extra.get("knowledge_embedder"),
                 "knowledge_sources": len(knowledge_sources) if knowledge_sources else 0,
+                # Run 锁用的是哪种实现：进程内锁在多副本下等于没锁，运维必须能一眼看到
+                "run_lock": type(_run_lock).__name__,
             },
         }
 

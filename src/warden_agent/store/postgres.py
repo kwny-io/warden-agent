@@ -48,9 +48,20 @@ class PostgresStore:
         import psycopg
 
         self._psycopg = psycopg
+        # autocommit=True 是刻意的，有两个原因（都是 Postgres 与 SQLite 的行为差异）：
+        #  1) **避免"毒丸连接"**：Postgres 里事务内任一语句报错后，整个事务进入 aborted 状态，
+        #     此后**所有**语句（包括读、甚至健康探针）都会失败，直到有人 rollback。
+        #     本项目此前没有任何 rollback()，一次坏写就能把这条连接废掉、且不会自愈。
+        #     SQLite 没有这个语义（错的只是那一条语句），所以这个坑只在 Postgres 上暴露。
+        #  2) 读操作不再长期占着 idle-in-transaction（长连接下的常见运维问题）。
+        # 需要原子性的多语句写入，用 `with self.conn.transaction():` 显式开事务块
+        # （psycopg3 在 autocommit 模式下也支持），见 delete_run / append_message。
+        # 注：各写方法末尾原本的 `self.conn.commit()` 在 autocommit 下是无害的空操作，
+        # 保留它不影响语义（单语句写入已经即时提交）。
         self.conn = psycopg.connect(
             host=host, port=port, dbname=dbname,
             user=user, password=password, connect_timeout=connect_timeout,
+            autocommit=True,
         )
         self._init_schema()
 
@@ -77,9 +88,14 @@ class PostgresStore:
                     approval_id TEXT NOT NULL,
                     tool_name   TEXT NOT NULL,
                     arguments   TEXT NOT NULL,
-                    reason      TEXT NOT NULL
+                    reason      TEXT NOT NULL,
+                    -- 进入"等待审批"的时刻：告警算"等了多久"要准确，不能靠 run 的最后活动时间近似
+                    created_at  TEXT
                 )
             """)
+            cur.execute(
+                "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS created_at TEXT"
+            )
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS approval_history (
                     id          SERIAL PRIMARY KEY,
@@ -162,6 +178,16 @@ class PostgresStore:
                 "CREATE INDEX IF NOT EXISTS idx_credential_leases_expiry "
                 "ON credential_leases (scope, expires_at)"
             )
+            # Run 级锁（租约式）：多副本下防止同一个 run 被两个副本同时驱动。
+            # 带 expires_at：持有者崩了无需人工解锁，租约到期即可被接管。
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS run_locks (
+                    run_id      TEXT PRIMARY KEY,
+                    owner       TEXT NOT NULL,
+                    acquired_at DOUBLE PRECISION NOT NULL,
+                    expires_at  DOUBLE PRECISION NOT NULL
+                )
+            """)
         self.conn.commit()
 
     # ---- Run 状态 ----
@@ -186,14 +212,17 @@ class PostgresStore:
         return run
 
     def delete_run(self, run_id: str) -> None:
-        """删除整个会话：对话、待审批、checkpoint、事件、状态一并清掉（与 SqliteStore 一致）。"""
-        with self.conn.cursor() as cur:
+        """删除整个会话：对话、待审批、checkpoint、事件、状态一并清掉（与 SqliteStore 一致）。
+
+        五条 DELETE 必须**同生共死**，所以显式开事务块（autocommit 模式下 `transaction()`
+        会真的发 BEGIN/COMMIT）。中途失败则整体回滚，不会留下删了一半的会话。
+        """
+        with self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute("DELETE FROM messages WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM pending_approvals WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM checkpoints WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM run_events WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
-        self.conn.commit()
 
     def record_approval_decision(
         self,
@@ -303,7 +332,9 @@ class PostgresStore:
             json.dumps(message.tool_call.to_dict())
             if message.tool_call else None
         )
-        with self.conn.cursor() as cur:
+        # "查重 + 插入"是一对读改写，放进同一个事务块里（autocommit 模式下显式 BEGIN/COMMIT），
+        # 否则查完与写之间可能被别的写入插进来，查重的意义就打折了。
+        with self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM messages "
                 "WHERE run_id = %s AND role = %s AND content = %s "
@@ -350,14 +381,29 @@ class PostgresStore:
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO pending_approvals "
-                "(run_id, approval_id, tool_name, arguments, reason) "
-                "VALUES (%s, %s, %s, %s, %s) "
+                "(run_id, approval_id, tool_name, arguments, reason, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (run_id) DO UPDATE SET "
                 "approval_id = EXCLUDED.approval_id, tool_name = EXCLUDED.tool_name, "
-                "arguments = EXCLUDED.arguments, reason = EXCLUDED.reason",
-                (run_id, approval_id, tool_name, json.dumps(arguments), reason),
+                "arguments = EXCLUDED.arguments, reason = EXCLUDED.reason, "
+                "created_at = EXCLUDED.created_at",
+                (
+                    run_id, approval_id, tool_name,
+                    json.dumps(arguments), reason, _now_iso(),
+                ),
             )
         self.conn.commit()
+
+    def pending_approval_created_at(self, run_id: str) -> str | None:
+        """该 run 进入"等待审批"的时刻（ISO 字符串）；没有待审批或老数据没记则 None。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT created_at FROM pending_approvals WHERE run_id = %s", (run_id,)
+            )
+            row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])
 
     def load_pending_approval(
         self, run_id: str
@@ -485,6 +531,69 @@ class PostgresStore:
 
     def close(self) -> None:
         self.conn.close()
+
+    # ---- Run 级锁（租约式；RunLockStore 协议，见 runtime/locking.py）----
+    #
+    # 取锁是**单条原子语句**：`ON CONFLICT ... DO UPDATE ... WHERE expires_at <= now`
+    # —— 键存在且租约未过期时不更新（抢不到）；已过期则被接管。语句本身原子，
+    # 所以并发抢同一把锁只有一方能拿到；随后读回来核对 (owner, expires_at) 确认归属。
+    # 注：autocommit 模式下「UPSERT + 读回」是两条语句，但不存在竞态——我们写入的
+    # expires_at 在未来，别人只有在其过期后（即 <= now）才可能接管。
+    def acquire_run_lock(
+        self, run_id: str, owner: str, expires_at: float, now: float
+    ) -> bool:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO run_locks (run_id, owner, acquired_at, expires_at) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (run_id) DO UPDATE SET "
+                "  owner = EXCLUDED.owner, "
+                "  acquired_at = EXCLUDED.acquired_at, "
+                "  expires_at = EXCLUDED.expires_at "
+                "WHERE run_locks.expires_at <= %s",
+                (run_id, owner, now, expires_at, now),
+            )
+            cur.execute(
+                "SELECT owner, expires_at FROM run_locks WHERE run_id = %s", (run_id,)
+            )
+            row = cur.fetchone()
+        if row is None:
+            return False
+        return str(row[0]) == owner and float(row[1]) == expires_at
+
+    def renew_run_lock(
+        self, run_id: str, owner: str, expires_at: float, now: float
+    ) -> bool:
+        """续租：只有**当前持有者且未过期**才能续（避免续到别人的锁上）。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE run_locks SET expires_at = %s "
+                "WHERE run_id = %s AND owner = %s AND expires_at > %s",
+                (expires_at, run_id, owner, now),
+            )
+            changed = cur.rowcount
+        return int(changed or 0) > 0
+
+    def release_run_lock(self, run_id: str, owner: str) -> None:
+        """释放：只删自己的锁（owner 不匹配时不动，防止误删他人的锁）。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM run_locks WHERE run_id = %s AND owner = %s", (run_id, owner)
+            )
+
+    def run_lock_owner(self, run_id: str, now: float) -> str | None:
+        """当前持有者（已过期视为无人持有，并顺手清掉那行）。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT owner, expires_at FROM run_locks WHERE run_id = %s", (run_id,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            if float(row[1]) <= now:
+                cur.execute("DELETE FROM run_locks WHERE run_id = %s", (run_id,))
+                return None
+            return str(row[0])
 
     # ---- 凭证保管库（CredentialVault 协议，见 credential/vault.py）----
     def save_credential(self, credential: StoredCredential) -> None:

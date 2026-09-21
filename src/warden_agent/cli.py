@@ -10,9 +10,17 @@
   warden caps                       列出能力（GET /capabilities）
   warden coding "<需求>"             本地编码任务（读代码 → 出 diff → 门禁落地）
   warden recover                    本地读存档点，输出跨 Run 恢复计划（只判断不执行）
+  warden backup [dest]              做一份一致性备份（SQLite 在线备份 API）
+  warden restore <backup> [--force] 从备份恢复（破坏性，会覆盖目标库）
+  warden stuck [--older-than-min N] 列出等待人工处理超时的 run（接告警用，有则退出码 3）
 
-默认连 http://127.0.0.1:8000；可用环境变量 WARDEN_BASE_URL 覆盖。
+默认连 http://127.0.0.1:8000；可用环境变量 `WARDEN_SERVER_URL` 覆盖要连的**服务地址**。
 需要先启动服务：  py -m warden_agent.web.run_server
+
+⚠️ 为什么这里用 `WARDEN_SERVER_URL` 而不是 `WARDEN_BASE_URL`：
+  后者已经被 **custom 模型**占用（`model/deepseek.py` 拿它当 OpenAI 兼容端点）。
+  两者曾经同名 → 配了自建模型网关之后，`warden chat` 会把请求发到那个**模型网关**上去。
+  现在彻底分开：`WARDEN_SERVER_URL` = CLI 要连的 Warden 服务；`WARDEN_BASE_URL` = 模型端点。
 """
 
 from __future__ import annotations
@@ -20,11 +28,23 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
 
-DEFAULT_BASE = os.environ.get("WARDEN_BASE_URL", "http://127.0.0.1:8000")
+
+def default_base_url(env: Mapping[str, str] | None = None) -> str:
+    """CLI 要连的 Warden 服务地址。`WARDEN_SERVER_URL` 可覆盖。
+
+    刻意**不**读 `WARDEN_BASE_URL`——那是模型端点（custom provider）；
+    混用的后果是 CLI 把请求发到模型网关上去。
+    """
+    src: Mapping[str, str] = env if env is not None else os.environ
+    return src.get("WARDEN_SERVER_URL") or "http://127.0.0.1:8000"
+
+
+DEFAULT_BASE = default_base_url()
 
 
 def _client() -> httpx.Client:
@@ -226,15 +246,82 @@ def _cmd_recover(args: argparse.Namespace) -> None:
     print("\n（以上只是计划；真正续跑请加 --apply）")
 
 
+def _cmd_backup(args: argparse.Namespace) -> None:
+    """做一份一致性备份（SQLite 在线备份 API，不需要停服务）。"""
+    from warden_agent.runtime.backup import BackupError, backup_sqlite
+
+    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    try:
+        info = backup_sqlite(db, args.dest or None)
+    except BackupError as e:
+        _die(str(e))
+    print(f"备份完成：{info['backup']}")
+    print(f"  源库：{info['source']}")
+    print(f"  大小：{info['bytes']} 字节｜校验：{info['verified']}")
+
+
+def _cmd_restore(args: argparse.Namespace) -> None:
+    """从备份恢复。目标库已存在时必须显式 --force（恢复是破坏性操作）。"""
+    from warden_agent.runtime.backup import BackupError, restore_sqlite
+
+    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    try:
+        info = restore_sqlite(args.backup, db, overwrite=args.force)
+    except BackupError as e:
+        _die(str(e))
+    print(f"恢复完成：{info['backup']} → {info['restored_to']}")
+    print(f"  大小：{info['bytes']} 字节｜校验：{info['verified']}")
+    print("  ⚠️ 请确认该库当前没有别的进程在用（服务应已停止）")
+
+
+def _cmd_stuck(args: argparse.Namespace) -> None:
+    """列出"等待人工处理超时"的 run —— 可直接接 cron 告警（有输出就该有人看）。"""
+    import json
+
+    from warden_agent.runtime.alerting import describe_stuck, stuck_awaiting_human
+    from warden_agent.runtime.checkpoint import checkpoint_store_for
+    from warden_agent.store.sqlite import SqliteStore
+
+    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    try:
+        store = SqliteStore(db)
+    except Exception as e:  # 打不开库
+        _die(f"无法打开存档库 {db}: {e}")
+    cp_store = checkpoint_store_for(store)
+    assert cp_store is not None
+
+    runs = stuck_awaiting_human(
+        store, cp_store,
+        older_than_seconds=args.older_than_min * 60.0,
+        owner=args.owner or None,
+    )
+    if args.json:
+        print(json.dumps(
+            [{"run_id": r.run_id, "status": r.status,
+              "waiting_seconds": r.waiting_seconds, "detail": r.detail} for r in runs],
+            ensure_ascii=False, indent=2,
+        ))
+    else:
+        print(describe_stuck(runs))
+    # 有需要人工处理的就返回非 0，便于 cron/监控用退出码判断
+    if runs:
+        raise SystemExit(3)
+
+
 def _apply_recovery(
     store: Any, cp_store: Any, controller: Any, args: argparse.Namespace
 ) -> None:
     """`recover --apply`：用默认装配真正执行一轮恢复，并打印每个 run 的处置。"""
     from warden_agent.agent import build_agent
+    from warden_agent.core.settings import env_flag
+    from warden_agent.runtime.locking import run_lock_for
     from warden_agent.runtime.worker import RecoveryWorker
 
+    # Run 级锁：多副本下同一个 run 可能同时出现在两边的恢复计划里，没有闸门就会
+    # 两边一起写、后写覆盖前写。开了 WARDEN_SHARED_STATE 就用存储里的共享锁。
+    lock = run_lock_for(store, shared=env_flag(os.environ.get("WARDEN_SHARED_STATE")))
     agent = build_agent(store=store)
-    worker = RecoveryWorker(controller, agent.session_factory)
+    worker = RecoveryWorker(controller, agent.session_factory, lock=lock)
     actions = worker.run_once()
     if not actions:
         print("没有需要处理的 run。")
@@ -288,6 +375,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="真正执行一轮恢复（默认只打印计划；用默认模型/工具装配，见命令文档）",
     )
     p_recover.set_defaults(func=_cmd_recover)
+
+    p_backup = sub.add_parser("backup", help="做一份一致性备份（不需要停服务）")
+    p_backup.add_argument(
+        "dest", nargs="?", default="", help="备份文件路径（默认带时间戳自动命名）"
+    )
+    p_backup.add_argument("--db", default="", help="源库路径（默认取 WARDEN_DB_PATH）")
+    p_backup.set_defaults(func=_cmd_backup)
+
+    p_restore = sub.add_parser("restore", help="从备份恢复（破坏性：会覆盖目标库）")
+    p_restore.add_argument("backup", help="备份文件路径")
+    p_restore.add_argument("--db", default="", help="目标库路径（默认取 WARDEN_DB_PATH）")
+    p_restore.add_argument("--force", action="store_true", help="目标库已存在时确认覆盖")
+    p_restore.set_defaults(func=_cmd_restore)
+
+    p_stuck = sub.add_parser("stuck", help="列出等待人工处理超时的 run（接告警用）")
+    p_stuck.add_argument(
+        "--older-than-min", type=float, default=60.0, help="超过多少分钟算超时（默认 60）"
+    )
+    p_stuck.add_argument("--owner", default="", help="只看某个用户的 run（默认全部）")
+    p_stuck.add_argument("--db", default="", help="存档库路径（默认取 WARDEN_DB_PATH）")
+    p_stuck.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p_stuck.set_defaults(func=_cmd_stuck)
     return p
 
 

@@ -29,6 +29,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from warden_agent.tool.catalog import ToolSpec, function_tool
+from warden_agent.web.outbound import OutboundLimiter
 
 
 # ---- 结果模型 ----
@@ -59,6 +60,9 @@ class WebFetchProvider(Protocol):
 # ---- 内置：本地模拟 provider（离线可测）----
 class LocalMockSearchProvider:
     """本地模拟搜索：命中本地"知识库"里的条目，不联网、确定、可测。"""
+
+    # 不联网 → 不占用出站配额（真实 provider 必须置 True，与 LocalMockFetchProvider 同理）
+    requires_network = False
 
     def __init__(self, entries: list[WebSearchResult] | None = None) -> None:
         self._entries = list(entries or [])
@@ -388,19 +392,26 @@ def make_web_tools(
     fetch_provider: WebFetchProvider | None = None,
     url_policy: WebUrlPolicy | None = None,
     names: tuple[str, str] = ("web.search", "web.fetch"),
+    outbound: OutboundLimiter | None = None,
 ) -> list[ToolSpec]:
     """造 web.search / web.fetch 两张技能卡。
 
     - search_provider / fetch_provider：可传真实 provider（Tavily/Brave）；None 用本地模拟。
     - url_policy：URL 访问策略，默认只放 http/https 且拒绝内网地址。
+    - outbound：出站限速/配额闸门（见 `web/outbound.py`）。**默认开启**，参数偏保守：
+      单次请求的超时/体积上限只界定"一次"，不界定"多少次"——总量无界这口子没有理由默认敞着。
+      离线 provider（`requires_network = False`）不占用配额，所以演示与测试不受影响。
 
     安全：发请求前会做 DNS 解析校验（`check_for_network`），**默认即开启**；
     只有明确声明 `requires_network = False` 的纯离线 provider（如内置 mock）
     才走静态检查。默认严格是为了"新接入的 provider 天然安全"，不依赖作者记得声明。
+
+    顺序：**URL 策略先于出站闸门**——被策略拒绝的 URL 不该消耗配额（拒绝不是"发出去了"）。
     """
     search: WebSearchProvider = search_provider or LocalMockSearchProvider()
     fetch: WebFetchProvider = fetch_provider or LocalMockFetchProvider()
     policy = url_policy or WebUrlPolicy()
+    limiter = outbound or OutboundLimiter()
     search_name, fetch_name = names
 
     @function_tool(
@@ -412,7 +423,13 @@ def make_web_tools(
         pure=True,
     )
     def search_tool(query: str) -> str:
-        results = search.search(query)
+        if getattr(search, "requires_network", True):
+            with limiter.guard(f"search:{type(search).__name__}") as decision:
+                if decision.denied:
+                    return f"[限流] {decision.reason}"
+                results = search.search(query)
+        else:
+            results = search.search(query)
         if not results:
             return "没有搜到相关结果。"
         return "\n".join(
@@ -430,15 +447,28 @@ def make_web_tools(
     def fetch_tool(url: str) -> str:
         # 默认走严格路径（含 DNS 解析校验）；只有显式声明离线的 provider 才跳过。
         # 默认严格 = 新接入的 provider 天然安全，不靠作者记得声明。
-        if getattr(fetch, "requires_network", True):
+        online = bool(getattr(fetch, "requires_network", True))
+        if online:
             ok, reason = policy.check_for_network(url)
         else:
             ok, reason = policy.check(url)
         if not ok:
             return f"[拒绝] {reason}"
-        result = fetch.fetch(url)
+        if online:
+            # 策略已过，这时才占用出站配额（按 host 分桶，对单个站点保持礼貌）
+            with limiter.guard(_host_of(url)) as decision:
+                if decision.denied:
+                    return f"[限流] {decision.reason}"
+                result = fetch.fetch(url)
+        else:
+            result = fetch.fetch(url)
         if result.error:
             return f"[抓取失败] {result.error}"
         return result.content
 
     return [search_tool, fetch_tool]
+
+
+def _host_of(url: str) -> str:
+    """取 URL 的 host，作为出站限速的分桶键（取不到就归到 unknown）。"""
+    return (urlparse(url).hostname or "unknown").lower()

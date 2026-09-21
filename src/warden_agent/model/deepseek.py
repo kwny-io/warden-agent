@@ -403,28 +403,47 @@ def create_model(provider: str, api_key: str | None = None, **kwargs: Any) -> Op
     provider 支持 deepseek / openai / zhipu / bailian / custom。
       - 内置四家：各自绑定 base_url 和默认 model，key 从对应环境变量读。
       - custom：通用接入任意 OpenAI 兼容 API。全部从环境变量读（零改源码）：
-          WARDEN_API_KEY    -> API Key
-          WARDEN_BASE_URL   -> 兼容端点（如自建网关 / Ollama / 硅基流动）
-          WARDEN_MODEL      -> 模型名
-        也支持直接在 create_model 传 base_url / model 覆盖。
+          WARDEN_MODEL_API_KEY -> API Key
+          WARDEN_BASE_URL      -> 兼容端点（如自建网关 / Ollama / 硅基流动）
+          WARDEN_MODEL         -> 模型名
+        也支持直接在 create_model 传 base_url / model / api_key 覆盖。
+
+    为什么 custom 用的是 `WARDEN_MODEL_API_KEY` 而不是 `WARDEN_API_KEY`：
+      后者是 **HTTP 服务的鉴权密钥**（`web/run_server.py` 用它做 Bearer 认证）。
+      两者同名会造成一个很难发现的坑——用 `WARDEN_API_KEY` 开鉴权、又用 custom 接自建网关时，
+      模型会把你**服务端的鉴权密钥**当成模型 key 发给那个网关。所以这两个用途彻底分开。
+
+    另一个刻意的设计：custom **不会**回落到 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`。
+      否则"我把 custom 指向了某个第三方网关，却忘了配 key"会变成
+      **把你的 DeepSeek key 发给那个第三方**——密钥外泄。custom 的 key 必须显式配置。
 
     用法：
         model = create_model("zhipu")          # 读 ZHIPU_API_KEY
         model = create_model("deepseek")       # 读 DEEPSEEK_API_KEY
-        model = create_model("custom")         # 读 WARDEN_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL
+        model = create_model("custom")  # 读 WARDEN_MODEL_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL
     """
     if provider == "custom":
         import os
-        key = api_key or os.environ.get("WARDEN_API_KEY")
+        key = api_key or os.environ.get("WARDEN_MODEL_API_KEY")
         base_url = kwargs.pop("base_url", os.environ.get("WARDEN_BASE_URL"))
         model = kwargs.pop("model",
                            os.environ.get("WARDEN_MODEL") or DEFAULT_DEEPSEEK_MODEL)
         if not base_url:
             raise ModelCallError(
                 "custom 接入需要 WARDEN_BASE_URL（OpenAI 兼容端点）。"
-                "可在 .env 里设 WARDEN_BASE_URL + WARDEN_MODEL + WARDEN_API_KEY，"
+                "可在 .env 里设 WARDEN_BASE_URL + WARDEN_MODEL + WARDEN_MODEL_API_KEY，"
                 "或用 create_model('custom', base_url=..., model=..., api_key=...)。"
             )
+        if not key:
+            raise ModelCallError(
+                "custom 接入需要密钥：请设 WARDEN_MODEL_API_KEY，"
+                "或 create_model('custom', api_key=...)。\n"
+                "  · 注意是 WARDEN_MODEL_API_KEY，**不是** WARDEN_API_KEY"
+                "（后者是 HTTP 服务的鉴权密钥，两者用途不同）。\n"
+                "  · 本机网关 / Ollama 这类不校验密钥的端点：填任意非空占位串，"
+                "例如 WARDEN_MODEL_API_KEY=not-needed。"
+            )
+        # key 显式传入 → 基类不会再去回落 OPENAI_API_KEY/DEEPSEEK_API_KEY（防密钥外泄到第三方）
         return OpenAiCompatibleModel(api_key=key, model=model, base_url=base_url, **kwargs)
     try:
         cls = _PROVIDERS[provider]

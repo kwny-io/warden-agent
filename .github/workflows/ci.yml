@@ -8,18 +8,41 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    # 起一个真实 PostgreSQL：让"存储可换 PostgreSQL"从**声称支持**变成**在 CI 里被验证**。
+    # 此前 PG 集成测试是 skipif 跳过的、CI 里也没有库 —— 等于那段代码从未在自动化环境跑过。
+    # 用 trust 认证免密，与本仓库测试的连接约定（用户 postgres、空密码、库 warden）一致。
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: warden
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      WARDEN_TEST_PG_HOST: localhost
+      WARDEN_TEST_PG_DB: warden
+      WARDEN_TEST_PG_USER: postgres
+      WARDEN_TEST_PG_PASSWORD: ""
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # 用 uv 按 uv.lock 安装：**依赖版本可复现**。
+      # `--frozen` 禁止重新解析 —— lock 与 pyproject 不一致时 CI 直接失败，
+      # 而不是"悄悄装到别的版本上，本地过、CI 挂"。
+      - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          enable-cache: true
+      - name: Install (按 uv.lock 固定版本)
+        run: uv sync --frozen --extra dev
       - name: Ruff (lint)
-        run: ruff check src tests
+        run: uv run --frozen ruff check src tests
       - name: Mypy (strict)
-        run: mypy src/warden_agent
+        run: uv run --frozen mypy src/warden_agent
       - name: Pytest
-        run: python -m pytest -q --tb=short -p no:cacheprovider
+        run: uv run --frozen pytest --tb=short -p no:cacheprovider

@@ -295,6 +295,7 @@ def augment_catalog(
     memory_scope: Any = None,
     sandbox: bool = False,
     sandbox_spec: SandboxSpec | None = None,
+    outbound_limiter: Any = None,
 ) -> Any:
     """把 Memory / RAG / Skill / Web / MCP 的能力工具注册进目录（可复用给 HTTP 层）。
 
@@ -346,7 +347,7 @@ def augment_catalog(
         from warden_agent.web import make_web_tools
 
         search_provider, fetch_provider = web_providers or (None, None)
-        for spec in make_web_tools(search_provider, fetch_provider):
+        for spec in make_web_tools(search_provider, fetch_provider, outbound=outbound_limiter):
             catalog.register(spec)
         extra["web_fetch"] = (
             type(fetch_provider).__name__
@@ -422,6 +423,7 @@ def build_agent(
     planner: Any = None,
     intent: Any = None,
     max_context_chars: int = 0,
+    outbound_limiter: Any = None,
 ) -> Agent:
     """一键装配一个 Agent：模型 + 工具 + 策略 + 存储 +（可选）能力。
 
@@ -440,6 +442,9 @@ def build_agent(
       web_providers  (搜索 provider, 抓取 provider) 二元组；传了即启用 web 工具族。
                      不传（配合 web=True）= 内置离线 mock。真实联网抓取见
                      web/search.py 的 HttpFetchProvider 与 providers_from_env()。
+      outbound_limiter  出站限速/配额闸门（web/outbound.py 的 OutboundLimiter）。
+                     不传 = 用默认保守参数（全局 120/60s、单 host 20/60s、并发 8）。
+                     传 None 之外的实例可自定义；离线 provider 不占用配额。
       skills         dict{alias: SKILL.md} 或 目录路径 → 加载技能系统。
       web            True=启用 web.search / web.fetch。
       mcp_server     MCP server 启动命令（有 node 则导入其工具）。
@@ -469,6 +474,7 @@ def build_agent(
         skills=skills, web=web,
         mcp_server=mcp_server, git_workdir=git_workdir,
         sandbox=sandbox, sandbox_spec=sandbox_spec,
+        outbound_limiter=outbound_limiter,
     )
 
     # 策略与存储

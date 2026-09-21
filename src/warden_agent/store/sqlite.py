@@ -81,7 +81,10 @@ class SqliteStore:
                 approval_id TEXT NOT NULL,
                 tool_name   TEXT NOT NULL,
                 arguments   TEXT NOT NULL,   -- JSON
-                reason      TEXT NOT NULL
+                reason      TEXT NOT NULL,
+                -- 进入"等待审批"的时刻：告警要算"等了多久"。用 run 的最后活动时间
+                -- 近似会被后续操作刷新、从而**低估**等待时长，所以单独记一个。
+                created_at  TEXT
             );
             CREATE TABLE IF NOT EXISTS checkpoints (
                 run_id  TEXT PRIMARY KEY,
@@ -141,6 +144,15 @@ class SqliteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_credential_leases_expiry
                 ON credential_leases (scope, expires_at);
+            -- Run 级锁（租约式）：多副本下防止同一个 run 被两个副本同时驱动。
+            -- 带 expires_at 是刻意的：持有者崩了不需要人工解锁，租约到期即可被接管。
+            -- 只有针对 run_id 的原子 UPSERT 才算数（见 acquire_run_lock）。
+            CREATE TABLE IF NOT EXISTS run_locks (
+                run_id      TEXT PRIMARY KEY,
+                owner       TEXT NOT NULL,
+                acquired_at REAL NOT NULL,
+                expires_at  REAL NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -170,6 +182,16 @@ class SqliteStore:
             self.conn.execute("ALTER TABLE runs ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
             self.conn.execute(
                 "UPDATE runs SET user_id = 'demo-user' WHERE user_id = ''"
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+        # v4：pending_approvals 表加 created_at，记"进入等待审批的时刻"——
+        # 供挂起超时告警算准确时长（用 run 的最后活动时间近似会低估）。
+        # 老库补列后历史行为 NULL → 告警侧退回用最后活动时间近似（只会低估，不会虚报）。
+        try:
+            self.conn.execute(
+                "ALTER TABLE pending_approvals ADD COLUMN created_at TEXT"
             )
             self.conn.commit()
         except sqlite3.OperationalError:
@@ -395,14 +417,31 @@ class SqliteStore:
         with self._lock:
             self.conn.execute(
                 "INSERT INTO pending_approvals "
-                "(run_id, approval_id, tool_name, arguments, reason) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "(run_id, approval_id, tool_name, arguments, reason, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET "
                 "approval_id=excluded.approval_id, tool_name=excluded.tool_name, "
-                "arguments=excluded.arguments, reason=excluded.reason",
-                (run_id, approval_id, tool_name, f"v{ver}:{encoded_args}", reason),
+                "arguments=excluded.arguments, reason=excluded.reason, "
+                "created_at=excluded.created_at",
+                (
+                    run_id, approval_id, tool_name,
+                    f"v{ver}:{encoded_args}", reason, _now_iso(),
+                ),
             )
             self.conn.commit()
+
+    def pending_approval_created_at(self, run_id: str) -> str | None:
+        """该 run 进入"等待审批"的时刻（ISO 字符串）；没有待审批或老数据没记则返回 None。
+
+        给"挂起超时告警"用：比拿 run 的最后活动时间来近似更准——后者会被等待期间的
+        任何一次操作刷新，从而**低估**等待时长。
+        """
+        row = self.conn.execute(
+            "SELECT created_at FROM pending_approvals WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])
 
     def load_pending_approval(self, run_id: str) -> tuple[str, str, dict[str, object], str] | None:
         """读回某 run 待审批的一步；没有返回 None。"""
@@ -647,6 +686,68 @@ class SqliteStore:
             )
             self.conn.commit()
             return int(cur.rowcount or 0)
+
+    # ---- Run 级锁（租约式；RunLockStore 协议，见 runtime/locking.py）----
+    #
+    # 取锁是**单条原子语句**：`ON CONFLICT ... DO UPDATE ... WHERE expires_at <= now`
+    # —— 键已存在且租约未过期时不更新（等于抢不到）；已过期则被接管。这条语句本身是原子的，
+    # 所以多进程/多副本并发抢同一把锁时，只有一方能拿到（再读回来核对 owner 即可确认）。
+    def acquire_run_lock(
+        self, run_id: str, owner: str, expires_at: float, now: float
+    ) -> bool:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO run_locks (run_id, owner, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO UPDATE SET "
+                "  owner = excluded.owner, "
+                "  acquired_at = excluded.acquired_at, "
+                "  expires_at = excluded.expires_at "
+                "WHERE run_locks.expires_at <= ?",
+                (run_id, owner, now, expires_at, now),
+            )
+            row = self.conn.execute(
+                "SELECT owner, expires_at FROM run_locks WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self.conn.commit()
+        if row is None:
+            return False
+        return str(row[0]) == owner and float(row[1]) == expires_at
+
+    def renew_run_lock(
+        self, run_id: str, owner: str, expires_at: float, now: float
+    ) -> bool:
+        """续租：只有**当前持有者且未过期**才能续（避免续到别人的锁上）。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE run_locks SET expires_at = ? "
+                "WHERE run_id = ? AND owner = ? AND expires_at > ?",
+                (expires_at, run_id, owner, now),
+            )
+            self.conn.commit()
+            return int(cur.rowcount or 0) > 0
+
+    def release_run_lock(self, run_id: str, owner: str) -> None:
+        """释放：只删自己的锁（owner 不匹配时不动，防止误删他人的锁）。"""
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM run_locks WHERE run_id = ? AND owner = ?", (run_id, owner)
+            )
+            self.conn.commit()
+
+    def run_lock_owner(self, run_id: str, now: float) -> str | None:
+        """当前持有者（已过期视为无人持有，并顺手清掉那行）。"""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT owner, expires_at FROM run_locks WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if float(row[1]) <= now:
+                self.conn.execute("DELETE FROM run_locks WHERE run_id = ?", (run_id,))
+                self.conn.commit()
+                return None
+            return str(row[0])
 
     def close(self) -> None:
         self.conn.close()

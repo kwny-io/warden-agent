@@ -217,13 +217,47 @@ def test_assistant_tool_call_映射为完整tool_calls() -> None:
 # ---------- custom 通用接入（傻瓜式接任意 OpenAI 兼容 API） ----------
 
 def test_create_model_custom_读环境变量(monkeypatch) -> None:
-    """custom: 从 WARDEN_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL 零改源码接入。"""
-    monkeypatch.setenv("WARDEN_API_KEY", "k-c")
+    """custom: 从 WARDEN_MODEL_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL 零改源码接入。"""
+    monkeypatch.setenv("WARDEN_MODEL_API_KEY", "k-c")
     monkeypatch.setenv("WARDEN_BASE_URL", "http://localhost:11434/v1")
     monkeypatch.setenv("WARDEN_MODEL", "my-llama")
     m = create_model("custom")
     assert isinstance(m, OpenAiCompatibleModel)
     assert m.model == "my-llama"
+    assert "11434" in str(m._client.base_url)
+
+
+def test_create_model_custom_不读服务端鉴权密钥(monkeypatch) -> None:
+    """回归：`WARDEN_API_KEY` 是 HTTP 服务的鉴权密钥，**不能**被 custom 当模型 key 用。
+
+    两者曾经同名 → 用 WARDEN_API_KEY 开鉴权、又用 custom 接自建网关时，
+    模型会把**服务端鉴权密钥**发给那个网关。现在 custom 只认 WARDEN_MODEL_API_KEY。
+    """
+    monkeypatch.delenv("WARDEN_MODEL_API_KEY", raising=False)
+    monkeypatch.setenv("WARDEN_API_KEY", "服务端鉴权密钥-不该被模型用")
+    monkeypatch.setenv("WARDEN_BASE_URL", "https://gw.example.com/v1")
+    with pytest.raises(DeepSeekError) as exc:
+        create_model("custom")
+    assert "WARDEN_MODEL_API_KEY" in str(exc.value)
+
+
+def test_create_model_custom_不回落到其他厂商密钥(monkeypatch) -> None:
+    """回归：custom 若借用别的厂商密钥，等于**把那个密钥发给第三方** → 必须拒绝。"""
+    monkeypatch.delenv("WARDEN_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("WARDEN_API_KEY", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-真实厂商密钥")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-另一个厂商密钥")
+    monkeypatch.setenv("WARDEN_BASE_URL", "https://third-party-gw.example.com/v1")
+    with pytest.raises(DeepSeekError) as exc:
+        create_model("custom")
+    assert "WARDEN_MODEL_API_KEY" in str(exc.value)
+
+
+def test_create_model_custom_本机网关可填占位串(monkeypatch) -> None:
+    """Ollama 这类不校验密钥的端点：填任意非空占位串即可。"""
+    monkeypatch.setenv("WARDEN_MODEL_API_KEY", "not-needed")
+    monkeypatch.setenv("WARDEN_BASE_URL", "http://localhost:11434/v1")
+    m = create_model("custom")
     assert "11434" in str(m._client.base_url)
 
 
