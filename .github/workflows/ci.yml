@@ -52,13 +52,15 @@ jobs:
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
         # 副作用是——**如果 CI 里的 service 没连上，它们会静默跳过、CI 依然绿**，
         # 于是"在 CI 里验证 PG"这句话就是空的。这条把那种情况变成明确失败。
+        # 三个文件都要列上：只要有 PG 依赖的测试漏进来就会静默跳过，守卫必须覆盖全。
         run: |
           set -o pipefail
           out=$(uv run --frozen pytest tests/test_postgres_integration.py \
-                tests/test_store_interface.py -p no:cacheprovider 2>&1 | tail -1)
+                tests/test_store_interface.py tests/test_notify_event_bus.py \
+                -p no:cacheprovider 2>&1 | tail -1)
           echo "$out"
           case "$out" in
             *skipped*)
-              echo "::error::PostgreSQL 集成测试被跳过了——service 没连上？这条步骤就是防这个的"
+              echo "::error::PostgreSQL 依赖的测试被跳过了——service 没连上？这条步骤就是防这个的"
               exit 1 ;;
           esac
