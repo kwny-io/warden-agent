@@ -363,12 +363,16 @@ def main() -> None:
     # 多副本部署：把幂等 / 事件流 / 限流计数放进共享存储（同一个库），
     # 否则每个副本各算一份 —— 幂等失效、SSE 丢事件、限额翻倍。
     shared_state = _shared_state_from_env(os.environ)
-    coordination = coordination_for(store, shared=shared_state)
+    # 事件总线：poll（默认，轮询）或 notify（LISTEN/NOTIFY 唤醒，仅 Postgres 有效）。
+    # notify 不改变正确性——事件仍落表、订阅仍读表，通知只把"睡满间隔"变成"变化即醒"。
+    event_bus_mode = (os.environ.get("WARDEN_EVENT_BUS") or "poll").strip().lower()
+    coordination = coordination_for(store, shared=shared_state, event_bus=event_bus_mode)
     logger.info(
-        "协调状态：%s",
+        "协调状态：%s（事件总线 %s）",
         "共享存储（多副本）"
         if shared_state
         else "进程内（单副本；多副本请设 WARDEN_SHARED_STATE=1）",
+        type(coordination[1]).__name__,
     )
     try:
         limiter = limiter_from_env(os.environ, store=coordination[2])

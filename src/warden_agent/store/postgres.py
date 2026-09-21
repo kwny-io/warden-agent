@@ -58,12 +58,22 @@ class PostgresStore:
         # （psycopg3 在 autocommit 模式下也支持），见 delete_run / append_message。
         # 注：各写方法末尾原本的 `self.conn.commit()` 在 autocommit 下是无害的空操作，
         # 保留它不影响语义（单语句写入已经即时提交）。
-        self.conn = psycopg.connect(
-            host=host, port=port, dbname=dbname,
-            user=user, password=password, connect_timeout=connect_timeout,
-            autocommit=True,
-        )
+        # 连接参数留一份：需要**另开连接**时用（例如 LISTEN/NOTIFY 的事件总线
+        # 要独占一条连接，不能和 store 自己的读写抢同一条）
+        self._connect_kwargs: dict[str, Any] = {
+            "host": host, "port": port, "dbname": dbname,
+            "user": user, "password": password, "connect_timeout": connect_timeout,
+        }
+        self.conn = psycopg.connect(**self._connect_kwargs, autocommit=True)
         self._init_schema()
+
+    def new_connection(self) -> Any:
+        """再开一条 autocommit 连接（调用方负责关）。
+
+        用途：LISTEN/NOTIFY 需要一条**专门等待通知**的连接——等待期间它被占住，
+        不能和 store 的读写共用（否则会互相阻塞）。
+        """
+        return self._psycopg.connect(**self._connect_kwargs, autocommit=True)
 
     def _init_schema(self) -> None:
         with self.conn.cursor() as cur:

@@ -197,6 +197,27 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         sensitive=True,
         note="不设则用进程内临时密钥（能加密，但重启后解不开）并告警",
     ),
+    EnvSpec(
+        "WARDEN_CREDENTIAL_OLD_KEYS", "凭证密钥轮换期的历史密钥（逗号分隔，仅用于解密）",
+        "credential/broker.py", ("credential/broker.py",),
+        sensitive=True,
+        note="配新主密钥 + 旧密钥放这里 → 跑 `warden rotate-credentials` 重加密 → 摘掉旧密钥。"
+             "不配它而直接换主密钥 = 存量密文全部解不开",
+    ),
+    EnvSpec(
+        "WARDEN_EVENT_BUS", "事件总线实现：poll（轮询，默认）或 notify（LISTEN/NOTIFY 唤醒）",
+        "web/run_server.py", ("web/run_server.py",),
+        default="poll",
+        note="notify 仅对 Postgres 有效（需要另开一条 LISTEN 连接）；不满足时回落为轮询并告警。"
+             "它只降低延迟，正确性仍靠落表+读表——丢通知不会丢事件",
+    ),
+    EnvSpec(
+        "WARDEN_AUDIT_KEY", "审计链的 HMAC 密钥材料（防篡改）",
+        "web/audit.py", ("web/audit.py",),
+        sensitive=True,
+        note="不设则审计链退化为**不带密钥**的哈希链并告警：仍能发现「手改/删行」，"
+             "但挡不住会重算整条链的人。审计链要跨重启校验，所以不生成临时密钥",
+    ),
     # ---- 前端与沙箱 ----
     EnvSpec("WARDEN_WEB_DIST", "前端静态文件目录", "web/server.py",
             ("web/server.py",), kind="path"),

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -153,3 +153,87 @@ def as_vault(store: object) -> CredentialVault:
     if all(callable(getattr(store, name, None)) for name in required):
         return store  # type: ignore[return-value]  # 结构化满足协议
     return InMemoryCredentialVault()
+
+
+@dataclass(frozen=True)
+class RotationReport:
+    """一次密钥轮换的结果（可打印、可审计）。"""
+
+    scanned: int
+    rotated: int
+    already_current: int
+    failed: tuple[str, ...]  # 解不开的凭证名（**必须报出来**，不能静默跳过）
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+    def describe(self) -> str:
+        lines = [
+            f"密钥轮换：扫描 {self.scanned} 条，重加密 {self.rotated} 条，"
+            f"已是新密钥 {self.already_current} 条"
+        ]
+        if self.failed:
+            lines.append(
+                f"⚠️ 有 {len(self.failed)} 条**任何密钥都解不开**（未改动，数据保持原样）："
+                + "、".join(self.failed)
+                + "\n   常见原因：轮换时漏配 WARDEN_CREDENTIAL_OLD_KEYS，或密文被损坏。"
+            )
+        return "\n".join(lines)
+
+
+def rotate_credentials(
+    vault: object,
+    cipher: object,
+    scopes: Iterable[str] = (DEPLOYMENT_SCOPE,),
+    *,
+    extra_scopes: Iterable[str] = (),
+) -> RotationReport:
+    """把存量凭证密文从旧密钥重加密到当前密钥。
+
+    为什么需要它：换了 `WARDEN_CREDENTIAL_KEY` 之后，**旧密文用新密钥解不开**——
+    没有这个步骤，轮换就等于把已有凭证全废掉。
+
+    做法：逐个读出密文 → 判断是否还是旧密钥（`needs_rotation`）→ 解出明文 →
+    用当前密钥重新加密写回。**只改密文，不动明文、不动其它字段。**
+
+    安全与诚实：
+      - 解不开的凭证**原样保留**并记进 `failed`，不会被静默删掉或覆盖；
+      - 轮换是**幂等**的：已经用当前密钥加密的会直接跳过（`already_current`）；
+      - 轮换期间旧密钥仍在 `old_key_materials` 里，所以**读写都不会中断**；
+        全部重加密完再摘掉旧密钥即可。
+    """
+    scanned = rotated = already = 0
+    failed: list[str] = []
+    all_scopes = tuple(scopes) + tuple(extra_scopes)
+
+    for scope in all_scopes:
+        for name in vault.list_credential_names(scope):  # type: ignore[attr-defined]
+            scanned += 1
+            record = vault.load_credential(scope, name)  # type: ignore[attr-defined]
+            if record is None:       # 刚好被删了
+                continue
+            encrypted = dict(record.encrypted)
+            try:
+                # 判断是否需要轮换；"谁也解不开"会在这里抛错（数据问题，不能当"无需轮换"）
+                if not any(
+                    cipher.needs_rotation(token) for token in encrypted.values()  # type: ignore[attr-defined]
+                ):
+                    already += 1
+                    continue
+                # 用旧密钥解出明文，再用当前密钥重新加密（密文换了，明文一字不动）
+                refreshed = {
+                    field: cipher.encrypt(cipher.decrypt(token))  # type: ignore[attr-defined]
+                    for field, token in encrypted.items()
+                }
+            except Exception:  # noqa: BLE001 - 解不开就如实记账，绝不覆盖
+                failed.append(f"{scope or '<部署级>'}/{name}")
+                continue
+            vault.save_credential(  # type: ignore[attr-defined]
+                StoredCredential(scope=scope, name=name, encrypted=refreshed)
+            )
+            rotated += 1
+
+    return RotationReport(
+        scanned=scanned, rotated=rotated, already_current=already, failed=tuple(failed)
+    )

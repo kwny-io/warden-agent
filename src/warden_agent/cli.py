@@ -13,6 +13,8 @@
   warden backup [dest]              做一份一致性备份（SQLite 在线备份 API）
   warden restore <backup> [--force] 从备份恢复（破坏性，会覆盖目标库）
   warden stuck [--older-than-min N] 列出等待人工处理超时的 run（接告警用，有则退出码 3）
+  warden audit-verify               校验审计链是否完整（被动过则退出码 4）
+  warden rotate-credentials         把存量凭证密文重加密到当前密钥（密钥轮换）
 
 默认连 http://127.0.0.1:8000；可用环境变量 `WARDEN_SERVER_URL` 覆盖要连的**服务地址**。
 需要先启动服务：  py -m warden_agent.web.run_server
@@ -308,6 +310,86 @@ def _cmd_stuck(args: argparse.Namespace) -> None:
         raise SystemExit(3)
 
 
+def _cmd_audit_verify(args: argparse.Namespace) -> None:
+    """校验审计链是否完整（防篡改的兑现方式：改了必然被发现）。
+
+    有输出即代表**审计被人动过**（字段被改 / 中间被删 / 被重排），返回非 0 便于接巡检告警。
+    """
+    import json
+
+    from warden_agent.web.audit import SqliteAuditStore
+
+    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    try:
+        store = SqliteAuditStore(db_path=db)
+    except Exception as e:  # 打不开库（路径不对/损坏）
+        _die(f"无法打开审计库 {db}: {e}")
+
+    ok, detail = store.verify_chain()
+    if args.json:
+        print(json.dumps({"ok": ok, "detail": detail, "db": db}, ensure_ascii=False))
+    else:
+        print(("✅ " if ok else "❌ ") + detail)
+    if not ok:
+        # 审计被动过是**需要人立刻看**的事件，用非 0 退出码让巡检能报警
+        raise SystemExit(4)
+
+
+def _cmd_rotate_credentials(args: argparse.Namespace) -> None:
+    """把存量凭证密文从旧密钥重加密到当前密钥（轮换的第二半）。
+
+    用法：先把新密钥配成 `WARDEN_CREDENTIAL_KEY`、旧密钥放进
+    `WARDEN_CREDENTIAL_OLD_KEYS`，跑本命令完成重加密，确认无误后再摘掉旧密钥。
+    不做这一步直接换密钥 = 存量凭证全部解不开。
+    """
+    import json
+    import os as _os
+
+    from warden_agent.credential.broker import default_broker
+    from warden_agent.credential.vault import rotate_credentials
+    from warden_agent.store.sqlite import SqliteStore
+
+    db = args.db or _os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    try:
+        store = SqliteStore(db)
+    except Exception as e:  # 打不开库
+        _die(f"无法打开凭证库 {db}: {e}")
+
+    broker = default_broker(_os.environ, vault=store)
+    # 作用域：默认只处理部署级；多用户各自导入的 key 用 --scope 逐个指定（或 --all-scopes）
+    scopes = [s for s in (args.scope or "").split(",") if s]
+    extra = _scopes_in_store(store) if args.all_scopes else ()
+    report = rotate_credentials(store, broker._cipher, scopes or ("",), extra_scopes=extra)  # noqa: SLF001
+
+    if args.json:
+        print(json.dumps(
+            {"scanned": report.scanned, "rotated": report.rotated,
+             "already_current": report.already_current, "failed": list(report.failed)},
+            ensure_ascii=False, indent=2,
+        ))
+    else:
+        print(report.describe())
+    if not report.ok:
+        # 有解不开的凭证 → 不能假装轮换成功（那些密文还是旧密钥，摘掉旧密钥就永久损失）
+        raise SystemExit(5)
+
+
+def _scopes_in_store(store: Any) -> list[str]:
+    """列出库里出现过的所有凭证作用域（给 `--all-scopes` 用）。
+
+    `store` 是 SqliteStore / PostgresStore，这里只读它的连接，取 distinct scope。
+    取不到（表不存在 / 连接异常）就当作没有额外作用域，不因此中断轮换。
+    """
+    conn = getattr(store, "conn", None)
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute("SELECT DISTINCT scope FROM credentials").fetchall()
+    except Exception:  # noqa: BLE001 - 表不存在 / 连接异常
+        return []
+    return [str(r[0]) for r in rows]
+
+
 def _apply_recovery(
     store: Any, cp_store: Any, controller: Any, args: argparse.Namespace
 ) -> None:
@@ -397,6 +479,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stuck.add_argument("--db", default="", help="存档库路径（默认取 WARDEN_DB_PATH）")
     p_stuck.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_stuck.set_defaults(func=_cmd_stuck)
+
+    p_audit = sub.add_parser("audit-verify", help="校验审计链是否完整（防篡改巡检）")
+    p_audit.add_argument("--db", default="", help="审计库路径（默认取 WARDEN_DB_PATH）")
+    p_audit.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p_audit.set_defaults(func=_cmd_audit_verify)
+
+    p_rotate = sub.add_parser(
+        "rotate-credentials", help="把存量凭证密文重加密到当前密钥（密钥轮换的第二半）"
+    )
+    p_rotate.add_argument("--db", default="", help="凭证库路径（默认取 WARDEN_DB_PATH）")
+    p_rotate.add_argument("--scope", default="", help="只处理这些作用域（逗号分隔，默认部署级）")
+    p_rotate.add_argument("--all-scopes", action="store_true", help="处理库里出现过的全部作用域")
+    p_rotate.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p_rotate.set_defaults(func=_cmd_rotate_credentials)
     return p
 
 

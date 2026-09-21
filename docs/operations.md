@@ -17,6 +17,7 @@
 | 当前能力与关键开关 | `GET /capabilities` | 尤其看 `features.run_lock`——**多副本下必须是 `SqlRunLock`**，`InProcessRunLock` 等于没锁 |
 | 指标 | `GET /metrics`（Prometheus 文本） | 请求数/耗时分布/5xx/限流拒绝数 |
 | **挂太久没人管的会话** | `GET /alerts/stuck?older_than_min=60` | `count=0` |
+| **审计有没有被动过** | `warden audit-verify`（被动过退出码 4） | `✅ 链完整：N 条记录` |
 | 恢复计划 | `GET /recovery/plan` | 该续/该重试/等人工/终态四类 |
 
 启动日志里会打印**生效配置**：协调状态（共享/进程内）、入站限流、**出站限速**、
@@ -170,7 +171,12 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
   - 不配 → 用"进程内临时密钥"并告警：**能加密，但重启后旧密文解不开**。
   - 换密钥 → **存量密文无法解密**（当前没有轮换工具）。轮换需要：先解出明文、
     用新密钥重新加密写回。这一步**还没做**。
-- 审计表**不是防篡改的**（要"不可否认"通常得哈希链或 WORM 存储）——**还没做**。
+- 审计表**已是防篡改链**：每条记录带 HMAC 链哈希（改字段 / 删中间行 / 重排都会断链），
+  巡检用 `warden audit-verify`。⚠️ **必须配 `WARDEN_AUDIT_KEY`**：不配则退化为不带密钥的
+  哈希链（能查出手改/删行，但挡不住「改完重算整条链」）并告警。
+- **密钥轮换**：新密钥配 `WARDEN_CREDENTIAL_KEY`、旧密钥进 `WARDEN_CREDENTIAL_OLD_KEYS` →
+  `warden rotate-credentials`（幂等）→ 确认无误后**摘掉旧密钥**。直接换主密钥而不跑这一步，
+  等于把存量凭证全废掉；轮换有解不开的会以退出码 5 报出来（那些密文原样保留，补回旧密钥还能救）。
 
 ---
 
@@ -180,7 +186,7 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 |---|---|---|
 | 挂起时长的**近似**来源（`WAITING_INTERACTION` / 老库行） | 只有这类会低估；`WAITING_APPROVAL` 已精确 | 已标明 `source`，未消除近似 |
 | ~~Run 锁 TTL 窗口~~ | ~~超长驱动可能被接管~~ | **已由心跳续租关闭**；仅进程卡死时会丢锁（有告警） |
-| 事件总线是**轮询**（默认 250ms） | 多副本下事件有延迟 | 可换 Redis/NOTIFY |
+| ~~事件总线是轮询~~ | **已提供 `WARDEN_EVENT_BUS=notify`**（LISTEN/NOTIFY，仅 Postgres） | 实测发布→唤醒 47ms（轮询 110ms / 最坏 250ms）；通知只是提示，丢了不丢事件 |
 | 熔断状态、出站并发上限**进程内** | 每副本各一份，不具全局语义 | 已文档化 |
 | ~~PostgreSQL 真库测试仅在本地~~ | **CI 里已实跑**（16 条零跳过，且有断言防静默跳过） | 已闭环 |
 | 真实搜索 provider 未实现 | `web.search` 仍是离线 mock | 见 README 路线图 |

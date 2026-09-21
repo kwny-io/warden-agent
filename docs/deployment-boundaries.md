@@ -42,6 +42,12 @@ Warden Agent 是一个**有状态的 Agent 运行时**，支持两种部署形�
 但零新依赖且对 SQLite/PostgreSQL 通用；需要更低延迟可换 Redis/NATS 实现，
 只要满足 `EventBus` 协议，上层一行不改。
 
+**已经提供了更低延迟的一种**：`WARDEN_EVENT_BUS=notify` → `PostgresNotifyEventBus`，
+用 LISTEN/NOTIFY 把订阅从"睡满间隔"变成"变化即醒"（实测发布→唤醒 47ms）。
+它**不改变正确性**：事件仍先落表、订阅仍回表读增量，通知只是提示——
+通知丢了（例如发出时对面还没 LISTEN）只会让这一次退回轮询，**不丢事件**。
+只有 Postgres 有 LISTEN，且需要"另开一条监听连接"；不满足时回落为轮询并告警。
+
 ## 进程内状态清单（扩容时逐项确认）
 
 | 状态 | 位置 | 多副本后果 | 现状 |

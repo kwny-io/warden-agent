@@ -235,14 +235,28 @@ def default_broker(
     """
     src: Mapping[str, str] = env if env is not None else os.environ
     material = src.get("WARDEN_CREDENTIAL_KEY")
+    # 密钥轮换：主密钥之外可挂历史密钥（逗号分隔），**只用于解密兜底**。
+    # 轮换流程见 vault.rotate_credentials：配新主密钥 + 旧密钥进 OLD_KEYS → 重加密 → 摘掉旧密钥。
+    old_materials = [
+        item.strip().encode("utf-8")
+        for item in (src.get("WARDEN_CREDENTIAL_OLD_KEYS") or "").split(",")
+        if item.strip()
+    ]
     if material:
-        cipher = CredentialCipher(material.encode("utf-8"))
+        cipher = CredentialCipher(material.encode("utf-8"), old_materials)
     else:
         logger.warning(
             "未配置 WARDEN_CREDENTIAL_KEY：凭证以**进程内临时密钥**加密"
             "（进程退出即失效，不落盘）。生产环境请为每个部署配置独立密钥。"
         )
+        # 临时密钥下不给历史密钥兜底：两者混在一起只会让"为什么解不开"更难查
         cipher = CredentialCipher(secrets.token_bytes(32))
+    if old_materials:
+        logger.info(
+            "凭证密钥轮换：已挂 %d 把历史密钥（仅用于解密）。"
+            "跑 `warden rotate-credentials` 完成重加密后即可摘掉它们。",
+            len(old_materials),
+        )
     return CredentialBroker(
         cipher, ttl_seconds=ttl_seconds, vault=vault, scope=scope
     )

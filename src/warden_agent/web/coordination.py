@@ -18,15 +18,21 @@
 `SqlEventBus` 用**轮询增量**读事件表，比 Pub/Sub 延迟高一点（默认 250ms，可调），
 但胜在零新依赖、通用（SQLite/Postgres 都行）；对延迟敏感可换成 Redis/NATS 实现，
 只要满足 `EventBus` 协议，上层一行不用改。
+`PostgresNotifyEventBus` 则是"轮询 + LISTEN/NOTIFY 唤醒"：事件仍落表、订阅仍读表，
+通知只用来把等待从"睡满间隔"变成"变化即醒"——所以**丢通知最多退回轮询，不会丢事件**。
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
+import logging
 import threading
 import time
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +225,92 @@ class SqlEventBus:
             time.sleep(min(self._poll_interval, remaining))
 
 
+# 通知频道名（唯一事实源，供文档/测试引用）。
+# 注意：下面的 LISTEN / NOTIFY 语句里**内联写死**了这个名字——Postgres 的
+# LISTEN/NOTIFY 不接受参数占位符（频道名是标识符而不是值），所以没法参数化；
+# 而把 SQL 存成变量再 execute 又正是要避免的写法。两处的名字由
+# `tests/test_notify_event_bus.py` 断言一致，防止漂移。
+NOTIFY_CHANNEL = "warden_events"
+
+
+class PostgresNotifyEventBus(SqlEventBus):
+    """在 SqlEventBus 之上加 LISTEN/NOTIFY：把事件延迟从"轮询间隔"降到"通知到达"。
+
+    设计原则（关键）：**通知只是提示，正确性仍然靠落表 + 读表**。
+      - `publish` 先把事件写进 `run_events`（durable），再 NOTIFY 一句"有新东西了"；
+      - 订阅端醒来后**一律回表读增量**，不把通知内容当数据；
+      - 通知可能丢（发出时对面还没 LISTEN），所以等待超时后会**退回轮询**再查一次。
+
+    结果：丢通知最多让这一次退回轮询间隔（不丢事件、不乱序），
+    而正常路径的延迟只有通知往返时间（实测远低于默认 250ms 轮询间隔）。
+
+    为什么不让通知携带事件本体：Postgres 的 NOTIFY 载荷上限 8000 字节（事件可能超），
+    而且一旦依赖载荷，"丢通知"就等于"丢事件"。
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        poll_interval: float = 0.25,
+        *,
+        notify_timeout: float = 1.0,
+        listener: Any = None,
+    ) -> None:
+        super().__init__(store, poll_interval)
+        self._notify_timeout = notify_timeout
+        # LISTEN 需要**独占一条连接**（等待通知期间它被占住，不能与 store 的读写共用）
+        self._listener = listener if listener is not None else store.new_connection()
+        self._owns_listener = listener is None
+        with self._listener.cursor() as cur:
+            cur.execute("LISTEN warden_events")   # 频道名与 NOTIFY_CHANNEL 一致（有测试守着）
+
+    def publish(self, run_id: str, event: dict[str, Any]) -> None:
+        super().publish(run_id, event)                    # 先落表（durable）
+        with self._store.conn.cursor() as cur:            # 再喊一声（只是提示，不带数据）
+            cur.execute("NOTIFY warden_events")
+
+    def poll(
+        self, run_id: str, after_seq: int, timeout: float
+    ) -> list[tuple[int, dict[str, Any]]]:
+        deadline = time.monotonic() + timeout
+        while True:
+            rows = self._read(run_id, after_seq)          # 快路径：可能已经有事件了
+            if rows:
+                return rows
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return []
+            self._wait_for_notify(min(self._notify_timeout, remaining))
+            # 醒来后回到循环开头**再读表**——通知不带数据，也可能丢
+
+    def _read(self, run_id: str, after_seq: int) -> list[tuple[int, dict[str, Any]]]:
+        out: list[tuple[int, dict[str, Any]]] = []
+        for seq, data in self._store.list_events_after(run_id, after_seq):
+            try:
+                out.append((int(seq), json.loads(str(data))))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def _wait_for_notify(self, timeout: float) -> None:
+        """等一条通知（最多 timeout 秒）。拿不到就正常返回，由调用方退回轮询。
+
+        用 `notifies(timeout=...)` 而不是自己 select：psycopg 会顺手处理连接保活。
+        监听连接不可用时**不能让订阅崩掉**——退回轮询即可（事件不会丢）。
+        """
+        try:
+            for _ in self._listener.notifies(timeout=timeout, stop_after=1):
+                return
+        except Exception:  # noqa: BLE001 - 监听连接坏了不该拖垮订阅
+            logger.warning("LISTEN 连接异常，本次退回轮询等待（事件不会丢）")
+            time.sleep(min(self._poll_interval, timeout))
+
+    def close(self) -> None:
+        if self._owns_listener:
+            with contextlib.suppress(Exception):
+                self._listener.close()
+
+
 class SqlRateLimitStore:
     """存储版限流计数：多副本共享同一窗口计数，全局限额不翻倍。"""
 
@@ -235,20 +327,44 @@ class SqlRateLimitStore:
 # ---------------------------------------------------------------------------
 # 装配
 # ---------------------------------------------------------------------------
-def coordination_for(store: Any, *, shared: bool) -> tuple[
-    IdempotencyStore, EventBus, RateLimitStore
-]:
+def _event_bus_for(store: Any, mode: str) -> EventBus:
+    """按需造事件总线：`notify` 用 LISTEN/NOTIFY 唤醒，其余用纯轮询。
+
+    LISTEN/NOTIFY 只有 Postgres 有，且需要能"再开一条连接"（`new_connection`）——
+    不满足就**回落为轮询并告警**：能力不够要说出来，而不是假装用了通知。
+    """
+    if mode != "notify":
+        return SqlEventBus(store)
+    if callable(getattr(store, "new_connection", None)):
+        return PostgresNotifyEventBus(store)
+    logger.warning(
+        "请求 WARDEN_EVENT_BUS=notify，但存储 %s 不支持另开监听连接（LISTEN 需要 Postgres）"
+        "——回落为轮询实现。事件不会丢，只是延迟等于轮询间隔。",
+        type(store).__name__,
+    )
+    return SqlEventBus(store)
+
+
+def coordination_for(
+    store: Any, *, shared: bool, event_bus: str = "poll"
+) -> tuple[IdempotencyStore, EventBus, RateLimitStore]:
     """按"是否多副本"造一套协调组件。
 
     `shared=False`：进程内实现（单副本默认，行为与历史一致）。
     `shared=True`：存储实现（多副本共享）——要求 store 具备共享状态方法
     （`get_idempotent` / `append_event` / `hit_rate_limit`），否则回落到进程内并告警。
+    `event_bus="notify"`：多副本时用 LISTEN/NOTIFY 唤醒（只对 Postgres 生效，见
+    `PostgresNotifyEventBus`）；不满足条件时回落为轮询并告警——**能力不够就明说**。
     """
     if shared and all(
         hasattr(store, m)
         for m in ("get_idempotent", "append_event", "hit_rate_limit")
     ):
-        return SqlIdempotencyStore(store), SqlEventBus(store), SqlRateLimitStore(store)
+        return (
+            SqlIdempotencyStore(store),
+            _event_bus_for(store, event_bus),
+            SqlRateLimitStore(store),
+        )
     if shared:
         import logging
 

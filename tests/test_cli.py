@@ -22,6 +22,8 @@ _EXPECTED = {
     "backup": "_cmd_backup",
     "restore": "_cmd_restore",
     "stuck": "_cmd_stuck",
+    "audit-verify": "_cmd_audit_verify",
+    "rotate-credentials": "_cmd_rotate_credentials",
 }
 
 
