@@ -182,7 +182,7 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | ~~Run 锁 TTL 窗口~~ | ~~超长驱动可能被接管~~ | **已由心跳续租关闭**；仅进程卡死时会丢锁（有告警） |
 | 事件总线是**轮询**（默认 250ms） | 多副本下事件有延迟 | 可换 Redis/NOTIFY |
 | 熔断状态、出站并发上限**进程内** | 每副本各一份，不具全局语义 | 已文档化 |
-| PostgreSQL 真库测试 | 本地已跑通；**CI 里已起 PG service**（待 push 后确认绿） | 见 `.github/workflows/ci.yml` |
+| ~~PostgreSQL 真库测试仅在本地~~ | **CI 里已实跑**（16 条零跳过，且有断言防静默跳过） | 已闭环 |
 | 真实搜索 provider 未实现 | `web.search` 仍是离线 mock | 见 README 路线图 |
 | 默认嵌入是**词频匹配** | 换个说法就掉分 | 配 `WARDEN_EMBED_*` 才是语义 |
 | 抓取只有去标签粗提取 | 拿不到 SPA / 正文抽取 | 需要 headless 浏览器 |

@@ -106,7 +106,7 @@
     连接参数可用 `WARDEN_TEST_PG_*` 环境变量覆盖（方便挂到 CI 的 service container）。
     **没起 PG 时整体自动跳过**（已实测：11 skip、0 failed），所以 CI 保持绿。
   - 测试数因此分两套：**无 PG = 591 passed / 13 skipped；起了 PG = 603 passed / 1 skipped**。
-  - ⚠️ **仍未做**：把 PG service 加进 GitHub Actions（本地验证 ≠ CI 验证；这条要靠 push 后才能确认）。
+  - ~~仍待做：把 PG service 加进 GitHub Actions~~ → **已做并在推送后确认**（2026-09-22）：CI 里 16 条 PG 测试零跳过，另加了一条断言防「静默跳过」。
 
 - **依赖锁定（企业级推进第 3 项）**。新增 `uv.lock`（48 个包全部固定版本）；CI 改为
   `uv sync --frozen` + `uv run --frozen ...`。**`--frozen` 是关键**：lock 与 pyproject 不一致时
@@ -224,8 +224,13 @@
   （trust 认证 + `warden` 库 + 健康检查），并用 `WARDEN_TEST_PG_*` 环境变量指过去。
   这样"存储可换 PostgreSQL"从**声称支持**变成**在 CI 里被验证**——此前 PG 集成测试是被
   `skipif` 跳过的，等于那段代码从未在自动化环境跑过。
-  ⚠️ **这一条我无法在本地验证**（GitHub Actions 只能在推上去之后才跑）：本地能确认的是
-  "同样的命令在本机真库上跑通"（667 passed / 1 skipped），CI 侧要等 push 后的结果。
+  **已在推送后确认（这一步原先标注为"无法本地验证"）**：CI 首跑 663 passed / 5 skipped 全绿，
+  但"绿"本身**不能证明 PG 测试真跑了**（skipif 的副作用：service 连不上也会静默跳过、照样绿）。
+  所以补了两处：pytest 加 `-rs`（跳过原因进日志）、并新增一步**断言**
+  （单独跑 PG 两个测试文件，输出里出现 `skipped` 就 exit 1；本地已双向验证该断言有效）。
+  第二次 CI 的结果给出直接证据——5 条跳过的原因分别是 MCP 连不上（3，CI 未构建 ts 客户端）、
+  runner 容器不允许建命名空间（1）、前端未构建（1），**没有一条是 PG**；
+  而断言步骤输出 **`16 passed`**：PG 的 16 条测试在 CI 里全部执行、零跳过。
 
 ### 尚未实现（路线图）
 
