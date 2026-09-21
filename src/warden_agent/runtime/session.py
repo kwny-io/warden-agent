@@ -31,6 +31,7 @@ from warden_agent.loop.cognition import (
 from warden_agent.loop.loop import exec_tool
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
+from warden_agent.runtime.checkpoint import CheckpointManager, CheckpointStore
 from warden_agent.store.base import RunStore
 from warden_agent.tool.catalog import ToolCatalog
 
@@ -42,6 +43,14 @@ logger = logging.getLogger(__name__)
 
 class TypedOutputError(Exception):
     """类型化结果交付失败：模型返回的内容还原不成给定 Pydantic 类型。"""
+
+
+class RunNotResumable(Exception):
+    """该 Run 不能自动续跑（已完成/已取消，或正卡在等人工）。
+
+    崩溃恢复时区分"能自动续"和"必须等人"很关键：把等待审批的 Run 自动续跑，
+    等于绕过人工闸门；把已完成的 Run 再跑一遍，是重复执行。
+    """
 
 
 @dataclass
@@ -126,6 +135,7 @@ class AgentSession:
         memory: Any = None,
         memory_scope: Any = None,
         max_context_chars: int = 0,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.run_id = run_id
         self.model = model
@@ -148,6 +158,12 @@ class AgentSession:
         self.memory = memory
         self._memory_scope = memory_scope
         self.max_context_chars = max_context_chars
+        # 存档点：把"跑到第几轮、正在哪一步"也落库。load_run + messages 能还原状态与
+        # 对话，但还原不出迭代位置——那正是跨 Run 恢复控制器（runtime/recovery.py）
+        # 分组的依据。没给 store 时是空实现（内存态），不影响会话本身。
+        self._checkpoints = CheckpointManager(checkpoint_store)
+        # 重启后接续"这是第几次尝试"，别让重试计数归零（否则重试上限形同虚设）
+        self._checkpoints.adopt_attempts_from(run_id)
 
         # 结构化输出目标（typed_reply 用）：类型化结果还原
         self._reply_type: Any = None
@@ -203,6 +219,16 @@ class AgentSession:
     def _persist_run(self) -> None:
         self.store.save_run(self.run)
 
+    def _checkpoint(self, step: str, iteration: int) -> None:
+        """记一个存档点（run_id + 此刻状态 + 迭代编号 + 进行到哪一步）。
+
+        存档写失败不能拖垮会话——降级为告警，与审计的"尽力而为"策略一致。
+        """
+        try:
+            self._checkpoints.capture(self.run, iteration, step)
+        except Exception:  # noqa: BLE001 - 存档是辅助能力，不能成为主路径单点
+            logger.warning("存档点写入失败 run=%s step=%s", self.run_id, step)
+
     def _persist_all_messages(self) -> None:
         # 简化：会话持有的消息作为整体重写（教学版）；生产可用增量 append
         for m in self.messages:
@@ -225,6 +251,45 @@ class AgentSession:
             self.messages.append(Message(role="user", content=user_text))
             self.store.append_message(self.run_id, self.messages[-1])
 
+        return self._advance()
+
+    def resume(self) -> SessionOutcome:
+        """从已存状态**继续**一次未完成的运行（不追加新的用户输入）。
+
+        与 `start()` 的区别：`start()` 需要一句新用户指令；`resume()` 用于"进程崩溃/
+        重启后回到存档点接着跑"——状态与对话都已从库里恢复，直接从循环继续。
+        跨 Run 恢复工作进程（`runtime/worker.py`）就是靠它把计划执行掉的。
+
+        可续 / 不可续：
+          - `FAILED`（终态）→ 允许：这就是"重试"，回到 PENDING 重新驱动；
+          - `COMPLETED` / `CANCELLED` / `TIMED_OUT` → 抛 `RunNotResumable`（跑了是重复执行）；
+          - `WAITING_APPROVAL` / `WAITING_INTERACTION` / `SUSPENDED` → 抛 `RunNotResumable`
+            （**必须等人**，自动续跑等于绕过人工闸门）；
+          - 其余（PENDING / QUEUED / RUNNING / …）→ 继续跑。
+        """
+        if self.run.status == RunStatus.FAILED:
+            # 重试：清掉上次残留的审批状态，回到 PENDING 重新驱动。
+            # attempts +1 并随存档点写回——重试上限就是靠它判断的。
+            self._checkpoints.attempts += 1
+            self._clear_approval()
+            self.run.restart()
+            self._persist_run()
+        elif self.run.is_terminal():
+            raise RunNotResumable(
+                f"Run {self.run_id!r} 已是终态 {self.run.status.name}，无需续跑"
+            )
+        if self.run.status in (
+            RunStatus.WAITING_APPROVAL,
+            RunStatus.WAITING_INTERACTION,
+            RunStatus.SUSPENDED,
+        ):
+            raise RunNotResumable(
+                f"Run {self.run_id!r} 正在等人工（{self.run.status.name}），不能自动续跑"
+            )
+        if self.run.status in (RunStatus.PENDING, RunStatus.QUEUED):
+            self.run.mark_queued()
+            self.run.start()
+            self._persist_run()
         return self._advance()
 
     def run_typed(self, reply_type: Any, user_text: str) -> Any:
@@ -345,7 +410,8 @@ class AgentSession:
                                RunStatus.CANCELLED, RunStatus.TIMED_OUT):
             raise RuntimeError(f"会话已结束，不能继续({self.run.status.name})")
 
-        for _ in range(self.max_iterations):
+        for iteration in range(self.max_iterations):
+            self._checkpoint("model_call", iteration)
             response = self.model.chat(ChatRequest(
                 messages=self._request_messages(),
                 tools=[t.to_openai_schema() for t in self.catalog.all()],
@@ -366,7 +432,7 @@ class AgentSession:
                             f"策略拒绝执行 {call.name!r}: {verdict.reason}"
                         )
                     if verdict.decision == Decision.ASK:
-                        return self._hold_for_approval(call, verdict.reason)
+                        return self._hold_for_approval(call, verdict.reason, iteration)
                     # 【认知】调用前的意图校验：疑似误调就提示模型，不执行
                     hint = self._cognition_hint(call)
                     if hint is not None:
@@ -374,6 +440,7 @@ class AgentSession:
                         self.messages.append(hint_msg)
                         self.store.append_message(self.run_id, hint_msg)
                         continue
+                    self._checkpoint("tool_exec", iteration)
                     self._execute(call)
                 continue  # 本批工具都执行完，回到循环让模型再想
 
@@ -383,6 +450,7 @@ class AgentSession:
                 self.run.begin_completing()
                 self.run.complete()
                 self._persist_run()
+                self._checkpoint("done", iteration)
                 return on_content(response.content)
 
         raise RuntimeError("AgentLoop 迭代超过上限，任务未收敛（可能模型一直在调用工具）")
@@ -437,7 +505,8 @@ class AgentSession:
 
         yield {"type": "start"}
 
-        for _ in range(self.max_iterations):
+        for iteration in range(self.max_iterations):
+            self._checkpoint("model_call", iteration)
             request = ChatRequest(
                 messages=self._request_messages(),
                 tools=[t.to_openai_schema() for t in self.catalog.all()],
@@ -475,7 +544,7 @@ class AgentSession:
                             f"策略拒绝执行 {call.name!r}: {verdict.reason}"
                         )
                     if verdict.decision == Decision.ASK:
-                        outcome = self._hold_for_approval(call, verdict.reason)
+                        outcome = self._hold_for_approval(call, verdict.reason, iteration)
                         assert isinstance(outcome, NeedsApproval)
                         yield {"type": "needs_approval",
                                "approval": self._approval_dict(outcome.approval)}
@@ -489,6 +558,7 @@ class AgentSession:
                         yield {"type": "tool_hint", "name": call.name, "text": hint}
                         continue
                     # 流式下也把工具结果落库（复用 _execute，携带 tool_call_id；含稳定性+错误喂回）
+                    self._checkpoint("tool_exec", iteration)
                     self._execute(call)
                 continue
 
@@ -498,6 +568,7 @@ class AgentSession:
                 self.run.begin_completing()
                 self.run.complete()
                 self._persist_run()
+                self._checkpoint("done", iteration)
                 yield {"type": "final", "text": response.content}
                 return
 
@@ -513,7 +584,9 @@ class AgentSession:
         }
 
 
-    def _hold_for_approval(self, call: ToolCall, reason: str) -> SessionOutcome:
+    def _hold_for_approval(
+        self, call: ToolCall, reason: str, iteration: int = 0
+    ) -> SessionOutcome:
         """ASK：挂起，进 WAITING_APPROVAL，等人工拍板。"""
         self._gated = call
         self._approval = ApprovalRequest(
@@ -524,6 +597,9 @@ class AgentSession:
         )
         self.run.wait_for_approval()  # RUNNING -> WAITING_APPROVAL
         self._persist_run()
+        # 存档点状态 = WAITING_APPROVAL：跨 Run 恢复据此把它归入 awaiting_human
+        # （不能自动续跑，必须等人拍板）
+        self._checkpoint("awaiting_approval", iteration)
         # 把待审批的一步也存下来，重启后能继续等批准
         self.store.save_pending_approval(
             self.run_id,

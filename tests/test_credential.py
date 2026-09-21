@@ -21,11 +21,15 @@ def test_加密后库里看不到明文(cipher: CredentialCipher) -> None:
     broker = CredentialBroker(cipher)
     broker.register("openai", {"api_key": dummy_key})
 
-    stored = broker._secrets["openai"]["api_key"]  # 直接看"库底"
+    fields = broker.encrypted_fields("openai")
+    assert fields is not None
+    stored = fields["api_key"]  # 直接看"库底"（密文）
     assert dummy_key not in stored
     # 且是真正的加密：同一明文两次入库结果不同（带随机 nonce）
     broker.register("openai2", {"api_key": dummy_key})
-    assert stored != broker._secrets["openai2"]["api_key"]
+    other = broker.encrypted_fields("openai2")
+    assert other is not None
+    assert stored != other["api_key"]
 
 
 def test_租约拿回明文且可解密(cipher: CredentialCipher) -> None:
@@ -75,7 +79,9 @@ def test_篡改密文解密失败(cipher: CredentialCipher) -> None:
     """GCM 完整性：改一个字节的密文，解密必须抛错，不能解出坏数据继续用。"""
     broker = CredentialBroker(cipher)
     broker.register("openai", {"api_key": "sk-abc"})
-    stored = broker._secrets["openai"]["api_key"]
+    fields = broker.encrypted_fields("openai")
+    assert fields is not None
+    stored = fields["api_key"]
     # 取中间字符替换为"必定不同"的字符：nonce 随机，若固定改首字符为 "A"，
     # 原首字符恰好是 "A" 时密文未变，解密不会抛错（概率 1/64，CI 曾踩中）。
     mid = len(stored) // 2

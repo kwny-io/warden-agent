@@ -50,6 +50,11 @@ class InMemoryRunStore:
         self._messages: dict[str, list[Message]] = {}
         self._pending: dict[str, tuple[str, str, dict[str, object], str]] = {}
         self._approval_history: list[dict[str, Any]] = []
+        self._checkpoints: dict[str, object] = {}
+        self._idempotency: dict[str, str] = {}
+        self._events: list[tuple[int, str, str]] = []  # (seq, run_id, data)
+        self._events_seq = 0
+        self._rate_limits: dict[str, tuple[float, int]] = {}
 
     def save_run(self, run: AgentRun) -> None:
         self._runs[run.run_id] = run
@@ -92,6 +97,8 @@ class InMemoryRunStore:
         self._runs.pop(run_id, None)
         self._messages.pop(run_id, None)
         self._pending.pop(run_id, None)
+        self._checkpoints.pop(run_id, None)
+        self._events = [e for e in self._events if e[1] != run_id]
 
     def save_pending_approval(
         self,
@@ -128,9 +135,62 @@ class InMemoryRunStore:
             "created_at": _now_iso(),
         })
 
-    def list_approval_history(self, limit: int = 20) -> list[dict[str, Any]]:
-        """审批决策历史（最新的在前）。字段形状与 SqliteStore 对齐。"""
-        return list(reversed(self._approval_history[-limit:]))
+    def list_approval_history(
+        self, limit: int = 20, owner: str | None = None
+    ) -> list[dict[str, Any]]:
+        """审批决策历史（最新的在前）。字段形状与 SqliteStore 对齐。
+
+        owner 给定时只保留该用户名下 Run 的决策（按 Run 归属过滤）。
+        """
+        rows = list(reversed(self._approval_history[-limit:]))
+        if owner:
+            rows = [
+                r for r in rows
+                if (run := self.load_run(r["run_id"])) is not None
+                and run.user_id == owner
+            ]
+        return rows
+
+    # ---- 检查点 ----
+    def save_checkpoint(self, checkpoint: object) -> None:
+        self._checkpoints[getattr(checkpoint, "run_id", "")] = checkpoint
+
+    def load_checkpoint(self, run_id: str) -> object | None:
+        return self._checkpoints.get(run_id)
+
+    def list_checkpoints(self) -> list[object]:
+        return list(self._checkpoints.values())
+
+    # ---- 跨副本共享状态（内存版即"不共享"，够单副本/测试用）----
+    def get_idempotent(self, key: str) -> str | None:
+        return self._idempotency.get(key)
+
+    def save_idempotent(self, key: str, payload: str) -> None:
+        self._idempotency[key] = payload
+
+    def append_event(self, run_id: str, payload: str) -> int:
+        self._events_seq += 1
+        self._events.append((self._events_seq, run_id, payload))
+        return self._events_seq
+
+    def list_events_after(
+        self, run_id: str, after_seq: int, limit: int = 200
+    ) -> list[tuple[int, str]]:
+        return [
+            (seq, data)
+            for seq, rid, data in self._events
+            if rid == run_id and seq > after_seq
+        ][:limit]
+
+    def hit_rate_limit(
+        self, bucket_key: str, window_seconds: int, now: float
+    ) -> tuple[int, float]:
+        start, count = self._rate_limits.get(bucket_key, (now, 0))
+        if now - start >= window_seconds:
+            start, count = now, 0
+        count += 1
+        self._rate_limits[bucket_key] = (start, count)
+        return count, start
 
 
 class Agent:
@@ -166,6 +226,15 @@ class Agent:
     def typed_reply(self, reply_type: Any, user_text: str) -> Any:
         """类型化结果：让模型按 reply_type 的 schema 返回，还原成对象。"""
         return self._new_session().run_typed(reply_type, user_text)
+
+    @property
+    def session_factory(self) -> Callable[[str], AgentSession]:
+        """会话工厂：给定 run_id 造/恢复一个会话。
+
+        暴露出来供跨 Run 恢复工作进程（`runtime/worker.py`）复用——worker 需要
+        "按 run_id 拿到会话并续跑"，这正是这个工厂的语义。
+        """
+        return self._session_factory
 
 
 def _make_sandbox_tool(spec: SandboxSpec) -> ToolSpec:
@@ -216,6 +285,9 @@ def augment_catalog(
     catalog: ToolCatalog,
     *,
     memory: bool = False,
+    memory_repository: Any = None,
+    knowledge: Any = None,
+    web_providers: Any = None,
     skills: dict[str, str] | str | None = None,
     web: bool = False,
     mcp_server: str | None = None,
@@ -224,9 +296,14 @@ def augment_catalog(
     sandbox: bool = False,
     sandbox_spec: SandboxSpec | None = None,
 ) -> Any:
-    """把 Memory / Skill / Web / MCP 的能力工具注册进目录（可复用给 HTTP 层）。
+    """把 Memory / RAG / Skill / Web / MCP 的能力工具注册进目录（可复用给 HTTP 层）。
 
-    返回：注入的运行时依赖（额外能力），目前是 MemoryService（所有会话共享）。
+    - `memory_repository`：记忆库实现。不传用 `InMemoryMemoryStore`（进程内，重启即丢）；
+      传 `SqliteMemoryStore(...)` 则**跨会话的用户级记忆才真的记得住**。
+    - `knowledge`：RAG 知识来源。`VectorStore` 实例 / `True`（内置离线语料）/ 目录路径；
+      不传则不注册 `knowledge.search`。
+
+    返回：注入的运行时依赖（额外能力），如 MemoryService（所有会话共享）。
     不做任何抛出——能力不可用（如没 node）就静默跳过，保证降级不崩溃。
     """
     from warden_agent.memory import InMemoryMemoryStore, MemoryScope, MemoryService
@@ -239,10 +316,12 @@ def augment_catalog(
 
     # 1. 记忆
     if memory:
-        memory_service = MemoryService(InMemoryMemoryStore())
+        repository = memory_repository or InMemoryMemoryStore()
+        memory_service = MemoryService(repository)
         for spec in make_memory_tools(memory_service, scope):
             catalog.register(spec)
         extra["memory_service"] = memory_service
+        extra["memory_persistent"] = memory_repository is not None
 
     # 2. 技能（SKILL.md）
     if skills:
@@ -261,10 +340,19 @@ def augment_catalog(
         extra["skill_catalog"] = skill_catalog
 
     # 3. Web 搜索/抓取
-    if web:
+    #    web_providers 给定时用指定的 provider（如真实联网抓取 HttpFetchProvider）；
+    #    只给 web=True 则用内置离线 mock（零网络，测试与演示不受网络影响）。
+    if web or web_providers:
         from warden_agent.web import make_web_tools
-        for spec in make_web_tools():
+
+        search_provider, fetch_provider = web_providers or (None, None)
+        for spec in make_web_tools(search_provider, fetch_provider):
             catalog.register(spec)
+        extra["web_fetch"] = (
+            type(fetch_provider).__name__
+            if fetch_provider is not None
+            else "LocalMockFetchProvider"
+        )
 
     # 4. MCP（需 node；可用则导入经过审查的工具）
     if mcp_server:
@@ -296,6 +384,19 @@ def augment_catalog(
         catalog.register(_make_sandbox_tool(sandbox_spec or SandboxSpec()))
         extra["sandbox"] = True
 
+    # 7. RAG 知识库（检索 + 来源引用）
+    #    此前 rag/ 只被 demo 与评测引用，产品路径从不构造 VectorStore ——
+    #    所以模型手里根本没有 knowledge.search。这里把它接上。
+    if knowledge is not None:
+        from warden_agent.rag import build_knowledge, make_knowledge_tool
+
+        store, embedder_name, sources = build_knowledge(knowledge)
+        catalog.register(make_knowledge_tool(store))
+        extra["knowledge_store"] = store
+        # 嵌入器名要能被打进日志：在词频嵌入下宣称"语义检索"是过度声称
+        extra["knowledge_embedder"] = embedder_name
+        extra["knowledge_sources"] = sources
+
     return extra
 
 
@@ -308,6 +409,9 @@ def build_agent(
     max_iterations: int = 10,
     api_key: str | None = None,
     memory: bool = False,
+    memory_repository: Any = None,
+    knowledge: Any = None,
+    web_providers: Any = None,
     skills: dict[str, str] | str | None = None,
     web: bool = False,
     mcp_server: str | None = None,
@@ -329,6 +433,13 @@ def build_agent(
       store          存储。RunStore 实现(SqliteStore/InMemoryRunStore)；None 用进程内存。
       api_key        真实模型用。None 时读对应环境变量。
       memory         True=启用记忆工具(memory.remember/recall)。
+      memory_repository  记忆库实现；不传=InMemoryMemoryStore（进程内，重启即丢），
+                     传 SqliteMemoryStore(...) 则跨会话记忆落盘。
+      knowledge      RAG 知识来源：VectorStore 实例 / True（内置离线语料）/ 目录路径；
+                     不传则不注册 knowledge.search。
+      web_providers  (搜索 provider, 抓取 provider) 二元组；传了即启用 web 工具族。
+                     不传（配合 web=True）= 内置离线 mock。真实联网抓取见
+                     web/search.py 的 HttpFetchProvider 与 providers_from_env()。
       skills         dict{alias: SKILL.md} 或 目录路径 → 加载技能系统。
       web            True=启用 web.search / web.fetch。
       mcp_server     MCP server 启动命令（有 node 则导入其工具）。
@@ -353,7 +464,9 @@ def build_agent(
         for _name, spec in items:
             catalog.register(spec)  # spec 是已生成的技能卡实例（见 pydantic_tool/function_tool）
     extra = augment_catalog(
-        catalog, memory=memory, skills=skills, web=web,
+        catalog, memory=memory, memory_repository=memory_repository,
+        knowledge=knowledge, web_providers=web_providers,
+        skills=skills, web=web,
         mcp_server=mcp_server, git_workdir=git_workdir,
         sandbox=sandbox, sandbox_spec=sandbox_spec,
     )
@@ -363,6 +476,8 @@ def build_agent(
     run_store: RunStore = store if store is not None else InMemoryRunStore()
 
     def make_session(run_id: str) -> AgentSession:
+        from warden_agent.runtime.checkpoint import checkpoint_store_for
+
         return AgentSession(
             run_id=run_id,
             model=model,
@@ -377,6 +492,9 @@ def build_agent(
             memory=extra.get("memory_service"),
             memory_scope=extra.get("memory_scope"),
             max_context_chars=max_context_chars,
+            # 存档点：让 SDK 路径同样"记得跑到第几轮、在哪一步"，
+            # 崩溃后可被恢复工作进程续跑（checkpoint_store_for 对不支持的存储返回 None）
+            checkpoint_store=checkpoint_store_for(run_store),
         )
 
     return Agent(make_session)

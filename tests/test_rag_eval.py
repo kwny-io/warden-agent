@@ -61,6 +61,43 @@ def test_空用例集不除以零() -> None:
     assert (report.top1, report.recall_at_k, report.mrr) == (0.0, 0.0, 0.0)
 
 
+def test_k覆盖率反映小库抬高() -> None:
+    """k/语料块数——越高说明 recall@k 越可能是"库小"而非"检索器强"。"""
+    small = RetrievalReport(embedder_name="t", k=3, outcomes=(), corpus_size=7)
+    assert abs(small.k_coverage - 3 / 7) < 1e-9
+    big = RetrievalReport(embedder_name="t", k=3, outcomes=(), corpus_size=1000)
+    assert big.k_coverage < 0.01
+
+
+def test_报告逐条排名在前且标注口径() -> None:
+    """逐条排名要打印出来——聚合数字会掩盖"垫底进榜"这种命中。"""
+    from warden_agent.rag.eval import format_report
+
+    report = RetrievalReport(
+        embedder_name="offline", k=3, corpus_size=7,
+        outcomes=(
+            CaseOutcome("报销要走什么流程", "财务", 1),
+            CaseOutcome("我想请几天假出去玩，有什么规定", "15 天", 3),
+        ),
+    )
+    out = format_report(report)
+    assert "逐条命中排名" in out
+    assert "第 3" in out                       # 垫底命中也要能看见
+    assert "recall@3 的口径" in out             # 小库抬高指标，必须提示
+    assert "43%" in out                        # 3/7 的覆盖率
+
+
+def test_大语料不打印小库口径提示() -> None:
+    """库足够大时 k 覆盖率很低，不该刷无关提示。"""
+    from warden_agent.rag.eval import format_report
+
+    report = RetrievalReport(
+        embedder_name="offline", k=3, corpus_size=1000,
+        outcomes=(CaseOutcome("报销要走什么流程", "财务", 2),),
+    )
+    assert "recall@3 的口径" not in format_report(report)
+
+
 def test_评测能跑通且指标在合理区间() -> None:
     report = evaluate(_policy_store(), embedder_name="offline")
     for value in (report.top1, report.recall_at_k, report.mrr):
@@ -142,11 +179,22 @@ def test_配齐环境变量才切语义嵌入(monkeypatch: pytest.MonkeyPatch) -
     assert name.startswith("semantic:")
 
 
-def test_嵌入端点解析不了时构造即失败_不拖到第一次检索() -> None:
-    """.invalid 这类域名解析不了 → 构造就报错（fail fast），而不是检索时才炸。"""
+def test_嵌入端点解析不了时构造即失败_不拖到第一次检索(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """域名解析不了 → 构造就报错（fail fast），而不是检索时才炸。
+
+    这里**注入"解析失败"**而不是依赖某个域名真的解析不了：有些运行环境（企业代理、
+    沙箱）会做 DNS 通配劫持，把任何域名都解析到保留段——那样"解析失败"的前提就不成立，
+    测试会随环境飘。要测的是"解析失败时怎么处理"，所以把失败条件直接造出来。
+    """
+    def _no_dns(_host: str, _port: object) -> list[object]:
+        raise OSError("DNS 不可用（测试注入）")
+
+    monkeypatch.setattr("warden_agent.rag.knowledge.socket.getaddrinfo", _no_dns)
     with pytest.raises(ValueError) as ei:
         openai_compatible_embedder(
-            base_url="https://example.invalid/v1", api_key="k", model="m",
+            base_url="https://embed.example.com/v1", api_key="k", model="m",
         )
     assert "无法解析" in str(ei.value)
 

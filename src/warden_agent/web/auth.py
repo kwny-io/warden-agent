@@ -58,6 +58,17 @@ class TrustedCaller:
             "product_id": self.product_id,
         }
 
+    @property
+    def user_id(self) -> str:
+        """该调用者在"会话归属"维度的身份。
+
+        以 `principal_id` 为准——这是本模块的核心约定：**用户身份来自凭证，不来自请求**。
+        历史实现里 `user_id` 是客户端自带的查询参数（`?user_id=xxx`），等于让调用方
+        自己声明"我是谁"，拿到一把 key 就能冒充任意用户。认证开启后，端点一律用
+        这里返回的值作为归属，查询参数被忽略（见 server._identity）。
+        """
+        return self.principal_id
+
 
 def _normalize(value: str, field: str) -> str:
     text = str(value).strip()
@@ -86,6 +97,7 @@ def operation_for(method: str, path: str) -> RunOperation:
 
     与路由表对应：
       POST /chat/{id} / /chat/stream/{id}   → SUBMIT_INPUT
+      POST /runs/{id}                        → START（预创建会话）
       GET  /status/{id} / /approvals        → QUERY
       POST /approve|reject/{id}             → COMMAND
       GET  /events/{id}                     → SUBSCRIBE_EVENTS
@@ -99,6 +111,8 @@ def operation_for(method: str, path: str) -> RunOperation:
         return RunOperation.COMMAND
     if method == "GET" and path.startswith("/events"):
         return RunOperation.SUBSCRIBE_EVENTS
+    if method == "POST" and path.startswith("/runs"):
+        return RunOperation.START
     if method == "POST" and (path.startswith("/chat/stream") or path.startswith("/chat")):
         return RunOperation.SUBMIT_INPUT
     if method == "GET" and (path.startswith("/memory") or path == "/audit"):
@@ -151,3 +165,34 @@ class RunOperationAuthorizer:
     ) -> None:
         if self._fn is not None:
             self._fn(caller, operation, run_id)
+
+
+def owner_authorizer(load_owner: Callable[[str], str | None]) -> AuthorizeFn:
+    """构造"按 Run 归属"的授权回调：调用者只能碰自己名下的 Run。
+
+    `load_owner(run_id)` 返回该 Run 的归属用户（无归属或不存在时返回 None）。
+
+    放行规则：
+      - `run_id` 为空（与具体 Run 无关的操作，如 /models、/health）→ 放行；
+      - Run **不存在**或**尚无归属** → 放行，由端点按调用者身份建立归属
+        （否则"首次对话/预创建会话"会被自己的授权门挡死）；
+      - Run 已有归属且等于调用者身份 → 放行；
+      - 其余（归属是别人）→ 抛 HttpAuthorizationError（403）。
+
+    这是把"多租户"从"按字段过滤"变成真正边界的关键一步：此前 `user_id` 可被
+    客户端任意指定，且授权器默认空转（全放行），拿到一把 key 就能读写他人会话。
+    """
+    def authorize_owner(
+        caller: TrustedCaller,
+        operation: RunOperation,
+        run_id: str | None,
+    ) -> None:
+        if run_id is None:
+            return
+        owner = load_owner(run_id)
+        if owner and owner != caller.user_id:
+            raise HttpAuthorizationError(
+                f"调用者 {caller.user_id!r} 无权操作归属 {owner!r} 的会话 {run_id!r}"
+            )
+
+    return authorize_owner

@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-379%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-546%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -46,14 +46,13 @@
 工具调用**：超时护栏（卡死不停摆）→ 指数退避重试（扛瞬时故障与限流）→ 统一降级兜底
 （重试耗尽走 fallback）→ 熔断保护（连续失败自动短路，冷却后半开试探）。
 
-> **当前状态：独立模块（未接入主链路）。** 实现与测试齐备（`tests/test_tool_stability.py`），
-> 但 `build_agent` / HTTP / CLI 的工具调用**尚未经过它**——全仓只有 `loop/loop.py` 的注释提到
-> 接入方式（给工具执行器传一个 `StableToolExecutor(StabilityConfig(...))`）。要让它真正生效，
-> 需要在工具执行链路上显式接线。
+> **已接入产品路径。** `build_agent` / `build_app` 均可传 `stability`，产品入口 `run_server`
+> **默认开启**（`WARDEN_STABILITY=0` 关）。重试是安全的：按 `ToolSpec.pure` 判定，
+> **非纯工具只对瞬时错误重试**，不会把 `fs.delete` 这类有副作用的操作重放。
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——379 项测试零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——546 项测试零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（6 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -83,9 +82,26 @@
   `isolation_note()` 报出当前档位；资源限制经 POSIX rlimit / Windows Job Object。
   ⚠️ **内核档与容器边界默认互斥**：容器里要用内核档就得加 `SYS_ADMIN`，那会削弱容器本身。
   所以是二选一——用容器当边界（推荐），或用内核档跑在宿主/CI 上。
-- **存储层**（独立模块）：凭证 AES-GCM 加密 + 短租约 + 脱敏（密钥保存在进程内，未落库）
+- **凭证层**：模型的 API Key 由 `CredentialBroker` 保管——**AES-GCM 加密 + 短租约 + 密文落库**
+  （`credentials` / `credential_leases` 表，见 `credential/vault.py`）：导入的 key 不再明文躺在
+  进程内 dict 里，也不随进程退出而丢失；租约只落元数据，取用时回查密文现解，**明文不落盘**。
+  按调用者身份分作用域——同租户的 A 用户读不到 B 用户导入的 key。
+  `SecretRedactor` 把密钥从日志中抹掉；密钥材料取 `WARDEN_CREDENTIAL_KEY`（未配置时退化为
+  进程内临时密钥并**明确告警**，不假装持久化）
+- **多租户（仅鉴权模式）**：`WARDEN_API_KEYS=alice:k1,bob:k2` 让每个 key 绑定一个身份，
+  **身份由服务端从 key 推出，客户端无法自称**；针对他人 Run 的读 / 写 / 删 / 审批一律 403，
+  `/runs`、`/approvals`、`/audit` 按调用者收敛。⚠️ 匿名开发模式（`WARDEN_ALLOW_ANON=1`）
+  保留 `?user_id=` 只为切换演示账号，**不是安全边界**——口径详见下方「部署边界」
+- **限流**：进程内固定窗口限流，默认每调用者 60 秒 600 次（`WARDEN_RATE_LIMIT=次数/秒数`，`0` 关），
+  超限返 429 + `Retry-After`，健康探针豁免
+- **可水平扩展**：幂等表 / SSE 事件流 / 限流计数抽成可插拔实现（`web/coordination.py`）——
+  单副本走进程内（默认，零延迟），多副本设 `WARDEN_SHARED_STATE=1` + PostgreSQL 即放进共享存储，
+  幂等、事件流、限额**全局一致**；恢复工作进程（`runtime/worker.py`）负责把崩溃的 Run 真正续跑
 - **容器层**：`Dockerfile` 多阶段构建 + **非 root 运行** + `HEALTHCHECK`；
   `docker-compose.yml` 里 `read_only` / `cap_drop: ALL` / `no-new-privileges` / 只发布到回环
+
+> 📐 **部署边界与多租户口径**（单副本 vs 多副本的开关、进程内状态清单、缩容/扩容注意项）：
+> 见 [docs/deployment-boundaries.md](./docs/deployment-boundaries.md)。
 
 ### ⑦ 模型无关——"大脑"可整体替换，治理与循环才是资产
 
@@ -154,6 +170,17 @@ flowchart TB
 可溯源；技能系统（SKILL.md）采用渐进披露——平时只在目录，按任务意图评分预热、确认后才
 注入正文，技能多版本并存、默认解析最新版本。
 
+两条接线上的诚实说明：
+
+- **RAG 已接进产品路径**（此前只在 demo/评测里用，模型拿不到 `knowledge.search`）：
+  `build_agent(knowledge=...)` / `build_app(knowledge=...)` / `WARDEN_KNOWLEDGE=1|<文档目录>`。
+  默认嵌入器是**离线词频哈希**——**词面匹配，不是语义检索**（换了说法问就会掉分，
+  作者在代码里标注了实测对比）；要真语义请配 `WARDEN_EMBED_BASE_URL` 等三项走兼容端点。
+  启动日志会写明当前用的是哪一种，避免"在词频嵌入下宣称语义检索"。
+- **记忆默认落盘**：`build_agent(memory=True)` / HTTP 服务用 `SqliteMemoryStore`，
+  `USER` 作用域（跨会话用户级记忆）才真的记得住；不传记忆库时是进程内实现（重启即丢）。
+  召回按**关键词重叠**匹配，不是向量召回。
+
 ## 为什么需要 Warden
 
 多数 Agent 框架止步于"能跑通一次对话"。进入真实业务后，需要回答的是另一类问题：
@@ -221,7 +248,7 @@ flowchart TB
     SESSION -- "共享 exec_tool（单一来源）" --> LOOP
     LOOP --> PL
     LOOP --> INT
-    LOOP -. "稳定层接入点（独立模块，未接线）" .-> SB
+    LOOP -. "稳定性层（超时/退避/降级/熔断）" .-> SB
     SB --> TOOL
     POL -- "调用前门禁" --> LOOP
     SESSION -- "每步落库/恢复" --> STORE
@@ -324,7 +351,7 @@ agent = build_agent(provider=model)
 python -m warden_agent.web.run_server
 ```
 
-- `http://127.0.0.1:8000/` —— 内置 React 控制台：**三栏可拖拽战术终端**（对话列表 ⇄ SSE 真流式对话 ⇄ 治理信息栏）、多账号 USER_ID 隔离、会话管理与删除、审批队列与决策历史、模型运行时热切换
+- `http://127.0.0.1:8000/` —— 内置 React 控制台：**三栏可拖拽战术终端**（对话列表 ⇄ SSE 真流式对话 ⇄ 治理信息栏）、账号切换（鉴权模式下由 API Key 决定身份，详见[部署边界](./docs/deployment-boundaries.md)）、会话管理与删除、审批队列与决策历史、模型运行时热切换
 - `http://127.0.0.1:8000/docs` —— 交互式 API 文档
 
 | 方法 | 路径 | 说明 |
@@ -332,7 +359,7 @@ python -m warden_agent.web.run_server
 | POST | `/chat/{run_id}` | 同步对话，返回最终回答或审批请求 |
 | POST | `/chat/stream/{run_id}` | SSE 流式对话 |
 | GET | `/events/{run_id}` | SSE 事件流订阅 |
-| GET / POST | `/runs` · `/runs/{run_id}` | 会话列表（按账号过滤）、预创建会话（幂等） |
+| GET / POST | `/runs` · `/runs/{run_id}` | 会话列表（**鉴权模式按凭证身份过滤**）、预创建会话（幂等） |
 | DELETE | `/runs/{run_id}` | 删除会话（状态 / 对话 / 待审批一并清除） |
 | GET / POST | `/users` | 中控台账号（USER_ID）登记与查询 |
 | GET | `/status/{run_id}` | 会话状态查询 |
@@ -341,10 +368,18 @@ python -m warden_agent.web.run_server
 | GET | `/models` · POST `/models/select` | 可用模型清单与运行时热切换（支持导入 API Key） |
 | GET | `/capabilities` · `/memory/{scope}` | 能力清单与记忆查询 |
 | GET | `/health/live` · `/health/ready` · `/metrics` | 存活/就绪探针与指标 |
-| GET | `/audit` | 审计轨迹（需认证） |
+| GET | `/audit` | 审计轨迹（需认证；**按租户隔离**） |
+| GET | `/recovery/plan` | 跨 Run 恢复计划（resume / retry / await_human / terminal；只读判断） |
 
 服务契约：统一版本头（`X-Warden-Api-Version`）、`Idempotency-Key` 请求幂等、
-problem+json 统一错误码。环境变量：`WARDEN_API_KEY`（Bearer 认证，**对外部署必须设**）、
+problem+json 统一错误码（限流 429 附 `Retry-After`）。
+环境变量：`WARDEN_API_KEY`（Bearer 认证，**对外部署必须设**）、
+`WARDEN_API_KEYS`（**多用户隔离**，`alice:k1,bob:k2`）、`WARDEN_API_USER`（单 key 模式身份）、
+`WARDEN_TENANT`（租户 id）、`WARDEN_RATE_LIMIT`（限流，默认 `600/60`，`0` 关）、
+`WARDEN_SHARED_STATE`（多副本共享协调状态，默认关）、
+`WARDEN_KNOWLEDGE`（RAG：`1`=内置离线语料 / 文档目录路径，默认关）、
+`WARDEN_WEB_FETCH`（开启真实联网抓取；默认离线 mock）、
+`WARDEN_CREDENTIAL_KEY`（凭证加密密钥材料；**只从环境变量读取**，不设则用进程内临时密钥并告警）、
 `WARDEN_HOST`（默认 `127.0.0.1` 只本机；容器里设 `0.0.0.0`）、`WARDEN_AUDIT=1`（审计账本）、
 `WARDEN_DB_PATH`（SQLite 路径；rootfs 只读时指向挂载卷）、`GIT_WORKDIR`（将指定仓库暴露为
 `git.apply_patch` 门禁工具）。
@@ -352,6 +387,10 @@ problem+json 统一错误码。环境变量：`WARDEN_API_KEY`（Bearer 认证�
 **鉴权是 fail-closed 的**：没设 `WARDEN_API_KEY` 又没显式 `WARDEN_ALLOW_ANON=1` → 拒绝启动；
 对外监听（如 `0.0.0.0`）却不带鉴权 → 也拒绝启动。本机开发想省事就显式写
 `WARDEN_ALLOW_ANON=1`，让"无鉴权"成为一个**被写出来的决定**，而不是默认状态。
+
+**多用户隔离**用 `WARDEN_API_KEYS=alice:k1,bob:k2`：每个 key 绑定一个身份，
+客户端传的 `?user_id=` 会被忽略，越权访问他人会话返回 403。只在鉴权模式下成立，
+口径详见 [docs/deployment-boundaries.md](./docs/deployment-boundaries.md)。
 
 ### CLI
 
@@ -362,10 +401,13 @@ warden stream my-run "讲讲多 Agent 协作"           # 流式对话
 warden approvals                                 # 查看待审批队列
 warden approve my-run                            # 批准 / warden reject my-run 拒绝
 warden coding "给 hello.py 加一个 greet 函数"      # 本地编码任务：读代码 → 出 diff → 门禁落地
+warden recover --json                            # 本地读存档点，输出跨 Run 恢复计划
+warden recover --apply                           # 真正执行一轮恢复（续跑崩溃的 Run）
 ```
 
 审批闭环在命令行同样成立：`chat` 触发审批 → `approvals` 查看队列 → `approve` / `reject` 决策。
-CLI 默认连接 `http://127.0.0.1:8000`，可用 `WARDEN_BASE_URL` 覆盖；`coding` 为本地命令，不依赖服务。
+CLI 默认连接 `http://127.0.0.1:8000`，可用 `WARDEN_BASE_URL` 覆盖；`coding` 与 `recover`
+为本地命令，不依赖服务。
 
 ### 演示脚本
 
@@ -405,8 +447,8 @@ python -m warden_agent.demo_e2e                                                 
 | 服务契约（`web/server.py`） | 统一版本头、Idempotency-Key 幂等、problem+json 统一错误码 | 已实现 |
 | 认证 / 审计 / 健康检查（`web/`） | Bearer 认证、审计账本、liveness/readiness 探针 | 已实现 |
 | CLI（`cli.py`） | `warden` 命令族：chat / stream / approvals / approve / reject / health / caps / coding | 已实现 |
-| RAG 检索（`rag/`） | 向量库 + `knowledge.search` 工具 | 已实现 |
-| RAG 来源引用（`rag/knowledge.py`） | 检索结果携带 SourceHit，回答可溯源 | 已实现 |
+| RAG 检索（`rag/`） | 向量库 + `knowledge.search` 工具；**已接线**：`build_agent(knowledge=...)` / `build_app` / `run_server` 的 `WARDEN_KNOWLEDGE`（`1`=内置离线语料，或给文档目录） | 已实现 |
+| RAG 来源引用（`rag/knowledge.py`） | 检索结果携带 SourceHit，回答可溯源；嵌入器可切换（默认**离线词频**，配 `WARDEN_EMBED_*` 走真语义端点），启动日志会写明用的是哪一种 | 已实现 |
 | 多 Agent（`multiagent/`） | 主管模式，子 Agent 封装为工具 | 已实现 |
 | 多 Agent 结构化交接 | 专员间以交接单（角色 / 任务 / 结论）传递，结果可复核 | 已实现 |
 | 多 Agent 共享记忆 | 专员共享 WORKSPACE 工作记忆，避免重复检索 | 已实现 |
@@ -415,32 +457,36 @@ python -m warden_agent.demo_e2e                                                 
 | 技能系统（`skill/`） | SKILL.md 协议、渐进披露、信任快照 | 已实现 |
 | 技能版本化 | 同一技能多版本并存，默认解析最新版本 | 已实现 |
 | 技能触发 | 按任务意图评分选择技能，信号与意图路由同源 | 已实现 |
-| 记忆（`memory/`） | 多作用域、候选确认、冲突消解、审计 | 已实现 |
+| 记忆（`memory/`） | 多作用域（RUN / SESSION / USER / WORKSPACE）、候选确认、冲突消解、审计；**已接线**：`build_agent(memory=True)` / HTTP 默认开启，产品入口用 `SqliteMemoryStore` **落盘**（`USER` 作用域跨会话才真的记得住），不传则用进程内实现 | 已实现 |
 | MCP 客户端（`mcp/` + `ts/mcp-client`） | TypeScript SDK 连接 MCP，工具先行审查再导入 | 已实现 |
-| Web 搜索 / 抓取（`web/search.py`） | 多 provider 可插拔，URL 策略管控 | 已实现 |
+| Web 搜索 / 抓取（`web/search.py`） | 多 provider 可插拔，URL 策略管控。`web.fetch` 提供**真实联网抓取**（`HttpFetchProvider`，`WARDEN_WEB_FETCH=1` 开启）：**每一跳重定向都重新过 URL 策略**（拒内网/环回/云元数据，防 SSRF 绕过）、只吃文本类响应、超时/响应体/跳转次数都有界。**搜索仍是离线 mock**（真实搜索需第三方 API key，未实现） | 已实现（搜索部分） |
 | Git 集成（`git/`） | revision 探测、unified-diff 应用、合并门禁 | 已实现 |
 | Coding Agent（`coding_agent/`） | 需求 → 读代码 → 生成 diff → 门禁落地 | 已实现 |
-| Web 控制台（`web/`） | React + TypeScript + Tailwind + Vite：三栏可拖拽战术终端（对话列表 / SSE 真流式对话 / 治理信息栏），多账号 USER_ID 隔离，会话管理与删除，审批队列与决策历史；**顶栏可填访问密钥（Bearer），与 `WARDEN_API_KEY` 鉴权共存**；FastAPI 单端口托管 | 已实现 |
+| Web 控制台（`web/`） | React + TypeScript + Tailwind + Vite：三栏可拖拽战术终端（对话列表 / SSE 真流式对话 / 治理信息栏），账号切换（鉴权模式下身份由 API Key 决定），会话管理与删除，审批队列与决策历史；**顶栏可填访问密钥（Bearer），与 `WARDEN_API_KEY` 鉴权共存**；FastAPI 单端口托管 | 已实现 |
 | 模型热切换（`web/server.py`） | `/models` 运行时切换模型（fake / deepseek / openai / zhipu / bailian），支持导入 API Key，全会话即时生效 | 已实现 |
 | 配置加载（`core/config.py`） | `.env` 加载，密钥不进代码 | 已实现 |
 | SDK 面（`agent.py`） | `build_agent` 一键装配、`typed_reply` 结构化输出、pydantic 工具 | 已实现 |
 | 架构边界测试（`tests/`） | AST 校验模块依赖单向 | 已实现 |
 | 工具稳定性层（`tool/stability.py`） | 超时护栏 / 指数退避 / 降级兜底 / 熔断；**已接线**：`build_agent` / `build_app` 均可传，产品入口默认开启（`WARDEN_STABILITY=0` 关）。按 `pure` 判定，非纯工具只对瞬时错误重试 | 已实现 |
-| 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏（密钥存进程内） | 独立模块 |
-| Checkpoint / 门禁（`runtime/`） | 断点恢复、失败重试、完成前校验 | 独立模块 |
+| 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏；**已接线且落库**：模型的 API Key 经 `CredentialBroker` 加密后写进 `credentials` 表（重启仍在），租约元数据写进 `credential_leases` 表（过期惰性清理），按调用者身份分作用域；`SecretRedactor` 对网关异常日志脱敏 | 已实现 |
+| Checkpoint / 恢复（`runtime/`） | 会话在 `model_call` / `tool_exec` / `awaiting_approval` / `done` 落存档点；`RecoveryController` 分组为 resume / retry / await_human / terminal；**`RecoveryWorker` 真正执行续跑**（`attempts` 递增、超上限不再试、**等人工的绝不自动续**）；入口 `GET /recovery/plan` 与 `warden recover --apply` | 已实现 |
+| 多租户授权（`web/auth.py`） | 身份由 API Key 决定、按 Run 归属拦截越权（403）；列表类接口按调用者收敛。**仅鉴权模式生效** | 已实现 |
+| 请求限流（`web/ratelimit.py`） | 固定窗口，按调用者/来源分桶，429 + `Retry-After`，健康探针豁免 | 已实现 |
+| 跨副本协调状态（`web/coordination.py`） | 幂等表 / 事件流 / 限流计数可插拔：单副本进程内，多副本 `WARDEN_SHARED_STATE=1` 走共享存储（幂等与 SSE 跨副本一致） | 已实现 |
 | 受控执行（`execution/`） | 受管子进程、输出 / 超时 / 并发预算，经沙箱工具接入主链 | 已实现 |
 | 执行沙箱（`execution/sandbox.py`） | **两档，必须分清**：语义档（只读副本 + NetworkPolicy 正则，跨平台但要明白**它不是安全边界**）；内核档（Linux + `unshare -rn` 网络命名空间，子进程无网络栈、绕不过）。档位探测是**功能性的**（有 `unshare` 不等于有权用）。**已在 WSL2 与容器实测**：`unshare -rn` 下 `eth0` 消失、连接 `ENETUNREACH` | 已实现 |
 | Agent 评测集（`evals/`） | 三类黄金集共 **30 例**：意图路由 12 / 技能触发 8 / **循环能力 10**。第三类断言落在**轨迹与决策**上（失败自愈、防打转、意图门禁、策略 DENY、迭代上限、参数保真、配对不变量），不是"回答非空"；`python -m warden_agent.evals` 出报告，可作 CI 门禁 | 已实现 |
-| 检索质量评测（`rag/eval.py`） | 标注问答集算 **top-1 / recall@k / MRR**，把 RAG 从"看着能用"变成有数字：`python -m warden_agent.rag.eval`（离线词频嵌入实测 top-1 85.7% / recall@3 100% / MRR 0.905）；语义嵌入端点**强制公网地址**（拒环回/私有/保留，解析后校验防 DNS rebinding） | 已实现 |
+| 检索质量评测（`rag/eval.py`） | 标注问答集算 **top-1 / recall@k / MRR**，把 RAG 从"看着能用"变成有数字：`python -m warden_agent.rag.eval`（离线词频嵌入实测 **top-1 85.7% / MRR 0.905**；`recall@3` 虽是 100% 但**被小语料抬高**——7 块库返回 3 块已覆盖 43%，报告会主动标注这点）。报告**逐条打印首现排名**，避免"垫底命中"被聚合数字掩盖；语义嵌入端点**强制公网地址**（拒环回/私有/保留，解析后校验防 DNS rebinding） | 已实现 |
 
-> **状态标注**：标注「独立模块」的组件已完成实现并通过测试，具备独立价值，但尚未接入产品
-> 主链路（`build_agent` / HTTP / CLI）。文档与实际行为保持一致——已接入主链路的模块均真实生效。
+> **口径说明**：本表「状态」区分"已实现（且已接入产品路径）"与"独立模块（实现+测试齐备，
+> 但未接入 `build_agent` / HTTP / CLI）"。当前**没有标注为「独立模块」的条目**——凭证与恢复
+> 都已接线。文档与实际行为保持一致：凡列入纵深防御的能力，均在运行路径上真实生效。
 
 ## 工程质量
 
-- **测试**：**379 项测试全量通过**（1 项 Postgres 集成测试在无数据库环境下自动跳过），覆盖状态机、工具稳定性层、执行循环、审批、持久化恢复、HTTP 契约、SSE 流式、RAG 与检索质量、多 Agent、技能系统、记忆、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、凭证加密、端到端演示等
+- **测试**：**546 项测试通过**（共 548 项；按环境自动跳过 2–3 项：Postgres 集成、未构建前端时的 SPA、无 node 时的 MCP）。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、多租户越权拦截、限流、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘（换实例读同一库仍在）**、**真实联网抓取的 SSRF 防护（含重定向绕过）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等
 - **Agent 评测**：内置黄金评测集（30 例，三类），通过率作为 CI 质量门禁
-- **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告（离线词频嵌入，实测 **top-1 85.7% / recall@3 100% / MRR 0.905**）；换真语义嵌入只需配三个环境变量，同一套标注集可对比
+- **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告，并**逐条打印首现排名**（离线词频嵌入实测 **top-1 85.7% / MRR 0.905**）。⚠️ 报告里的 `recall@3 = 100%` **被小语料抬高**——7 块库、k=3 一次返回 43% 的库，命中几乎是必然的，**该数字不代表检索器强**；报告在 k 覆盖率 ≥25% 时会主动提示。换真语义嵌入只需配三个环境变量，同一套标注集可对比相对提升
 - **类型检查**：`mypy --strict` 零错误（79 个源文件）
 - **静态检查**：`ruff` 零告警
 - **架构守护**：架构边界测试以 AST 校验分层依赖单向，防止层级倒挂

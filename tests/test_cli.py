@@ -18,6 +18,7 @@ _EXPECTED = {
     "health": "_cmd_health",
     "caps": "_cmd_caps",
     "coding": "_cmd_coding",
+    "recover": "_cmd_recover",
 }
 
 

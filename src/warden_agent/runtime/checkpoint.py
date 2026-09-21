@@ -69,16 +69,30 @@ class Checkpoint:
 
 
 class CheckpointManager:
-    """管理一次 Run 的存档点：最新 Checkpoint 存/取/推进。"""
+    """管理一次 Run 的存档点：最新 Checkpoint 存/取/推进。
+
+    `attempts` 是"这个 Run 累计尝试了几次"——**由本管理器持有并写进每个存档点**，
+    而不是靠数数据库行数（`checkpoints` 表按 run_id 覆盖写，永远只有一行）。
+    重试上限（`RecoveryController.max_attempts_per_run`）就靠它判断。
+    """
 
     def __init__(self, persistence: CheckpointStore | None = None) -> None:
         self._persistence = persistence
         self._latest: Checkpoint | None = None
+        self.attempts = 1  # 本次尝试算第 1 次；恢复时会从已有存档点接续
+
+    def adopt_attempts_from(self, run_id: str) -> int:
+        """从持久化的存档点接续 attempts（重启后不让计数归零）。"""
+        if self._persistence is not None:
+            cp = self._persistence.load(run_id)
+            if cp is not None:
+                self.attempts = max(1, cp.attempts)
+        return self.attempts
 
     def capture(self, run: AgentRun, iteration: int, step: str,
                 usage_tokens: int = 0) -> Checkpoint:
         cp = Checkpoint(run_id=run.run_id, status=run.status, iteration=iteration,
-                        step=step, usage_tokens=usage_tokens)
+                        step=step, usage_tokens=usage_tokens, attempts=self.attempts)
         self._latest = cp
         if self._persistence is not None:
             self._persistence.save(cp)
@@ -96,6 +110,7 @@ class CheckpointManager:
             return None
         run.status = cp.status
         self._latest = cp
+        self.attempts = max(1, cp.attempts)
         return cp
 
 
@@ -144,6 +159,21 @@ class SqliteCheckpointStore(CheckpointStore):
     def list(self) -> list[Checkpoint]:
         cps = self._store.list_checkpoints()
         return [cp for cp in cps if isinstance(cp, Checkpoint)]
+
+
+def checkpoint_store_for(store: Any) -> CheckpointStore | None:
+    """把具备 checkpoint 能力的存储适配成 `CheckpointStore`；不具备则返回 None。
+
+    会话主循环与跨 Run 恢复控制器都依赖这个接口（save/load/list）。放在 runtime 层，
+    SDK 面（`agent.py`）与产品面（`web/`）共用同一份判断，不再各写一遍。
+    拿不到就返回 None —— 存档退化为内存态，不影响会话可用性。
+    """
+    if all(
+        hasattr(store, m)
+        for m in ("save_checkpoint", "load_checkpoint", "list_checkpoints")
+    ):
+        return SqliteCheckpointStore(store)
+    return None
 
 
 # ---------------------------------------------------------------------------

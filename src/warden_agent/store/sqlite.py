@@ -25,6 +25,12 @@ from pathlib import Path
 from typing import Any
 
 from warden_agent.core.run.status import AgentRun, RunStatus
+from warden_agent.credential.vault import (
+    StoredCredential,
+    StoredLease,
+    decode_fields,
+    encode_fields,
+)
 from warden_agent.model.model import Message, ToolCall
 from warden_agent.store.codec import DEFAULT_CODEC_REGISTRY, VersionedCodecRegistry
 
@@ -94,6 +100,47 @@ class SqliteStore:
                 user_id    TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL
             );
+            -- 幂等表：多副本共享同一张表，同一 Idempotency-Key 才不会各缓存一份
+            CREATE TABLE IF NOT EXISTS idempotency (
+                key        TEXT PRIMARY KEY,
+                payload    TEXT NOT NULL,   -- JSON（body 以 base64 存放）
+                created_at TEXT NOT NULL
+            );
+            -- 事件流：SSE 事件落库，多副本订阅同一张表（轮询增量）
+            CREATE TABLE IF NOT EXISTS run_events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id     TEXT NOT NULL,
+                data       TEXT NOT NULL,   -- 事件 JSON
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events (run_id, id);
+            -- 限流计数：固定窗口，多副本共享 → 全局限额不翻倍
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                bucket_key   TEXT PRIMARY KEY,
+                window_start REAL NOT NULL,
+                count        INTEGER NOT NULL
+            );
+            -- 凭证密文：AES-GCM 密文（外加随机 nonce），明文绝不落这张表。
+            -- 没有它，"加密"只发生在内存里，进程一退凭证就没了。
+            CREATE TABLE IF NOT EXISTS credentials (
+                scope      TEXT NOT NULL,   -- 作用域：部署级 / 租户级 / 用户级
+                name       TEXT NOT NULL,
+                data       TEXT NOT NULL,   -- JSON: 字段名 -> 密文
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (scope, name)
+            );
+            -- 凭证租约：只存元数据（无明文）。取租约时按 name 回查密文现解，
+            -- 所以"租约跨重启存活"与"明文不落盘"可以并存。
+            CREATE TABLE IF NOT EXISTS credential_leases (
+                scope      TEXT NOT NULL,
+                lease_id   TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                issued_at  TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (scope, lease_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_credential_leases_expiry
+                ON credential_leases (scope, expires_at);
             """
         )
         self.conn.commit()
@@ -209,11 +256,12 @@ class SqliteStore:
         return out
 
     def delete_run(self, run_id: str) -> None:
-        """删除整个会话：对话、待审批、checkpoint、状态一并清掉。"""
+        """删除整个会话：对话、待审批、checkpoint、事件、状态一并清掉。"""
         with self._lock:
             self.conn.execute("DELETE FROM messages WHERE run_id = ?", (run_id,))
             self.conn.execute("DELETE FROM pending_approvals WHERE run_id = ?", (run_id,))
             self.conn.execute("DELETE FROM checkpoints WHERE run_id = ?", (run_id,))
+            self.conn.execute("DELETE FROM run_events WHERE run_id = ?", (run_id,))
             self.conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
             self.conn.commit()
 
@@ -236,13 +284,27 @@ class SqliteStore:
             )
             self.conn.commit()
 
-    def list_approval_history(self, limit: int = 20) -> list[dict[str, Any]]:
-        """审批决策历史（最新的在前）。"""
-        rows = self.conn.execute(
-            "SELECT run_id, approval_id, tool_name, decision, created_at "
-            "FROM approval_history ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    def list_approval_history(
+        self, limit: int = 20, owner: str | None = None
+    ) -> list[dict[str, Any]]:
+        """审批决策历史（最新的在前）。
+
+        owner 给定时只返回该用户名下 Run 的决策——审批历史记着"谁批准了哪个高危工具、
+        带什么参数"，属于租户数据，不能跨租户可见。
+        """
+        if owner:
+            rows = self.conn.execute(
+                "SELECT h.run_id, h.approval_id, h.tool_name, h.decision, h.created_at "
+                "FROM approval_history h JOIN runs r ON r.run_id = h.run_id "
+                "WHERE r.user_id = ? ORDER BY h.id DESC LIMIT ?",
+                (owner, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT run_id, approval_id, tool_name, decision, created_at "
+                "FROM approval_history ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [
             {"run_id": r[0], "approval_id": r[1], "tool_name": r[2],
              "decision": r[3], "created_at": r[4]}
@@ -433,6 +495,158 @@ class SqliteStore:
         if isinstance(obj, dict):
             return Checkpoint.from_dict(obj)
         return None
+
+    # ---- 跨副本共享状态（幂等 / 事件流 / 限流计数）----
+    def get_idempotent(self, key: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT payload FROM idempotency WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def save_idempotent(self, key: str, payload: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO idempotency (key, payload, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET payload = excluded.payload",
+                (key, payload, _now_iso()),
+            )
+            self.conn.commit()
+
+    def append_event(self, run_id: str, payload: str) -> int:
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO run_events (run_id, data, created_at) VALUES (?, ?, ?)",
+                (run_id, payload, _now_iso()),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_events_after(
+        self, run_id: str, after_seq: int, limit: int = 200
+    ) -> list[tuple[int, str]]:
+        rows = self.conn.execute(
+            "SELECT id, data FROM run_events WHERE run_id = ? AND id > ? "
+            "ORDER BY id LIMIT ?",
+            (run_id, after_seq, limit),
+        ).fetchall()
+        return [(int(r[0]), str(r[1])) for r in rows]
+
+    def hit_rate_limit(
+        self, bucket_key: str, window_seconds: int, now: float
+    ) -> tuple[int, float]:
+        """固定窗口计数 +1，返回 (本窗口累计次数, 窗口起始时刻)。
+
+        读-改-写在同一把锁内完成，保证多线程下计数不丢。
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT window_start, count FROM rate_limits WHERE bucket_key = ?",
+                (bucket_key,),
+            ).fetchone()
+            if row is None or now - float(row[0]) >= window_seconds:
+                start, count = now, 1
+            else:
+                start, count = float(row[0]), int(row[1]) + 1
+            self.conn.execute(
+                "INSERT INTO rate_limits (bucket_key, window_start, count) VALUES (?, ?, ?) "
+                "ON CONFLICT(bucket_key) DO UPDATE SET "
+                "window_start = excluded.window_start, count = excluded.count",
+                (bucket_key, start, count),
+            )
+            self.conn.commit()
+        return count, start
+
+    # ---- 凭证保管库（CredentialVault 协议，见 credential/vault.py）----
+    #
+    # 结构化满足协议：本类不需要 import 协议的实现，只要方法名/签名一致即可被当作
+    # vault 使用。这里存的一律是**密文**（加密在 credential 层完成），存储层不碰明文。
+    def save_credential(self, credential: StoredCredential) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO credentials (scope, name, data, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(scope, name) DO UPDATE SET "
+                "data = excluded.data, updated_at = excluded.updated_at",
+                (
+                    credential.scope,
+                    credential.name,
+                    encode_fields(credential.encrypted),
+                    _now_iso(),
+                ),
+            )
+            self.conn.commit()
+
+    def load_credential(self, scope: str, name: str) -> StoredCredential | None:
+        row = self.conn.execute(
+            "SELECT data FROM credentials WHERE scope = ? AND name = ?", (scope, name)
+        ).fetchone()
+        if row is None:
+            return None
+        return StoredCredential(scope=scope, name=name, encrypted=decode_fields(row[0]))
+
+    def delete_credential(self, scope: str, name: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM credentials WHERE scope = ? AND name = ?", (scope, name)
+            )
+            self.conn.commit()
+
+    def list_credential_names(self, scope: str) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT name FROM credentials WHERE scope = ? ORDER BY name", (scope,)
+        ).fetchall()
+        return [str(r[0]) for r in rows]
+
+    def save_credential_lease(self, lease: StoredLease) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO credential_leases "
+                "(scope, lease_id, name, issued_at, expires_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scope, lease_id) DO UPDATE SET "
+                "name = excluded.name, issued_at = excluded.issued_at, "
+                "expires_at = excluded.expires_at",
+                (
+                    lease.scope,
+                    lease.lease_id,
+                    lease.name,
+                    lease.issued_at.isoformat(),
+                    lease.expires_at.isoformat(),
+                ),
+            )
+            self.conn.commit()
+
+    def load_credential_lease(self, scope: str, lease_id: str) -> StoredLease | None:
+        row = self.conn.execute(
+            "SELECT name, issued_at, expires_at FROM credential_leases "
+            "WHERE scope = ? AND lease_id = ?",
+            (scope, lease_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return StoredLease(
+            scope=scope,
+            lease_id=lease_id,
+            name=str(row[0]),
+            issued_at=datetime.fromisoformat(str(row[1])),
+            expires_at=datetime.fromisoformat(str(row[2])),
+        )
+
+    def delete_credential_lease(self, scope: str, lease_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM credential_leases WHERE scope = ? AND lease_id = ?",
+                (scope, lease_id),
+            )
+            self.conn.commit()
+
+    def purge_expired_credential_leases(self, scope: str, now: datetime) -> int:
+        """删掉某作用域下已过期的租约记录，返回删除条数（惰性清理，防止表只增不减）。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM credential_leases WHERE scope = ? AND expires_at <= ?",
+                (scope, now.isoformat()),
+            )
+            self.conn.commit()
+            return int(cur.rowcount or 0)
 
     def close(self) -> None:
         self.conn.close()

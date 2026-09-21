@@ -5,6 +5,288 @@
 
 ---
 
+## 2026-09-21（第七批：凭证密文与租约落库）
+
+### 本轮改动（在工作区，尚未 commit）
+
+> ⚠️ 说明：本批与第三～六批的改动目前都还在工作区（`git log` 停在第二批 `e76db3e`）。
+> 下面第三节标注的"已提交"是当时写下时的口吻，实际状态以 `git status` 为准。
+
+- **凭证的"加密"终于兑现**。此前 `CredentialCipher` 的 AES-GCM 是真的，但加解密的密文与租约
+  都活在 `CredentialBroker` 进程内的一个 dict 里——**进程一退凭证就没了**，`register` 过的
+  key 全丢，加密等于白做（README 却把"凭证 AES-GCM 加密"列为纵深防御能力）。
+  现在新增 `credential/vault.py`，把密文与租约交给存储层：
+  - `CredentialVault` 协议 + `InMemoryCredentialVault`（默认，行为与历史一致）；
+  - `SqliteStore` / `PostgresStore` **结构化满足**该协议（方法名签名一致即算，存储层不反向
+    import credential 模块，依赖方向保持单向）；新增 `credentials` / `credential_leases` 两张表。
+  - `build_app` 默认 `default_broker(vault=as_vault(store))`：用 SQLite/PostgreSQL 时**自动落库**，
+    内存版存储则静默退回进程内（不会因"少实现一个接口"而崩）。
+- **明文不落盘**。租约只落**元数据**（`name / issued_at / expires_at`），取租约时按 name 回查
+  密文现解——所以"租约跨重启存活"和"明文不写库"两件事可以同时成立。测试直接读 `.db`
+  文件字节断言明文不出现。
+- **租约过期惰性清理**：`get()` 命中过期即删该行，`issue()` 顺手清掉同作用域的历史过期租约，
+  避免表只增不减。
+- **按调用者身份隔离**（`scope`）。⚠️ 这里对上一批的建议做了一处**修正**：原计划"按 tenant 隔离"，
+  但本项目的 `tenant_id`（`WARDEN_TENANT`，默认 `local`）是**整租户共用**的，同租户的 alice 与 bob
+  会互相读到对方导入的 key——隔离形同虚设。故改用 `caller.user_id`（= `principal_id`，来自凭证）
+  作为作用域；**启动配置的 key 记为部署级**（`DEPLOYMENT_SCOPE`），全体调用者共用。
+  查询 key 时先看自己作用域、再回落部署级。
+- `CredentialBroker` 新增 `encrypted_fields()` 供审计/测试核对"库里没有明文"；既有测试里
+  对私有属性 `_secrets` 的访问改为该公开方法（断言意图不变）。
+
+### 尚未实现（路线图）
+
+- **租约 TTL 仍未与模型生命周期绑定**：模型实例构造后自身持有密钥字符串，租约过期不会让
+  已构造的模型失效。租约的价值在"保管与审计"，不在"运行时收回"（沿用上一批口径）。
+- **没有 KMS / 密钥轮换**：密钥材料是单个环境变量，轮换需重新加密存量密文（未做迁移工具）。
+  跨副本必须共用同一把密钥，否则副本互相解不开。
+- **模型切换本身仍是全局的**：key 已按用户隔离，但 `/models/select` 改的是进程级"当前模型"，
+  一个用户切换会影响所有用户——这是既有设计，本轮未改（要按用户分模型需另存每用户的当前模型）。
+- **`credential_leases` 表会随租约发放增长**：靠惰性清理收敛，没有独立的后台清理任务。
+
+### 验证
+
+- `pytest` → **546 passed, 2 skipped**（新增 14 条 `tests/test_credential_persistence.py`）
+- `mypy --strict` → 85 个源文件零错误；`ruff` → 全绿
+- 测试覆盖：换实例读同一库凭证仍在、换实例租约仍有效、库文件里翻不到明文、
+  过期租约读取时被清理、发新租约时清历史过期项、凭证删除后租约失效、
+  不同 scope 互不可见/互不覆盖、`as_vault` 装配、HTTP 端到端
+  （导入的 key 跨重启仍在；同租户 A/B 两用户互不可见、B 无法借用 A 的 key）
+
+---
+
+## 2026-09-20（第六批：真实联网抓取工具）
+
+### 已提交
+
+- **新增 `HttpFetchProvider`：项目里第一个真正会发网络请求的能力**。
+  此前 `web.search` / `web.fetch` 的接口与 URL 安全策略都齐了，但**只有离线 mock**——
+  `web.fetch` 默认对任何 URL 都返回"页面不存在"，等于没有联网能力。
+  现在 `WARDEN_WEB_FETCH=1` 即可让 `web.fetch` 真发 HTTP 抓网页、并把 HTML 粗提取成可读正文。
+  - **默认仍是离线 mock**（不发任何请求）："Agent 能不能出网"是应该由运维显式决定的能力，
+    不该悄悄打开；也让测试保持全离线。
+  - **安全上四道约束**（缺一道都能被绕过）：
+    1. 工具层 DNS 校验（沿用既有 `WebUrlPolicy.check_for_network`）；
+    2. **每一跳重定向都重新校验**——**关掉 httpx 的 `follow_redirects`**，自己逐跳解析。
+       原因：公网域名返回 `302 Location: http://169.254.169.254/`（云元数据端点）是
+       SSRF 的经典绕过，自动跟随重定向的实现会直接把内网请求打出去。这是本次最关键的一处。
+    3. 只吃文本类响应（`text/*` / json / xml），二进制直接拒（不把图片塞进模型上下文）；
+    4. 超时 / 最大响应体（默认 200KB，超了截断并标注）/ 最大跳转次数都有界。
+  - `transport` 与 `resolver` 可注入 → 测试全程离线、确定（含重定向绕过的回归用例）。
+  - `providers_from_env()` 负责开关；`/capabilities` 新增 `features.web_fetch`，
+    启动日志在开启时会**明确告警"Agent 可主动访问公网"**。
+
+- **新增 20 条测试**（`tests/test_web_fetch.py`）：HTML 正文提取、实体还原、script/style 剔除、
+  文本/二进制分流、404 与网络异常转错误（不抛）、响应体截断、**非公网地址在发请求前就被拒
+  （且断言一个请求都没发）**、**重定向到内网地址被拦且内网一次都没被请求**、
+  **重定向到"解析为内网"的域名被拦（DNS rebinding）**、相对跳转解析、跳转次数上限、
+  环境开关、能力清单暴露实现。
+  另用**真实网络**验证过一次端到端：`https://example.com` 抓取成功并提取出正文；
+  `169.254.169.254` 被拒。
+
+### 尚未实现（路线图）
+
+- **真实搜索 provider 没有实现**：`web.search` 仍是离线 mock（没配条目就返回空）。
+  真实搜索 API（Tavily / Brave / 阿里云 IQS 等）都需要第三方 key，
+  接口（`WebSearchProvider`）与安全策略都已备好，补一个类即可接入——
+  但没有 key 就无法验证，所以没有硬塞一段未经验证的代码进来。
+- 抓取没做正文抽取算法（Readability 那类），只有去标签的粗提取；也没处理 JS 渲染页面
+  （拿不到 SPA 的内容，需要 headless 浏览器）。
+- 出网没有全局限速/配额（只有单次请求的超时与响应体上限）；高频抓取需要另加。
+
+### 验证
+
+- `pytest` → **532 passed, 2 skipped**（共 534 项；无 node 的机器是 531 passed / 3 skipped）
+- `mypy --strict` → 84 个源文件零错误；`ruff` → 全绿
+- 真实网络冒烟：`https://example.com` → status 200 + 正文；
+  `http://169.254.169.254/latest/meta-data/` → `[拒绝] 不是公网地址`
+
+---
+
+## 2026-09-20（第五批：RAG 接线 + 记忆落盘）
+
+### 已提交
+
+- **RAG 接进产品路径**。此前 `rag/` 只被 `demo_e2e.py` 与 `rag/eval.py` 引用——
+  `build_agent` / `build_app` / `run_server` **没有任何地方构造 `VectorStore`**，
+  `rag/__init__.py` 甚至是 0 字节。所以向量库、检索、来源引用、检索质量评测全都在，
+  但模型手里的工具清单里**没有 `knowledge.search`**：又一处"实现了没接线"
+  （与前面修过的凭证、恢复同类；这一处是第四轮遗漏的）。
+  - 新增 `rag/loader.py`：`build_knowledge(source)` 支持三种来源——
+    `VectorStore` 实例（原样使用）/ `True`（内置离线语料）/ 目录路径（索引 `.md`/`.txt`）。
+  - `augment_catalog` 新增 `knowledge` 参数并注册 `make_knowledge_tool`；
+    `build_agent` / `build_app` 同步透传；`run_server` 新增 `WARDEN_KNOWLEDGE=1|<目录>`。
+  - `rag/__init__.py` 补齐导出（此前为空文件）。
+  - **默认嵌入器仍是离线词频哈希（词面匹配，不是语义检索）**——这一点在启动日志里
+    明确打出嵌入器名，避免"在词频嵌入下宣称语义检索"。真语义走 `WARDEN_EMBED_*`。
+  - 新增 12 条测试（`tests/test_rag_wiring.py`）：三种来源、目录索引跳过非文本/空文件、
+    注入库原样使用、`/capabilities` 可见、**端到端验证模型真能调 `knowledge.search`
+    并在观察里拿到带来源的资料**、环境开关解析。
+
+- **记忆落盘**。`MemoryRepository` 协议此前只有 `InMemoryMemoryStore` 一个实现，
+  而 `augment_catalog` 固定用它——后果是 `USER` 作用域（"跨会话的用户级记忆"）
+  在语义上成立、在实现上落空：进程一退就没了。
+  - 新增 `SqliteMemoryStore`（`memory/store.py`）：实现同一套接口（save/find/find_ref/
+    latest/search），语义与内存版对齐（含"latest 优先有效项"）；审计轨迹、冲突字段、
+    过期时间一并落盘。
+  - `augment_catalog` 新增 `memory_repository`；`build_agent` / `build_app` 透传；
+    **`run_server` 默认改用 `SqliteMemoryStore`**，并记 `extra["memory_persistent"]`
+    标明是哪种实现。
+  - 新增 10 条测试（`tests/test_memory_persistence.py`）：存储语义、**换新实例读同一库
+    数据仍在**（模拟重启）、候选流落盘、审计落盘、HTTP `/memory/user` 能读到落盘的记忆。
+
+- **文档**：README 的 RAG / 记忆两行状态改准（并补上"词面匹配不是语义检索""召回是关键词
+  重叠"两条诚实说明）；`.env.example` 加 `WARDEN_KNOWLEDGE` 与 `WARDEN_EMBED_*`；
+  `docs/deployment-boundaries.md` 补记忆在多副本下的注意项。
+
+- **检索评测报告改为"逐条排名在前"**（`rag/eval.py`）：聚合数字会掩盖"靠运气命中"——
+  实测那条改说法的问法（"我想请几天假出去玩，有什么规定"，期望"15 天"）**正确片段相似度为
+  0.000、排第 3**，只因 7 块库里 k=3 一次返回 3 块（覆盖 43%）才被顺带捞回；
+  而 top-1 是完全无关的"出差交通"。现在报告会打印每条问法的首现排名，并在
+  **k 覆盖率 ≥25% 时明确标注 `recall@k` 被小库抬高、不代表检索器强**（新增 `k_coverage` 属性）。
+  拿了"recall@3 100%"去对外说会被一句"你库多大"戳穿，这个提示是防这个的。
+
+- **修正一处与代码不符的注释**：`rag/knowledge.py` 模块 docstring 原写"检索用余弦相似度，
+  纯 numpy 实现"——但代码是纯 Python（`math.sqrt` + 列表推导），pyproject 里也没有 numpy。
+  已改为与实现一致，并补上真实描述（暴力全扫 O(N)、点积即余弦因向量已归一化、
+  进程内不落盘、4096 维 Python float 单条约 130KB）。
+
+### 尚未实现（路线图）
+
+- **默认 RAG 仍是词面匹配**：要跨过"换个说法就掉分"，需配真语义嵌入端点
+  （代码路径已备好，只是默认不联网）。
+- **向量库是进程内、全量扫描**：`VectorStore` 把 chunk 放在 list 里线性算余弦，
+  没有持久化、没有 ANN 索引。大语料需要换真正的向量库（FAISS/pgvector 等），
+  当前实现适合中小知识库与离线演示。
+- **记忆召回是关键词重叠**，不是向量召回；`USER` 作用域虽已落盘，但多副本并发写
+  同一 key 的冲突消解只做了版本/状态层面，没有分布式锁。
+
+### 验证
+
+- `pytest` → **512 passed, 2 skipped**（共 514 项；无 node 的机器是 511 passed / 3 skipped）
+- `mypy --strict` → 84 个源文件零错误；`ruff` → 全绿
+- 冒烟：`WARDEN_KNOWLEDGE=1` 起服务，`/capabilities` 报出
+  `tools=['knowledge.search', 'memory.recall', 'memory.remember']`，
+  `features.knowledge_embedder='offline-term-frequency'`、`memory_persistent=true`
+
+---
+
+## 2026-09-20（第四批：水平扩展 + 恢复工作进程）
+
+### 已提交
+
+- **支持多副本部署（水平扩展）**。此前幂等表、SSE 事件总线、限流计数都是**进程内 dict**，
+  起第二个副本就会出现：同一 `Idempotency-Key` 打到不同副本重复执行、客户端连副本 A 而
+  事件产生在副本 B 收不到、实际限额 ≈ 配置值 × 副本数。现在把这三样抽成可插拔实现
+  （新增 `web/coordination.py`：`IdempotencyStore` / `EventBus` / `RateLimitStore` 三个协议）：
+  - **单副本**（默认）：`InProcess*` 实现，行为与历史一致、零延迟；
+  - **多副本**：`WARDEN_SHARED_STATE=1` → `Sql*` 实现，复用 `RunStore` 的共享表
+    （新增 `idempotency` / `run_events` / `rate_limits` 三张表 + 对应接口方法，
+    SQLite 与 PostgreSQL 都实现；Postgres 一并补齐了此前缺失的 `checkpoints` 支持）。
+  - `SqlEventBus` 用轮询增量读事件表（默认 250ms），不引入 Redis 等新依赖；
+    对延迟敏感可换 Redis/NATS，只要满足 `EventBus` 协议。
+  - 新增 10 条测试（`tests/test_shared_state.py`）：**同一个 store 上起两个 app 实例**，
+    验证幂等只执行一次、限流总额度不翻倍、事件能被另一副本订阅到；并配了
+    `shared_state=False` 的**对照测试**，如实暴露"不共享会怎样"。
+
+- **恢复工作进程：计划真正被执行**。此前 `RecoveryController` 只判断不执行，
+  重启后一堆 run 实际没人管。现在：
+  - `AgentSession.resume()`：从已存状态继续一次未完成的运行（不追加新用户输入）。
+    **安全边界**：对 `WAITING_APPROVAL` / `WAITING_INTERACTION` / `SUSPENDED` 抛
+    `RunNotResumable`——自动续跑等待审批的 Run 等于绕过人工闸门；对已完成/已取消的
+    Run 也拒绝（否则是重复执行）；只有 `FAILED` 允许重试。
+  - `RecoveryWorker`（新增 `runtime/worker.py`）：按计划续跑 / 重试 / 等人 / 跳过，
+    单个 Run 失败不拖垮整轮；`run_once()` 跑一轮、`run_forever()` 守护形态。
+  - **`attempts` 归位**：重试计数改由 `CheckpointManager` 持有并写进每个存档点
+    （原来只在 `Checkpoint` 上占个字段，没人维护；会话重启后计数会归零，重试上限形同虚设）。
+    现在 `resume()` 在 FAILED 分支 `attempts += 1` 并随存档点写回。
+  - 入口：`warden recover --apply`（本地跑一轮）；默认 `warden recover` 仍只打印计划。
+  - 新增 11 条测试（`tests/test_worker.py`）：崩溃后续跑、完成态拒绝、**等人工不自动续**、
+    FAILED 重试且 attempts 递增、超上限跳过、单 run 失败隔离、CLI `--apply`。
+
+- **`build_agent` 补上存档点**：SDK 路径此前也没传 `checkpoint_store`，同样不写 checkpoint。
+  新增 `runtime/checkpoint.py` 的 `checkpoint_store_for(store)` 作为统一适配入口，
+  SDK 面与产品面共用一份判断（不再各写一遍）。
+
+- **文档**：`docs/deployment-boundaries.md` 从"多副本不支持"改写为"单副本/多副本两种形态"，
+  列出协调状态对照表、多副本部署要点（PostgreSQL、共享开关、凭证密钥统一、会话粘性）；
+  README 同步；`.env.example` 加 `WARDEN_SHARED_STATE`。
+
+### 尚未实现（路线图）
+
+- **会话粘性仍是部署侧责任**：`SessionRegistry` 是纯缓存（会从库重建，正确性没问题），
+  但同一 `run_id` 被两个副本**同时**驱动会出现后写覆盖前写。要彻底解决需在存储层加
+  Run 级分布式锁（或其上层的单会话单副本路由）。当前给的是"建议做粘性路由"，不是强制。
+- **`SqlEventBus` 是轮询实现**：延迟约等于轮询间隔（默认 250ms）。低延迟场景应换
+  Redis Pub/Sub 或 Postgres LISTEN/NOTIFY 实现（协议已备好，实现未做）。
+- **工具稳定性层的熔断状态仍是进程内**：每个副本各自熔断，不具全局语义。
+
+---
+
+## 2026-09-19（第三批：补齐"实现了没接线"与多租户/扩缩容口径）
+
+### 已提交
+
+- **多租户从"按字段过滤"变成真边界**（本轮最大的一处安全修正）。此前 `user_id` 来自
+  客户端查询参数（`?user_id=`），且 `RunOperationAuthorizer` 建的时候**没传回调 = 全放行** ——
+  拿到一把 key 就能读写、删除他人会话、替他人审批高危操作，README 的"多账号 USER_ID 隔离"
+  只是前端过滤器。现在：
+  - **身份由凭证决定**：新增 `WARDEN_API_KEYS=alice:k1,bob:k2`（每个 key 绑定一个用户），
+    认证模式下端点一律用 `caller.user_id`（= `principal_id`），**查询参数被忽略**。
+    `TrustedCaller.user_id` 把这个约定显式化（`web/auth.py`）。
+  - **按归属授权**：新增 `owner_authorizer(load_owner)`，对**已存在且已归属**的 Run，
+    调用者与归属不符即 403。覆盖 chat / status / messages / events / runs / approve / reject
+    （`_extract_run_id` 同步补上 `/runs/{id}`、`/messages/{id}`——少覆盖一条，归属校验在那条路上
+    就等于没开）。
+  - **列表类接口按调用者收敛**：`/runs`、`/approvals`、`/approvals/history`（`list_approval_history`
+    四个实现统一加 `owner` 参数）、`/users`、`/audit`（按 `tenant_id`）。
+  - **不改坏本地演示**：匿名开发模式（未开鉴权）保留 `?user_id=` 旧行为。
+  - 新增 14 条测试（`tests/test_web_tenancy.py`）覆盖身份派生、读/写/删/审批四类越权、
+    列表收敛、审计租户隔离，以及"匿名模式不受影响"的对照组。
+
+- **跨 Run 恢复真正接线**（此前 `CheckpointManager` / `RecoveryController` / `SqliteCheckpointStore`
+  **全仓只在测试里出现**）。根因比"缺入口"更深一层：**产品路径从不写 checkpoint**，
+  `checkpoints` 表永远是空的，所以恢复控制器即使接上也是空转。现在：
+  - `AgentSession` 在 `model_call` / `tool_exec` / `awaiting_approval` / `done` 四个点落存档点
+    （非流式与流式两条路径都埋）；写失败降级为告警，不成为主路径单点。
+  - 新增入口：`GET /recovery/plan`（认证模式下按归属过滤）与
+    `warden recover [--db] [--owner] [--json]`（本地命令，只判断不执行）。
+  - 新增 9 条测试（`tests/test_recovery_wiring.py`）：存档步骤序列、等待审批归入 `awaiting_human`、
+    终态归入 `terminal`、端点与 CLI 输出。
+
+- **凭证模块真正接线**（此前 `CredentialBroker` / `SecretRedactor` 全仓零引用，
+  而 README 把"凭证 AES-GCM 加密 + 脱敏"列为防御能力）。现在：模型的 API Key 经
+  `CredentialBroker` **加密保管 + 短租约**（不再明文躺在 `imported_keys` dict 里），
+  `SecretRedactor` 对网关异常日志脱敏并挂到 `app.state`。
+  新增 `default_broker()`：`WARDEN_CREDENTIAL_KEY` 给密钥材料，未配置则退化为**进程内临时密钥**
+  并**明确告警**（不制造"已持久化加密"的假象——原来的 `derive_key_from_env` 会直接抛错，
+  等于该模块永远无法在默认配置下启用）。
+
+- **新增请求限流**（可用性这条线此前完全空白）：`web/ratelimit.py` 进程内固定窗口限流器，
+  默认每调用者 60 秒 600 次（`WARDEN_RATE_LIMIT=次数/秒数`，`0` 关），429 + `Retry-After`，
+  健康探针豁免，拒绝计入 `warden_rate_limited_total` 指标。新增 23 条测试。
+
+- **口径文档**：新增 `docs/deployment-boundaries.md`——明确单节点前提、**进程内状态清单**
+  （会话缓存 / SSE 总线 / 幂等表 / 限流桶 / 凭证密钥 / 熔断状态）及各自的多副本后果与扩展接缝，
+  并说清"多租户仅在鉴权模式成立、匿名模式不是安全边界"。README 同步收敛相关表述。
+
+- **仓库卫生**：删除根目录误操作留下的空目录 `pyproject.toml;C`。
+
+- **文档对齐**：README 测试数 379 → **465**；工具稳定性层的"独立模块（未接入主链路）"是过时描述
+  （上一批已接线），一并更正；架构图该虚线标注同步更新。
+
+### 尚未实现（路线图）
+
+- **水平扩展仍不支持**：幂等表、SSE 事件总线、`SessionRegistry`、限流计数都在进程内，
+  多副本部署会让幂等/事件流/限额各自为政。接缝已在 `docs/deployment-boundaries.md` 列出
+  （改共享存储 / Redis 总线 / 网关限流），本轮**未实现**，只把边界写清楚。
+- **RecoveryController 仍只判断不执行**：没有内置常驻 worker 去真正续跑，
+  计划由 `GET /recovery/plan` / `warden recover` 输出，执行交调用方。
+- **凭证的租约 TTL 未与模型生命周期绑定**：模型实例构造后自身持有密钥，
+  租约过期不会让已构造的模型失效（租约的价值在"保管与审计"，不在"运行时收回"）。
+
+---
+
 ## 2026-09-19（第二批：认知能力接进产品路径）
 
 ### 已提交

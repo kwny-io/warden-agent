@@ -11,7 +11,10 @@ RAG 的完整流程（三句话）：
   - 向量存储：VectorStore，存 chunk 文本 + embedding。
   - 嵌入函数可替换：默认用纯 Python 的哈希嵌入（零重依赖、离线可测、不花钱）；
     以后想接入 FastEmbed / 真嵌入 API，只需传一个函数进来，其他地方不用改。
-  - 检索用余弦相似度，纯 numpy 实现。
+  - 检索：把问题向量与库里**每一个** chunk 向量算相似度，排序取 top-k。纯 Python 实现
+    （不依赖 numpy），暴力全扫 O(N)；向量在嵌入阶段已 L2 归一化，所以点积即余弦。
+  - 存储：进程内两个平行 list（chunk 文本 + 向量），**不落盘**，重启靠重新索引。
+    维度 4096 且用 Python float 存，单条向量约 130KB —— 适合中小知识库，上量需换向量库。
   - 通过 function_tool 暴露成 knowledge.search 技能卡，模型自动会用。
 """
 from __future__ import annotations

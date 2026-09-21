@@ -18,6 +18,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from warden_agent.core.run.status import AgentRun, RunStatus
+from warden_agent.credential.vault import (
+    StoredCredential,
+    StoredLease,
+    decode_fields,
+    encode_fields,
+)
 from warden_agent.model.model import Message, ToolCall
 
 
@@ -98,6 +104,64 @@ class PostgresStore:
                     created_at TEXT NOT NULL
                 )
             """)
+            # 检查点（与 SqliteStore 对齐：单查 + 枚举，供跨 Run 恢复使用）
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    run_id TEXT PRIMARY KEY,
+                    data   TEXT NOT NULL
+                )
+            """)
+            # 跨副本共享状态：幂等 / 事件流 / 限流计数
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS idempotency (
+                    key        TEXT PRIMARY KEY,
+                    payload    TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS run_events (
+                    id         BIGSERIAL PRIMARY KEY,
+                    run_id     TEXT NOT NULL,
+                    data       TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events (run_id, id)"
+            )
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rate_limits (
+                    bucket_key   TEXT PRIMARY KEY,
+                    window_start DOUBLE PRECISION NOT NULL,
+                    count        BIGINT NOT NULL
+                )
+            """)
+            # 凭证密文与租约（与 SqliteStore 对齐，见 credential/vault.py）。
+            # 存的是 AES-GCM 密文，明文不落这张表。
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS credentials (
+                    scope      TEXT NOT NULL,
+                    name       TEXT NOT NULL,
+                    data       TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (scope, name)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS credential_leases (
+                    scope      TEXT NOT NULL,
+                    lease_id   TEXT NOT NULL,
+                    name       TEXT NOT NULL,
+                    issued_at  TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    PRIMARY KEY (scope, lease_id)
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_credential_leases_expiry "
+                "ON credential_leases (scope, expires_at)"
+            )
         self.conn.commit()
 
     # ---- Run 状态 ----
@@ -122,10 +186,12 @@ class PostgresStore:
         return run
 
     def delete_run(self, run_id: str) -> None:
-        """删除整个会话：对话、待审批、状态一并清掉（与 SqliteStore 语义一致）。"""
+        """删除整个会话：对话、待审批、checkpoint、事件、状态一并清掉（与 SqliteStore 一致）。"""
         with self.conn.cursor() as cur:
             cur.execute("DELETE FROM messages WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM pending_approvals WHERE run_id = %s", (run_id,))
+            cur.execute("DELETE FROM checkpoints WHERE run_id = %s", (run_id,))
+            cur.execute("DELETE FROM run_events WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
         self.conn.commit()
 
@@ -148,14 +214,24 @@ class PostgresStore:
             )
         self.conn.commit()
 
-    def list_approval_history(self, limit: int = 20) -> list[dict[str, Any]]:
-        """审批决策历史（最新的在前）。"""
+    def list_approval_history(
+        self, limit: int = 20, owner: str | None = None
+    ) -> list[dict[str, Any]]:
+        """审批决策历史（最新的在前）。owner 给定时只返回该用户名下 Run 的决策。"""
         with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT run_id, approval_id, tool_name, decision, created_at "
-                "FROM approval_history ORDER BY id DESC LIMIT %s",
-                (limit,),
-            )
+            if owner:
+                cur.execute(
+                    "SELECT h.run_id, h.approval_id, h.tool_name, h.decision, h.created_at "
+                    "FROM approval_history h JOIN runs r ON r.run_id = h.run_id "
+                    "WHERE r.user_id = %s ORDER BY h.id DESC LIMIT %s",
+                    (owner, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT run_id, approval_id, tool_name, decision, created_at "
+                    "FROM approval_history ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
             rows = cur.fetchall()
         return [
             {"run_id": r[0], "approval_id": r[1], "tool_name": r[2],
@@ -308,5 +384,202 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    # ---- 检查点（与 SqliteStore 对齐）----
+    def save_checkpoint(self, checkpoint: object) -> None:
+        from warden_agent.runtime.checkpoint import Checkpoint
+
+        assert isinstance(checkpoint, Checkpoint)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO checkpoints (run_id, data) VALUES (%s, %s) "
+                "ON CONFLICT (run_id) DO UPDATE SET data = EXCLUDED.data",
+                (checkpoint.run_id, json.dumps(checkpoint.to_dict(), ensure_ascii=False)),
+            )
+        self.conn.commit()
+
+    def load_checkpoint(self, run_id: str) -> object | None:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT data FROM checkpoints WHERE run_id = %s", (run_id,))
+            row = cur.fetchone()
+        return None if row is None else self._decode_checkpoint(row[0])
+
+    def list_checkpoints(self) -> list[object]:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT data FROM checkpoints ORDER BY run_id")
+            rows = cur.fetchall()
+        out: list[object] = []
+        for (raw,) in rows:
+            cp = self._decode_checkpoint(raw)
+            if cp is not None:
+                out.append(cp)
+        return out
+
+    @staticmethod
+    def _decode_checkpoint(raw: object) -> object | None:
+        from warden_agent.runtime.checkpoint import Checkpoint
+
+        try:
+            obj = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return None
+        return Checkpoint.from_dict(obj) if isinstance(obj, dict) else None
+
+    # ---- 跨副本共享状态（幂等 / 事件流 / 限流计数）----
+    def get_idempotent(self, key: str) -> str | None:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT payload FROM idempotency WHERE key = %s", (key,))
+            row = cur.fetchone()
+        return None if row is None else str(row[0])
+
+    def save_idempotent(self, key: str, payload: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO idempotency (key, payload, created_at) VALUES (%s, %s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET payload = EXCLUDED.payload",
+                (key, payload, _now_iso()),
+            )
+        self.conn.commit()
+
+    def append_event(self, run_id: str, payload: str) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO run_events (run_id, data, created_at) VALUES (%s, %s, %s) "
+                "RETURNING id",
+                (run_id, payload, _now_iso()),
+            )
+            row = cur.fetchone()
+        self.conn.commit()
+        return int(row[0]) if row is not None else 0
+
+    def list_events_after(
+        self, run_id: str, after_seq: int, limit: int = 200
+    ) -> list[tuple[int, str]]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, data FROM run_events WHERE run_id = %s AND id > %s "
+                "ORDER BY id LIMIT %s",
+                (run_id, after_seq, limit),
+            )
+            rows = cur.fetchall()
+        return [(int(r[0]), str(r[1])) for r in rows]
+
+    def hit_rate_limit(
+        self, bucket_key: str, window_seconds: int, now: float
+    ) -> tuple[int, float]:
+        """固定窗口计数 +1。用单条 UPSERT 完成"过期则重置、否则累加"，避免读改写竞态。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO rate_limits (bucket_key, window_start, count) "
+                "VALUES (%s, %s, 1) "
+                "ON CONFLICT (bucket_key) DO UPDATE SET "
+                "  count = CASE WHEN %s - rate_limits.window_start >= %s "
+                "               THEN 1 ELSE rate_limits.count + 1 END, "
+                "  window_start = CASE WHEN %s - rate_limits.window_start >= %s "
+                "                      THEN %s ELSE rate_limits.window_start END "
+                "RETURNING count, window_start",
+                (bucket_key, now, now, window_seconds, now, window_seconds, now),
+            )
+            row = cur.fetchone()
+        self.conn.commit()
+        return (int(row[0]), float(row[1])) if row is not None else (1, now)
+
     def close(self) -> None:
         self.conn.close()
+
+    # ---- 凭证保管库（CredentialVault 协议，见 credential/vault.py）----
+    def save_credential(self, credential: StoredCredential) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO credentials (scope, name, data, updated_at) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (scope, name) DO UPDATE SET "
+                "data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+                (
+                    credential.scope,
+                    credential.name,
+                    encode_fields(credential.encrypted),
+                    _now_iso(),
+                ),
+            )
+        self.conn.commit()
+
+    def load_credential(self, scope: str, name: str) -> StoredCredential | None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT data FROM credentials WHERE scope = %s AND name = %s",
+                (scope, name),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return StoredCredential(scope=scope, name=name, encrypted=decode_fields(row[0]))
+
+    def delete_credential(self, scope: str, name: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM credentials WHERE scope = %s AND name = %s", (scope, name)
+            )
+        self.conn.commit()
+
+    def list_credential_names(self, scope: str) -> list[str]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT name FROM credentials WHERE scope = %s ORDER BY name", (scope,)
+            )
+            rows = cur.fetchall()
+        return [str(r[0]) for r in rows]
+
+    def save_credential_lease(self, lease: StoredLease) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO credential_leases "
+                "(scope, lease_id, name, issued_at, expires_at) VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (scope, lease_id) DO UPDATE SET "
+                "name = EXCLUDED.name, issued_at = EXCLUDED.issued_at, "
+                "expires_at = EXCLUDED.expires_at",
+                (
+                    lease.scope,
+                    lease.lease_id,
+                    lease.name,
+                    lease.issued_at.isoformat(),
+                    lease.expires_at.isoformat(),
+                ),
+            )
+        self.conn.commit()
+
+    def load_credential_lease(self, scope: str, lease_id: str) -> StoredLease | None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, issued_at, expires_at FROM credential_leases "
+                "WHERE scope = %s AND lease_id = %s",
+                (scope, lease_id),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return StoredLease(
+            scope=scope,
+            lease_id=lease_id,
+            name=str(row[0]),
+            issued_at=datetime.fromisoformat(str(row[1])),
+            expires_at=datetime.fromisoformat(str(row[2])),
+        )
+
+    def delete_credential_lease(self, scope: str, lease_id: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM credential_leases WHERE scope = %s AND lease_id = %s",
+                (scope, lease_id),
+            )
+        self.conn.commit()
+
+    def purge_expired_credential_leases(self, scope: str, now: datetime) -> int:
+        """删掉某作用域下已过期的租约记录，返回删除条数（惰性清理）。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM credential_leases WHERE scope = %s AND expires_at <= %s",
+                (scope, now.isoformat()),
+            )
+            count = cur.rowcount
+        self.conn.commit()
+        return int(count or 0)

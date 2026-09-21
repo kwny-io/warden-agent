@@ -8,6 +8,8 @@
   warden reject <run_id>            拒绝（POST /reject/{run_id}）
   warden health                     健康检查（GET /health/live + /health/ready）
   warden caps                       列出能力（GET /capabilities）
+  warden coding "<需求>"             本地编码任务（读代码 → 出 diff → 门禁落地）
+  warden recover                    本地读存档点，输出跨 Run 恢复计划（只判断不执行）
 
 默认连 http://127.0.0.1:8000；可用环境变量 WARDEN_BASE_URL 覆盖。
 需要先启动服务：  py -m warden_agent.web.run_server
@@ -18,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Any
 
 import httpx
 
@@ -149,6 +152,99 @@ def _cmd_coding(args: argparse.Namespace) -> None:
         print("\n已应用改动的文件:", ", ".join(result.applied_files))
 
 
+def _cmd_recover(args: argparse.Namespace) -> None:
+    """读取存档点，输出跨 Run 恢复计划；`--apply` 则真正执行一轮恢复。
+
+    默认**只判断不执行**（打印计划）。加 `--apply` 会用 `RecoveryWorker` 真正续跑：
+    该续的续、该重试的重试（超上限不再试）、等人工的不碰、终态的跳过。
+
+    ⚠️ 真跑起来需要与原会话一致的模型/工具/策略装配（`build_agent(...)` 的参数）。
+    这里用默认装配（离线假模型、无工具），够验证链路与离线场景；生产请在自己的
+    工作进程里用同一套装配构造 `RecoveryWorker`（见 `runtime/worker.py`）。
+    """
+    import json
+
+    from warden_agent.runtime.checkpoint import checkpoint_store_for
+    from warden_agent.runtime.recovery import RecoveryController
+    from warden_agent.store.sqlite import SqliteStore
+
+    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    try:
+        store = SqliteStore(db)
+    except Exception as e:  # 打不开库（路径不对/损坏）
+        _die(f"无法打开存档库 {db}: {e}")
+    cp_store = checkpoint_store_for(store)
+    assert cp_store is not None  # SqliteStore 一定支持 checkpoint
+    controller = RecoveryController(cp_store)
+
+    if args.apply:
+        _apply_recovery(store, cp_store, controller, args)
+        return
+
+    plan = controller.plan()
+
+    owner = args.owner
+    def _visible(run_id: str) -> bool:
+        if not owner:
+            return True
+        run = store.load_run(run_id)
+        return run is not None and run.user_id == owner
+
+    groups = {
+        "该续跑 (resume)": plan.to_resume,
+        "该重试 (retry)": plan.to_retry,
+        "等待人工 (await_human)": plan.awaiting_human,
+        "已终态 (skip)": plan.terminal,
+    }
+    if args.json:
+        payload = {
+            "db": db,
+            "decisions": {k: v for k, v in plan.decisions.items() if _visible(k)},
+            "to_resume": [c.to_dict() for c in plan.to_resume if _visible(c.run_id)],
+            "to_retry": [c.to_dict() for c in plan.to_retry if _visible(c.run_id)],
+            "awaiting_human": [c.to_dict() for c in plan.awaiting_human if _visible(c.run_id)],
+            "terminal": [c.to_dict() for c in plan.terminal if _visible(c.run_id)],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    total = sum(1 for k in plan.decisions if _visible(k))
+    if total == 0:
+        print(f"存档库 {db} 里没有可恢复的 run（可能从未运行过，或已全部处理）。")
+        return
+    print(f"存档库: {db}")
+    for title, cps in groups.items():
+        rows = [c for c in cps if _visible(c.run_id)]
+        if not rows:
+            continue
+        print(f"\n{title}  ({len(rows)})")
+        for cp in rows:
+            print(
+                f"  {cp.run_id:<28} 状态={cp.status.name:<16} "
+                f"迭代={cp.iteration} 步骤={cp.step} 尝试={cp.attempts}"
+            )
+    print("\n（以上只是计划；真正续跑请加 --apply）")
+
+
+def _apply_recovery(
+    store: Any, cp_store: Any, controller: Any, args: argparse.Namespace
+) -> None:
+    """`recover --apply`：用默认装配真正执行一轮恢复，并打印每个 run 的处置。"""
+    from warden_agent.agent import build_agent
+    from warden_agent.runtime.worker import RecoveryWorker
+
+    agent = build_agent(store=store)
+    worker = RecoveryWorker(controller, agent.session_factory)
+    actions = worker.run_once()
+    if not actions:
+        print("没有需要处理的 run。")
+        return
+    print(f"执行一轮恢复，共 {len(actions)} 个 run：")
+    for a in actions:
+        detail = f"  {a.detail}" if a.detail else ""
+        print(f"  {a.run_id:<28} {a.action}{detail}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="warden", description="Warden Agent 命令行")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -180,6 +276,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_coding.add_argument("requirement")
     p_coding.add_argument("--workdir", default=".", help="git 仓库根目录（默认当前目录）")
     p_coding.set_defaults(func=_cmd_coding)
+
+    p_recover = sub.add_parser("recover", help="跨 Run 恢复计划（读存档点，只判断不执行）")
+    p_recover.add_argument(
+        "--db", default="", help="存档库路径（默认取 WARDEN_DB_PATH，再退到本地默认库）"
+    )
+    p_recover.add_argument("--owner", default="", help="只看某个用户的 run（默认全部）")
+    p_recover.add_argument("--json", action="store_true", help="以 JSON 输出（便于脚本消费）")
+    p_recover.add_argument(
+        "--apply", action="store_true",
+        help="真正执行一轮恢复（默认只打印计划；用默认模型/工具装配，见命令文档）",
+    )
+    p_recover.set_defaults(func=_cmd_recover)
     return p
 
 

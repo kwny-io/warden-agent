@@ -68,6 +68,7 @@ class RetrievalReport:
     embedder_name: str
     k: int
     outcomes: tuple[CaseOutcome, ...]
+    corpus_size: int = 0   # 语料块数：用于判断 recall@k 是否被"小库"抬高
 
     @property
     def top1(self) -> float:
@@ -90,6 +91,17 @@ class RetrievalReport:
             return 0.0
         return sum(1 / o.rank for o in self.outcomes if o.rank) / len(self.outcomes)
 
+    @property
+    def k_coverage(self) -> float:
+        """一次检索覆盖了库的多大比例（k / 语料块数）。
+
+        这个比例越高，`recall@k` 越不可信：k=3 而库只有 7 块时，一次就返回了 43% 的库，
+        "命中"几乎是必然的，跟检索器强不强没关系。
+        """
+        if self.corpus_size <= 0:
+            return 0.0
+        return min(1.0, self.k / self.corpus_size)
+
     def misses(self) -> tuple[CaseOutcome, ...]:
         """前 k 条都没命中的问法 —— 这些就是当前的失败样例。"""
         return tuple(o for o in self.outcomes if o.rank is None)
@@ -108,23 +120,49 @@ def evaluate(store: VectorStore, k: int = 3,
                 rank = i
                 break
         outcomes.append(CaseOutcome(query=query, expected=expected, rank=rank))
-    return RetrievalReport(embedder_name=embedder_name, k=k, outcomes=tuple(outcomes))
+    return RetrievalReport(
+        embedder_name=embedder_name, k=k, outcomes=tuple(outcomes),
+        corpus_size=len(store),
+    )
 
 
 def format_report(report: RetrievalReport) -> str:
+    """渲染报告：**逐条排名在前、聚合指标在后**，并标注 recall@k 的适用条件。
+
+    为什么要把逐条排名摆出来：只看聚合数字会掩盖"命中得靠运气"这种情况——
+    例如某条问法正确片段相似度为 0、只因库小 k 大才被顺带捞回，聚合看是"命中"，
+    逐条看才知道它是垫底进的。数字要能自己解释自己。
+    """
     lines = [
         f"嵌入器：{report.embedder_name}",
-        f"语料块数：{len(POLICY_CORPUS)}   问法数：{len(report.outcomes)}   k={report.k}",
-        "-" * 46,
+        f"语料块数：{report.corpus_size or len(POLICY_CORPUS)}   "
+        f"问法数：{len(report.outcomes)}   k={report.k}",
+        "-" * 62,
+        "逐条命中排名（1 = 排第一；'未命中' = 前 k 条里都没有期望片段）：",
+    ]
+    for i, o in enumerate(report.outcomes, start=1):
+        rank = "未命中" if o.rank is None else f"第 {o.rank}"
+        lines.append(f"  {i}. {o.query:<28} 期望 {o.expected!r:<12} → {rank}")
+
+    lines += [
+        "-" * 62,
         f"top-1 准确率   {report.top1:>6.1%}",
         f"recall@{report.k}      {report.recall_at_k:>6.1%}",
         f"MRR            {report.mrr:>6.3f}",
     ]
     if report.misses():
-        lines.append("-" * 46)
+        lines.append("-" * 62)
         lines.append(f"未命中（前 {report.k} 条都没有期望片段）：")
         for o in report.misses():
             lines.append(f"  · {o.query!r} —— 期望片段 {o.expected!r}")
+    if report.k_coverage >= 0.25:
+        lines += [
+            "-" * 62,
+            f"⚠️ recall@{report.k} 的口径：本库 {report.corpus_size} 块，k={report.k} "
+            f"一次就返回全库的 {report.k_coverage:.0%}，",
+            "   \"命中\"几乎是必然的——这个数字**不代表检索器强**。看 top-1 与 MRR 更有意义；",
+            "   换真语义嵌入时比的是同一套用例的相对提升，不要拿这个绝对值对外说。",
+        ]
     return "\n".join(lines)
 
 

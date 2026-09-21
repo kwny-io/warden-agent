@@ -29,6 +29,45 @@ def test_有key时开启bearer鉴权() -> None:
     assert keys is not None
     assert "k-1" in keys
     assert keys["k-1"].tenant_id == "local"
+    # 单 key 模式的默认身份是 demo-user（与控制台默认账号一致）
+    assert keys["k-1"].user_id == "demo-user"
+
+
+def test_单key模式身份可由环境变量指定() -> None:
+    keys, mode = resolve_auth({"WARDEN_API_KEY": "k-1", "WARDEN_API_USER": "alice"})
+    assert mode == "bearer"
+    assert keys is not None
+    assert keys["k-1"].user_id == "alice"
+
+
+def test_多用户多密钥_每个key绑定独立身份() -> None:
+    keys, mode = resolve_auth({"WARDEN_API_KEYS": "alice:k-aaa,bob:k-bbb"})
+    assert mode == "bearer"
+    assert keys is not None
+    assert keys["k-aaa"].user_id == "alice"
+    assert keys["k-bbb"].user_id == "bob"
+    # 默认同租户，可用 WARDEN_TENANT 覆盖
+    assert keys["k-aaa"].tenant_id == "local"
+
+
+def test_多用户模式可指定租户() -> None:
+    keys, _ = resolve_auth({"WARDEN_API_KEYS": "alice:k-aaa", "WARDEN_TENANT": "acme"})
+    assert keys is not None
+    assert keys["k-aaa"].tenant_id == "acme"
+
+
+@pytest.mark.parametrize("bad", ["alice", "alice:", ":k-aaa", "alice:k-1,bob"])
+def test_多用户格式错误时拒绝启动(bad: str) -> None:
+    """`用户id:密钥` 写错就 fail-closed，而不是悄悄放行一个畸形配置。"""
+    with pytest.raises(AuthConfigError):
+        resolve_auth({"WARDEN_API_KEYS": bad})
+
+
+def test_多用户key优先于单key() -> None:
+    keys, mode = resolve_auth({"WARDEN_API_KEYS": "alice:k-a", "WARDEN_API_KEY": "k-single"})
+    assert mode == "bearer"
+    assert keys is not None
+    assert "k-a" in keys and "k-single" not in keys
 
 
 def test_无key且未显式允许匿名时拒绝启动() -> None:

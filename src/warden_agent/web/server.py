@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import threading
 import time
 import uuid
@@ -44,6 +43,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from warden_agent.core.metrics import metrics
+from warden_agent.credential.broker import CredentialBroker, SecretRedactor, default_broker
+from warden_agent.credential.vault import DEPLOYMENT_SCOPE, as_vault
 from warden_agent.model.model import AgentChatModel, Message
 from warden_agent.policy.policy import PolicyEngine
 from warden_agent.runtime.session import AgentSession, FinalReply, NeedsApproval
@@ -58,8 +59,15 @@ from warden_agent.web.auth import (
     RunOperationAuthorizer,
     TrustedCaller,
     operation_for,
+    owner_authorizer,
+)
+from warden_agent.web.coordination import (
+    EventBus,
+    IdempotencyStore,
+    coordination_for,
 )
 from warden_agent.web.health import HealthResult, liveness, readiness
+from warden_agent.web.ratelimit import RateLimiter, client_key
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +76,7 @@ API_VERSION = "1.0"
 
 
 def _cache_idem_response(
-    store: dict[str, Any], key: str, response: Any
+    store: IdempotencyStore, key: str, response: Any
 ) -> None:
     """把响应缓存进幂等表。
 
@@ -76,22 +84,22 @@ def _cache_idem_response(
     但流只能消费一次。这里只把"可缓存"的信息结构记下，真正的 body 读取同步在
     _gateway 里用 async for 完成并重建 response。
     """
-    store[key] = {
+    store.put(key, {
         "status_code": response.status_code,
         "headers": dict(response.headers),
         # body 由调用方（_gateway）填充
         "body": None,
-    }
+    })
 
 
 async def _drain_and_rebuild(
-    response: Any, store: dict[str, Any], key: str
+    response: Any, store: IdempotencyStore, key: str
 ) -> Any:
     """消费 response 的 body 流，缓存进幂等表，返回一个可重放的新 Response。"""
     body_bytes = b"".join([chunk async for chunk in response.body_iterator])
     item = store.get(key) or {}
     item["body"] = body_bytes
-    store[key] = item
+    store.put(key, item)
 
     headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
     return JSONResponse(
@@ -101,9 +109,9 @@ async def _drain_and_rebuild(
     )
 
 
-def _idem_response_from_store(store: dict[str, Any], key: str) -> Any | None:
+def _idem_response_from_store(store: IdempotencyStore, key: str) -> Any | None:
     item = store.get(key)
-    if not item:
+    if not item or item.get("body") is None:
         return None
     body = item.get("body")
     content: Any
@@ -137,12 +145,19 @@ _API_TITLES: dict[int, str] = {
     403: "Forbidden",
     404: "Not Found",
     409: "Conflict",
+    429: "Too Many Requests",
     500: "Internal Server Error",
     503: "Service Unavailable",
 }
 
 
-def _problem(status: int, code: str, detail: str, correlation_id: str) -> JSONResponse:
+def _problem(
+    status: int,
+    code: str,
+    detail: str,
+    correlation_id: str,
+    extra_headers: dict[str, str] | None = None,
+) -> JSONResponse:
     """构造 RFC 7807 风格的 problem+json 响应（RFC 7807 problem+json）。"""
     return JSONResponse(
         status_code=status,
@@ -159,18 +174,26 @@ def _problem(status: int, code: str, detail: str, correlation_id: str) -> JSONRe
             "Content-Type": "application/problem+json",
             "X-Warden-Api-Version": "1.0",
             "X-Correlation-Id": correlation_id,
+            **(extra_headers or {}),
         },
     )
 
 
 def _extract_run_id(path: str) -> str | None:
-    """从请求路径里挖出 run_id（用于授权与审计），挖不到返回 None。"""
+    """从请求路径里挖出 run_id（用于授权与审计），挖不到返回 None。
+
+    覆盖所有"针对某个 Run"的路由：chat / status / approve / reject / events / runs /
+    messages。少覆盖一条，归属授权（owner_authorizer）在那条路上就等于没开——
+    所以这里和路由表必须同步维护。
+    """
     segments = path.rstrip("/").split("/")
     if len(segments) >= 3:
         # /chat/stream/{run_id} → ["", "chat", "stream", id]
         if segments[1] == "chat" and len(segments) == 4 and segments[2] == "stream":
             return segments[3]
-        if segments[1] in ("chat", "status", "approve", "reject", "events"):
+        if segments[1] in (
+            "chat", "status", "approve", "reject", "events", "runs", "messages",
+        ):
             return segments[2]
     return None
 
@@ -230,6 +253,7 @@ class SessionRegistry:
         planner: Any = None,
         intent: Any = None,
         max_context_chars: int = 0,
+        checkpoint_store: Any = None,
     ) -> None:
         self._model = model
         self._catalog = catalog
@@ -240,6 +264,7 @@ class SessionRegistry:
         self._planner = planner
         self._intent = intent
         self._max_context_chars = max_context_chars
+        self._checkpoint_store = checkpoint_store
         self.extra = extra or {}  # 额外能力（如 memory_service / skill_catalog）
         self._sessions: dict[str, AgentSession] = {}
         self._lock = threading.Lock()
@@ -264,6 +289,7 @@ class SessionRegistry:
                     memory=self.extra.get("memory_service"),
                     memory_scope=self.extra.get("memory_scope"),
                     max_context_chars=self._max_context_chars,
+                    checkpoint_store=self._checkpoint_store,
                 )
                 self._sessions[run_id] = sess
             return sess
@@ -272,6 +298,11 @@ class SessionRegistry:
         """把会话从内存下线（删除会话时用，数据库由调用方清理）。"""
         with self._lock:
             self._sessions.pop(run_id, None)
+
+    def run_ids(self) -> list[str]:
+        """当前在内存里的会话 id 快照（遍历用；不要在调用期间持有锁）。"""
+        with self._lock:
+            return list(self._sessions.keys())
 
     def set_model(self, model: AgentChatModel) -> None:
         """运行时切换模型：替换默认模型，并同步到所有已缓存的会话。"""
@@ -292,6 +323,72 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
     ]
 
 
+def _checkpoint_store_for(store: Any) -> Any:
+    """给具备 checkpoint 能力的存储套上 `CheckpointStore` 适配器（见 runtime 层实现）。"""
+    from warden_agent.runtime.checkpoint import checkpoint_store_for
+
+    return checkpoint_store_for(store)
+
+
+def _plan_to_dict(plan: Any, owner: str | None, owner_of: Any) -> dict[str, Any]:
+    """把 RecoveryPlan 转成 JSON 可序列化的字典，并按归属过滤（owner 给定时）。"""
+    def visible(cp: Any) -> bool:
+        return owner is None or owner_of(cp.run_id) == owner
+
+    return {
+        "decisions": {
+            rid: d
+            for rid, d in plan.decisions.items()
+            if owner is None or owner_of(rid) == owner
+        },
+        "to_resume": [cp.to_dict() for cp in plan.to_resume if visible(cp)],
+        "to_retry": [cp.to_dict() for cp in plan.to_retry if visible(cp)],
+        "awaiting_human": [cp.to_dict() for cp in plan.awaiting_human if visible(cp)],
+        "terminal": [cp.to_dict() for cp in plan.terminal if visible(cp)],
+    }
+
+
+def _model_key_name(model_id: str) -> str:
+    """模型 API Key 在凭证 broker 里的登记名。"""
+    return f"model:{model_id}"
+
+
+def _credential_scope(request: Request) -> str:
+    """凭证作用域 = 调用者身份。
+
+    多租户下 `tenant_id` 是**整租户共用**的（`WARDEN_TENANT`，默认 `local`），
+    用它做隔离会让同租户的 A、B 两用户互相读到对方导入的 key。所以这里用
+    `user_id`（= principal_id，来自凭证本身）作为隔离维度；匿名开发模式
+    （未开鉴权）回落到部署级作用域。
+    """
+    caller: TrustedCaller | None = getattr(request.state, "caller", None)
+    return caller.user_id if caller is not None else DEPLOYMENT_SCOPE
+
+
+def _has_model_key(broker: CredentialBroker, model_id: str, scope: str) -> bool:
+    """某作用域（或部署级）是否已登记该模型的 key——部署级 key 全体可用。"""
+    name = _model_key_name(model_id)
+    return broker.has(name, scope) or (
+        scope != DEPLOYMENT_SCOPE and broker.has(name, DEPLOYMENT_SCOPE)
+    )
+
+
+def _registered_model_key(
+    broker: CredentialBroker, model_id: str, scope: str
+) -> str | None:
+    """从 broker 取回某模型已导入的 key（走短租约；未登记返回 None）。
+
+    先看调用者自己的，再回落到部署级（启动时配的那把，全体共用）。
+    """
+    name = _model_key_name(model_id)
+    for candidate in (scope, DEPLOYMENT_SCOPE):
+        if not broker.has(name, candidate):
+            continue
+        lease = broker.issue(name, scope=candidate)
+        return lease.value.fields.get("api_key")
+    return None
+
+
 def build_app(
     model: AgentChatModel,
     catalog: ToolCatalog,
@@ -299,6 +396,9 @@ def build_app(
     store: SqliteStore,
     system_prompt: str = "你是一个能使用工具的助手。",
     memory: bool = False,
+    memory_repository: Any = None,
+    knowledge: Any = None,
+    web_providers: Any = None,
     skills: dict[str, str] | str | None = None,
     web: bool = False,
     mcp_server: str | None = None,
@@ -312,11 +412,18 @@ def build_app(
     planner: Any = None,
     intent: Any = None,
     max_context_chars: int = 0,
+    credential_broker: CredentialBroker | None = None,
+    rate_limiter: RateLimiter | None = None,
+    shared_state: bool = False,
+    idempotency_store: IdempotencyStore | None = None,
+    event_bus: EventBus | None = None,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
-    memory/skills/web/mcp_server：让 Agent 在 HTTP 服务里也能用这些能力（复用
-    agent.augment_catalog，把对应工具注册进目录）。
+    memory/skills/web/mcp_server/knowledge：让 Agent 在 HTTP 服务里也能用这些能力
+    （复用 agent.augment_catalog，把对应工具注册进目录）。
+      memory_repository：记忆库实现；不传=进程内（重启即丢），传 SqliteMemoryStore 则落盘。
+      knowledge        ：RAG 知识来源：VectorStore / True（内置语料）/ 目录路径。
 
     阶段13 新增（产品级 HTTP 服务）：
       api_keys    ：{API Key: TrustedCaller}。非空则开启认证，业务接口都要带
@@ -330,6 +437,9 @@ def build_app(
     extra = augment_catalog(
         catalog,
         memory=memory,
+        memory_repository=memory_repository,
+        knowledge=knowledge,
+        web_providers=web_providers,
         skills=skills,
         web=web,
         mcp_server=mcp_server,
@@ -341,6 +451,9 @@ def build_app(
         planner=planner,
         intent=intent,
         max_context_chars=max_context_chars,
+        # 存档点落库：把 SqliteStore 的 checkpoint 方法适配成 CheckpointStore 接口，
+        # 会话侧才能真正"记下跑到第几轮、正在哪一步"（见 _owner_of / recovery 端点）。
+        checkpoint_store=_checkpoint_store_for(store),
     )
     app = FastAPI(title="Warden Agent Python", version=API_VERSION)
 
@@ -375,15 +488,28 @@ def build_app(
             "make": lambda key: _ds.BailianModel(api_key=key),
         },
     }
-    # 已导入的 API Key（内存态，重启失效；初始 key 由 build_app 参数带入）
-    imported_keys: dict[str, str] = {}
+    # 已导入的模型 API Key 由凭证 broker 保管：**加密落库 + 短租约**，不再明文躺在
+    # 一个 dict 里，也不再随进程退出而丢失（store 支持落库时自动用 store 当保管库；
+    # 内存版存储则退回进程内）。redactor 用于把密钥从日志中抹掉（见网关异常分支）。
+    broker = credential_broker or default_broker(vault=as_vault(store))
+    redactor = SecretRedactor()
     if model_api_key and model_id in model_catalog:
-        imported_keys[model_id] = model_api_key
+        # 启动配置的 key 记为**部署级**：全体调用者共用（它由部署者提供，不属于某个用户）。
+        broker.register(
+            _model_key_name(model_id), {"api_key": model_api_key}, DEPLOYMENT_SCOPE
+        )
+        redactor.add(model_api_key)
     current_model_id = model_id
+    # 把脱敏器挂到 app 上，供其它处理器/扩展复用（密钥不进日志）
+    app.state.secret_redactor = redactor
 
     @app.get("/models")
-    def models_view() -> dict[str, Any]:
-        """可用模型列表 + 当前使用的模型。"""
+    def models_view(request: Request) -> dict[str, Any]:
+        """可用模型列表 + 当前使用的模型。
+
+        `configured` 按调用者视角计算：自己导入过、或部署级配过，都算已配置。
+        """
+        scope = _credential_scope(request)
         return {
             "current": current_model_id,
             "models": [
@@ -391,27 +517,34 @@ def build_app(
                     "id": mid,
                     "name": info["name"],
                     "needs_key": info["needs_key"],
-                    "configured": (not info["needs_key"]) or mid in imported_keys,
+                    "configured": (not info["needs_key"])
+                    or _has_model_key(broker, mid, scope),
                 }
                 for mid, info in model_catalog.items()
             ],
         }
 
     @app.post("/models/select")
-    def models_select(body: ModelSelectIn) -> dict[str, Any]:
-        """切换模型；带 api_key 视为"导入"（Key 存内存，重启后回到启动配置）。"""
+    def models_select(body: ModelSelectIn, request: Request) -> dict[str, Any]:
+        """切换模型；带 api_key 视为"导入"（凭凭证 broker 加密落库，重启后仍在）。
+
+        导入的 key 记在**调用者自己的作用域**下：同租户的其他用户读不到、用不了；
+        部署级（启动配置）的那把则全体可见。
+        """
         nonlocal current_model_id
+        scope = _credential_scope(request)
         info = model_catalog.get(body.id)
         if info is None:
             raise HTTPException(status_code=404, detail=f"未知模型: {body.id}")
-        key = body.api_key or imported_keys.get(body.id)
+        key = body.api_key or _registered_model_key(broker, body.id, scope)
         if info["needs_key"] and not key:
             raise HTTPException(
                 status_code=400, detail=f"{info['name']} 需要先导入 API Key"
             )
         registry.set_model(info["make"](key))
         if body.api_key:
-            imported_keys[body.id] = body.api_key
+            broker.register(_model_key_name(body.id), {"api_key": body.api_key}, scope)
+            redactor.add(body.api_key)
         current_model_id = body.id
         return {"ok": True, "current": current_model_id}
 
@@ -425,13 +558,43 @@ def build_app(
         [0.01, 0.05, 0.1, 0.5, 1.0],
     )
     m_approvals = m.counter("warden_approvals_total", "审批决策数", ["action"])
+    m_rate_limited = m.counter("warden_rate_limited_total", "被限流拒绝的请求数", ["path"])
 
     # ---- 阶段13：认证 + 审计中间件 ----
     authenticator = ApiKeyAuthenticator(api_keys) if api_keys else None
-    authorizer = RunOperationAuthorizer()
+
+    def _owner_of(run_id: str) -> str | None:
+        """读某个 Run 的归属用户（不存在或尚无归属时返回 None）。"""
+        run = store.load_run(run_id)
+        return run.user_id if run is not None and run.user_id else None
+
+    # 认证开启 → 启用"按归属授权"：调用者只能操作自己名下的 Run。
+    # 未认证（anon-dev）→ 保持旧的开放行为，本地开发不该被租户边界挡死。
+    authorizer = (
+        RunOperationAuthorizer(owner_authorizer(_owner_of))
+        if authenticator is not None
+        else RunOperationAuthorizer()
+    )
+
+    def _identity(request: Request, query_user_id: str | None) -> str:
+        """解析"这次请求属于哪个用户"。
+
+        认证模式：以**凭证派生的身份**为准（`caller.user_id`），忽略查询参数——
+        身份由服务端从 key 推出，客户端说了不算。这正是多租户与"按字段过滤"的分界。
+        匿名开发模式：沿用查询参数（前端靠它切换演示账号），缺省 `demo-user`。
+        """
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        if caller is not None:
+            return caller.user_id
+        return query_user_id or "demo-user"
+
     audit = AuditLogger(audit_store) if audit_store is not None else None
-    # 幂等表：Idempotency-Key → 缓存的响应（进程内即可，重启清空可接受）
-    idem_store: dict[str, Any] = {}
+    # 协调状态：幂等表 / 事件总线。
+    #   shared_state=False（默认）→ 进程内实现，单副本行为与历史一致；
+    #   shared_state=True          → 存储实现，多副本读写同一张表，幂等与事件流才跨副本成立。
+    _coordination = coordination_for(store, shared=shared_state)
+    idem_store: IdempotencyStore = idempotency_store or _coordination[0]
+    bus: EventBus = event_bus or _coordination[1]
     # 中间件闭包里带"当前是否开启"标志，`_is_public`/`_extract_run_id` 复用在端点里
     audit_enabled = audit is not None
 
@@ -453,10 +616,30 @@ def build_app(
                 except HttpAuthenticationError as e:
                     return _problem(401, "AUTHENTICATION_REQUIRED", str(e), correlation_id)
                 if caller is not None:
+                    # 把已认证身份挂到 request 上，端点据此解析归属（见 _identity）
+                    request.state.caller = caller
                     try:
                         authorizer.authorize(caller, operation, run_id)
                     except HttpAuthorizationError as e:
                         return _problem(403, "AUTHORIZATION_DENIED", str(e), correlation_id)
+            # 限流：健康探针等公开路径豁免（负载均衡探活不能被限流挡住），
+            # 其余按调用者身份（匿名时按来源 IP）计数。
+            if rate_limiter is not None and not _is_public(path):
+                rl_key = client_key(
+                    caller.user_id if caller is not None else None,
+                    request.client.host if request.client else None,
+                )
+                allowed, retry_after = rate_limiter.check(rl_key)
+                if not allowed:
+                    m_rate_limited.inc(labels=(path,))
+                    status_code = 429
+                    return _problem(
+                        429,
+                        "RATE_LIMITED",
+                        f"请求过于频繁，请 {retry_after} 秒后重试",
+                        correlation_id,
+                        extra_headers={"Retry-After": str(retry_after)},
+                    )
             # 幂等：带 Idempotency-Key 的 POST，同 key 重复请求返回同一结果。
             # 流式端点(SSE)不参与幂等缓存（消费流会破坏它）。
             idem_key = request.headers.get("Idempotency-Key")
@@ -474,8 +657,11 @@ def build_app(
                 _cache_idem_response(idem_store, idem_key, response)
                 response = await _drain_and_rebuild(response, idem_store, idem_key)
             return response
-        except Exception:  # noqa: BLE001 - 网关兜底，不泄漏内部细节
-            logger.exception("网关异常 method=%s path=%s", method, path)
+        except Exception as exc:  # noqa: BLE001 - 网关兜底，不泄漏内部细节
+            # 异常信息可能带上请求体/URL 里的密钥，落日志前先脱敏
+            logger.exception(
+                "网关异常 method=%s path=%s err=%s", method, path, redactor.redact(str(exc))
+            )
             return _problem(500, "INTERNAL_ERROR", "请求未能完成", correlation_id)
         finally:
             # T8 指标：请求数 + 耗时分布 + 5xx 错误数（耗时直方图：桶已在注册时绑定）
@@ -515,12 +701,37 @@ def build_app(
 
     # ---- 阶段13：审计查询 ----
     @app.get("/audit")
-    def audit_view() -> list[dict[str, Any]]:
-        """返回最近的审计轨迹（含 correlation_id / 调用者 / 操作 / 结果状态）。"""
+    def audit_view(request: Request) -> list[dict[str, Any]]:
+        """返回最近的审计轨迹（含 correlation_id / 调用者 / 操作 / 结果状态）。
+
+        认证模式下只返回**调用者所在租户**的记录——审计是合规数据，
+        跨租户读取等于把别人家的操作账本交出去。
+        """
         if audit is None:
             raise HTTPException(status_code=404, detail="未开启审计(audit_store=None)")
-        records = audit_store.query(limit=200)  # type: ignore[union-attr]
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        tenant = caller.tenant_id if caller is not None else None
+        records = audit_store.query(limit=200, tenant_id=tenant)  # type: ignore[union-attr]
         return [r.to_dict() for r in records]
+
+    # ---- 跨 Run 恢复：崩溃/重启后"哪些该续、哪些该重试、哪些该等人" ----
+    @app.get("/recovery/plan")
+    def recovery_plan(request: Request) -> dict[str, Any]:
+        """读取全部存档点，产出恢复计划（只读判断，不执行任何动作）。
+
+        用途：进程崩溃/重启后，工作进程或运维据此决定续跑/重试/等待人工，
+        而不是"全部从头再跑一遍"。`RecoveryController` 本身只判断不执行，
+        真正的执行由调用方负责。认证模式下只暴露调用者自己名下的 Run。
+        """
+        from warden_agent.runtime.recovery import RecoveryController
+
+        cp_store = _checkpoint_store_for(store)
+        if cp_store is None:
+            raise HTTPException(status_code=501, detail="当前存储不支持存档点")
+        plan = RecoveryController(cp_store).plan()
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        owner = caller.user_id if caller is not None else None
+        return _plan_to_dict(plan, owner, _owner_of)
 
     # 首页：返回可视化演示控制台（HTML），让服务"看得见"。
     # T10 起优先返回 React 构建产物（web/dist）；若未构建则回退到旧版静态 index.html。
@@ -563,32 +774,23 @@ def build_app(
                 html = "<h1>Warden Agent</h1><p>未找到演示页面。</p>"
         return HTMLResponse(html)
 
-    # 事件总线（SSE）：run_id -> Queue，状态变化时广播
-    event_buses: dict[str, queue.Queue[dict[str, Any]]] = {}
-    buses_lock = threading.Lock()
-
-    def _bus(run_id: str) -> queue.Queue[dict[str, Any]]:
-        with buses_lock:
-            q = event_buses.get(run_id)
-            if q is None:
-                q = queue.Queue()
-                event_buses[run_id] = q
-            return q
-
     @app.post("/chat/{run_id}")
-    def chat(run_id: str, body: ChatRequestIn, user_id: str = "demo-user") -> ChatResponseOut:
+    def chat(
+        run_id: str, body: ChatRequestIn, request: Request, user_id: str = "demo-user"
+    ) -> ChatResponseOut:
         sess = registry.get(run_id)
         if not sess.run.user_id:
-            sess.run.user_id = user_id  # 首次对话的会话归属当前用户
+            # 首轮对话建立归属：认证模式下身份来自凭证（user_id 参数被忽略）
+            sess.run.user_id = _identity(request, user_id)
         try:
             outcome = sess.start(body.text)
         except Exception as e:  # 工具未注册 / 被 DENY 等
             logger.exception("chat 失败 run=%s", run_id)
-            _bus(run_id).put({"event": "error", "message": str(e)})
+            bus.publish(run_id, {"event": "error", "message": str(e)})
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         if isinstance(outcome, FinalReply):
-            _bus(run_id).put({"event": "final", "text": outcome.text})
+            bus.publish(run_id, {"event": "final", "text": outcome.text})
             return ChatResponseOut(
                 run_id=run_id,
                 status=sess.status().name,
@@ -597,7 +799,7 @@ def build_app(
                 messages=_serialize_messages(outcome.messages),
             )
         if isinstance(outcome, NeedsApproval):
-            _bus(run_id).put({"event": "needs_approval", "approval": outcome.approval.tool_name})
+            bus.publish(run_id, {"event": "needs_approval", "approval": outcome.approval.tool_name})
             return ChatResponseOut(
                 run_id=run_id,
                 status=sess.status().name,
@@ -617,20 +819,29 @@ def build_app(
         return {"run_id": run_id, "status": sess.status().name}
 
     @app.get("/runs")
-    def runs(user_id: str = "") -> list[dict[str, Any]]:
-        """对话列表：最近活跃的会话；带 user_id 时只返回该用户的。"""
-        return store.list_runs(limit=50, owner=user_id or None)
+    def runs(request: Request, user_id: str = "") -> list[dict[str, Any]]:
+        """对话列表：最近活跃的会话。
+
+        认证模式下只返回**调用者自己**的会话（身份来自凭证，`user_id` 参数被忽略）；
+        匿名开发模式下按 `user_id` 过滤，不传则返回全部。
+        """
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        owner = caller.user_id if caller is not None else (user_id or None)
+        return store.list_runs(limit=50, owner=owner)
 
     @app.post("/runs/{run_id}")
-    def create_run(run_id: str, user_id: str = "demo-user") -> dict[str, Any]:
-        """预创建会话：归属当前 USER_ID，立即可见于该用户的对话列表。幂等。
+    def create_run(
+        run_id: str, request: Request, user_id: str = "demo-user"
+    ) -> dict[str, Any]:
+        """预创建会话：归属当前身份，立即可见于该用户的对话列表。幂等。
 
-        已存在的会话不改变归属。
+        已存在的会话不改变归属（归属由已认证凭证锁定，不能被后续请求改写）。
         """
-        store.create_user(user_id)
+        identity = _identity(request, user_id)
+        store.create_user(identity)
         sess = registry.get(run_id)
         if store.load_run(run_id) is None:
-            sess.run.user_id = user_id
+            sess.run.user_id = identity
             store.save_run(sess.run)
         return {
             "run_id": run_id,
@@ -639,16 +850,28 @@ def build_app(
         }
 
     @app.get("/users")
-    def users_view() -> list[dict[str, Any]]:
-        """已登记的中控台用户。"""
+    def users_view(request: Request) -> list[dict[str, Any]]:
+        """已登记的中控台用户。
+
+        认证模式下只返回调用者自己——否则等于开放了一个"枚举他人账号"的接口。
+        """
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        if caller is not None:
+            return [u for u in store.list_users() if u["user_id"] == caller.user_id]
         return store.list_users()
 
     @app.post("/users")
-    def users_create(body: UserCreateIn) -> dict[str, Any]:
-        """登记用户（幂等：已存在则不动）。"""
+    def users_create(body: UserCreateIn, request: Request) -> dict[str, Any]:
+        """登记用户（幂等：已存在则不动）。
+
+        认证模式下只能登记调用者自己，不能替别人建档。
+        """
         uid = body.user_id.strip()
         if not uid:
             raise HTTPException(status_code=400, detail="user_id 不能为空")
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        if caller is not None and uid != caller.user_id:
+            raise HTTPException(status_code=403, detail="无权为其他账号建档")
         store.create_user(uid)
         return {"ok": True, "user_id": uid}
 
@@ -666,11 +889,18 @@ def build_app(
         return _serialize_messages(sess.messages)
 
     @app.get("/approvals")
-    def approvals() -> list[dict[str, Any]]:
-        """列出所有"等待审批"的会话（审批队列）。"""
+    def approvals(request: Request) -> list[dict[str, Any]]:
+        """列出"等待审批"的会话（审批队列）。
+
+        认证模式下只列**调用者自己**名下的会话——审批队列是人工闸门入口，
+        跨租户可见会让别人看到甚至替你决策高危操作。
+        """
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
         result = []
-        for run_id in list(registry._sessions.keys()):
+        for run_id in registry.run_ids():
             sess = registry.get(run_id)
+            if caller is not None and sess.run.user_id != caller.user_id:
+                continue
             pending = sess.pending_approval()
             if pending is not None:
                 result.append(
@@ -685,9 +915,14 @@ def build_app(
         return result
 
     @app.get("/approvals/history")
-    def approvals_history() -> list[dict[str, Any]]:
-        """审批决策历史（已批准 / 已拒绝，最新的在前）。"""
-        return store.list_approval_history(limit=20)
+    def approvals_history(request: Request) -> list[dict[str, Any]]:
+        """审批决策历史（已批准 / 已拒绝，最新的在前）。
+
+        认证模式下只返回调用者名下 Run 的决策（审批历史含工具名与参数，属租户数据）。
+        """
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        owner = caller.user_id if caller is not None else None
+        return store.list_approval_history(limit=20, owner=owner)
 
     @app.post("/approve/{run_id}")
     def approve(run_id: str) -> ChatResponseOut:
@@ -702,7 +937,7 @@ def build_app(
             pending.arguments, "approved",
         )
         if isinstance(outcome, FinalReply):
-            _bus(run_id).put({"event": "final", "text": outcome.text})
+            bus.publish(run_id, {"event": "final", "text": outcome.text})
             return ChatResponseOut(
                 run_id=run_id,
                 status=sess.status().name,
@@ -738,7 +973,7 @@ def build_app(
             pending.arguments, "rejected",
         )
         if isinstance(outcome, FinalReply):
-            _bus(run_id).put({"event": "final", "text": outcome.text})
+            bus.publish(run_id, {"event": "final", "text": outcome.text})
             return ChatResponseOut(
                 run_id=run_id,
                 status=sess.status().name,
@@ -794,14 +1029,25 @@ def build_app(
 
     @app.get("/events/{run_id}")
     async def events(run_id: str) -> StreamingResponse:
-        """SSE：监听某会话的事件（最终结果 / 审批请求 / 错误）。"""
-        q = _bus(run_id)
+        """SSE：监听某会话的事件（最终结果 / 审批请求 / 错误）。
 
+        走可插拔事件总线：单副本是进程内实现（条件变量唤醒、无延迟），
+        多副本换成存储实现（多个副本订阅同一张事件表），客户端连任一副本都能收到。
+        """
         def generate() -> Any:
+            seq = 0
             while True:
-                item = q.get()
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-                if item.get("event") in ("final", "error"):
+                items = bus.poll(run_id, seq, timeout=15.0)
+                if not items:
+                    yield ": keep-alive\n\n"  # 心跳，防中间层掐连接
+                    continue
+                stop = False
+                for s, ev in items:
+                    seq = s
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                    if ev.get("event") in ("final", "error"):
+                        stop = True
+                if stop:
                     break
 
         return StreamingResponse(generate(), media_type="text/event-stream")
@@ -811,13 +1057,21 @@ def build_app(
         """列出这个 Agent 服务目前可用的能力（工具 + 启用的特性）。"""
         tool_names = sorted(t.name for t in registry._catalog.all())
         skill_cat = registry.extra.get("skill_catalog")
+        knowledge_sources = registry.extra.get("knowledge_sources")
         return {
             "tools": tool_names,
             "features": {
                 "memory": "memory_service" in registry.extra,
+                # 记忆是否落盘：进程内实现重启即丢，运维/前端需要能区分
+                "memory_persistent": bool(registry.extra.get("memory_persistent")),
                 "skills": [s for s in (skill_cat.aliases() if skill_cat else [])],
                 "web": any(t.name.startswith("web.") for t in registry._catalog.all()),
                 "mcp_server": registry.extra.get("mcp_server"),
+                # 真实联网抓取是否开启（默认是离线 mock）——运维需要能一眼看到外网出口状态
+                "web_fetch": registry.extra.get("web_fetch"),
+                # RAG：报出嵌入器名，避免"词频嵌入被当成语义检索"
+                "knowledge_embedder": registry.extra.get("knowledge_embedder"),
+                "knowledge_sources": len(knowledge_sources) if knowledge_sources else 0,
             },
         }
 
