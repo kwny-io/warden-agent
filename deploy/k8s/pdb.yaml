@@ -1,0 +1,12 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: warden-agent
+  labels:
+    app.kubernetes.io/name: warden-agent
+spec:
+  # 节点维护（drain/升级）时至少留一个副本在服务——没有这条，"滚动维护"会变成"整体不可用"
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: warden-agent

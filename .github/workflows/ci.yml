@@ -52,8 +52,15 @@ jobs:
         # `-rs` 让跳过原因也打进日志：CI 里"跳过"和"通过"看起来一样绿，
         # 不写原因就没法判断是不是该跑的被静默跳过了。
         # `--cov` 同时**执行覆盖率门禁**：`fail_under` 配在 pyproject.toml（单一事实源，
-        # 基线 87% / 门槛 85%），这里不再重复写数字——避免"两个地方各写一个阈值"漂移。
+        # 基线 85.7% / 门槛 84%），这里不再重复写数字——避免"两个地方各写一个阈值"漂移。
         run: uv run --frozen pytest --tb=short -rs -p no:cacheprovider --cov=warden_agent
+      - name: K8s manifests 校验（kubeconform，官方 schema 严格模式）
+        # 只查**字段合法性**（官方 schema）；"我们的要求"（探针齐全、优雅停机时间小于
+        # terminationGracePeriodSeconds、非 root + rootfs 只读、不用 :latest、多副本必配 PG…）
+        # 由 tests/test_k8s_manifests.py 离线守着——那条在 Pytest 里已经跑了。
+        run: |
+          docker run --rm -v "$PWD/deploy/k8s:/m:ro" ghcr.io/yannh/kubeconform:v0.6.7 \
+            -summary -strict /m
       - name: 断言 PostgreSQL 集成测试真的执行了（防静默跳过）
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
         # 副作用是——**如果 CI 里的 service 没连上，它们会静默跳过、CI 依然绿**，

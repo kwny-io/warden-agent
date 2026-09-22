@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: warden-agent
+  labels:
+    app.kubernetes.io/name: warden-agent
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: warden-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  # SSE 是长连接，别让连接被过早掐断
+  sessionAffinity: None

@@ -37,6 +37,8 @@ deploy/observability/warden_token
 # 本地漏洞扫描产物（trivy 的漏洞库缓存很大，镜像导出 tar 也很大——都别提交）
 .trivy-cache/
 .trivy-img.tar
+# kubeconform 用的 k8s JSON schema 缓存（本地校验用；CI 里用默认在线源）
+.k8s-schemas/
 # 审计导出产物（本机归档用，不入版本库）
 audit-exports/
 

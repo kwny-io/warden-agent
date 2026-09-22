@@ -1,0 +1,47 @@
+# 非敏感配置（**密钥不在这里**，见 secret.example.yaml）
+#
+# 这份 ConfigMap 表达的是"单副本也能用、多副本必须满足的那几个开关"。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: warden-config
+  labels:
+    app.kubernetes.io/name: warden-agent
+data:
+  # ---- 服务与监听 ----
+  PORT: "8000"
+  # 容器内必须监听 0.0.0.0，否则 Service/探针连不上；鉴权由 Secret 里的 key 保证
+  # （对外监听 + 无鉴权 → run_server 会 fail-closed 拒绝启动）。
+  WARDEN_HOST: "0.0.0.0"
+  # rootfs 只读，SQLite（审计/记忆）与临时文件必须有可写卷 —— 见 Deployment 的 volumeMounts
+  WARDEN_DB_PATH: "/data/warden.db"
+
+  # ---- 存储：多副本必须用 PostgreSQL ----
+  # 配了 WARDEN_PG_HOST 就用 PostgreSQL（见 run_server._store_from_env）；密码在 Secret 里。
+  WARDEN_PG_HOST: "REPLACE_ME-pg-host"
+  WARDEN_PG_PORT: "5432"
+  WARDEN_PG_DB: "warden"
+  WARDEN_PG_USER: "warden"
+  # 多副本必须开：幂等 / 事件流 / 限流计数 / Run 锁才进共享存储。
+  # 不开的话实际限额 ≈ 配置值 × 副本数，且同一 run 会被两个副本并发驱动。
+  WARDEN_SHARED_STATE: "1"
+  # 事件总线用 LISTEN/NOTIFY 唤醒（仅 Postgres 有效）；它只降低延迟，正确性仍靠落表读表。
+  WARDEN_EVENT_BUS: "notify"
+
+  # ---- 审计与记忆（⚠️ 目前只有 SQLite 实现）----
+  # 多副本下这两个**每副本一份、彼此不一致**（审计链各自独立、记忆各自一套）。
+  # 所以参考配置里先关掉；单副本可以开。见 docs/operations.md 的已知边界。
+  WARDEN_AUDIT: "0"
+
+  # ---- 停机 ----
+  # 收到 SIGTERM 后最多等 30s 把在飞请求跑完，然后关资源并退出。
+  # Deployment 的 terminationGracePeriodSeconds 必须**大于**它（这里设 45）。
+  WARDEN_SHUTDOWN_GRACE_S: "30"
+
+  # ---- 可观测性 ----
+  WARDEN_TRACING: "1"
+
+  # ---- 多租户 / 角色 ----
+  # 管理员名单（逗号分隔的用户 id）。**不配就没有管理员**（fail-closed）。
+  WARDEN_ADMIN_PRINCIPALS: "REPLACE_ME-ops-user"
+  WARDEN_TENANT: "REPLACE_ME-tenant"

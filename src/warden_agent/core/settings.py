@@ -122,6 +122,28 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "web/run_server.py", ("web/run_server.py", "cli.py"), kind="path",
     ),
     EnvSpec(
+        "WARDEN_PG_HOST", "PostgreSQL 主机；**设了它就用 PostgreSQL**（否则用 SQLite）",
+        "web/run_server.py", ("web/run_server.py",),
+        note="多副本必须用 PostgreSQL（SQLite 是单机文件，跨主机共享文件系统不支持）。"
+             "配套 WARDEN_SHARED_STATE=1 才让幂等/事件/限流/Run 锁进共享存储",
+    ),
+    EnvSpec(
+        "WARDEN_PG_PORT", "PostgreSQL 端口", "web/run_server.py", ("web/run_server.py",),
+        default="5432", kind="int",
+    ),
+    EnvSpec(
+        "WARDEN_PG_DB", "PostgreSQL 库名", "web/run_server.py", ("web/run_server.py",),
+        default="warden",
+    ),
+    EnvSpec(
+        "WARDEN_PG_USER", "PostgreSQL 用户", "web/run_server.py", ("web/run_server.py",),
+        default="postgres",
+    ),
+    EnvSpec(
+        "WARDEN_PG_PASSWORD", "PostgreSQL 密码", "web/run_server.py", ("web/run_server.py",),
+        sensitive=True, note="放 Secret / 环境变量，别进 ConfigMap 或镜像",
+    ),
+    EnvSpec(
         "WARDEN_SHARED_STATE", "多副本共享协调状态（幂等/事件流/限流计数/Run 锁进数据库）",
         "web/run_server.py", ("web/run_server.py", "cli.py"), kind="bool",
         note="多副本必须开，否则实际限额 ≈ 配置值 × 副本数、且同一 run 会被并发驱动。"

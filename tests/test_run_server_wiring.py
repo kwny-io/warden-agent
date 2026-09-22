@@ -126,3 +126,25 @@ def test_演示策略把删除列为需要审批() -> None:
     policy = _build_policy()
     assert policy.evaluate("fs.delete", {"path": "x"}).decision == Decision.ASK
     assert policy.evaluate("weather.get", {"city": "上海"}).decision == Decision.ALLOW
+
+# ---------- 存储选择（多副本的前提：能真的选到 PostgreSQL）----------
+
+
+def test_默认用SQLite(tmp_path, monkeypatch) -> None:
+    from warden_agent.store.sqlite import SqliteStore
+    from warden_agent.web.run_server import _store_from_env
+
+    monkeypatch.setenv("WARDEN_DB_PATH", str(tmp_path / "t.db"))
+    store = _store_from_env({})
+    assert isinstance(store, SqliteStore)
+
+
+def test_配了PG主机时连不上_明确报错且不退回SQLite() -> None:
+    """**刻意不回落**：悄悄退回 SQLite 会让人"以为多副本在共享、其实各一个库"。"""
+    from warden_agent.web.run_server import _store_from_env
+
+    # 指向一个必然连不上的地址（端口 1）
+    with pytest.raises(RuntimeError) as exc:
+        _store_from_env({"WARDEN_PG_HOST": "127.0.0.1", "WARDEN_PG_PORT": "1"})
+    assert "PostgreSQL" in str(exc.value)
+    assert "不退回 SQLite" in str(exc.value)

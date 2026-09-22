@@ -273,6 +273,41 @@ def _db_path() -> str:
     return env_str("WARDEN_DB_PATH", "warden-agent-local.db")
 
 
+def _store_from_env(env: Mapping[str, str]) -> Any:
+    """按环境造存储：**配了 `WARDEN_PG_HOST` 就用 PostgreSQL，否则 SQLite**。
+
+    为什么必须有这个开关：文档里"多副本部署：存储用 PostgreSQL"这句话此前**不可执行**——
+    `run_server` 写死了 SQLite。于是"支持多副本"只存在于文档里（SQLite 是单机文件，
+    两个副本各自一个库，幂等/事件/限流/Run 锁全部各自为政）。
+    多副本要配套 `WARDEN_SHARED_STATE=1`（把协调状态也放进同一张库）。
+
+    ⚠️ **已知边界**：审计与记忆目前**仍只有 SQLite 实现**，多副本下每个副本一份、彼此不一致。
+    所以"多副本 + 审计/记忆"这个组合要么关掉这两项，要么等它们的 PG 实现（见运维手册已知边界）。
+    """
+    host = env_str("WARDEN_PG_HOST", "", env).strip()
+    if not host:
+        return SqliteStore(_db_path())
+
+    from warden_agent.store.postgres import PostgresStore
+
+    logger.info("存储：PostgreSQL（host=%s db=%s）", host, env_str("WARDEN_PG_DB", "warden", env))
+    try:
+        return PostgresStore(
+            host=host,
+            port=env_int("WARDEN_PG_PORT", 5432, env),
+            dbname=env_str("WARDEN_PG_DB", "warden", env),
+            user=env_str("WARDEN_PG_USER", "postgres", env),
+            password=env_opt("WARDEN_PG_PASSWORD", env) or "",
+        )
+    except Exception as e:  # noqa: BLE001 - 连不上要**明确拒绝启动**，别悄悄退回 SQLite
+        raise RuntimeError(
+            f"无法连接 PostgreSQL（host={host}）：{e}\n"
+            "  · 检查 WARDEN_PG_* 配置与网络连通性；\n"
+            "  · **刻意不退回 SQLite**：那会让'以为在多副本共享、其实是各自一个库'，"
+            "比直接起不来危险得多。"
+        ) from e
+
+
 def _event_keep_from_env(env: Mapping[str, str]) -> int:
     """进程内事件总线每个 run 保留的最近事件数（`WARDEN_EVENT_KEEP`，默认 500）。
 
@@ -307,7 +342,9 @@ def _cognition_from_env(
 def main() -> None:
     load_env()  # 先读 .env（可选），密钥从环境变量取，不硬编码
     setup_logging()
-    store = SqliteStore(_db_path())  # 存档文件（已被 .gitignore 忽略）
+    # 存储：配了 WARDEN_PG_HOST 就是 PostgreSQL，否则 SQLite（见 _store_from_env）。
+    # 多副本必须走 PostgreSQL + WARDEN_SHARED_STATE=1，否则各副本一个库、协调状态各自为政。
+    store = _store_from_env(os.environ)
 
     # 模型：有 key 用真 DeepSeek，否则用假模型（离线可跑）
     model: AgentChatModel

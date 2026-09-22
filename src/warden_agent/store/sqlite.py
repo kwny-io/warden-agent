@@ -17,12 +17,14 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Concatenate, cast
 
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.credential.vault import (
@@ -33,6 +35,30 @@ from warden_agent.credential.vault import (
 )
 from warden_agent.model.model import Message, ToolCall
 from warden_agent.store.codec import DEFAULT_CODEC_REGISTRY, VersionedCodecRegistry
+
+
+def _locked[**P, R](
+    method: Callable[Concatenate[SqliteStore, P], R],
+) -> Callable[Concatenate[SqliteStore, P], R]:
+    """把方法体放进**存储自己的锁**里执行。
+
+    为什么读也要加锁（这是修过的一个真 bug）：连接是 `check_same_thread=False` **跨线程共享**的，
+    而 SQLite 的一条连接**不允许并发使用**——两个线程同时用它（哪怕一个读一个写）会抛
+    `sqlite3.InterfaceError: not an error`，在 HTTP 层表现为**偶发 500**（压测并发 8~12 时实测到）。
+    早先只有写方法 `with self._lock`，读方法没加，于是"读+写并发"这条最常见的组合会翻车。
+    改法用装饰器而不是给每个方法体重排缩进：diff 小、不会误伤相邻代码。
+
+    ⚠️ 锁用 **RLock**：某个读方法将来若调用另一个已加锁的方法，不会自锁死。
+    泛型参数（PEP 695）必须保留签名，否则 mypy 会把被装饰方法的返回值退化成 Any、
+    连累所有调用点（本文件里那种错一次报了 13 条）。
+    """
+    @functools.wraps(method)
+    def wrapper(self: SqliteStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+    # functools.wraps 的静态返回类型是 `_Wrapped[...]`，与声明的 Callable 形式不完全等价；
+    # 它保留的正是原签名，所以这里显式 cast 一次即可。
+    return cast("Callable[Concatenate[SqliteStore, P], R]", wrapper)
 
 
 def _now_iso() -> str:
@@ -51,7 +77,7 @@ class SqliteStore:
 
     def __init__(self, db_path: str | Path) -> None:
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._codec: VersionedCodecRegistry = DEFAULT_CODEC_REGISTRY
         self._init_schema()
         self._init_migrations()
@@ -197,10 +223,12 @@ class SqliteStore:
         except sqlite3.OperationalError:
             pass  # 列已存在
 
+    @_locked
     def schema_version(self) -> int:
         row = self.conn.execute("SELECT version FROM __schema_version__").fetchone()
         return int(row[0]) if row else 0
 
+    @_locked
     def ping(self) -> None:
         """健康检查探针：执行一句无害查询，确认连接与底层文件可用。
 
@@ -249,6 +277,7 @@ class SqliteStore:
             self.conn.commit()
 
     # ---- 读取（恢复用）----
+    @_locked
     def load_run(self, run_id: str) -> AgentRun | None:
         """读回某个 Run 的状态；不存在返回 None。"""
         row = self.conn.execute(
@@ -260,6 +289,7 @@ class SqliteStore:
         run.status = RunStatus[row[0]]  # 从名字恢复枚举
         return run
 
+    @_locked
     def load_messages(self, run_id: str) -> list[Message]:
         """读回某个 Run 的完整对话历史，顺序和存的时候一样。"""
         rows = self.conn.execute(
@@ -306,6 +336,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    @_locked
     def list_approval_history(
         self, limit: int = 20, owner: str | None = None
     ) -> list[dict[str, Any]]:
@@ -333,6 +364,7 @@ class SqliteStore:
             for r in rows
         ]
 
+    @_locked
     def list_runs(self, limit: int = 50, owner: str | None = None) -> list[dict[str, Any]]:
         """列出会话概要（前端会话列表用）：按最近活跃排序。
 
@@ -382,6 +414,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    @_locked
     def list_users(self) -> list[dict[str, Any]]:
         """已登记的用户列表（按创建时间）。"""
         rows = self.conn.execute(
@@ -430,6 +463,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    @_locked
     def pending_approval_created_at(self, run_id: str) -> str | None:
         """该 run 进入"等待审批"的时刻（ISO 字符串）；没有待审批或老数据没记则返回 None。
 
@@ -443,6 +477,7 @@ class SqliteStore:
             return None
         return str(row[0])
 
+    @_locked
     def load_pending_approval(self, run_id: str) -> tuple[str, str, dict[str, object], str] | None:
         """读回某 run 待审批的一步；没有返回 None。"""
         row = self.conn.execute(
@@ -490,6 +525,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    @_locked
     def load_checkpoint(self, run_id: str) -> object | None:
         """读回某个 run 的最新存档点；没有返回 None。"""
         row = self.conn.execute(
@@ -499,6 +535,7 @@ class SqliteStore:
             return None
         return self._decode_checkpoint(row[0])
 
+    @_locked
     def list_checkpoints(self) -> list[object]:
         """枚举所有 run 的存档点（跨 run 协调恢复用）。
 
@@ -536,6 +573,7 @@ class SqliteStore:
         return None
 
     # ---- 跨副本共享状态（幂等 / 事件流 / 限流计数）----
+    @_locked
     def get_idempotent(self, key: str) -> str | None:
         row = self.conn.execute(
             "SELECT payload FROM idempotency WHERE key = ?", (key,)
@@ -579,6 +617,7 @@ class SqliteStore:
             self.conn.commit()
             return int(cur.lastrowid or 0)
 
+    @_locked
     def list_events_after(
         self, run_id: str, after_seq: int, limit: int = 200
     ) -> list[tuple[int, str]]:
@@ -633,6 +672,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    @_locked
     def load_credential(self, scope: str, name: str) -> StoredCredential | None:
         row = self.conn.execute(
             "SELECT data FROM credentials WHERE scope = ? AND name = ?", (scope, name)
@@ -648,6 +688,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    @_locked
     def list_credential_names(self, scope: str) -> list[str]:
         rows = self.conn.execute(
             "SELECT name FROM credentials WHERE scope = ? ORDER BY name", (scope,)
@@ -672,6 +713,7 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    @_locked
     def load_credential_lease(self, scope: str, lease_id: str) -> StoredLease | None:
         row = self.conn.execute(
             "SELECT name, issued_at, expires_at FROM credential_leases "

@@ -1,0 +1,28 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: warden-agent
+  labels:
+    app.kubernetes.io/name: warden-agent
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: warden-agent
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    # ⚠️ 只按 CPU 扩缩是有前提的：本项目跑离线假模型时 CPU 与并发相关性还行，
+    #    但**接了真模型之后延迟由模型主导**，CPU 可能很闲而请求在排队——
+    #    那时应该改用"自定义指标"（如 in-flight 请求数 / p95 延迟），这需要在
+    #    集群里装 metrics adapter（属于部署侧的事，见 deploy/k8s/README.md）。
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # 缩容慢一点：SSE 长连接刚被摘掉的副本上还有在飞的流
+      stabilizationWindowSeconds: 300

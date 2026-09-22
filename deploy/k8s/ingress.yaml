@@ -1,0 +1,36 @@
+# 入口（以 nginx ingress 为例；别的网关把注解换成对应的即可）
+#
+# 两个关键点：
+#   1. **SSE 长连接**：`/events`、`/chat/stream` 是流式接口，必须关掉代理缓冲，
+#      否则"打字机"会被网关攒成一坨（应用已经发了 X-Accel-Buffering: no，这里是双保险）。
+#   2. **会话粘性**：同一 run 落到不同副本会多一次 423 重试（Run 锁能挡并发，
+#      但体验上会多一跳）。粘性只是体验优化，**正确性不依赖它**。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: warden-agent
+  labels:
+    app.kubernetes.io/name: warden-agent
+  annotations:
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "warden-affinity"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # 流式接口可能长时间不产出，读超时要放宽（与应用的模型超时对齐）
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["REPLACE_ME.example.com"]
+      secretName: warden-tls
+  rules:
+    - host: REPLACE_ME.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: warden-agent
+                port:
+                  name: http

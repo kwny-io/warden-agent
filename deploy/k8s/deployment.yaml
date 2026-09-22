@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warden-agent
+  labels:
+    app.kubernetes.io/name: warden-agent
+spec:
+  # 多副本的前提是 WARDEN_PG_HOST + WARDEN_SHARED_STATE=1（见 configmap.yaml）：
+  # Run 级锁保证同一 run 不会被两个副本并发驱动（抢不到回 423）。
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 先起新的、再停旧的：滚动期间始终有副本在服务
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: warden-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: warden-agent
+    spec:
+      # 必须**大于** WARDEN_SHUTDOWN_GRACE_S（30s）：给应用时间排空请求 + 关资源
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001          # 与镜像里的 warden 用户一致
+        runAsGroup: 10001
+        fsGroup: 10001            # 让挂载卷对该用户可写
+        seccompProfile:
+          type: RuntimeDefault
+      # 尽量把副本铺到不同节点/区域（单点故障不是"多副本"）
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: warden-agent
+      containers:
+        - name: app
+          # 用不可变 tag（digest 更佳）：`latest` 会让"回滚"变成"再拉一次不知道拉到什么"
+          image: REPLACE_ME/warden-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: warden-config
+            - secretRef:
+                name: warden-secrets
+          # 存活：进程活着就 200（不查依赖 —— 依赖问题由 readiness 表达，
+          # 否则数据库一抖就会把好端端的进程反复重启）
+          livenessProbe:
+            httpGet: { path: /health/live, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # 就绪：会 ping 底层存储；不通过就从 Service 摘掉，不再接流量
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # rootfs 只读 → 需要写盘的东西（SQLite、临时文件）挂可写卷
+            - { name: data, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        # ⚠️ 多副本下**不要**给 SQLite 用共享卷（跨主机共享文件系统不支持 SQLite）。
+        # 这里只用于审计/记忆（当前仅 SQLite 实现，多副本下应关掉，见 configmap 注释）
+        # 以及临时文件。真要多副本 + 审计/记忆，需要它们的 PG 实现。
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
