@@ -11,12 +11,17 @@
   3. `build_index()` 按**稀疏度**自动选：稀疏 → 倒排；稠密（真语义嵌入）→ 线性扫描。
   4. 稠密的规模化需要真 ANN（FAISS / pgvector）——**如实说**，见 `docs/operations.md` 的已知边界。
 
-⚠️ 关于"ANN"的诚实口径：倒排索引给的是**精确**结果（只是少算了必然为 0 的候选）。
-   所以它是"更快的精确检索"，**不是**近似最近邻。真 ANN（HNSW/IVF）要引入外部库，本轮没做。
+⚠️ 关于"ANN"的诚实口径：
+  · `LinearIndex` 是暴力扫描（精确，参照答案）；
+  · `SparseInvertedIndex` 给的是**精确**结果（只是少算了必然为 0 的候选）——是"更快的精确检索"；
+  · `IVFIndex` 才是**真 ANN**（近似最近邻）：k-means 聚类 + 只扫最近 `nprobe` 个簇，
+    用少量召回换速度。**零新依赖**（纯 Python），但对超大语料仍不如 FAISS/pgvector 这类
+    原生实现——需要真正上规模时再换外部向量库。
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any, Protocol
 
 
@@ -115,6 +120,119 @@ class SparseInvertedIndex:
         return scored[:top_k]
 
 
+class IVFIndex:
+    """倒排文件索引（IVF）——**真 ANN**（近似最近邻），纯 Python、零依赖。
+
+    做法：先用 k-means 把向量聚成 `nlist` 个簇（每簇一个质心），检索时只扫
+    "与查询最接近的 `nprobe` 个簇"。这是**近似**：真近邻若落在未探测的簇里就会被漏掉，
+    召回率随 `nprobe` 上升；`nprobe >= nlist` 时扫全部簇 ⇒ 退化为精确（等价于暴力扫描）。
+
+    与 `SparseInvertedIndex` 的区别要分清：
+      · 倒排（稀疏）是**精确**剪枝（不共享非零维必然 0 分，不丢结果）；
+      · IVF 是**近似**（用召回换速度）——这才是"ANN"。
+
+    聚类初始化用**确定性最远点**（不是随机）：先取第一个向量，之后每次取"与已有质心最不相似"
+    的向量。既确定可复现，也避免引入 RNG（索引构建不该有随机性）。
+
+    ⚠️ 诚实边界：纯 Python 实现适合"几十万级以内、且要零依赖"的场景；再往上（百万级/高维）
+    应换 FAISS / pgvector 这类原生库。
+    """
+
+    def __init__(self, *, nlist: int = 8, nprobe: int = 2, iters: int = 10) -> None:
+        if nlist < 1:
+            raise ValueError("nlist 必须 >= 1")
+        if nprobe < 1:
+            raise ValueError("nprobe 必须 >= 1")
+        self.nlist = nlist
+        self.nprobe = nprobe
+        self.iters = iters
+        self._vectors: list[list[float]] = []
+        self._centroids: list[list[float]] = []
+        self._lists: list[list[int]] = []
+        self._built = False
+
+    def add(self, vector: list[float]) -> None:
+        self._vectors.append(vector)
+        self._built = False  # 新向量进来 → 需要重新聚类
+
+    @property
+    def size(self) -> int:
+        return len(self._vectors)
+
+    @property
+    def list_sizes(self) -> list[int]:
+        """每个簇里的向量数（观察聚类是否均衡）。"""
+        return [len(members) for members in self._lists]
+
+    @staticmethod
+    def _normalize(vector: list[float]) -> list[float]:
+        norm = math.sqrt(sum(x * x for x in vector))
+        return [x / norm for x in vector] if norm else list(vector)
+
+    def _init_centroids(self, k: int) -> list[list[float]]:
+        """确定性最远点初始化：每次取与已有质心最不相似的向量作新质心。"""
+        centroids = [self._normalize(self._vectors[0])]
+        while len(centroids) < k:
+            worst_idx, worst_sim = 0, None
+            for i, vec in enumerate(self._vectors):
+                sim = max(dot_similarity(vec, c) for c in centroids)
+                if worst_sim is None or sim < worst_sim:
+                    worst_idx, worst_sim = i, sim
+            centroids.append(self._normalize(self._vectors[worst_idx]))
+        return centroids
+
+    def _assign(self, centroids: list[list[float]]) -> list[list[int]]:
+        lists: list[list[int]] = [[] for _ in centroids]
+        for i, vec in enumerate(self._vectors):
+            # 取相似度最大的质心；同分时取下标小的（确定性）
+            best = max(range(len(centroids)), key=lambda j: (dot_similarity(vec, centroids[j]), -j))
+            lists[best].append(i)
+        return lists
+
+    def _fit(self) -> None:
+        n = len(self._vectors)
+        if n == 0:
+            self._centroids, self._lists, self._built = [], [], True
+            return
+        k = min(self.nlist, n)
+        centroids = self._init_centroids(k)
+        for _ in range(self.iters):
+            lists = self._assign(centroids)
+            dim = len(self._vectors[0])
+            new_centroids: list[list[float]] = []
+            for j, members in enumerate(lists):
+                if not members:
+                    new_centroids.append(centroids[j])  # 空簇保留原质心
+                    continue
+                acc = [0.0] * dim
+                for i in members:
+                    for d, value in enumerate(self._vectors[i]):
+                        acc[d] += value
+                new_centroids.append(self._normalize(acc))
+            centroids = new_centroids
+        self._centroids = centroids
+        self._lists = self._assign(centroids)
+        self._built = True
+
+    def search(self, query: list[float], top_k: int) -> list[tuple[int, float]]:
+        if not self._vectors:
+            return []
+        if not self._built:
+            self._fit()
+        probe = min(self.nprobe, len(self._centroids))
+        # 选最近的 nprobe 个簇
+        order = sorted(
+            range(len(self._centroids)),
+            key=lambda j: (-dot_similarity(query, self._centroids[j]), j),
+        )[:probe]
+        candidates: list[int] = []
+        for j in order:
+            candidates.extend(self._lists[j])
+        scored = [(i, dot_similarity(query, self._vectors[i])) for i in candidates]
+        scored.sort(key=lambda t: (-t[1], t[0]))
+        return scored[:top_k]
+
+
 def sparsity(vector: list[float]) -> float:
     """零元素占比（0~1）。越高越适合倒排索引。"""
     if not vector:
@@ -124,19 +242,41 @@ def sparsity(vector: list[float]) -> float:
 
 
 def build_index(
-    vectors: list[list[float]], *, sparse_threshold: float = 0.5
+    vectors: list[list[float]],
+    *,
+    sparse_threshold: float = 0.5,
+    kind: str = "auto",
+    nlist: int = 8,
+    nprobe: int = 2,
 ) -> VectorIndex:
-    """按稀疏度自动选索引：稀疏（默认阈值 >50% 是零）→ 倒排；否则线性。
+    """构造向量索引。
 
-    为什么按稀疏度选：倒排索引的收益来自"大部分维度是零"。真语义嵌入通常是**稠密**的
-    （几乎没有零），倒排就退化成"几乎全量扫描"——那时线性扫描反而更简单直接。
+    `kind`：
+      - `"auto"`（默认）：按稀疏度自动选——稀疏（>50% 是零）→ 倒排；稠密 → 线性。
+        为什么按稀疏度：倒排的收益来自"大部分维度是零"；真语义嵌入通常稠密，
+        倒排会退化成"几乎全量扫描"，那时线性更简单直接。
+      - `"linear"`：暴力扫描（精确参照）。
+      - `"inverted"`：稀疏倒排（精确剪枝）。
+      - `"ivf"`：**真 ANN**（k-means + nprobe 探测；`nprobe>=nlist` 即精确）。
+        稠密大规模语料想要"用召回换速度"时用它。
     """
     if not vectors:
         return LinearIndex()
-    # 稀疏 → 倒排（能剪枝）；稠密 → 线性（倒排对稠密向量没有收益）
-    index: VectorIndex = (
-        SparseInvertedIndex() if sparsity(vectors[0]) >= sparse_threshold else LinearIndex()
-    )
+    if kind == "linear":
+        index: VectorIndex = LinearIndex()
+    elif kind == "inverted":
+        index = SparseInvertedIndex()
+    elif kind == "ivf":
+        index = IVFIndex(nlist=nlist, nprobe=nprobe)
+    elif kind == "auto":
+        # 稀疏 → 倒排（能剪枝）；稠密 → 线性（倒排对稠密向量没有收益）
+        index = (
+            SparseInvertedIndex()
+            if sparsity(vectors[0]) >= sparse_threshold
+            else LinearIndex()
+        )
+    else:
+        raise ValueError(f"未知的索引类型: {kind!r}")
     for vec in vectors:
         index.add(vec)
     return index
