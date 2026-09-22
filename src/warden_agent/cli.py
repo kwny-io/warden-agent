@@ -424,6 +424,18 @@ def _cmd_stuck(args: argparse.Namespace) -> None:
         older_than_seconds=args.older_than_min * 60.0,
         owner=args.owner or None,
     )
+    if getattr(args, "notify", False):
+        # 把结论真正投递出去（webhook / Alertmanager 接收端）；未配通道则是空实现
+        from warden_agent.runtime.notify import notifier_from_env, notify_stuck
+
+        notifier = notifier_from_env()
+        sent = notify_stuck(
+            store, cp_store, notifier,
+            older_than_seconds=args.older_than_min * 60.0,
+            owner=args.owner or None,
+        )
+        if sent:
+            print(f"已投递告警：{sent} 个 Run（通道 {type(notifier).__name__}）")
     if args.json:
         print(json.dumps(
             [{"run_id": r.run_id, "status": r.status,
@@ -705,6 +717,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stuck.add_argument("--owner", default="", help="只看某个用户的 run（默认全部）")
     p_stuck.add_argument("--db", default="", help="存档库路径（默认取 WARDEN_DB_PATH）")
     p_stuck.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p_stuck.add_argument("--notify", action="store_true",
+                         help="同时投递告警到 WARDEN_ALERT_WEBHOOK_URL（未配则不投递）")
     p_stuck.set_defaults(func=_cmd_stuck)
 
     p_audit = sub.add_parser("audit-verify", help="校验审计链是否完整（防篡改巡检）")
