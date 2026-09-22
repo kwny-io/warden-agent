@@ -5,6 +5,54 @@
 
 ---
 
+## 2026-09-23（第十九批：交付级能力补齐——细粒度 RBAC / 真搜索 / 告警通道 / 真 ANN / 审计归档）
+
+> 对齐"完全企业级交付"：把文档里点名的几处"未实现"逐个做成**能跑、能验证**的代码。
+
+### 1. 细粒度 RBAC：新增只读角色 `viewer`
+
+- `web/auth.py`：角色→权限映射（`ROLE_PERMISSIONS`）+ `role_allows` + `permission_authorizer`；
+  授权链 = **先角色权限、再 Run 归属**（`combine_authorizers`）。
+- 角色三档：`viewer`（只读）/ `user`（默认，读写+审批）/ `admin`（+全局视图/部署级操作）。
+  新增 `WARDEN_VIEWER_PRINCIPALS`；admin 优先于 viewer。**默认仍是 user**——新增 viewer 是加法，
+  不收紧既有部署。`/models/select` 归为写操作（只读角色不能切模型）。
+
+### 2. 真实联网搜索 provider（`web.search` 不再只有 mock）
+
+- `web/search.py`：`HttpSearchProvider`（tavily / brave / custom），返回统一 `WebSearchResult`；
+  错误转空结果不抛；端点先过 URL 策略（不把 key 发向内网）；`requires_network=True` → 计入出站配额。
+- `providers_from_env`：`WARDEN_SEARCH_PROVIDER` + `KEY`/`ENDPOINT`；**配不全就如实退回 mock 并告警**。
+- `/capabilities` 与启动日志报出搜索 provider。
+
+### 3. 告警投递通道（卡死 Run 主动通知）
+
+- `runtime/notify.py`：`Notifier` 协议 + `WebhookNotifier`（尽力而为、失败不抛）+ `NullNotifier`；
+  `notify_stuck` 汇总"等待人工超时"的 Run 并投递；`WARDEN_ALERT_WEBHOOK_URL`/`_HEADERS`。
+- CLI：`warden stuck --notify`。此前只有"查询式"告警，没人盯就一直挂着。
+
+### 4. 真 ANN：`IVFIndex`（纯 Python、零依赖）
+
+- `rag/vector_index.py`：k-means 聚类 + 只扫最近 `nprobe` 个簇；**确定性最远点初始化**（不引 RNG）；
+  `nprobe>=nlist` 时退化为精确。`build_index(kind=auto|linear|inverted|ivf)`。
+- 诚实口径更新：倒排是"更快的精确检索"，IVF 才是近似最近邻；超大语料仍建议 FAISS/pgvector。
+
+### 5. 审计归档（只追加 + 完整性清单）
+
+- `runtime/archive.py`：归档写**新文件绝不覆盖**，并把 文件 sha256 + 前驱哈希 追加进
+  `manifest.jsonl`（清单**串链**，用 `WARDEN_AUDIT_KEY` 键控）。`verify_archive` 校验清单链 + 文件哈希。
+- CLI：`warden audit-archive` / `audit-archive-verify`（断链退出码 4）。
+- **诚实边界**：这是软件层只追加，**不是真 WORM**；真 WORM 需存储层能力（S3 Object Lock / WORM 设备）。
+
+### 6. 测试
+
+- 新增 `test_rbac.py`(+4) / `test_web_search_provider.py`(9) / `test_notify.py`(5) /
+  `test_vector_ivf.py`(5) / `test_archive.py`(7)；CLI 子命令清单同步。
+
+> 仍未覆盖（需目标环境）：真云 KMS、接真实 Jaeger/Tempo 展示验收、LB、目标 K8s 实部署与容量结论、
+> 真模型端到端、真搜索 API 联网实测、Helm（需 helm 二进制）。
+
+---
+
 ## 2026-09-23（第十八批：可观测性收尾——span 接 OTLP 导出，零新依赖）
 
 > 此前 `core/tracing.py` 只做"链上下文不断 + span 结构化日志"，span **送不进** Jaeger/Tempo

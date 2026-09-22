@@ -552,6 +552,42 @@ def _cmd_audit_export(args: argparse.Namespace) -> None:
         raise SystemExit(4)
 
 
+def _cmd_audit_archive(args: argparse.Namespace) -> None:
+    """把审计记录归档成**只追加**的证据包（新文件 + 清单登记，绝不覆盖已有归档）。
+
+    退出码：0 正常；**4 = 审计链已断**（归档仍写出，便于取证，但要立刻报警）；1 = 打不开库。
+    """
+    from warden_agent.runtime.archive import archive_records
+
+    store, label = _open_audit_store(args)
+    chain_ok, detail = store.verify_chain()  # type: ignore[attr-defined]
+    rows = store.export_records(after_id=args.after_id, limit=args.limit)  # type: ignore[attr-defined]
+    try:
+        info = archive_records(args.dir, rows, name=args.name or None)
+    except (FileExistsError, ValueError) as e:
+        _die(str(e))
+    print(f"归档 {len(rows)} 条（来源 {label}）→ {info['file']}"
+          f"｜sha256={info['sha256'][:16]}…")
+    print(("✅ " if chain_ok else "❌ ") + detail)
+    if not chain_ok:
+        raise SystemExit(4)
+
+
+def _cmd_audit_archive_verify(args: argparse.Namespace) -> None:
+    """校验归档目录：清单链完整 + 每个文件 sha256 与清单一致。链断则退出码 4。"""
+    import json
+
+    from warden_agent.runtime.archive import verify_archive
+
+    ok, detail = verify_archive(args.dir)
+    if args.json:
+        print(json.dumps({"ok": ok, "detail": detail, "dir": args.dir}, ensure_ascii=False))
+    else:
+        print(("✅ " if ok else "❌ ") + detail)
+    if not ok:
+        raise SystemExit(4)
+
+
 def _cmd_rotate_credentials(args: argparse.Namespace) -> None:
     """把存量凭证密文从旧密钥重加密到当前密钥（轮换的第二半）。
 
@@ -744,6 +780,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_export.add_argument("--limit", type=int, default=0, help="最多导出多少条（0 = 全部）")
     p_export.set_defaults(func=_cmd_audit_export)
+
+    p_archive = sub.add_parser(
+        "audit-archive", help="把审计记录归档成只追加的证据包（新文件 + 清单登记）"
+    )
+    p_archive.add_argument("--db", default="", help="审计库路径（默认取 WARDEN_DB_PATH）")
+    p_archive.add_argument("--pg", action="store_true",
+                           help="连 PostgreSQL 审计库（读 WARDEN_PG_*）")
+    p_archive.add_argument("--dir", required=True, help="归档目录（清单 manifest.jsonl 落这里）")
+    p_archive.add_argument("--name", default="", help="归档文件名（纯文件名，默认按时间命名）")
+    p_archive.add_argument("--after-id", type=int, default=0, help="只归档 id 大于该值的记录")
+    p_archive.add_argument("--limit", type=int, default=0, help="最多归档多少条（0 = 全部）")
+    p_archive.set_defaults(func=_cmd_audit_archive)
+
+    p_archive_v = sub.add_parser(
+        "audit-archive-verify", help="校验审计归档（清单链 + 文件 sha256）；断链退出码 4"
+    )
+    p_archive_v.add_argument("--dir", required=True, help="归档目录")
+    p_archive_v.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p_archive_v.set_defaults(func=_cmd_audit_archive_verify)
 
     p_rotate = sub.add_parser(
         "rotate-credentials", help="把存量凭证密文重加密到当前密钥（密钥轮换的第二半）"

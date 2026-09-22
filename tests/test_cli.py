@@ -26,6 +26,8 @@ _EXPECTED = {
     "stuck": "_cmd_stuck",
     "audit-verify": "_cmd_audit_verify",
     "audit-export": "_cmd_audit_export",
+    "audit-archive": "_cmd_audit_archive",
+    "audit-archive-verify": "_cmd_audit_archive_verify",
     "rotate-credentials": "_cmd_rotate_credentials",
 }
 
