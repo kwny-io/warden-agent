@@ -176,6 +176,11 @@ class SandboxSpec:
     readonly_workspace: bool = True      # 跑在临时只读副本上
     isolation: str = "auto"
     budget: ExecutionBudget = field(default_factory=ExecutionBudget)
+    # 允许被拷入只读工作区的**根目录**。`workspace_input` 必须落在它下面。
+    # `None` = **不允许任何 workspace_input**（fail-closed）——因为 workspace_input 往往来自
+    # 模型/工具参数（不可信）：不设边界就等于"Agent 可以把任意宿主目录（如 ~/.ssh、/root）
+    # 拷进沙箱再读出来"，那是任意文件读取，不是隔离。
+    workspace_root: str | None = None
 
 
 class IsolationUnavailableError(RuntimeError):
@@ -230,9 +235,9 @@ class NetworkPolicy:
 class SandboxedExecutionBroker:
     """在 ExecutionBroker 上套一层沙箱隔离。
 
-    用法（尽量贴近原 ExecutionBroker，好上手）：
-        broker = SandboxedExecutionBroker(spec=SandboxSpec(), inner=ExecutionBroker())
-        result = broker.execute(["ls"], workspace_input="/some/readonly/src")
+    用法：构造时给一个 `SandboxSpec`（**建议指定 `workspace_root`**），再调用它的执行入口，
+    把要拷入的目录作为 `workspace_input` 传进去。`workspace_input` 必须落在 `workspace_root`
+    之内；未配根目录则一律拒绝拷贝（见 `_ensure_within_root`）。
     """
 
     def __init__(
@@ -248,6 +253,30 @@ class SandboxedExecutionBroker:
     def isolation_note(self) -> str:
         """当前隔离档的可读说明 —— 对外汇报时请直接引用它，别自己措辞。"""
         return self.tier.describe()
+
+    def _ensure_within_root(self, src: Path) -> None:
+        """校验 workspace_input 落在配置的 `workspace_root` 之内（fail-closed）。
+
+        为什么必须做：workspace_input 常来自模型/工具参数（不可信）。不设边界时，
+        Agent 可以传 `~/.ssh`、`/root`、仓库本身，把任意宿主目录拷进沙箱再读出来——
+        那是**任意文件读取**，与"只读隔离"的初衷相反。未配置根目录时**一律拒绝**，
+        而不是"默认放开"。
+        """
+        root = self.spec.workspace_root
+        if root is None:
+            raise ValueError(
+                "[沙箱拒绝] 未配置 workspace_root，不允许把任意路径拷进工作区"
+                "（workspace_input 常来自模型参数，必须显式限定根目录）"
+            )
+        try:
+            resolved = src.resolve()
+            root_resolved = Path(root).resolve()
+        except OSError as e:
+            raise ValueError(f"[沙箱拒绝] 无法解析工作区路径: {e}") from e
+        if not resolved.is_relative_to(root_resolved):
+            raise ValueError(
+                f"[沙箱拒绝] workspace_input 不在允许的根目录内：{resolved} ⊄ {root_resolved}"
+            )
 
     def execute(
         self,
@@ -275,10 +304,15 @@ class SandboxedExecutionBroker:
         workdir: str | None = None
         _tmp: tempfile.TemporaryDirectory[str] | None = None
         if self.spec.readonly_workspace:
-            _tmp = tempfile.TemporaryDirectory(prefix="warden-sandbox-")
-            workdir = _tmp.name
+            # **先校验、再建临时目录**：校验失败就不该留下临时目录（否则它会一直挂到
+            # 进程 GC 才清理，Windows 上还会触发 unraisable 警告）。
+            src: Path | None = None
             if workspace_input is not None:
                 src = Path(workspace_input)
+                self._ensure_within_root(src)
+            _tmp = tempfile.TemporaryDirectory(prefix="warden-sandbox-")
+            workdir = _tmp.name
+            if src is not None:
                 if src.is_dir():
                     _copy_tree_readonly(src, Path(workdir))
                 elif src.is_file():

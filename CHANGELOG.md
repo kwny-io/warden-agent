@@ -5,6 +5,52 @@
 
 ---
 
+## 2026-09-23（第二十批：交付级代码审计——修掉 6 个真缺陷）
+
+> 对全仓做了一轮安全 + 可靠性审计，**修掉 6 个真问题**（多数只在 PG/多线程/只读角色下暴露，
+> SQLite 单副本 + 既有测试全绿所以一直没发现）。
+
+### 修掉的缺陷
+
+1. **`PostgresStore` 没有 `ping()` → PG 部署下 `/health/ready` 永远 503**（P0）
+   `web/health.py` 对存储调 `ping()`，而 PG 版没这个方法 → 探针抛 `AttributeError` 被吞 →
+   **K8s pod 永远不 Ready、LB 不路由**。SQLite 版一直有 `ping`，所以只坑 PG。
+   已补 `ping()` + 真库就绪探针测试。
+2. **`PostgresStore` / `PostgresAuditStore` 缺进程内锁 → 事务块并发互踩**（P0）
+   `with conn.transaction():` 在多线程下会在同一条连接上嵌套成 savepoint，交错时抛
+   `OutOfOrderTransactionNesting`，甚至让一个请求的 COMMIT 提交另一个的半成品。
+   已加 `RLock` 串行化事务块路径。
+3. **`/chat/stream` 在建流前出错会永久占住 Run 锁**（P0）
+   租约带后台心跳续租；建会话阶段抛异常时 `lease.stop()` 被跳过 → 该 run 一直回 423 直到重启。
+   已用 `try/except: lease.stop(); raise` 兜住。
+4. **`DELETE /runs/{id}` 被当成读操作 → 只读角色能删会话**（HIGH）
+   `operation_for` 对未匹配方法落到 `QUERY` 默认，而 `viewer` 持有 `QUERY`。已把
+   `DELETE /runs/*` 与 `POST /users` 归为写动作（`COMMAND`）。
+5. **幂等缓存全局、不按调用者作用域 → 跨用户响应泄露**（HIGH）
+   任一认证用户用别人用过的 `Idempotency-Key` 就能读到别人的缓存响应体
+   （`/chat` 响应含模型输出/会话状态），或抢占 key 让别人的请求 409。
+   已把存储键改为 `调用者:<header key>`。
+6. **沙箱 `workspace` 参数可指向任意宿主目录 → 任意文件读取**（HIGH）
+   `workspace_input` 常来自模型参数（不可信），旧实现无边界检查，模型可传 `~/.ssh`/`/root`
+   把文件拷进沙箱读出来。新增 `SandboxSpec.workspace_root`，**未配根目录一律拒绝拷贝**
+   （fail-closed）；`build_agent(sandbox=True)` 默认限定为当前工作目录。
+
+### 测试
+
+- 新增/扩展：PG `ping`+就绪探针、只读角色不能删会话、幂等键按调用者作用域、
+  沙箱根目录越界拒绝、agent 沙箱显式根目录。全量 **929 passed / 3 skipped**，覆盖 85.45%。
+
+### 仍未处理（审计发现，见交付面清单）
+
+- 表**无保留策略**：`idempotency`（成功快照永不删）、`run_events`（共享总线无上限）、
+  `rate_limits`（行永不删）、`audit_log`（设计如此）、`memories`（purge 无调度）；
+- 关键静默失败**缺指标/告警**：锁续租失败、事件丢弃、审计写失败、OTLP 丢弃；
+- 请求体**无大小上限**；SSE 长连接**无并发上限**；
+- `store/migrations.py` 是死代码且 `ALTER` 错误被静默吞掉；PG 单连接吞吐上限；
+- CI 缺 SBOM/镜像签名/migration 检查；配置守卫对"整包传 Mapping"的读取不可见。
+
+---
+
 ## 2026-09-23（第十九批：交付级能力补齐——细粒度 RBAC / 真搜索 / 告警通道 / 真 ANN / 审计归档）
 
 > 对齐"完全企业级交付"：把文档里点名的几处"未实现"逐个做成**能跑、能验证**的代码。

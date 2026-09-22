@@ -463,6 +463,10 @@ class PostgresAuditStore:
                 "未配置 WARDEN_AUDIT_KEY：审计链退化为**不带密钥**的哈希链。"
                 "仍能发现「手改/删行」，但挡不住会重算整条链的人——生产环境请配置该密钥。"
             )
+        # 进程内 RLock：`append` 用 `conn.transaction()`，而事务块**不能**在多线程间
+        # 嵌套同一条连接（psycopg 会当成 savepoint 交错、抛 OutOfOrderTransactionNesting）。
+        # 跨副本的串行仍由 pg_advisory_xact_lock 保证；这把锁管的是"同进程多线程"。
+        self._lock = threading.RLock()
         self._init()
 
     def _init(self) -> None:
@@ -498,7 +502,7 @@ class PostgresAuditStore:
 
     def append(self, record: AuditRecord) -> None:
         # 整段放进一个事务 + 咨询锁：多副本并发写时链头只被一方推进（见类说明）。
-        with self._conn.transaction(), self._conn.cursor() as cur:
+        with self._lock, self._conn.transaction(), self._conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_AUDIT_CHAIN_LOCK,))
             cur.execute("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1")
             head = cur.fetchone()

@@ -398,7 +398,13 @@ def augment_catalog(
     if sandbox:
         from warden_agent.execution.sandbox import SandboxSpec
 
-        catalog.register(_make_sandbox_tool(sandbox_spec or SandboxSpec()))
+        if sandbox_spec is None:
+            # `shell.run` 的 workspace 参数是**模型给的**（不可信），所以默认把工作区根目录
+            # 限定在当前工作目录——否则模型可传任意宿主路径（如 ~/.ssh）把文件拷进沙箱读出来。
+            import os
+
+            sandbox_spec = SandboxSpec(workspace_root=os.getcwd())
+        catalog.register(_make_sandbox_tool(sandbox_spec))
         extra["sandbox"] = True
 
     # 7. RAG 知识库（检索 + 来源引用）

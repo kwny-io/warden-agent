@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -67,7 +68,24 @@ class PostgresStore:
             "user": user, "password": password, "connect_timeout": connect_timeout,
         }
         self.conn = psycopg.connect(**self._connect_kwargs, autocommit=True)
+        # 一把 RLock 串行化**事务块**路径。为什么需要（SQLite 版也有同款 `_locked`）：
+        # psycopg 的单条语句本身受连接内部锁保护，但 `with conn.transaction():` 这种
+        # **事务块**在多线程下会在同一条连接上互相嵌套成 savepoint，交错时抛
+        # `OutOfOrderTransactionNesting`，甚至可能让一个线程的 COMMIT 提交另一个线程的半成品。
+        # FastAPI 的同步端点跑在线程池里，所以"同一条连接被两个请求并发用"是常态。
+        self._lock = threading.RLock()
         self._init_schema()
+
+    def ping(self) -> None:
+        """健康检查探针：执行一句无害查询确认连接可用。
+
+        **必须存在**：`/health/ready` 会对存储调 `ping()`（见 web/health.py）；此前
+        `PostgresStore` 没有这个方法 → 探针抛 `AttributeError` 被吞掉 → **PG 部署下就绪探针
+        永远 503**，K8s pod 永远不 Ready、LB 不路由。SQLite 版一直有 `ping`，所以只坑 PG。
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
 
     def new_connection(self) -> Any:
         """再开一条 autocommit 连接（调用方负责关）。
@@ -228,8 +246,10 @@ class PostgresStore:
 
         五条 DELETE 必须**同生共死**，所以显式开事务块（autocommit 模式下 `transaction()`
         会真的发 BEGIN/COMMIT）。中途失败则整体回滚，不会留下删了一半的会话。
+
+        ⚠️ 持锁执行：`transaction()` 不可在多线程间嵌套同一条连接（见 __init__ 的说明）。
         """
-        with self.conn.transaction(), self.conn.cursor() as cur:
+        with self._lock, self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute("DELETE FROM messages WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM pending_approvals WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM checkpoints WHERE run_id = %s", (run_id,))
@@ -346,7 +366,7 @@ class PostgresStore:
         )
         # "查重 + 插入"是一对读改写，放进同一个事务块里（autocommit 模式下显式 BEGIN/COMMIT），
         # 否则查完与写之间可能被别的写入插进来，查重的意义就打折了。
-        with self.conn.transaction(), self.conn.cursor() as cur:
+        with self._lock, self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM messages "
                 "WHERE run_id = %s AND role = %s AND content = %s "

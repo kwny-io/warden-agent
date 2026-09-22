@@ -296,6 +296,21 @@ def _cleanup_memory(key: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_postgres_store有ping_就绪探针才可用() -> None:
+    """`/health/ready` 会对存储调 `ping()`。PostgresStore 曾**没有**这个方法 →
+    PG 部署下就绪探针抛 AttributeError 被吞 → **永远 503**、K8s pod 永不 Ready。"""
+    from warden_agent.store.postgres import PostgresStore
+    from warden_agent.web.health import readiness
+
+    store = PostgresStore(**_pg_params())  # type: ignore[arg-type]
+    try:
+        store.ping()  # 不抛即通过
+        result = readiness(store)
+        assert result.status == "ok", result.checks
+    finally:
+        store.close()
+
+
 def test_审计后端跟着主存储后端走(tmp_path) -> None:
     from warden_agent.store.postgres import PostgresStore
     from warden_agent.store.sqlite import SqliteStore

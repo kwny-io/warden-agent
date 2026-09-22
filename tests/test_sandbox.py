@@ -8,6 +8,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 from warden_agent.execution.broker import ExecutionBudget
 from warden_agent.execution.sandbox import (
     NetworkPolicy,
@@ -47,7 +49,7 @@ def test_只读工作区_改动不到宿主(tmp_path: Path) -> None:
     target = input_dir / "data.txt"
     target.write_text("ORIGINAL", encoding="utf-8")
 
-    spec = SandboxSpec(readonly_workspace=True)
+    spec = SandboxSpec(readonly_workspace=True, workspace_root=str(tmp_path))
     broker = SandboxedExecutionBroker(spec=spec)
     # 在沙箱工作区里改写 data.txt（但宿主那份不能被改）
     cmd = [sys.executable, "-c",
@@ -58,11 +60,35 @@ def test_只读工作区_改动不到宿主(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "ORIGINAL"
 
 
+def test_未配workspace_root时拒绝拷入任意路径() -> None:
+    """workspace_input 常来自模型参数（不可信）：不配根目录就必须 fail-closed 拒绝。"""
+    broker = SandboxedExecutionBroker(spec=SandboxSpec(readonly_workspace=True))
+    run = broker.execute
+    cmd = [sys.executable, "-c", "print(1)"]
+    outside = str(Path.home())
+    with pytest.raises(ValueError, match="workspace_root"):
+        run(cmd, workspace_input=outside)
+
+
+def test_workspace_input越出根目录被拒(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    spec = SandboxSpec(readonly_workspace=True, workspace_root=str(root))
+    broker = SandboxedExecutionBroker(spec=spec)
+    run = broker.execute
+    cmd = [sys.executable, "-c", "print(1)"]
+    with pytest.raises(ValueError, match="不在允许的根目录内"):
+        run(cmd, workspace_input=str(outside))
+
+
 def test_超时强杀() -> None:
     spec = SandboxSpec(budget=ExecutionBudget(timeout_seconds=1))
     broker = SandboxedExecutionBroker(spec=spec)
+    run = broker.execute
     cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
-    r = broker.execute(cmd, workspace_input=None)
+    r = run(cmd, workspace_input=None)
     assert r.timed_out is True
     # 跑完即可，不要求特定 exit_code（超时被强行终止）
 

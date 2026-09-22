@@ -172,6 +172,13 @@ def operation_for(method: str, path: str) -> RunOperation:
     """
     method = method.upper()
     path = path.split("?")[0].rstrip("/") or "/"
+    # 破坏性/写动作要**先**判定，否则会落到末尾的 `QUERY` 默认上——
+    # 那样 `DELETE /runs/{id}` 会被当成"读"，只读角色就能删自己的会话（与本模块
+    # "viewer 能看不能动"的契约相悖）。
+    if method == "DELETE" and path.startswith("/runs"):
+        return RunOperation.COMMAND
+    if method == "POST" and path.startswith("/users"):
+        return RunOperation.COMMAND
     if method == "GET" and (path.startswith("/status") or path == "/approvals"):
         return RunOperation.QUERY
     if method == "POST" and (path.startswith("/approve") or path.startswith("/reject")):

@@ -13,14 +13,15 @@ from pathlib import Path
 import pytest
 
 from warden_agent.agent import augment_catalog
+from warden_agent.execution.sandbox import SandboxSpec
 from warden_agent.tool.catalog import ToolCatalog
 
 _PY = f'"{Path(sys.executable).as_posix()}"'
 
 
-def _catalog_with_sandbox() -> ToolCatalog:
+def _catalog_with_sandbox(spec: SandboxSpec | None = None) -> ToolCatalog:
     catalog = ToolCatalog()
-    augment_catalog(catalog, sandbox=True)
+    augment_catalog(catalog, sandbox=True, sandbox_spec=spec)
     return catalog
 
 
@@ -54,7 +55,9 @@ def test_只读工作区_副本可写但宿主不动() -> None:
         host = Path(tmp)
         (host / "input.txt").write_text("hello", encoding="utf-8")
 
-        catalog = _catalog_with_sandbox()
+        # workspace 参数来自模型（不可信），所以必须显式给出允许的工作区根目录；
+        # 不配则默认限定在当前工作目录（见 augment_catalog 的 sandbox 分支）。
+        catalog = _catalog_with_sandbox(SandboxSpec(workspace_root=str(host)))
         ws = host.as_posix()
         seen = catalog.execute(
             "shell.run",

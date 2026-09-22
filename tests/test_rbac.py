@@ -233,3 +233,27 @@ async def test_只读角色能读但不能发起或修改() -> None:
         assert (
             await c.post("/models/select", json={"id": "fake"}, headers=hdr)
         ).status_code == 403
+        # 删除是**写**动作，不能因为 operation_for 落到 QUERY 默认就被放行
+        assert (await c.delete("/runs/run-x", headers=hdr)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_幂等键按调用者作用域_不会读到别人的缓存() -> None:
+    """幂等表是全局的：同一 header key 由不同调用者提交，不能互相命中对方的缓存响应。"""
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")] * 8),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=SqliteStore(Path(tempfile.mkdtemp()) / "t.db"),
+        api_keys=_callers(),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        key = {"Idempotency-Key": "same-key"}
+        ra = await c.post("/chat/run-a", json={"text": "hi"}, headers={**A_ALICE, **key})
+        assert ra.status_code == 200 and ra.json()["run_id"] == "run-a"
+        # bob 用**同一个 key**：绝不能拿到 alice 那条 /chat/run-a 的缓存响应
+        rb = await c.post("/chat/run-b", json={"text": "hi"}, headers={**A_BOB, **key})
+        assert rb.status_code == 200
+        assert rb.json()["run_id"] == "run-b", "跨调用者命中了幂等缓存（应为各自作用域）"

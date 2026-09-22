@@ -831,7 +831,16 @@ def build_app(
                     )
             # 幂等：带 Idempotency-Key 的 POST，同 key 重复请求返回同一结果。
             # 流式端点(SSE)不参与幂等缓存（消费流会破坏它）。
-            idem_key = request.headers.get("Idempotency-Key")
+            #
+            # 键**按调用者作用域**：幂等表是全局的，若直接拿客户端给的 header 当键，
+            # 任一认证用户用"别人用过的 key"重放，就会**读到别人的缓存响应体**
+            # （/chat 的响应含模型输出与会话状态），甚至抢占 key 让别人的请求被 409。
+            raw_idem = request.headers.get("Idempotency-Key")
+            caller_scope = (
+                caller.user_id if caller is not None
+                else (request.client.host if request.client else "anonymous")
+            )
+            idem_key = f"{caller_scope}:{raw_idem}" if raw_idem else None
             is_stream = path.startswith("/events") or path.startswith("/chat/stream")
             # 幂等：带 Idempotency-Key 的 POST，同 key 重复请求返回同一结果。
             # 关键在**先原子占位再执行**——"先查后做后写"有 TOCTOU：两个同 key 请求
@@ -1302,12 +1311,18 @@ def build_app(
         # 但必须活到 SSE 流结束——所以释放放在生成器的 finally 里，而不是端点作用域。
         # 租约自带心跳续租，所以"流很久"也不会中途过期被接管。
         lease = _acquire_run(run_id)
-        sess = registry.get(run_id)
-        if not sess.run.user_id:
-            # 归属只能用 `_identity` 派生（认证模式下来自凭证，忽略查询参数），
-            # 与非流式 `/chat` 一致——否则客户端能用 `?user_id=alice` 把消息写进别人名下。
-            sess.run.user_id = _identity(request, user_id)
-            registry.apply_owner_model(sess)  # 用该用户自己选的模型
+        try:
+            sess = registry.get(run_id)
+            if not sess.run.user_id:
+                # 归属只能用 `_identity` 派生（认证模式下来自凭证，忽略查询参数），
+                # 与非流式 `/chat` 一致——否则客户端能用 `?user_id=alice` 把消息写进别人名下。
+                sess.run.user_id = _identity(request, user_id)
+                registry.apply_owner_model(sess)  # 用该用户自己选的模型
+        except Exception:
+            # 建流**之前**出错也必须释放租约：租约带后台心跳续租，漏掉的话这个 run
+            # 会被永久占住（一直回 423），直到进程重启。流内的释放见 generate() 的 finally。
+            lease.stop()
+            raise
 
         def generate() -> Any:
             try:
