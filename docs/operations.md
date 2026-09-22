@@ -21,6 +21,8 @@
 | **审计有没有被动过** | `warden audit-verify`（被动过退出码 4） | `✅ 链完整：N 条记录` |
 | **审计归档/取证** | `warden audit-export`（带链字段，链断则退出码 4） | 产物落在 `--out-dir`（默认 `./audit-exports/`） |
 | **依赖/镜像有没有已知漏洞** | CI 的 `security`（pip-audit）与 `container`（trivy）job；本地可跑 `bash scripts/container_smoke.sh` | 都绿；trivy 只对**有修复**的 HIGH/CRITICAL 失败 |
+| **镜像里到底装了什么** | CI 的 `sbom` job（syft / SPDX JSON，构建产物可下载）；交付镜像是否为本次源码构建 | SBOM 产物含 OS 包 + Python 依赖；镜像签名只对 `v*` tag（`image-signing` job，cosign keyless） |
+| **schema 有没有"改了结构却忘了升版本"** | CI 的 `migration` job；本地 `uv run --frozen python scripts/check_migrations.py --backend sqlite` | 新库记录版本 == `_SCHEMA_VERSION`，且结构指纹与 `scripts/schema_snapshot.json` 一致 |
 | 恢复计划 | `GET /recovery/plan` | 该续/该重试/等人工/终态四类 |
 | **请求在链上的位置** | 响应头 `traceparent` / 日志里的 `trace_id=` | 与上游传入的 `trace_id` 一致（见「十、链路追踪」） |
 | **告警规则是否加载** | Prometheus UI → Status/Rules | 两组规则都在（`deploy/observability/alerts/`） |

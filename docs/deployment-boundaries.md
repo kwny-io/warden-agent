@@ -112,6 +112,8 @@ Warden Agent 是一个**有状态的 Agent 运行时**，支持两种部署形�
 | 鉴权 | **fail-closed** | 无 key 又无 `WARDEN_ALLOW_ANON=1` → 拒绝启动 |
 | 对外监听 | 拒绝无鉴权 | `WARDEN_HOST=0.0.0.0` + 无鉴权 → 拒绝启动 |
 | 限流 | **开启**，600 次/60 秒/调用者 | `WARDEN_RATE_LIMIT=0` 关闭；格式 `次数/秒数` |
+| 请求体上限 | **开启**，1 MiB（超限 413） | `WARDEN_MAX_REQUEST_BYTES` 可调；只对带 body 的方法生效（先看 Content-Length，无则边读边计数）；`0` 关 |
+| SSE 并发上限 | **开启**，100 条 `/chat/stream`（超限 503） | `WARDEN_SSE_MAX_CONNECTIONS` 可调；到上限**立刻拒绝不排队**；`0` 关 |
 | 协调状态 | **进程内**（单副本） | 多副本必须 `WARDEN_SHARED_STATE=1` |
 | RAG 知识库 | **关闭** | `WARDEN_KNOWLEDGE=1\|<目录>` 开启；默认**词频嵌入（词面匹配，非语义）**，要语义配 `WARDEN_EMBED_*` |
 | 出网抓取 | **关闭** | `WARDEN_WEB_FETCH=1` 开启真实 HTTP 抓取；每跳重定向都过 URL 策略（拒内网/环回/云元数据） |

@@ -5,6 +5,143 @@
 
 ---
 
+## 2026-09-23（第二十三批：交付面缺口收尾——表保留策略 + 静默失败指标/告警 + schema 版本收口）
+
+> 承接第二十批「仍未处理（审计发现）」前两条与第四条。这三条是**代码侧**能闭环的，
+> 与另外两条一起构成交付面缺口全套：请求体/SSE 上限见**第二十一批**，CI 的
+> SBOM / 镜像签名 / migration 检查见**第二十二批**。
+
+### 1. 表保留策略 + `warden prune` 调度（item 1）
+
+- 新增后台清扫线程 `MaintenanceSweeper` 与单次清扫 `sweep()`：`runtime/maintenance.py:29`
+  (`sweep`)、`:67` (`MaintenanceSweeper`)、`:100` (`_loop`)。启动装配见
+  `web/run_server.py:522-536`，停机时 `web/server.py:549-552` 调 `maintenance.stop()`。
+- 各存储保留方法（协议 + 两实现）：`store/base.py:104-116`
+  (`purge_expired_idempotency` / `purge_stale_rate_limits`)；SQLite `store/sqlite.py:639` / `:648`、
+  PG `store/postgres.py:582` / `:590`；记忆 `memory/store.py:310`（SQLite）/ `:490`（PG）`purge_expired`。
+- `run_events` 保留改由 `append_event(..., keep=)` 落地（`sqlite.py:622`、`postgres.py:564`、
+  `agent.py` 的内存实现），由 `web/coordination.py:461-464` 经 `WARDEN_EVENT_KEEP`（默认 500）传入。
+- CLI 子命令 `warden prune`：定义 `cli.py:592`（`_cmd_prune`），parser `cli.py:867-876`
+  （`--db/--pg/--ttl-hours/--json`），调用 `runtime.maintenance.sweep`，可接 cron。
+  ⚠️ 勿与备份清理 `backup-prune`（`cli.py:341`）混淆。
+- 新环境变量登记 `core/settings.py:240-245`：`WARDEN_MAINTENANCE_INTERVAL_S`（默认 300）、
+  `WARDEN_IDEMPOTENCY_TTL_S`（默认 86400）。
+- `audit_log` **按设计保留**（要求明确不动）。限流清理用固定年龄阈值兜底
+  (`DEFAULT_RATE_LIMIT_MAX_AGE_S=86400`)，非精确窗口判定——已在 docstring 写明。
+- 测试 `tests/test_maintenance.py`：事件裁剪、清扫、记忆物理删除、内存存储空操作、
+  线程零间隔、迁移收口。
+
+### 2. 静默失败指标 + 告警规则（item 2）
+
+- 通用埋点 `note()`（**绝不抛异常**，不拖垮主路径）：`core/metrics.py:290`。四处接入：
+  - 锁续租失败 → `warden_lock_renew_failures_total`（`runtime/locking.py:259-261`）
+  - 事件丢弃 → `warden_event_dropped_total`（`web/coordination.py:165-170`）
+  - 审计写失败 → `warden_audit_write_failures_total`（`web/audit.py:707-708`）
+  - OTLP → 丢弃 `warden_otlp_dropped_total`（`core/otel.py:166-167`）、导出失败
+    `warden_otlp_export_failures_total`（`core/otel.py:203-210`）
+- 新增告警规则组 `warden-silent-failures`：`deploy/observability/alerts/warden.rules.yml:117`
+  （5 条 alert：锁续租 / 事件丢弃 / 审计写失败 / OTLP 导出失败 / OTLP 丢弃）。
+- 守护测试：`tests/test_maintenance.py::test_真实告警规则引用的指标名都存在于代码`
+  断言 5 个指标名同时存在于规则文件与 `src/**/*.py`——**防规则永不响**。
+- 设计取舍：`note()` 不带标签，无法按 run/owner 聚合（社区版够用）。
+
+### 3. `store/migrations.py` 死代码收口（item 4，删除路线）
+
+- 文件已删除（-109 行）。全仓 grep `store.migrations` / `import migrations` / `migrations.`
+  **无任何代码引用**，删除不破坏 import。
+- 被静默吞掉的 `ALTER` 错误改显式判定：`store/sqlite.py:198-235`（`_has_column` 走
+  `pragma_table_info` 参数化查询，缺列才 `ALTER`，真失败会抛出，**不再静默吞错**）。
+- schema 版本显式落库：SQLite `_SCHEMA_VERSION=4`（`sqlite.py:191`）、`schema_version()`
+  （`sqlite.py:238`）；PG 对齐 `_SCHEMA_VERSION=4`（`postgres.py:40`）、`schema_version()`
+  （`postgres.py:239`）。`store/codec.py:1-7` 移除对 `migrations.py` 的引用。
+  （第二十二批的 `scripts/check_migrations.py` 给这套版本机制装了守门人。）
+- 测试：`tests/test_maintenance.py` 的 `test_老库打开后补列并记录schema版本` /
+  `test_schema版本是真实记录的`。
+
+### 全量验证（本机，无 PostgreSQL）
+
+- `uv run --frozen pytest -p no:cacheprovider`：**960 passed / 35 skipped / 0 failed**
+  （311.35 s，exit 0）；跳过 = PG/pg_dump 依赖项（本机无 PG），CI 起真 PG 后不跳过。
+- `uv run --frozen pytest --cov=warden_agent`：**TOTAL 84.00%**，门槛
+  `[tool.coverage.report] fail_under = 84` 达成（exit 0）。本机 PG 测试跳过，CI 测得更高。
+- `uv run --frozen mypy src/warden_agent`：**Success: no issues found in 98 source files**。
+- `uv run --frozen ruff check src tests`：**All checks passed**。
+
+> 仍未覆盖（需目标环境）：真 K8s 集群实部署、真云 KMS、真 Jaeger/Tempo 后端展示验收、
+> 容量结论（本机并发 1 p50 0.83s；并发 8 p95 12.3s，项目自述**不是容量结论**）。
+
+---
+
+## 2026-09-23（第二十二批：CI 交付面补齐——SBOM / 镜像签名 / migration 检查）
+
+> 补齐交付面清单里 CI 缺的三块：**SBOM / 镜像签名 / migration 检查**（item 5）。
+> 前两项让"交付的镜像"可追溯、可验证来源；第三项给 item 4 新引入的显式 schema
+> 版本机制装上守门人。三个都是**真跑、会红**的门禁，不是摆设。
+
+### 1. migration 检查（新增 `migration` job）
+
+- 新增 `scripts/check_migrations.py`：真起一个**全新**库，读出"表 → 列"结构指纹，
+  断言 ①新库记录的版本 == `_SCHEMA_VERSION`；②SQLite 与 PG 两个常量一致；
+  ③结构指纹与签入快照 `scripts/schema_snapshot.json` 一致。
+- **它拦的就是那个真问题**：加了表/列却忘 `_SCHEMA_VERSION += 1` —— 启动照旧成功、
+  老库停在上一个版本，"记录版本"与"真实结构"悄悄分叉；现在结构变了而版本没升
+  会**明确失败**并打印修复提示（升版本 + `--write` 重写快照）。
+- CI 起真 PG service，SQLite 与 PG **两个后端都查**（"可换存储"是明确承诺，
+  只查 SQLite 会漏掉 PG 侧漂移）。另加 `tests/test_migration_check.py`，让日常
+  `pytest` 也守着 SQLite 这一路。
+
+### 2. SBOM（新增 `sbom` job）
+
+- 构建交付镜像后用 syft（`anchore/sbom-action`）产出 **SPDX JSON** 成分清单，
+  上传为构建产物。扫的是**真镜像**而非源码树——交付的是镜像，OS 层包只有镜像里才有。
+- 价值：trivy 只回答"当前有没有已知漏洞"，SBOM 回答"到底装了什么"；
+  新 CVE 出现时可离线比对，而不必重建再扫。
+
+### 3. 镜像签名（新增 `image-signing` job）
+
+- **cosign keyless**（OIDC → Fulcio 短期证书 + Rekor 透明日志）签名，无需长期私钥。
+- **只在打 tag（`v*`）的 push 触发**，PR 上不跑——现在仓库还没有 publish 步骤，
+  所以该 job 顺带做"push 到 GHCR"；将来 publish 独立后换成按 digest 签即可。
+  注释里写明了这个假设，避免"签名签了个不存在的东西"。
+
+### 4. 清理与验证
+
+- 修掉 `ci.yml` 里仍引用已删除的 `store/migrations.py` 的 SAST 注释（item 4 已删该文件，
+  现在 bandit Medium 0、**无任何 `#nosec` 压制**）。
+- 本地验证：`yaml.safe_load` 通过（job 列表 = quality/container/security/migration/sbom/image-signing）；
+  `python scripts/check_migrations.py --backend sqlite` 通过；全量 `913 passed / 35 skipped`；
+  `ruff check src tests` 干净。
+
+---
+
+## 2026-09-23（第二十一批：入站请求保护——请求体上限 + SSE 并发上限）
+
+> 补齐交付面清单里"请求体无大小上限；SSE 长连接无并发上限"两项。两者都是
+> "别把服务打垮"的闸门，与限流（管**次数**）互补：一个管"一次能送多大"，一个管"同时多少条流"。
+
+### 1. 请求体大小上限（HTTP 413）
+
+- 新增入站闸门：带 body 的方法（POST/PUT/PATCH）超限返回 **413**（problem+json，
+  与其它错误响应一致）。先看 `Content-Length`（廉价），没有（chunked）就**边读边计数**——
+  否则不声明长度的客户端能把任意大的 body 灌进来。未超限时把已读字节透传给下游，
+  下游照常能读到 body（口径与 `request.body()` 一致，但内存被上限封顶）。
+- 环境变量 `WARDEN_MAX_REQUEST_BYTES`（默认 `1048576` = 1 MiB，`0` = 关闭）。
+  ⚠️ 它是**单次请求**的体积上限，不是频率——频率看 `WARDEN_RATE_LIMIT`。
+
+### 2. SSE 长连接并发上限（HTTP 503）
+
+- 新增 `SseConcurrencyGate`：`/chat/stream` 并发到上限**立刻 503**（不排队，
+  排队只会让一堆请求一起超时），名额在流结束（含客户端断开触发的 `GeneratorExit`）释放。
+- 环境变量 `WARDEN_SSE_MAX_CONNECTIONS`（默认 `100`，`0` = 关闭）。
+- 两个上限都在 `web/run_server.py` 启动日志里打印实际生效值。
+
+### 测试与验证
+
+- 新增 `tests/test_web_limits.py`：413（含 chunked）、未超限照常 200、503、闸门计数/释放语义。
+- 全量通过（含 `ruff` / `mypy`）。
+
+---
+
 ## 2026-09-23（第二十批：交付级代码审计——修掉 6 个真缺陷）
 
 > 对全仓做了一轮安全 + 可靠性审计，**修掉 6 个真问题**（多数只在 PG/多线程/只读角色下暴露，
@@ -42,12 +179,17 @@
 
 ### 仍未处理（审计发现，见交付面清单）
 
-- 表**无保留策略**：`idempotency`（成功快照永不删）、`run_events`（共享总线无上限）、
-  `rate_limits`（行永不删）、`audit_log`（设计如此）、`memories`（purge 无调度）；
-- 关键静默失败**缺指标/告警**：锁续租失败、事件丢弃、审计写失败、OTLP 丢弃；
-- 请求体**无大小上限**；SSE 长连接**无并发上限**；
-- `store/migrations.py` 是死代码且 `ALTER` 错误被静默吞掉；PG 单连接吞吐上限；
-- CI 缺 SBOM/镜像签名/migration 检查；配置守卫对"整包传 Mapping"的读取不可见。
+> **状态更新（第二十三批）**：下列前两条与第四条的 `store/migrations.py` 一条**已处理完毕**，
+> 见第二十三批；CI 三条见第二十二批；请求体/SSE 上限见第二十一批。仍开放的仅“PG 单连接吞吐上限”
+> 与“配置守卫对整包传 Mapping 的读取不可见”两项。
+
+- ✅（第二十三批）表保留策略：`idempotency` / `run_events` / `rate_limits` / `memories` 已加保留策略，
+  `audit_log` 按设计保留；
+- ✅（第二十三批）静默失败已补指标 + 告警规则：锁续租失败、事件丢弃、审计写失败、OTLP 丢弃；
+- ✅（第二十三批）`store/migrations.py` 死代码已删除，`ALTER` 错误改显式抛出、schema 版本落库；
+  **仍未处理**：PG 单连接吞吐上限；
+- ✅（第二十二批）CI 已补 SBOM/镜像签名/migration 检查；
+  **仍未处理**：配置守卫对"整包传 Mapping"的读取不可见。
 
 ---
 

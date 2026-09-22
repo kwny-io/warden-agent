@@ -10,9 +10,12 @@
 >   多副本必配 PG + 共享状态……）。
 > - 但**没有在真实集群上跑过**——"能不能起来、扩缩是否按预期"要靠你的集群验证。
 >   这一点不写成"已验证"，见 `docs/operations.md` 的已知边界。
-> - **审计与记忆目前只有 SQLite 实现**：多副本下每个副本一份、彼此不一致
->   （审计链各自独立、记忆各自一套）。所以参考配置里 `WARDEN_AUDIT=0`；
->   要"多副本 + 审计/记忆"需要它们的 PG 实现（尚未做）。
+> - **审计与记忆跟随主存储**（2026-09-23 起，不再是 SQLite 独占）：配了
+>   `WARDEN_PG_HOST` 时走 `PostgresAuditStore` / `PostgresMemoryStore`，多副本共享
+>   **同一账本**与**同一份记忆**（审计链写入用 `pg_advisory_xact_lock` 跨副本串行）。
+>   所以参考配置里是 `WARDEN_AUDIT=1`（见 `configmap.yaml`）；SQLite 后端只在单副本下用。
+>   ⚠️ 但 `WARDEN_AUDIT_KEY` **必须**在 Secret 里配，否则链退化为无密钥哈希链
+>   （能查出手改/删行，挡不住"改完重算整条链"）。核链用 `warden audit-verify --pg`。
 
 ## 文件
 
