@@ -48,6 +48,11 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "warden_agent"
 _ENV_LIKE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 # 同形状但确实不是环境变量的常量（逃生舱；目前为空）
 _NON_ENV_CONSTANTS: frozenset[str] = frozenset()
+# `core/settings.py` 里的类型化访问器：`env_int("PORT", 8000)` 也是"读了这个变量"，
+# 守卫必须认（否则模块改用访问器之后，守卫就"看不见"它读了什么，等于自废武功）。
+_ENV_ACCESSORS = frozenset({
+    "env_str", "env_opt", "env_int", "env_bool", "env_positive_int",
+})
 
 
 def _fake_value(tag: str) -> str:
@@ -55,12 +60,38 @@ def _fake_value(tag: str) -> str:
     return f"faux-{tag}-" + secrets.token_hex(8)
 
 
-def _collect_env_reads() -> dict[str, set[str]]:
-    """扫描源码，返回 {变量名: {读它的模块相对路径}}。
+def _read_literal(node: ast.AST) -> str | None:
+    """判断这个 AST 节点是否在"读某个名字的环境变量"，是则返回变量名字面量。
 
-    覆盖两种读法：`x.get("NAME")` 与 `x["NAME"]`（`x` 可能是 `os.environ`，
-    也可能是 `resolve_auth(env)` 这种注入进来的 Mapping）。
+    覆盖三种读法：
+      - `x.get("NAME")`（`x` 可能是 `os.environ`，也可能是注入进来的 Mapping）
+      - `x["NAME"]`
+      - 类型化访问器 `env_int("NAME", ...)` / `settings.env_bool("NAME")`
     """
+    if isinstance(node, ast.Call) and node.args:
+        first = node.args[0]
+        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+            return None
+        func = node.func
+        is_get = isinstance(func, ast.Attribute) and func.attr == "get"
+        is_accessor = (
+            (isinstance(func, ast.Name) and func.id in _ENV_ACCESSORS)
+            or (isinstance(func, ast.Attribute) and func.attr in _ENV_ACCESSORS)
+        )
+        if is_get or is_accessor:
+            return first.value
+        return None
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    ):
+        return node.slice.value
+    return None
+
+
+def _collect_env_reads() -> dict[str, set[str]]:
+    """扫描源码，返回 {变量名: {读它的模块相对路径}}（读法见 `_read_literal`）。"""
     reads: dict[str, set[str]] = {}
     for path in SRC.rglob("*.py"):
         try:
@@ -69,22 +100,7 @@ def _collect_env_reads() -> dict[str, set[str]]:
             continue
         rel = path.relative_to(SRC).as_posix()
         for node in ast.walk(tree):
-            literal: str | None = None
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "get"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)
-            ):
-                literal = node.args[0].value
-            elif (
-                isinstance(node, ast.Subscript)
-                and isinstance(node.slice, ast.Constant)
-                and isinstance(node.slice.value, str)
-            ):
-                literal = node.slice.value
+            literal = _read_literal(node)
             if literal and _ENV_LIKE.match(literal) and literal not in _NON_ENV_CONSTANTS:
                 reads.setdefault(literal, set()).add(rel)
     return reads
@@ -187,6 +203,48 @@ def test_拼错的WARDEN变量会被识别出来() -> None:
 def test_第三方变量不误报() -> None:
     """DEEPSEEK_API_KEY 这类非 WARDEN_ 前缀的不该被当成拼写错误。"""
     assert unknown_warden_variables({"DEEPSEEK_API_KEY": "placeholder", "PATH": "/usr/bin"}) == []
+
+
+# ---------- 类型化访问器（各模块读配置的统一入口）----------
+
+
+def test_守卫能识别类型化访问器() -> None:
+    """守卫必须认 `env_int("X", ...)` 这种读法——否则模块改用访问器后守卫就"看不见"了。"""
+    node = ast.parse('v = env_int("WARDEN_TEST_ONE", 1)').body[0].value
+    assert _read_literal(node) == "WARDEN_TEST_ONE"
+    node2 = ast.parse('v = settings.env_bool("WARDEN_TEST_TWO")').body[0].value
+    assert _read_literal(node2) == "WARDEN_TEST_TWO"
+    # 把变量名放进变量再传 → 扫不到。这是**约定**：变量名必须在调用处是字面量。
+    node3 = ast.parse("v = env_int(name_var)").body[0].value
+    assert _read_literal(node3) is None
+
+
+def test_访问器解析口径统一() -> None:
+    from warden_agent.core.settings import (
+        env_bool,
+        env_int,
+        env_opt,
+        env_positive_int,
+        env_str,
+    )
+
+    assert env_str("K", "d", {}) == "d"
+    assert env_str("K", "d", {"K": ""}) == "d"          # 空串按"没配"处理
+    assert env_opt("K", {}) is None
+    assert env_opt("K", {"K": ""}) == ""                # 需要区分时才用 env_opt
+
+    assert env_int("K", 7, {}) == 7
+    assert env_int("K", 7, {"K": " 9 "}) == 9
+    with pytest.raises(ValueError, match="K"):
+        env_int("K", 7, {"K": "many"})                  # 写错要点名变量，别静默用默认
+
+    assert env_bool("K", True, {}) is True
+    assert env_bool("K", True, {"K": "0"}) is False
+    assert env_bool("K", False, {"K": "yes"}) is True
+
+    assert env_positive_int("K", 5, {"K": "0"}) == 5    # <=0 → 用默认
+    assert env_positive_int("K", 5, {"K": "3"}) == 3
+    assert env_positive_int("K", 5, {"K": "-1"}) == 5
 
 
 def test_敏感值在日志里打码() -> None:

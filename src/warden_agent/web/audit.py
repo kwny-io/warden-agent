@@ -296,6 +296,55 @@ class SqliteAuditStore:
             prev_hash = stored_hash
         return True, f"链完整：{len(rows)} 条记录，链头 {prev_hash[:12]}…"
 
+    def export_records(
+        self, *, after_id: int = 0, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """按 id 升序导出审计记录（含**链字段** id/prev_hash/hash），供归档/取证。
+
+        为什么带上链字段：审计导出常被当作"交给审计方/存档"的证据。只导出内容而不带
+        `prev_hash`/`hash`，接收方就无法独立复核"这份导出有没有被动过"；
+        带上之后，接收方可以拿同样的键重算整条链。
+
+        `after_id` 支持增量导出（接着上次的 id 往后拉）。
+        两条 SQL 都**直接以字面量写在 execute 处**、只用占位符传值——不把 SQL 放进变量、
+        也不做任何字符串拼接（本仓库的硬约定：扫描器与守卫都按这条看着）。
+        """
+        if limit is not None and limit > 0:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT id, correlation_id, tenant_id, principal_type, principal_id,"
+                    " product_id, operation, run_id, method, path, status, at,"
+                    " prev_hash, hash FROM audit_log WHERE id > ? ORDER BY id LIMIT ?",
+                    (int(after_id), int(limit)),
+                ).fetchall()
+        else:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT id, correlation_id, tenant_id, principal_type, principal_id,"
+                    " product_id, operation, run_id, method, path, status, at,"
+                    " prev_hash, hash FROM audit_log WHERE id > ? ORDER BY id",
+                    (int(after_id),),
+                ).fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "correlation_id": r[1],
+                "tenant_id": r[2],
+                "principal_type": r[3],
+                "principal_id": r[4],
+                "product_id": r[5],
+                "operation": r[6],
+                "run_id": r[7],
+                "method": r[8],
+                "path": r[9],
+                "status": r[10],
+                "at": r[11],
+                "prev_hash": r[12],
+                "hash": r[13],
+            }
+            for r in rows
+        ]
+
     def query(
         self,
         *,

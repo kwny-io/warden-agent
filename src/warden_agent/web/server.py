@@ -799,14 +799,26 @@ def build_app(
         )
 
     # ---- T8 可观测性：指标出口（Prometheus text，可被 Grafana 抓取）----
+    # 挂起数的缓存：抓取时"现算"能保证数是对的（不漂移），但每次抓取都扫库在抓取密集时
+    # 是浪费。这里加一个短 TTL 缓存：TTL 内复用上次结果，TTL 外重新扫描。
+    # 取 15s 与 Prometheus 默认抓取间隔一致——**不会让"挂起数"比告警评估周期更旧**。
+    _stuck_cache: dict[str, float] = {"at": -1e9, "value": 0.0}
+    _STUCK_TTL_S = 15.0
+
     def _refresh_stuck_gauge() -> None:
-        """抓取时现算"挂太久的 Run 数"，写进 gauge。失败绝不让 /metrics 挂掉。
+        """把"挂太久的 Run 数"写进 gauge（带 TTL 缓存）。失败绝不让 /metrics 挂掉。
 
         为什么现算而不是在写入路径累加：累加式 gauge 在重启、多副本下都会漂移
         （每个副本只知道自己见过的那部分），而告警恰恰最怕"数不对"。抓取时对存储做一次
-        只读扫描得到的是**当前真实值**。代价是每次抓取扫一次库——本项目的规模下可接受；
-        规模上去后应改用物化视图/后台刷新（见运维手册"已知边界"）。
+        只读扫描得到的是**当前真实值**；再加 TTL 缓存，避免"抓取越频繁、扫得越多"。
+
+        ⚠️ 刷新失败时**保留上一次的值**，绝不写 0：写 0 等于把告警悄悄消掉
+        （`warden_stuck_runs > 0` 立刻变假），那是比"指标空缺"严重得多的错。
         """
+        now = time.monotonic()
+        if now - _stuck_cache["at"] < _STUCK_TTL_S:
+            m_stuck.set(_stuck_cache["value"], labels=("60m",))   # 缓存命中：不扫库
+            return
         try:
             from warden_agent.runtime.alerting import stuck_awaiting_human
 
@@ -814,9 +826,14 @@ def build_app(
             if cp_store is None:
                 return
             stuck = stuck_awaiting_human(store, cp_store, older_than_seconds=3600.0)
-            m_stuck.set(float(len(stuck)), labels=("60m",))
+            value = float(len(stuck))
         except Exception:  # noqa: BLE001 - 指标刷新失败不能影响 /metrics 本身
-            logger.debug("刷新 warden_stuck_runs 失败（忽略，不影响 /metrics）", exc_info=True)
+            logger.debug("刷新 warden_stuck_runs 失败（保留上次值，不影响 /metrics）",
+                         exc_info=True)
+            return
+        _stuck_cache["at"] = now
+        _stuck_cache["value"] = value
+        m_stuck.set(value, labels=("60m",))
 
     @app.get("/metrics", include_in_schema=False)
     def metrics_view() -> PlainTextResponse:

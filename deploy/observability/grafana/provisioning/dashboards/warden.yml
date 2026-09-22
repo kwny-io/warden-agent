@@ -1,0 +1,14 @@
+apiVersion: 1
+
+# 仪表盘自动加载：把 dashboards 目录挂进来即可（无需手工导入 JSON）。
+providers:
+  - name: warden
+    orgId: 1
+    folder: "Warden"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

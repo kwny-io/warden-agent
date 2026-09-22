@@ -14,6 +14,7 @@
   warden restore <backup> [--force] 从备份恢复（破坏性，会覆盖目标库）
   warden stuck [--older-than-min N] 列出等待人工处理超时的 run（接告警用，有则退出码 3）
   warden audit-verify               校验审计链是否完整（被动过则退出码 4）
+  warden audit-export               导出审计记录（JSONL/CSV，带链字段，顺带校链）
   warden rotate-credentials         把存量凭证密文重加密到当前密钥（密钥轮换）
 
 默认连 http://127.0.0.1:8000；可用环境变量 `WARDEN_SERVER_URL` 覆盖要连的**服务地址**。
@@ -335,6 +336,96 @@ def _cmd_audit_verify(args: argparse.Namespace) -> None:
         raise SystemExit(4)
 
 
+def _safe_export_name(name: str) -> str:
+    """校验导出文件名：只允许**纯文件名**（不许带目录、`..`、盘符、反斜杠）。
+
+    导出物集中落在 `--out-dir` 指定的目录里，文件名由本函数把关，
+    所以"写到哪"完全由 out-dir 决定，文件名无法把写入引到别处。
+    """
+    text = (name or "").strip()
+    if not text:
+        raise ValueError("导出文件名不能为空")
+    if "\\" in text or "/" in text or ".." in text or text.startswith("."):
+        raise ValueError(f"导出文件名必须是纯文件名（不含目录/..）：{name!r}")
+    if len(text) > 3 and text[1] == ":":  # Windows 盘符
+        raise ValueError(f"导出文件名不能带盘符：{name!r}")
+    return text
+
+
+def _utc_stamp() -> str:
+    """UTC 时间戳（用于导出文件默认命名，如 20260922T120000Z）。"""
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _cmd_audit_export(args: argparse.Namespace) -> None:
+    """导出审计记录（JSONL / CSV），并**顺带校验链是否完整**。
+
+    用途：归档 / 取证 / 交给审计方。导出**带上链字段**（id / prev_hash / hash），
+    接收方可以拿同样的 `WARDEN_AUDIT_KEY` 独立复核这份导出有没有被动过——
+    只导出内容的话，它只是一份"看起来对"的表格。
+
+    产物落在 `--out-dir`（默认 `./audit-exports/`）下的一个文件里；文件名可用 `--name` 指定，
+    只接受**纯文件名**（不带目录/`..`/盘符）——所以"写到哪"完全由 out-dir 决定。
+    这是本机运维命令（直接读库、按操作者权限写盘），不是 HTTP 接口。
+
+    退出码：0 正常；**4 = 链已断**（导出仍会写出，便于取证，但要立刻报警）；1 = 打不开库/写不出去。
+    """
+    import csv
+    import json
+    from pathlib import Path
+
+    from warden_agent.web.audit import SqliteAuditStore
+
+    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    try:
+        store = SqliteAuditStore(db_path=db)
+    except Exception as e:  # 打不开库（路径不对/损坏）
+        _die(f"无法打开审计库 {db}: {e}")
+
+    chain_ok, detail = store.verify_chain()
+    rows = store.export_records(after_id=args.after_id, limit=args.limit)
+
+    suffix = "csv" if args.format == "csv" else "jsonl"
+    try:
+        safe_name = _safe_export_name(args.name or f"audit-{_utc_stamp()}.{suffix}")
+    except ValueError as e:
+        _die(str(e))
+    out_dir = Path(args.out_dir).expanduser()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _die(f"无法创建导出目录 {out_dir}: {e}")
+    target_path = out_dir / safe_name
+
+    try:
+        with target_path.open("w", encoding="utf-8", newline="") as fh:
+            if args.format == "csv":
+                fields = [
+                    "id", "at", "correlation_id", "tenant_id", "principal_type",
+                    "principal_id", "product_id", "operation", "run_id", "method",
+                    "path", "status", "prev_hash", "hash",
+                ]
+                writer = csv.DictWriter(fh, fieldnames=fields)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+            else:  # jsonl（默认）
+                for row in rows:
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        _die(f"无法写入 {target_path}: {e}")
+
+    print(f"导出 {len(rows)} 条（after_id={args.after_id}"
+          + (f", limit={args.limit}" if args.limit else "")
+          + f"）→ {target_path}")
+    print(("✅ " if chain_ok else "❌ ") + detail)
+    if not chain_ok:
+        # 链断了要立刻让人知道：数据已导出，但"这份审计被动过"
+        raise SystemExit(4)
+
+
 def _cmd_rotate_credentials(args: argparse.Namespace) -> None:
     """把存量凭证密文从旧密钥重加密到当前密钥（轮换的第二半）。
 
@@ -395,13 +486,13 @@ def _apply_recovery(
 ) -> None:
     """`recover --apply`：用默认装配真正执行一轮恢复，并打印每个 run 的处置。"""
     from warden_agent.agent import build_agent
-    from warden_agent.core.settings import env_flag
+    from warden_agent.core.settings import env_bool
     from warden_agent.runtime.locking import run_lock_for
     from warden_agent.runtime.worker import RecoveryWorker
 
     # Run 级锁：多副本下同一个 run 可能同时出现在两边的恢复计划里，没有闸门就会
     # 两边一起写、后写覆盖前写。开了 WARDEN_SHARED_STATE 就用存储里的共享锁。
-    lock = run_lock_for(store, shared=env_flag(os.environ.get("WARDEN_SHARED_STATE")))
+    lock = run_lock_for(store, shared=env_bool("WARDEN_SHARED_STATE", False))
     agent = build_agent(store=store)
     worker = RecoveryWorker(controller, agent.session_factory, lock=lock)
     actions = worker.run_once()
@@ -484,6 +575,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--db", default="", help="审计库路径（默认取 WARDEN_DB_PATH）")
     p_audit.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_audit.set_defaults(func=_cmd_audit_verify)
+
+    p_export = sub.add_parser(
+        "audit-export", help="导出审计记录（JSONL/CSV，顺带校验链是否完整）"
+    )
+    p_export.add_argument("--db", default="", help="审计库路径（默认取 WARDEN_DB_PATH）")
+    p_export.add_argument(
+        "--out-dir", default="audit-exports", help="导出目录（默认 ./audit-exports）"
+    )
+    p_export.add_argument("--name", default="", help="导出文件名（纯文件名，默认按时间自动命名）")
+    p_export.add_argument("--format", choices=["jsonl", "csv"], default="jsonl", help="导出格式")
+    p_export.add_argument(
+        "--after-id", type=int, default=0, help="只导出 id 大于该值的记录（增量导出）"
+    )
+    p_export.add_argument("--limit", type=int, default=0, help="最多导出多少条（0 = 全部）")
+    p_export.set_defaults(func=_cmd_audit_export)
 
     p_rotate = sub.add_parser(
         "rotate-credentials", help="把存量凭证密文重加密到当前密钥（密钥轮换的第二半）"

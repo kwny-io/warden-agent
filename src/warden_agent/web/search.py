@@ -28,6 +28,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from warden_agent.core.settings import env_bool
 from warden_agent.core.tracing import current_traceparent
 from warden_agent.tool.catalog import ToolSpec, function_tool
 from warden_agent.web.outbound import OutboundLimiter
@@ -256,8 +257,7 @@ def providers_from_env(
     为什么默认不开真实抓取：Agent 能主动访问外网是一个**应该由运维显式决定**的能力，
     不该悄悄打开。开了之后每一跳仍受 WebUrlPolicy 约束（拒内网/环回/元数据地址）。
     """
-    off = ("0", "false", "no", "off")
-    fetch_enabled = (env.get("WARDEN_WEB_FETCH") or "").strip().lower() not in (*off, "")
+    fetch_enabled = env_bool("WARDEN_WEB_FETCH", False, env)
     fetch: WebFetchProvider = HttpFetchProvider() if fetch_enabled else LocalMockFetchProvider()
     return LocalMockSearchProvider(), fetch
 

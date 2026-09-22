@@ -4,6 +4,10 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  # 每周定时跑一次：**依赖与基镜像的新 CVE 不需要改代码就会出现**，
+  # 只在 push/PR 上扫描的话，"没人提交"就等于"没人检查"。
+  schedule:
+    - cron: "0 3 * * 1"   # 每周一 03:00 UTC
 
 jobs:
   quality:
@@ -85,3 +89,33 @@ jobs:
             -v "$PWD/deploy/observability/alerts:/a:ro" \
             prom/prometheus:v2.55.0 \
             check rules /a/warden.rules.yml /a/warden.slo.yml
+      - name: 镜像漏洞扫描（trivy：HIGH/CRITICAL 且**有修复**才失败）
+        # `--ignore-unfixed`：只对"有修复可用"的漏洞失败。基镜像里常见"尚无修复"的包
+        # （perl / util-linux 等），把它们也算失败会让门禁变成噪声、最后被人关掉。
+        # 实测：**基镜像拉新后 0 命中**；用陈旧缓存则会命中 13 条——所以门禁有意义的前提是
+        # 拉新基镜像（container_smoke.sh 的 build 已加 --pull）。
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.57.1 image \
+            --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress warden-agent:ci
+
+  security:
+    runs-on: ubuntu-latest
+    # 依赖漏洞扫描：按 uv.lock 固定的**运行依赖**做门禁。
+    # 为什么单独一个 job、而不是塞进 quality：它跟"代码质量"是两条独立的信号
+    # （代码全绿但依赖爆了 CVE 是完全可能的），分开跑能让红的是哪一类一眼看清。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install (按 uv.lock 固定版本，含 dev)
+        run: uv sync --frozen --extra dev
+      - name: 依赖漏洞扫描（pip-audit，只扫运行依赖）
+        # 只扫 `--no-dev` 的导出：运行依赖进了交付镜像，dev 依赖不进镜像、风险面小得多。
+        # 想连 dev 一起看，去掉 --no-dev 即可（本地跑过：dev 也干净）。
+        run: |
+          uv export --frozen --no-emit-project --no-dev -o /tmp/req.txt
+          uv run --frozen pip-audit -r /tmp/req.txt --strict

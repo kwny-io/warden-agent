@@ -119,26 +119,56 @@ class InProcessIdempotencyStore:
                 self._data.pop(key, None)
 
 
+DEFAULT_EVENT_KEEP = 500
+
+
 class InProcessEventBus:
     """进程内事件总线（条件变量唤醒，无轮询延迟）。
 
-    每个 run 的事件保留最近 `_KEEP` 条，防止无人订阅时无限增长。
+    每个 run 只保留最近 `keep` 条事件，防止无人订阅时无限增长。**这是"保留条数"上限**：
+    如果消费者在两次轮询之间积累的事件超过它，最早的会被丢弃——所以：
+      - 丢弃时**打警告**（含累计条数），不让它静默发生；
+      - 消费者（`poll`）若发现自己的 `after_seq` 比保留的最早事件还旧，也会**收到缺口语义**
+        的警告（此前是"悄悄少几条"，消费方无从察觉）。
+    注意：事件只承载**进度展示**；最终结果与消息走 messages/存档，不因为这些事件丢而丢。
+    `keep` 可用 `WARDEN_EVENT_KEEP` 配置（见 run_server）。
     """
 
-    _KEEP = 500
-
-    def __init__(self) -> None:
+    def __init__(self, keep: int | None = None) -> None:
+        self._keep = int(keep) if keep and int(keep) > 0 else DEFAULT_EVENT_KEEP
         self._buckets: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         self._seq = 0
+        self._dropped: dict[str, int] = {}
+        self._gap_warned: set[str] = set()
         self._cv = threading.Condition()
+
+    @property
+    def keep(self) -> int:
+        """单个 run 最多保留多少条事件（运维可见）。"""
+        return self._keep
+
+    def dropped_count(self, run_id: str) -> int:
+        """该 run 累计被丢弃的事件数（0 = 从未丢过）。"""
+        with self._cv:
+            return self._dropped.get(run_id, 0)
 
     def publish(self, run_id: str, event: dict[str, Any]) -> None:
         with self._cv:
             self._seq += 1
             bucket = self._buckets.setdefault(run_id, [])
             bucket.append((self._seq, event))
-            if len(bucket) > self._KEEP:
-                del bucket[: len(bucket) - self._KEEP]
+            overflow = len(bucket) - self._keep
+            if overflow > 0:
+                del bucket[:overflow]
+                before = self._dropped.get(run_id, 0)
+                self._dropped[run_id] = before + overflow
+                if before == 0:
+                    # 首次丢弃才告警（避免刷屏），并说明"只影响进度展示"
+                    logger.warning(
+                        "事件保留上限 %d 被突破：run=%s 开始丢弃最早事件（累计已丢 %d 条）；"
+                        "慢消费者可能看不到部分进度事件，但最终结果不受影响",
+                        self._keep, run_id, overflow,
+                    )
             self._cv.notify_all()
 
     def poll(
@@ -147,9 +177,21 @@ class InProcessEventBus:
         deadline = time.monotonic() + timeout
         with self._cv:
             while True:
+                bucket = self._buckets.get(run_id, [])
+                # 缺口检测：消费者要的起点比"保留的最早事件"还旧 → 中间有事件被丢
+                if bucket and after_seq and bucket[0][0] > after_seq + 1:
+                    if run_id not in self._gap_warned:
+                        self._gap_warned.add(run_id)
+                        logger.warning(
+                            "事件流存在缺口：run=%s 请求 seq>%d，但最早可读的是 %d"
+                            "（更早的已被保留上限丢弃），消费者会看到事件不连续",
+                            run_id, after_seq, bucket[0][0],
+                        )
+                else:
+                    self._gap_warned.discard(run_id)  # 追上了 → 允许下次再报
                 items = [
                     (seq, ev)
-                    for seq, ev in self._buckets.get(run_id, [])
+                    for seq, ev in bucket
                     if seq > after_seq
                 ]
                 if items:
@@ -388,7 +430,8 @@ def _event_bus_for(store: Any, mode: str) -> EventBus:
 
 
 def coordination_for(
-    store: Any, *, shared: bool, event_bus: str = "poll"
+    store: Any, *, shared: bool, event_bus: str = "poll",
+    event_keep: int | None = None,
 ) -> tuple[IdempotencyStore, EventBus, RateLimitStore]:
     """按"是否多副本"造一套协调组件。
 
@@ -397,6 +440,7 @@ def coordination_for(
     （`get_idempotent` / `append_event` / `hit_rate_limit`），否则回落到进程内并告警。
     `event_bus="notify"`：多副本时用 LISTEN/NOTIFY 唤醒（只对 Postgres 生效，见
     `PostgresNotifyEventBus`）；不满足条件时回落为轮询并告警——**能力不够就明说**。
+    `event_keep`：进程内事件总线**每个 run 保留的最近事件数**（默认 500）。
     """
     if shared and all(
         hasattr(store, m)
@@ -415,4 +459,8 @@ def coordination_for(
             "多副本下幂等/事件/限流将各自为政。",
             type(store).__name__,
         )
-    return InProcessIdempotencyStore(), InProcessEventBus(), InProcessRateLimitStore()
+    return (
+        InProcessIdempotencyStore(),
+        InProcessEventBus(keep=event_keep),
+        InProcessRateLimitStore(),
+    )

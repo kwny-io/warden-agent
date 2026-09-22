@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from warden_agent.core.settings import env_flag
+from warden_agent.core.settings import env_bool
 
 _logger = logging.getLogger("warden.trace")
 
@@ -98,7 +98,7 @@ def child_span(parent: TraceContext | None) -> TraceContext:
 def enabled(env: Mapping[str, str] | None = None) -> bool:
     """链路追踪是否开启（`WARDEN_TRACING`，默认开）。"""
     source = os.environ if env is None else env
-    return env_flag(source.get("WARDEN_TRACING", "1"))
+    return env_bool("WARDEN_TRACING", True, source)
 
 
 def current() -> TraceContext | None:

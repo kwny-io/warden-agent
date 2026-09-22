@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -248,6 +249,14 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         note="不设则审计链退化为**不带密钥**的哈希链并告警：仍能发现「手改/删行」，"
              "但挡不住会重算整条链的人。审计链要跨重启校验，所以不生成临时密钥",
     ),
+    EnvSpec(
+        "WARDEN_EVENT_KEEP", "【进程内事件总线】每个 run 最多保留的最近事件数（默认 500）",
+        "web/run_server.py", ("web/run_server.py",),
+        default="500", kind="int",
+        note="这是**保留条数**上限：消费者在两次轮询之间积累超过它会丢最早的几条"
+             "（只影响进度展示；结果与消息走 messages/存档，不受影响）。丢弃时会打警告，"
+             "消费者侧也会收到「事件流存在缺口」的提示。多副本用 SqlEventBus 时此项不生效",
+    ),
     # ---- 可观测性 ----
     EnvSpec(
         "WARDEN_TRACING", "链路追踪（W3C traceparent 传播 + span 日志），默认开，0 关",
@@ -292,6 +301,57 @@ def env_flag(raw: str | None) -> bool:
     这正是那条守卫的用处。）
     """
     return (raw or "").strip().lower() in _BOOL_ON
+
+
+# ---------------------------------------------------------------------------
+# 类型化访问器：各模块读配置的统一入口
+# ---------------------------------------------------------------------------
+# 为什么要有它们：此前各模块自己 `os.environ.get("X")` 再手写 `int(...)` / 布尔判断，
+# 于是"同一个变量在不同模块解析口径不一致""写错了报错信息五花八门"这类问题迟早出现。
+# 访问器把**解析**收口到一处，各模块只声明"我要哪个变量、默认值是什么"。
+#
+# 关键约定：变量名在**调用处是字面量**（`env_int("PORT", 8000)`），
+# `tests/test_config_surface.py` 的 AST 守卫据此仍然能回答"谁读了哪个变量"。
+# 所以**不要**把变量名放进变量再传进来（`env_int(name_var)` 守卫会扫不到）。
+
+def _source(env: Mapping[str, str] | None) -> Mapping[str, str]:
+    return os.environ if env is None else env
+
+
+def env_str(name: str, default: str = "", env: Mapping[str, str] | None = None) -> str:
+    """读一个字符串配置；**未设置或空串**都返回 default（env 里空串通常等于"没配"）。"""
+    raw = _source(env).get(name)
+    return default if raw is None or raw == "" else raw
+
+
+def env_opt(name: str, env: Mapping[str, str] | None = None) -> str | None:
+    """读一个字符串配置，但**区分"未设置"(None) 与"空串"**（需要这个区分时用它）。"""
+    return _source(env).get(name)
+
+
+def env_int(name: str, default: int = 0, env: Mapping[str, str] | None = None) -> int:
+    """读一个整数配置；未设置/空串返回 default，写错则**报错并点名变量**。"""
+    raw = _source(env).get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as e:
+        raise ValueError(f"{name} 应为整数，实际为 {raw!r}") from e
+
+
+def env_bool(name: str, default: bool = False, env: Mapping[str, str] | None = None) -> bool:
+    """读一个布尔开关；未设置返回 default，否则按 `env_flag` 的口径判定。"""
+    raw = _source(env).get(name)
+    if raw is None:
+        return default
+    return env_flag(raw)
+
+
+def env_positive_int(name: str, default: int, env: Mapping[str, str] | None = None) -> int:
+    """读一个**正整数**配置；<=0 视为"用默认"（很多开关用 0 表示"关/不限"，不适用这里）。"""
+    value = env_int(name, default, env)
+    return value if value > 0 else default
 
 
 def _is_truthy(value: str) -> bool:

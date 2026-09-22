@@ -43,3 +43,20 @@ services:
     image: prom/blackbox-exporter:v0.25.0
     ports:
       - "127.0.0.1:9115:9115"
+
+  # 仪表盘：数据源与仪表盘都走 provisioning（挂载即生效，不用手工导入 JSON）。
+  # 打开 http://127.0.0.1:3000 → Dashboards → Warden → "Warden Agent 概览"。
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      # 演练环境默认免登录（**别照搬到生产**；生产请配 GF_AUTH_* 或接 SSO）
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus

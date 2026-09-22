@@ -198,3 +198,47 @@ async def test_事件流跨副本_另一副本能订阅到() -> None:
                     break
     assert '"final"' in body
     assert "好" in body
+
+
+# ---------- 进程内事件总线的保留上限（可配 + 可观测）----------
+
+
+def test_事件保留上限可配_且丢弃可观测() -> None:
+    """`keep` 决定每个 run 保留多少条事件；超出会丢最早的，但**必须能被察觉**。"""
+    bus = InProcessEventBus(keep=3)
+    for i in range(5):
+        bus.publish("run-1", {"n": i})
+
+    items = bus.poll("run-1", after_seq=0, timeout=0.01)
+    assert [ev["n"] for _seq, ev in items] == [2, 3, 4], "只应保留最近 3 条"
+    assert bus.keep == 3
+    assert bus.dropped_count("run-1") == 2, "丢弃条数要能被读到（而不是静默少几条）"
+
+
+def test_事件被丢后_消费者能收到缺口提示(caplog) -> None:
+    """消费者按 seq 前进时若跨过了被丢的区间，应给出"存在缺口"的日志。"""
+    import logging
+
+    bus = InProcessEventBus(keep=2)
+    for i in range(4):
+        bus.publish("run-2", {"n": i})       # 保留最近 2 条（seq 3、4）
+
+    with caplog.at_level(logging.WARNING, logger="warden_agent.web.coordination"):
+        got = bus.poll("run-2", after_seq=1, timeout=0.01)   # 要 seq>1，但最早只到 seq=3
+    assert [seq for seq, _ev in got] == [3, 4]
+    assert any("缺口" in r.message for r in caplog.records), "应提示事件流存在缺口"
+
+
+def test_未超限时不丢事件也不报缺口() -> None:
+    bus = InProcessEventBus(keep=10)
+    for i in range(3):
+        bus.publish("run-3", {"n": i})
+    assert bus.dropped_count("run-3") == 0
+    assert [ev["n"] for _s, ev in bus.poll("run-3", after_seq=0, timeout=0.01)] == [0, 1, 2]
+
+
+def test_装配时能传入保留上限() -> None:
+    _idem, bus, _rl = coordination_for(_store(), shared=False, event_keep=7)
+    assert isinstance(bus, InProcessEventBus)
+    assert bus.keep == 7
+

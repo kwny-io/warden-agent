@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -19,6 +20,9 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 ALERT_DIR = REPO / "deploy" / "observability" / "alerts"
+DASHBOARD = (
+    REPO / "deploy" / "observability" / "grafana" / "dashboards" / "warden-overview.json"
+)
 SRC = REPO / "src" / "warden_agent"
 
 # 指标名 token（含记录规则里的冒号形式）
@@ -92,6 +96,39 @@ def test_slo记录规则都被告警或其它规则用到() -> None:
     # 记录规则允许引用别的记录规则；但每一条最终都应被某条 alert 的表达式或其它记录规则用到
     unused = recording - referenced
     assert not unused, f"这些记录规则定义了却没人引用：{sorted(unused)}"
+
+
+def test_grafana仪表盘引用的指标都真实存在() -> None:
+    """仪表盘也会漂移：指标改名后，面板会**静静地变成空图**（不报错、没人发现）。
+
+    这里对每个面板的 PromQL 做与告警规则同样的核对——引用的 `warden_*` 指标必须
+    要么在代码里真实定义、要么是同目录 SLO 文件里声明的记录规则。
+    """
+    dashboard = DASHBOARD
+    assert dashboard.exists(), f"仪表盘文件不见了：{dashboard}"
+    with dashboard.open(encoding="utf-8") as fh:
+        doc = json.load(fh)
+
+    exprs: list[str] = []
+    for panel in doc.get("panels", []):
+        for target in panel.get("targets", []):
+            expr = target.get("expr")
+            if expr:
+                exprs.append(str(expr))
+    assert exprs, "仪表盘里应当有 PromQL 查询"
+
+    app = _app_metrics()
+    slo = _load("warden.slo.yml")
+    recording = {r["record"] for r in _rules(slo) if "record" in r}
+    referenced: set[str] = set()
+    for expr in exprs:
+        referenced.update(_TOKEN_RE.findall(expr))
+
+    unknown = [
+        token for token in referenced
+        if token not in recording and _normalize(token) not in app
+    ]
+    assert not unknown, f"仪表盘引用了不存在的指标：{sorted(unknown)}"
 
 
 def test_每条告警都有严重级别与说明() -> None:

@@ -31,6 +31,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from warden_agent.core.settings import env_str
+
 
 @runtime_checkable
 class KeyProvider(Protocol):
@@ -219,7 +221,7 @@ def resolve_key_provider(env: Mapping[str, str] | None = None) -> KeyProvider | 
     其它取值不认识 → 直接报错，**不静默回落到 env**（那等于"以为在托管、其实没托管"）。
     """
     src: Mapping[str, str] = env if env is not None else os.environ
-    kind = (src.get("WARDEN_KMS_PROVIDER") or "").strip().lower()
+    kind = env_str("WARDEN_KMS_PROVIDER", "", src).strip().lower()
     if kind in ("", "env"):
         return None
     if kind == "aws-kms":

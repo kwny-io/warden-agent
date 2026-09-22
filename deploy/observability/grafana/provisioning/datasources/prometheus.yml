@@ -1,0 +1,13 @@
+apiVersion: 1
+
+# Grafana 数据源：指向同栈里的 Prometheus。
+# 注意 `access: proxy`（默认）：由 Grafana 服务端去抓 Prometheus，浏览器不直连。
+datasources:
+  - name: Prometheus
+    uid: prometheus          # 仪表盘里用这个 uid 引用，保证"导入即可用"
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s

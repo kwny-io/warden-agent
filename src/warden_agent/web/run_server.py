@@ -48,7 +48,11 @@ from warden_agent.core.config import load_env
 from warden_agent.core.logging_setup import get_logger, setup_logging
 from warden_agent.core.settings import (
     describe,
-    env_flag,
+    env_bool,
+    env_int,
+    env_opt,
+    env_positive_int,
+    env_str,
     unknown_warden_variables,
     validate_env,
 )
@@ -167,12 +171,12 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
         if keys:
             return keys, "bearer"
 
-    single_key = env.get("WARDEN_API_KEY")
+    single_key = env_opt("WARDEN_API_KEY", env)
     if single_key:
-        user_id = (env.get("WARDEN_API_USER") or "demo-user").strip() or "demo-user"
+        user_id = env_str("WARDEN_API_USER", "demo-user", env).strip() or "demo-user"
         return {single_key: _caller_for(user_id, tenant)}, "bearer"
 
-    if env.get("WARDEN_ALLOW_ANON", "").strip().lower() in ("1", "true", "yes"):
+    if env_bool("WARDEN_ALLOW_ANON", False, env):
         return None, "anon-dev"
 
     raise AuthConfigError(
@@ -222,8 +226,10 @@ def _stability_from_env(env: Mapping[str, str]) -> bool:
     重试是安全的：稳定性层按 `ToolSpec.pure` 判定，**非纯工具只对瞬时错误重试**，
     不会把 `fs.delete` 这类有副作用的操作重放。
     """
-    off = ("0", "false", "no", "off")
-    return env.get("WARDEN_STABILITY", "1").strip().lower() not in off
+    # 统一走访问器：此前这里用 `not in off` 判定，**口径与其它布尔开关不一致**
+    # （未知取值会被当成"开"；而 ALLOW_ANON 那边又漏了 "on"）。启动校验已经拦住非法取值，
+    # 所以统一口径不会改变合法配置的行为。
+    return env_bool("WARDEN_STABILITY", True, env)
 
 
 def _shared_state_from_env(env: Mapping[str, str]) -> bool:
@@ -233,9 +239,9 @@ def _shared_state_from_env(env: Mapping[str, str]) -> bool:
     同一 Idempotency-Key 打到不同副本会重复执行、SSE 事件收不到、限流总额度翻倍。
     单副本默认关（进程内实现更快、无轮询）。
 
-    解析统一走 `core.settings.env_flag`，避免同一个变量出现多个解析口径。
+    解析统一走 `core.settings.env_bool`，避免同一个变量出现多个解析口径。
     """
-    return env_flag(env.get("WARDEN_SHARED_STATE"))
+    return env_bool("WARDEN_SHARED_STATE", False, env)
 
 
 def _db_path() -> str:
@@ -244,7 +250,15 @@ def _db_path() -> str:
     容器里用 `WARDEN_DB_PATH` 指向可写卷 —— rootfs 设成只读（read_only: true）时，
     写 WORKDIR 会失败，必须显式给一个挂载卷里的路径。
     """
-    return os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    return env_str("WARDEN_DB_PATH", "warden-agent-local.db")
+
+
+def _event_keep_from_env(env: Mapping[str, str]) -> int:
+    """进程内事件总线每个 run 保留的最近事件数（`WARDEN_EVENT_KEEP`，默认 500）。
+
+    统一走 `core.settings` 的访问器：解析口径只有一处，写错会点名变量报错。
+    """
+    return env_positive_int("WARDEN_EVENT_KEEP", 500, env)
 
 
 def _cognition_from_env(
@@ -261,14 +275,12 @@ def _cognition_from_env(
         要开就设 `WARDEN_PLANNER=1`（值得，因为复杂任务本来就贵）。
     """
     intent = ToolIntentRouter(catalog)
-    on = ("1", "true", "yes", "on")
     planner = (
         ModelPlanner(model)
-        if env.get("WARDEN_PLANNER", "").strip().lower() in on
+        if env_bool("WARDEN_PLANNER", False, env)
         else None
     )
-    raw = env.get("WARDEN_MAX_CONTEXT_CHARS", "").strip()
-    limit = int(raw) if raw.isdigit() else DEFAULT_MAX_CONTEXT_CHARS
+    limit = env_int("WARDEN_MAX_CONTEXT_CHARS", DEFAULT_MAX_CONTEXT_CHARS, env)
     return planner, intent, limit
 
 
@@ -365,8 +377,11 @@ def main() -> None:
     shared_state = _shared_state_from_env(os.environ)
     # 事件总线：poll（默认，轮询）或 notify（LISTEN/NOTIFY 唤醒，仅 Postgres 有效）。
     # notify 不改变正确性——事件仍落表、订阅仍读表，通知只把"睡满间隔"变成"变化即醒"。
-    event_bus_mode = (os.environ.get("WARDEN_EVENT_BUS") or "poll").strip().lower()
-    coordination = coordination_for(store, shared=shared_state, event_bus=event_bus_mode)
+    event_bus_mode = env_str("WARDEN_EVENT_BUS", "poll", os.environ).strip().lower()
+    coordination = coordination_for(
+        store, shared=shared_state, event_bus=event_bus_mode,
+        event_keep=_event_keep_from_env(os.environ),
+    )
     logger.info(
         "协调状态：%s（事件总线 %s）",
         "共享存储（多副本）"
@@ -442,7 +457,7 @@ def main() -> None:
         outbound_limiter=outbound,
         run_lock=run_lock,
     )
-    port = int(os.environ.get("PORT", "8000"))
+    port = env_int("PORT", 8000)
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)
     logger.info("OpenAPI 文档:  http://127.0.0.1:%s/docs", port)
     logger.info("健康检查:      /health/live  /health/ready")

@@ -34,6 +34,12 @@ local-tmp/
 # Prometheus 抓取用的 Bearer token（内容 = WARDEN_API_KEY）
 deploy/observability/warden_token
 
+# 本地漏洞扫描产物（trivy 的漏洞库缓存很大，镜像导出 tar 也很大——都别提交）
+.trivy-cache/
+.trivy-img.tar
+# 审计导出产物（本机归档用，不入版本库）
+audit-exports/
+
 # IDE / 系统
 .idea/
 .vscode/

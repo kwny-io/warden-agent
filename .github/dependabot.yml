@@ -1,0 +1,40 @@
+# Dependabot：依赖与基镜像的自动升级 PR
+#
+# 为什么要有：漏洞扫描（CI 里的 pip-audit / trivy）负责**发现**问题，
+# 而"发现之后谁来升级"没人管的话，门禁只会一直红。这里让升级变成自动来的 PR。
+#
+# 覆盖四类：
+#   - uv     ：uv.lock（本项目的 Python 依赖锁定）
+#   - npm    ：web/（前端）
+#   - docker ：Dockerfile 里的基镜像（node:20-slim / python:3.12-slim）——
+#              基镜像的 CVE 只能靠"重新拉取 + 重建"来修，所以这条很关键
+#   - github-actions：workflow 里用到的 action 版本
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "base-image"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]

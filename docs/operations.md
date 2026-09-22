@@ -19,6 +19,8 @@
 | 指标 | `GET /metrics`（Prometheus 文本） | 请求数/耗时分布/5xx/限流拒绝数/`warden_stuck_runs` |
 | **挂太久没人管的会话** | `GET /alerts/stuck?older_than_min=60` | `count=0` |
 | **审计有没有被动过** | `warden audit-verify`（被动过退出码 4） | `✅ 链完整：N 条记录` |
+| **审计归档/取证** | `warden audit-export`（带链字段，链断则退出码 4） | 产物落在 `--out-dir`（默认 `./audit-exports/`） |
+| **依赖/镜像有没有已知漏洞** | CI 的 `security`（pip-audit）与 `container`（trivy）job；本地可跑 `bash scripts/container_smoke.sh` | 都绿；trivy 只对**有修复**的 HIGH/CRITICAL 失败 |
 | 恢复计划 | `GET /recovery/plan` | 该续/该重试/等人工/终态四类 |
 | **请求在链上的位置** | 响应头 `traceparent` / 日志里的 `trace_id=` | 与上游传入的 `trace_id` 一致（见「十、链路追踪」） |
 | **告警规则是否加载** | Prometheus UI → Status/Rules | 两组规则都在（`deploy/observability/alerts/`） |
@@ -197,7 +199,9 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | 默认嵌入是**词频匹配** | 换个说法就掉分 | 配 `WARDEN_EMBED_*` 才是语义 |
 | 抓取只有去标签粗提取 | 拿不到 SPA / 正文抽取 | 需要 headless 浏览器 |
 | ~~没有告警规则库 / SLO / 链路追踪 / 灰度~~ | **已补齐**（规则库+SLO、traceparent 链路、健康门控灰度） | 见第九～十一节；span 送后端仍需接 OTel exporter |
-| `warden_stuck_runs` 抓取时现算 | 每次抓取对存储做一次只读扫描 | 本规模可接受；规模大改用物化视图/后台刷新 |
+| `warden_stuck_runs` 抓取时现算 | ~~每次抓取对存储做一次只读扫描~~ **已加 15s TTL 缓存**（与默认抓取间隔一致） | 刷新失败时保留上次值、**绝不写 0**（写 0 会把告警悄悄消掉） |
+| **漏洞扫描的有效性取决于基镜像新鲜度** | 用陈旧缓存的基镜像扫会命中"其实已修"的 CVE（实测 13 条 → 拉新后 0 条） | 冒烟脚本构建已加 `--pull`（受限网络可 `SMOKE_NO_PULL=1`）；CI 每周定时跑 + dependabot 盯基镜像 |
+| 进程内事件总线保留上限 | 超 `WARDEN_EVENT_KEEP`（默认 500）会丢最早事件 | 只影响进度展示；丢弃有警告、消费者能收到「存在缺口」提示 |
 | 熔断/出站并发/`InProcessRunLock` 的**进程内语义** | 每副本各一份 | 已文档化（多副本须用共享实现） |
 | **记忆按 `owner` 隔离**（2026-09-22 起） | 升级前写入的记忆 `owner` 为空串，**用户在 `/memory/{scope}` 与召回里看不到** | 空串 = 部署级共享；需要保留的旧数据应补写 `owner`（`UPDATE memories SET owner=? WHERE uid=?`） |
 | 幂等并发时返回 **409**（`IDEMPOTENCY_IN_FLIGHT`） | 同 `Idempotency-Key` 的第二个并发请求不再重复执行，改为明确拒绝 | 客户端应按幂等语义重试（带 `Retry-After`） |
@@ -215,10 +219,14 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
   以及**多窗口燃烧率**告警（快窗口发现快、慢窗口防误报）。
 - **抓取要带 Bearer**：`/metrics` 与其他业务接口一样受鉴权保护；`prometheus.yml` 用
   `bearer_token_file` 从文件读 key（**别把 key 写进配置文件**）。
-- **本地演练**：`deploy/observability/docker-compose.yml` 一键起 Prometheus+Alertmanager，
+- **本地演练**：`deploy/observability/docker-compose.yml` 一键起 Prometheus+Alertmanager**+Grafana**，
   人为制造错误率/挂起 Run 看告警是否按预期触发。
-- **守卫**：`tests/test_alert_rules.py` 断言规则引用的每个指标都真实存在、记录规则都被告警引用
-  （防"改了指标名、规则悄悄指向不存在的指标"）；CI 另用 `promtool` 校验语法。
+- **看板**：`grafana/` 下是 provisioning（数据源 + 仪表盘），挂载即生效；
+  「Warden Agent 概览」包含挂起 Run / 可用性 SLI / 5xx 占比 / 限流速率 / 请求速率 / 延迟 p50-p95-p99 /
+  错误速率 / 审批决策。演练环境默认匿名只读，**生产别照搬**（请配 GF_AUTH_* 或接 SSO）。
+- **守卫**：`tests/test_alert_rules.py` 断言规则与**仪表盘**引用的每个指标都真实存在、
+  记录规则都被告警引用（防"改了指标名、规则/看板悄悄指向不存在的指标"——看板会变成空图且不报错）；
+  CI 另用 `promtool` 校验规则语法。
 
 **阈值是起点，不是真理**——先按默认跑，再按业务真实水位调。
 

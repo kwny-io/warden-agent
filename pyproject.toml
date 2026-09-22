@@ -33,6 +33,8 @@ dev = [
     "mypy>=1.10",
     "pyright",
     "psycopg[binary]",
+    # 依赖漏洞扫描（CI 里对 lock 固定的运行依赖做门禁；见 .github/workflows/ci.yml）
+    "pip-audit>=2.7",
 ]
 postgres = ["psycopg[binary]"]
 # 密钥托管（KMS/HSM）：aws-kms 模式需要 boto3。vault-transit 走 httpx（已在依赖里），无需额外包。

@@ -40,7 +40,16 @@ trap cleanup EXIT
 
 # ---- 1. 构建 ----
 log "构建镜像 $IMAGE（多阶段：node 构建前端 → python 运行）"
-docker build -t "$IMAGE" .
+# `--pull`：每次都拉最新基镜像。这不只是"保持新鲜"——**镜像漏洞扫描（trivy）的有效性依赖它**：
+# 基镜像（python/node:slim）里的包 CVE 只能靠"基镜像更新 + 重建"来修。
+# 实测：用陈旧缓存的基镜像会命中 13 条 HIGH/CRITICAL（可修复），拉新后 0 条。
+# 本机网络受限（例如镜像源不可达）时可 `SMOKE_NO_PULL=1` 跳过拉取，用本地已有基镜像构建。
+PULL_FLAG="--pull"
+if [ "${SMOKE_NO_PULL:-0}" = "1" ]; then
+  PULL_FLAG=""
+  log "⚠️ SMOKE_NO_PULL=1：跳过拉取基镜像（漏洞扫描的结论会失真——基镜像可能是旧的）"
+fi
+docker build $PULL_FLAG -t "$IMAGE" .
 
 # ---- 2. 起容器（带和生产一致的加固参数）----
 # read_only + cap_drop ALL + no-new-privileges 与 docker-compose.yml 一致：
