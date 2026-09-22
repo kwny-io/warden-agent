@@ -123,24 +123,29 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     ),
     EnvSpec(
         "WARDEN_PG_HOST", "PostgreSQL 主机；**设了它就用 PostgreSQL**（否则用 SQLite）",
-        "web/run_server.py", ("web/run_server.py",),
+        "web/run_server.py", ("web/run_server.py", "cli.py"),
         note="多副本必须用 PostgreSQL（SQLite 是单机文件，跨主机共享文件系统不支持）。"
-             "配套 WARDEN_SHARED_STATE=1 才让幂等/事件/限流/Run 锁进共享存储",
+             "配套 WARDEN_SHARED_STATE=1 才让幂等/事件/限流/Run 锁进共享存储。"
+             "cli.py 也读它：`warden audit-verify/export --pg` 要连审计所在的 PG",
     ),
     EnvSpec(
-        "WARDEN_PG_PORT", "PostgreSQL 端口", "web/run_server.py", ("web/run_server.py",),
+        "WARDEN_PG_PORT", "PostgreSQL 端口", "web/run_server.py",
+        ("web/run_server.py", "cli.py"),
         default="5432", kind="int",
     ),
     EnvSpec(
-        "WARDEN_PG_DB", "PostgreSQL 库名", "web/run_server.py", ("web/run_server.py",),
+        "WARDEN_PG_DB", "PostgreSQL 库名", "web/run_server.py",
+        ("web/run_server.py", "cli.py"),
         default="warden",
     ),
     EnvSpec(
-        "WARDEN_PG_USER", "PostgreSQL 用户", "web/run_server.py", ("web/run_server.py",),
+        "WARDEN_PG_USER", "PostgreSQL 用户", "web/run_server.py",
+        ("web/run_server.py", "cli.py"),
         default="postgres",
     ),
     EnvSpec(
-        "WARDEN_PG_PASSWORD", "PostgreSQL 密码", "web/run_server.py", ("web/run_server.py",),
+        "WARDEN_PG_PASSWORD", "PostgreSQL 密码", "web/run_server.py",
+        ("web/run_server.py", "cli.py"),
         sensitive=True, note="放 Secret / 环境变量，别进 ConfigMap 或镜像",
     ),
     EnvSpec(
@@ -317,6 +322,28 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "WARDEN_SERVER_URL", "CLI 要连的 Warden 服务地址",
         "cli.py", ("cli.py",), default="http://127.0.0.1:8000",
         note="**不是** WARDEN_BASE_URL（那是 custom 模型的端点）",
+    ),
+    # ---- OTLP 链路导出（标准 OTEL 变量名，交给运维熟悉的约定）----
+    EnvSpec(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTLP 收集器基地址（如 http://localhost:4318）；给了它即开启 span 导出",
+        "core/otel.py", ("core/otel.py",),
+        note="标准 OTEL 变量名。未设且未设 TRACES_ENDPOINT → 不导出（只打结构化日志）",
+    ),
+    EnvSpec(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTLP traces 专用完整地址（优先于基地址；如 http://localhost:4318/v1/traces）",
+        "core/otel.py", ("core/otel.py",),
+    ),
+    EnvSpec(
+        "OTEL_SERVICE_NAME", "OTLP resource 里的 service.name",
+        "core/otel.py", ("core/otel.py",), default="warden-agent",
+    ),
+    EnvSpec(
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTLP 请求头（`k=v,k2=v2`；如接托管后端带鉴权头）",
+        "core/otel.py", ("core/otel.py",), sensitive=True,
+        note="可能含鉴权 token，按敏感值处理（日志里打码）",
     ),
 )
 

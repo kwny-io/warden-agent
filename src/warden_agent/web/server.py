@@ -543,6 +543,11 @@ def build_app(
             _close_quietly(bus, "事件总线")
             _close_quietly(memory_repository, "记忆库")
             _close_quietly(store, "主存储")
+            # OTLP 导出器：停机前尽量把队列里的 span 冲刷掉（未开启时是空操作）
+            from warden_agent.core import otel
+
+            with contextlib.suppress(Exception):
+                otel.shutdown()
             logger.info("停机完成")
 
     app = FastAPI(

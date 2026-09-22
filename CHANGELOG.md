@@ -5,6 +5,42 @@
 
 ---
 
+## 2026-09-23（第十八批：可观测性收尾——span 接 OTLP 导出，零新依赖）
+
+> 此前 `core/tracing.py` 只做"链上下文不断 + span 结构化日志"，span **送不进** Jaeger/Tempo
+> （文档已如实标注"未接 OTLP 后端"）。本批补上导出——**零依赖**，用已有的 httpx 走 OTLP/HTTP JSON。
+
+### 1. `core/otel.py`：零依赖 OTLP/HTTP 导出器
+
+- `otlp_config_from_env`：认标准变量 `OTEL_EXPORTER_OTLP_ENDPOINT`（自动补 `/v1/traces`）、
+  `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`（优先）、`OTEL_SERVICE_NAME`、`OTEL_EXPORTER_OTLP_HEADERS`。
+  未配 endpoint → 整体关闭，`record_span` 空操作、开销接近零。
+- **后台批量发送**：span 入有界队列（2048），守护线程攒批（256/批）POST；**请求路径不做网络 IO**。
+  队列满丢弃并计数告警；发送失败只记日志并计数——与审计同一取向：**绝不拖垮主路径**。
+- `tracing._run_span` 结束时调用 `otel.record_span(...)`；停机时 `otel.shutdown()` 冲刷队列。
+- 时间戳用**字符串**传 unix nano（OTLP JSON 用 JSON number 会丢 64 位精度）。
+- 诚实边界：只做 span 子集（trace/span/parent id、名称、起止、属性、kind）；未做采样策略、
+  metrics/logs 信号、gRPC、mTLS。
+
+### 2. 配置面与守卫
+
+- `core/settings.py` 登记 4 个 `OTEL_*` 变量（`consumers=core/otel.py`）；`OTEL_EXPORTER_OTLP_HEADERS`
+  按敏感值处理。
+- 顺带修：`cli.py` 读 `WARDEN_PG_*`（`--pg`）后，注册表 consumers 补上 `cli.py`——
+  配置面 AST 守卫当场把"越权读变量"报了出来（守卫的价值）。
+
+### 3. 测试
+
+- 新增 `tests/test_otlp_export.py`（5 条）：配置解析（基址/traces 优先/头）、用
+  `httpx.MockTransport` 假收集器验证 POST 的 **OTLP JSON 结构**、收集器不可达只计数不抛、
+  未配置时空操作、tracing→导出器的接线（链 id 正确）。
+- **真网络端到端实测**：起本地假 OTLP 收集器，`span()` 产出经导出器以
+  `POST /v1/traces` 到达，service.name / span 名 / traceId / 属性全部正确 ✓。
+
+> 仍未覆盖（需目标环境）：接真实 Jaeger/Tempo 后端做展示验收。
+
+---
+
 ## 2026-09-23（第十七批：多副本一致性——审计与记忆落 PostgreSQL，关掉"多副本必须关审计"这个洞）
 
 > 此前多副本交付有个**自相矛盾**的地方：`deploy/k8s/configmap.yaml` 被迫写 `WARDEN_AUDIT=0`，

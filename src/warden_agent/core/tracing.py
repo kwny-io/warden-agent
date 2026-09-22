@@ -122,6 +122,7 @@ def _run_span(
     ctx = child_span(parent)
     token = _current.set(ctx)
     started = time.perf_counter()
+    started_ns = time.time_ns()
     try:
         yield ctx
     finally:
@@ -135,6 +136,19 @@ def _run_span(
             ctx.parent_span_id or "-",
             duration_ms,
             f" {extra}" if extra else "",
+        )
+        # 导出到 OTLP 收集器（未配置时为空操作；见 core/otel.py）。
+        # 放在日志之后、还原上下文之前；导出失败不影响任何东西。
+        from warden_agent.core import otel
+
+        otel.record_span(
+            trace_id=ctx.trace_id,
+            span_id=ctx.span_id,
+            parent_span_id=ctx.parent_span_id,
+            name=name,
+            start_ns=started_ns,
+            end_ns=time.time_ns(),
+            attributes=attributes,
         )
         _current.reset(token)
 

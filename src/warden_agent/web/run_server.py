@@ -474,6 +474,13 @@ def main() -> None:
         "开" if planner is not None else "关（设 WARDEN_PLANNER=1 可开）",
         ctx_chars or "不裁剪",
     )
+    # 链路追踪出口：配了 OTLP endpoint 才会把 span 送出去（否则只打结构化日志）。
+    from warden_agent.core import otel
+
+    if otel.otlp_config_from_env(os.environ) is not None:
+        logger.info("链路追踪：span 将导出到 OTLP 收集器（OTEL_EXPORTER_OTLP_*）")
+    else:
+        logger.info("链路追踪：仅结构化日志（设 OTEL_EXPORTER_OTLP_ENDPOINT 可导出到 OTLP）")
     # 出站闸门：单次请求的超时/体积上限只界定"一次"，不界定"多少次"。
     # 计数与入站限流共用同一套存储接缝 → 多副本下把 store 换成存储实现，限额才是全局的。
     try:
