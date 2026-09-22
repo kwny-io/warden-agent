@@ -33,7 +33,11 @@ from warden_agent.loop.loop import exec_tool
 from warden_agent.memory.owner import owner_scope
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
-from warden_agent.runtime.checkpoint import CheckpointManager, CheckpointStore
+from warden_agent.runtime.checkpoint import (
+    CheckpointManager,
+    CheckpointStore,
+    CompletionGuard,
+)
 from warden_agent.store.base import RunStore
 from warden_agent.tool.catalog import ToolCatalog
 
@@ -177,6 +181,8 @@ class AgentSession:
         # 当前正被审批拦截、等待放行的工具调用（批准后才执行）
         self._gated: ToolCall | None = None
         self._approval: ApprovalRequest | None = None
+        # 完成门禁的基线：驱动开始时已存在的悬空工具调用（恢复来的历史，不算"本次未执行"）
+        self._dangling_baseline: set[str] = set()
 
         # 恢复"等待审批"的中间态：把上次卡住的那一步也还原
         pending = store.load_pending_approval(run_id)
@@ -386,6 +392,39 @@ class AgentSession:
             self._mark_failed()
             raise
 
+    def _dangling_tool_ids(self) -> set[str]:
+        """历史里"assistant 发起了 tool_call、但还没有配对 tool 结果"的调用 id。
+
+        注意：**不能**直接拿它当"未执行"——恢复来的历史里可能本就有悬空调用
+        （进程在"记下工具调用、还没执行"之间崩过），那是 `_ensure_tool_results`
+        在请求层补齐的合法场景，不该阻止完成。所以完成门禁用的是
+        "本次驱动**新产生**的悬空"（减去驱动开始时的基线），见 `_mark_completed`。
+        """
+        answered = {
+            m.tool_call.id for m in self.messages if m.role == "tool" and m.tool_call
+        }
+        return {
+            m.tool_call.id for m in self.messages
+            if m.role == "assistant" and m.tool_call and m.tool_call.id not in answered
+        }
+
+    def _mark_completed(self, content: str) -> None:
+        """经**完成门禁**后把 Run 置为 COMPLETED（收口唯一的完成路径）。
+
+        门禁只拦"**本次驱动**新产生的悬空工具调用"——即模型这一轮说要调、却没执行。
+        恢复来的历史悬空（driving 开始时就存在）不算，那是合法的可恢复场景。
+        所以门禁平时不触发；一旦触发，说明有改动让循环"带着未执行的调用就完成了"。
+        """
+        new_pending = self._dangling_tool_ids() - self._dangling_baseline
+        CompletionGuard().validate(
+            self.run,
+            pending_tools=len(new_pending),
+            has_final_content=bool(content),
+        )
+        self.run.begin_completing()
+        self.run.complete()
+        self._persist_run()
+
     def _last_user_text(self) -> str:
         """取当前这一轮的用户输入（各入口都会把它 append 进 messages）。"""
         for m in reversed(self.messages):
@@ -440,6 +479,8 @@ class AgentSession:
             raise RuntimeError(f"会话已结束，不能继续({self.run.status.name})")
 
         with owner_scope(self.run.user_id), self._fail_run_on_error():
+            # 记录驱动起点：此后**新**产生的悬空工具调用才算"未执行"（见 _mark_completed）
+            self._dangling_baseline = self._dangling_tool_ids()
             for iteration in range(self.max_iterations):
                 self._checkpoint("model_call", iteration)
                 response = self.model.chat(ChatRequest(
@@ -477,9 +518,7 @@ class AgentSession:
                 if response.content is not None:
                     self.messages.append(Message(role="assistant", content=response.content))
                     self.store.append_message(self.run_id, self.messages[-1])
-                    self.run.begin_completing()
-                    self.run.complete()
-                    self._persist_run()
+                    self._mark_completed(response.content)
                     self._checkpoint("done", iteration)
                     return on_content(response.content)
 
@@ -547,6 +586,8 @@ class AgentSession:
 
         yield {"type": "start"}
 
+        # 驱动起点基线：此后新产生的悬空工具调用才算"未执行"（见 _mark_completed）
+        self._dangling_baseline = self._dangling_tool_ids()
         for iteration in range(self.max_iterations):
             self._checkpoint("model_call", iteration)
             request = ChatRequest(
@@ -607,9 +648,7 @@ class AgentSession:
             if response.content is not None:
                 self.messages.append(Message(role="assistant", content=response.content))
                 self.store.append_message(self.run_id, self.messages[-1])
-                self.run.begin_completing()
-                self.run.complete()
-                self._persist_run()
+                self._mark_completed(response.content)
                 self._checkpoint("done", iteration)
                 yield {"type": "final", "text": response.content}
                 return

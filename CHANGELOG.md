@@ -34,7 +34,14 @@
   secret 示例已含 `WARDEN_AUDIT_KEY`。对应离线结构守卫同步更新。
 - CLI：`warden audit-verify` / `audit-export` 新增 `--pg`，多副本（审计在 PG）时也能校验/导出链。
 
-### 4. 测试
+### 4. 完成门禁（CompletionGuard）接线
+
+- 此前 `CompletionGuard`（禁止"带悬挂工具调用 / 无最终回答"进 COMPLETED）**定义了却没接进主循环**。
+  现收口进 `AgentSession._mark_completed`：完成路径唯一，且门禁只拦"**本次驱动新产生**的悬空调用"——
+  恢复来的历史悬空（`_ensure_tool_results` 按请求补齐的合法场景）不算，否则会误伤崩溃恢复。
+- 新增 `tests/test_completion_guard_wiring.py`（4 条）。
+
+### 5. 测试
 
 - 新增 `tests/test_postgres_audit_memory.py`（6 条，真库）：链完整 / 篡改必被发现（改回即恢复）/
   **多副本并发写不分叉** / 记忆跨实例读回与归属隔离 / 状态与过期时间往返 / 后端选择正确。
