@@ -32,6 +32,7 @@ from warden_agent.core.settings import env_bool
 from warden_agent.core.tracing import current_traceparent
 from warden_agent.tool.catalog import ToolSpec, function_tool
 from warden_agent.web.outbound import OutboundLimiter
+from warden_agent.web.readability import extract_main_text
 
 
 # ---- 结果模型 ----
@@ -275,7 +276,9 @@ class HttpFetchProvider:
                     break
                 buf.extend(chunk)
             text = buf.decode(resp.encoding or "utf-8", errors="replace")
-            body = html_to_text(text) if "html" in ctype.lower() else text.strip()
+            # HTML 走**正文抽取**（Readability 那一类）：只留主要内容，把导航/侧边栏/页脚排掉。
+            # 抽不出正文时它内部会退回整页粗提取（见 web/readability.py 的兜底说明）。
+            body = extract_main_text(text) if "html" in ctype.lower() else text.strip()
             if truncated:
                 body += f"\n…（正文超过 {self.max_bytes} 字节，已截断）"
             return WebFetchResult(url=url, status=resp.status_code, content=body), None

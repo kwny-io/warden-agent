@@ -5,6 +5,75 @@
 
 ---
 
+## 2026-09-22（第十五批：纯代码三件——RBAC 角色 / 正文抽取 / 向量索引与持久化）
+
+> 顾问式盘点里"完全未做、但纯代码、不需要外部环境"的三件，一次做完。
+
+### 1. RBAC / 角色（`WARDEN_ADMIN_PRINCIPALS`）
+
+- **两档角色**，够用且不引入猜测：`user`（默认）与 `admin`。
+  - `admin` 能看**全局**视图：`/audit`、`/approvals/history`、`/alerts/stuck`、`/recovery/plan`
+    不再按归属过滤；并能切**部署级**默认模型（`POST /models/select {"scope": "deployment"}`）。
+  - `user` 一律按归属收敛（原有行为不变），仍可切**自己的**模型（`scope=self`，默认）。
+- **角色来自配置，不来自请求**：`role` 在 `TrustedCaller` 上，由 `resolve_auth` 按名单判定——
+  客户端带什么头/参数都不能把自己变成管理员（有回归测试）。
+- **fail-closed**：不配名单 ⇒ **没有人是管理员**；刻意**不支持通配符 `*`**（那等于一不小心全网开放）。
+- **刻意不做**：管理员**不能**读别人的记忆（`/memory/{scope}` 仍按 owner 隔离）——
+  运维要的是"系统状态"的全局视图，不是"用户数据"的全局视图。这条差异写在 `_owner_scope` 的注释里。
+- 新增 11 条测试（`tests/test_rbac.py`）。
+
+### 2. 抓取正文抽取（Readability 那一类，零新依赖）
+
+- 新增 `web/readability.py`：用标准库 `html.parser` 建轻量 DOM，**按块打分**选正文
+  （文本长度 + 段落数加权；`article`/`main`/`role=main` 加权；链接密度 >1/3 降权；
+   id/class 命中 `nav/sidebar/footer/related/comment…` 直接清零）；剔除 script/style/head。
+- `HttpFetchProvider` 抓 HTML 时改走正文抽取——此前是"去标签粗提取"，导航栏/侧边栏/页脚
+  全混在正文里（模型会把菜单当内容）。
+- **兜底**：抽出的内容太短就退回整页粗提取（宁可多点噪音，别把内容丢成碎片）；
+  **但明确标了 `article`/`main` 的块直接信任**，哪怕它很短（否则一篇短笔记会被判成"没抽到"）。
+- 新增 9 条测试（`tests/test_readability.py`，内联 fixture HTML，离线可验证）。
+
+### 3. 向量索引与持久化（替掉"进程内全量扫描 + 不落盘"）
+
+- 新增 `rag/vector_index.py`：
+  - `SparseInvertedIndex`：**倒排索引**（维度 → 文档），查询时只对"与查询共享非零维度"的文档打分。
+    在非负向量下这是**精确剪枝**（不共享非零维 ⇒ 点积必然为 0），**不是近似**——
+    测试里与暴力扫描**逐位一致**（含"候选不足 top_k"的补 0 分支）。
+  - `LinearIndex`：暴力扫描（保留为参照与兜底）；`build_index()` 按稀疏度自动选
+    （词频哈希是几千维几十非零 → 倒排；真语义嵌入通常稠密 → 线性）。
+  - **诚实口径**：倒排是"更快的精确检索"，**不是 ANN**；真 ANN（HNSW/IVF）要外部库，本轮没做。
+- `VectorStore` 支持 `persist_path`：向量**落 SQLite**（**稀疏编码**——只存非零维度），
+  重启**不用重新嵌入**。测试用"计数嵌入器"证明：重开实例后语料嵌入次数为 **0**，
+  只有查询嵌入 1 次（真语义嵌入按量计费，重启重算既慢又花钱）。
+- `cosine_similarity` 实现收口到 `vector_index.dot_similarity`（**语义不变**：仍是"假定已归一化"的点积），
+  索引与线性扫描共用同一打分函数，保证"换索引不换分数"。
+- 新增 9 条测试（`tests/test_vector_index.py`）。
+
+### 4. 过程中修掉的两处小 bug
+
+- **SQL 行内 `--` 注释把建表语句一起注释掉**（`CREATE TABLE ... vector TEXT NOT NULL,   -- 注释`
+  → `sqlite3.OperationalError: incomplete input`）。教训：**SQL 里不写行内注释**（本项目本来就约定
+  "SQL 只写字面量"，这条算它的延伸）。
+- **短 `<article>` 被 MIN_CHARS 兜底判成"没抽到"**，退回整页→把导航带回来。被自己写的测试当场问住，
+  改成"明确标了 article/main 的块直接信任"。两份教训已记入 `17-Bug复盘`（Bug 31、32）。
+
+### 验证
+
+`859 passed / 3 skipped`（起了 PostgreSQL，共 862 项），`ruff` 全绿，
+`mypy --strict` 95 文件零错误，覆盖率 **85.7% ≥ 门槛 84%**（门槛从 85 调到 84：见 pyproject 里的说明——
+贴着当前值的门槛会变成噪声门禁），bandit Medium+ 0。
+
+### 附带修的第三处
+
+- `is_loopback_host` 原先只认 `127.0.0.1`/`localhost`/`::1` 三个字符串，
+  绑到 `127.0.0.5`（同属回环网段）会被误判成"对外监听"。改用 `ipaddress` 判断**整个回环网段**
+  （方向的后果是要求鉴权，属 fail-closed、不是安全洞，但口径不对会让本地开发莫名其妙起不来）。
+- 新增 `tests/test_run_server_wiring.py`（18 条）：启动装配的**纯函数**部分（监听安全性、
+  各能力开关解析口径、演示目录/策略）——`run_server.py` 此前只有 41% 覆盖，
+  而本项目两次"未声明依赖/配置读错"都发生在这条路径上。
+
+---
+
 ## 2026-09-22（第十四批：交付侧"代码侧"补齐——SAST / 秘密扫描 / 覆盖率门槛 / 优雅停机 / API 版本政策 / 配置收口完成）
 
 > 顾问式盘点后挑出的"纯代码、不需要外部环境"的那几项。做完这批，

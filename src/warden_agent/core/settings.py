@@ -94,6 +94,15 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         kind="bool", note="不设 = 不无鉴权运行（fail-closed）",
     ),
     EnvSpec(
+        "WARDEN_ADMIN_PRINCIPALS", "管理员 principal 名单（逗号分隔；**不配就没有管理员**）",
+        "web/run_server.py", ("web/run_server.py", "web/auth.py"),
+        note="管理员能看**全局**视图（/audit、/approvals/history、/alerts/stuck、"
+             "/recovery/plan 不过滤归属）并切**部署级**默认模型（scope=deployment）。"
+             "刻意不支持通配符 `*`——那等于一不小心全网开放；"
+             "也刻意默认空（忘了配不该变成人人都是管理员）。"
+             "auth.py 也读它：名单解析与角色判定的纯函数放在那一层（可单独测）",
+    ),
+    EnvSpec(
         "WARDEN_TENANT",
         "租户 id（审计与授权按它隔离）",
         "web/run_server.py", ("web/run_server.py",),

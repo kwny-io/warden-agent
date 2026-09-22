@@ -20,14 +20,25 @@ RAG 的完整流程（三句话）：
 from __future__ import annotations
 
 import ipaddress
+import json
 import math
 import re
 import socket
+import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 from warden_agent.core.settings import env_opt
+from warden_agent.rag.vector_index import (
+    LinearIndex,
+    VectorIndex,
+    build_index,
+    decode_sparse,
+    dot_similarity,
+    encode_sparse,
+)
 from warden_agent.tool.catalog import ToolSpec, function_tool
 
 # 嵌入函数：输入一段文本，返回一个浮点向量（list[float]）
@@ -100,8 +111,11 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     ⚠️ 前提是"已归一化"——这里刻意不除范数：检索是热路径，给每一对都开根号太贵，
     归一化在嵌入阶段（`_term_frequency_embedder` / `openai_compatible_embedder`）就做掉了。
     把未归一化的向量丢进来，拿到的只是点积，**不是**余弦。
+
+    实现已收口到 `rag/vector_index.py` 的 `dot_similarity`（索引与线性扫描共用同一个打分函数，
+    保证"换索引不换分数"）；这里保留名字与语义，向后兼容既有调用方与评测脚本。
     """
-    return sum(x * y for x, y in zip(a, b, strict=True))
+    return dot_similarity(a, b)
 
 
 def _is_public_addr(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -216,9 +230,18 @@ class SourceHit:
 
 
 class VectorStore:
-    """一个极简的向量库：存 chunk + 向量，支持按相似度检索（可带来源引用）。"""
+    """一个向量库：存 chunk + 向量，按相似度检索（可带来源引用），**可落盘**。
 
-    def __init__(self, embedder: Embedder | None = None) -> None:
+    两处相对早期实现的改进（见 `rag/vector_index.py` 的说明）：
+      - **索引化检索**：稀疏向量走倒排索引剪枝（精确，不是近似）；稠密向量走线性扫描。
+        检索**不再无条件全量比较**，语料越大收益越明显。
+      - **持久化**（可选 `persist_path`）：向量落 SQLite，**重启不用重新嵌入**——
+        真语义嵌入是按量计费的，重启重算一遍既慢又花钱。
+    """
+
+    def __init__(
+        self, embedder: Embedder | None = None, *, persist_path: str | Path | None = None
+    ) -> None:
         self.embedder: Embedder = embedder or hash_embedder
         self._chunks: list[str] = []
         self._vectors: list[list[float]] = []
@@ -226,6 +249,66 @@ class VectorStore:
         self._sources: list[str] = []
         # 与 _chunks 一一对应的**唯一**来源标识（用于精确引用；同名来源也必须能区分）
         self._source_ids: list[str] = []
+        self._index: VectorIndex = LinearIndex()
+        self._persist_path = Path(persist_path) if persist_path else None
+        self._conn: sqlite3.Connection | None = None
+        if self._persist_path is not None:
+            self._open_store()
+            self._load_existing()
+
+    # ---- 持久化（SQLite：与其它存储同一个 db 文件亦可）----
+
+    def _open_store(self) -> None:
+        assert self._persist_path is not None
+        self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._persist_path), check_same_thread=False)
+        # vector 列存**稀疏编码 JSON**（只存非零维度）——词频哈希是几千维几十非零，全存太浪费。
+        # 注意：SQL 里别写行内 `--` 注释，它会把后面的建表语句一起注释掉（踩过）。
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_chunks ("
+            " seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " chunk TEXT NOT NULL,"
+            " vector TEXT NOT NULL,"
+            " source TEXT NOT NULL,"
+            " source_id TEXT NOT NULL)"
+        )
+        self._conn.commit()
+
+    def _load_existing(self) -> None:
+        """把已落盘的 chunk/向量读回来（**不重新嵌入**）。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT chunk, vector, source, source_id FROM rag_chunks ORDER BY seq"
+        ).fetchall()
+        if not rows:
+            return
+        vectors = [decode_sparse(json.loads(str(r[1]))) for r in rows]
+        for r in rows:
+            self._chunks.append(str(r[0]))
+            self._sources.append(str(r[2]))
+            self._source_ids.append(str(r[3]))
+        self._vectors = vectors
+        self._index = build_index(vectors)
+
+    def _persist(self, chunk: str, vector: list[float], source: str, source_id: str) -> None:
+        if self._conn is None:
+            return
+        self._conn.execute(
+            "INSERT INTO rag_chunks (chunk, vector, source, source_id) VALUES (?, ?, ?, ?)",
+            (chunk, json.dumps(encode_sparse(vector)), source, source_id),
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        """关闭落盘连接（幂等；没开持久化时是空操作）。"""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    @property
+    def size(self) -> int:
+        """库里有多少块（运维/测试用）。"""
+        return len(self._chunks)
 
     def add(self, text: str, *, chunk_size: int = 400, overlap: int = 50,
             source: str | None = None, source_id: str | None = None) -> None:
@@ -239,19 +322,19 @@ class VectorStore:
         for i, chunk in enumerate(chunks):
             # 全局块序号：保证 source_id 在"同一文档多块"乃至"多次 add 用同名 source"时仍唯一
             gidx = len(self._chunks)
+            vector = self.embedder(chunk)
             self._chunks.append(chunk)
-            self._vectors.append(self.embedder(chunk))
+            self._vectors.append(vector)
             # 来源标注：优先用"来源名+块序号"，否则空白块来源
             if source:
                 label = f"{source}（第{i + 1}节）" if len(chunks) > 1 else source
-                self._sources.append(label)
-                # 调用方给了 source_id 就照用；否则自动生成**唯一** id。
-                # 自动生成必须带全局序号：只用 source 名的话，同名的两块 source_id 会重复，
-                # 引用就无法区分（demo 里"年假"和"报销"同属《员工手册.pdf》就会撞）。
-                self._source_ids.append(source_id or f"{label}#{gidx + 1}")
+                src, sid = label, (source_id or f"{label}#{gidx + 1}")
             else:
-                self._sources.append("")
-                self._source_ids.append(source_id or "")
+                src, sid = "", (source_id or "")
+            self._sources.append(src)
+            self._source_ids.append(sid)
+            self._index.add(vector)
+            self._persist(chunk, vector, src, sid)
 
     def search(self, query: str, top_k: int = 3) -> list[tuple[str, float]]:
         """给定问题，返回最相关的 top_k 个文本块（带相似度分数）。
@@ -265,11 +348,8 @@ class VectorStore:
         if not self._chunks:
             return []
         qvec = self.embedder(query)
-        scored = [
-            (cidx, cosine_similarity(qvec, v))
-            for cidx, v in enumerate(self._vectors)
-        ]
-        scored.sort(key=lambda t: t[1], reverse=True)
+        # 走索引：稀疏向量倒排剪枝（结果与全量扫描**一致**），稠密走线性
+        scored = self._index.search(qvec, top_k)
         hits: list[SourceHit] = []
         for cidx, sim in scored[:top_k]:
             src = self._sources[cidx] if cidx < len(self._sources) else ""

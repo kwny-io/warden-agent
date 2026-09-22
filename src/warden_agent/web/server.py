@@ -232,6 +232,9 @@ class ModelSelectIn(BaseModel):
 
     id: str
     api_key: str | None = None
+    # "self"（默认）= 只切自己的会话；"deployment" = 切**部署默认**（所有人没自选过的会话都受影响）
+    # ——后者是运维动作，**只有管理员**能做（见 /models/select 的 403 分支）。
+    scope: str = "self"
 
 
 class UserCreateIn(BaseModel):
@@ -665,11 +668,26 @@ def build_app(
                 status_code=400, detail=f"{info['name']} 需要先导入 API Key"
             )
         owner = _identity(request, None)
-        registry.set_model(info["make"](key), model_id=body.id, owner=owner)
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        if body.scope not in ("self", "deployment"):
+            raise HTTPException(status_code=400, detail="scope 只能是 self 或 deployment")
+        if body.scope == "deployment":
+            # 切部署默认模型影响**所有人**（包括没自选过的会话）——这是运维动作，
+            # 只有管理员能做。普通用户仍可切"自己的"（scope=self，默认）。
+            if caller is None or not caller.is_admin:
+                raise HTTPException(
+                    status_code=403,
+                    detail="切换部署级默认模型需要管理员角色（普通用户可用 scope=self 切自己的）",
+                )
+            # 部署默认 = owner=None（所有会话，且成为新会话的默认）
+            registry.set_model(info["make"](key), model_id=body.id, owner=None)
+        else:
+            registry.set_model(info["make"](key), model_id=body.id, owner=owner)
         if body.api_key:
             broker.register(_model_key_name(body.id), {"api_key": body.api_key}, scope)
             redactor.add(body.api_key)
-        return {"ok": True, "current": registry.model_for(owner)[0] or body.id}
+        return {"ok": True, "current": registry.model_for(owner)[0] or body.id,
+                "scope": body.scope}
 
     # ---- T8 可观测性：指标定义（全局注册表，Prometheus 文本输出）----
     m = metrics()
@@ -713,6 +731,18 @@ def build_app(
         if caller is not None:
             return caller.user_id
         return query_user_id or "demo-user"
+
+    def _owner_scope(request: Request) -> str | None:
+        """读路径的**归属过滤口径**：普通用户 = 自己；**管理员 = None（全局视图）**。
+
+        只用于"运维要看全局"的三处（审计 / 挂起告警 / 恢复计划）。
+        ⚠️ **不用于 `/memory/{scope}`**：那是用户内容，管理员也不该随便读别人的记忆——
+        运维需要的是"系统状态"的全局视图，不是"用户数据"的全局视图。
+        """
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        if caller is None:
+            return None          # 匿名开发模式：保持历史行为（不过滤）
+        return None if caller.is_admin else caller.user_id
 
     audit = AuditLogger(audit_store) if audit_store is not None else None
     # 协调状态：幂等表 / 事件总线。
@@ -919,12 +949,14 @@ def build_app(
         即**租户 ≠ 用户**——只按 tenant 过滤，等于把同租户其他人的操作账本（含 run_id、
         身份、访问路径）交给任意一个认证用户，既能窥探又能枚举账号。
         这里与 `/runs`、`/approvals` 保持同一口径：按调用者收敛。
+        **管理员例外**：看租户全部（运维需要全局视图来判断"是不是有人在乱用"）。
         """
         if audit is None:
             raise HTTPException(status_code=404, detail="未开启审计(audit_store=None)")
         caller: TrustedCaller | None = getattr(request.state, "caller", None)
         tenant = caller.tenant_id if caller is not None else None
-        principal = caller.user_id if caller is not None else None
+        # 管理员看租户全部；普通用户只看自己（见 _owner_scope）
+        principal = _owner_scope(request)
         records = audit_store.query(  # type: ignore[union-attr]
             limit=200, tenant_id=tenant, principal_id=principal
         )
@@ -945,8 +977,7 @@ def build_app(
         if cp_store is None:
             raise HTTPException(status_code=501, detail="当前存储不支持存档点")
         plan = RecoveryController(cp_store).plan()
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        owner = caller.user_id if caller is not None else None
+        owner = _owner_scope(request)   # 管理员 → None（全局视图）
         return _plan_to_dict(plan, owner, _owner_of)
 
     @app.get("/alerts/stuck")
@@ -959,14 +990,14 @@ def build_app(
 
         ⚠️ 口径："等了多久"用 Run 的最后活动时间近似（不是"进入等待那一刻"），所以只会**低估**、
         不会虚报——"报了警"是可信的；"没报警"不等于一定没挂久。
+        **管理员**看全部（值班人要知道"整个系统有没有人卡着"）。
         """
         from warden_agent.runtime.alerting import stuck_awaiting_human
 
         cp_store = _checkpoint_store_for(store)
         if cp_store is None:
             raise HTTPException(status_code=501, detail="当前存储不支持存档点")
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        owner = caller.user_id if caller is not None else None
+        owner = _owner_scope(request)   # 管理员 → None（全局视图）
         stuck = stuck_awaiting_human(
             store, cp_store, older_than_seconds=older_than_min * 60.0, owner=owner
         )
@@ -1182,10 +1213,10 @@ def build_app(
     def approvals_history(request: Request) -> list[dict[str, Any]]:
         """审批决策历史（已批准 / 已拒绝，最新的在前）。
 
-        认证模式下只返回调用者名下 Run 的决策（审批历史含工具名与参数，属租户数据）。
+        认证模式下只返回调用者名下 Run 的决策（审批历史含工具名与参数，属租户数据）；
+        **管理员**看全部（与 /audit 同一口径）。
         """
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        owner = caller.user_id if caller is not None else None
+        owner = _owner_scope(request)   # 管理员 → None（全局视图）
         return store.list_approval_history(limit=20, owner=owner)
 
     @app.post("/approve/{run_id}")

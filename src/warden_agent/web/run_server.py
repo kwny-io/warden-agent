@@ -66,7 +66,7 @@ from warden_agent.runtime.locking import run_lock_for
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog, function_tool
 from warden_agent.web.audit import SqliteAuditStore
-from warden_agent.web.auth import TrustedCaller
+from warden_agent.web.auth import ROLE_USER, TrustedCaller, admin_principals, role_for
 from warden_agent.web.coordination import coordination_for
 from warden_agent.web.outbound import outbound_from_env
 from warden_agent.web.ratelimit import limiter_from_env
@@ -120,17 +120,34 @@ class AuthConfigError(RuntimeError):
 
 
 def is_loopback_host(host: str) -> bool:
-    """是否只监听本机。"""
-    return host in ("127.0.0.1", "localhost", "::1")
+    """是否只监听本机。
+
+    用 `ipaddress` 判断整个回环网段（**127.0.0.0/8** 与 `::1`），而不是只认
+    `127.0.0.1` 这一个字符串——绑到 `127.0.0.5` 同样是"只监听本机"，
+    按字符串比对会把它误判成"对外"（方向的后果是要求鉴权，属 fail-closed、
+    不是安全洞，但口径不对会让本地开发莫名其妙起不来）。
+    """
+    import ipaddress
+
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:      # 不是 IP 字面量（域名等）→ 不能认定为本机
+        return False
 
 
-def _caller_for(user_id: str, tenant: str) -> TrustedCaller:
-    """把一个用户 id 包成调用者身份。principal_id 即会话归属用户（见 TrustedCaller.user_id）。"""
+def _caller_for(user_id: str, tenant: str, role: str = ROLE_USER) -> TrustedCaller:
+    """把一个用户 id 包成调用者身份。principal_id 即会话归属用户（见 TrustedCaller.user_id）。
+
+    `role` 由 `WARDEN_ADMIN_PRINCIPALS` 决定（**不来自请求**）——见 auth.role_for。
+    """
     return TrustedCaller(
         tenant_id=tenant,
         principal_type="user",
         principal_id=user_id,
         product_id="http",
+        role=role,
     )
 
 
@@ -153,6 +170,8 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
     与控制台默认账号一致）。租户取 `WARDEN_TENANT`（默认 `local`）。
     """
     tenant = env_str("WARDEN_TENANT", "local", env).strip() or "local"
+    # 管理员名单来自配置（不配 ⇒ 没有管理员；见 auth.admin_principals 的 fail-closed 说明）。
+    admins = admin_principals(env)
 
     raw_keys = env_str("WARDEN_API_KEYS", "", env).strip()
     if raw_keys:
@@ -167,14 +186,15 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
                     f"WARDEN_API_KEYS 格式错误：{pair!r}。应为逗号分隔的 `用户id:密钥`，"
                     "例如 alice:sk-aaa,bob:sk-bbb"
                 )
-            keys[key.strip()] = _caller_for(user_id.strip(), tenant)
+            uid = user_id.strip()
+            keys[key.strip()] = _caller_for(uid, tenant, role_for(uid, admins))
         if keys:
             return keys, "bearer"
 
     single_key = env_opt("WARDEN_API_KEY", env)
     if single_key:
         user_id = env_str("WARDEN_API_USER", "demo-user", env).strip() or "demo-user"
-        return {single_key: _caller_for(user_id, tenant)}, "bearer"
+        return {single_key: _caller_for(user_id, tenant, role_for(user_id, admins))}, "bearer"
 
     if env_bool("WARDEN_ALLOW_ANON", False, env):
         return None, "anon-dev"

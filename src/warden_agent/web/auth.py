@@ -19,6 +19,15 @@ from enum import StrEnum
 
 from starlette.requests import Request
 
+# 角色：目前只有两档——**够用且不引入猜测**。
+#   user  ：普通调用者。所有"面向用户"的读路径按归属收敛（只看得到自己的）。
+#   admin ：运维/管理员。能看**全局**视图（审计/挂起/恢复计划）与切**部署级**默认模型。
+# 为什么不做"租户内细粒度角色"：现在只有 API Key → principal 这一层身份，
+# 没有组织/团队模型；先立"谁是运维"这一条最必要的边界，需要时再扩（见 operations.md）。
+ROLE_USER = "user"
+ROLE_ADMIN = "admin"
+_ROLES = (ROLE_USER, ROLE_ADMIN)
+
 
 class HttpAuthenticationError(Exception):
     """未认证（401）：请求没有有效凭据。"""
@@ -39,12 +48,17 @@ class TrustedCaller:
     principal_type: str
     principal_id: str
     product_id: str = "local"
+    # 角色来自**配置**（`WARDEN_ADMIN_PRINCIPALS`），不来自请求或客户端声明。
+    # 默认 user：**没显式配管理员，就没有管理员**（fail-closed 的同一个取向）。
+    role: str = ROLE_USER
 
     def __post_init__(self) -> None:
         tenant_id = _normalize(self.tenant_id, "tenantId")
         principal_type = _normalize(self.principal_type, "principalType")
         principal_id = _normalize(self.principal_id, "principalId")
         product_id = _normalize(self.product_id, "productId")
+        if self.role not in _ROLES:
+            raise ValueError(f"role 必须是 {list(_ROLES)} 之一，实际 {self.role!r}")
         object.__setattr__(self, "tenant_id", tenant_id)
         object.__setattr__(self, "principal_type", principal_type)
         object.__setattr__(self, "principal_id", principal_id)
@@ -56,7 +70,13 @@ class TrustedCaller:
             "principal_type": self.principal_type,
             "principal_id": self.principal_id,
             "product_id": self.product_id,
+            "role": self.role,
         }
+
+    @property
+    def is_admin(self) -> bool:
+        """是否为管理员（决定能否看全局视图 / 切部署级默认模型）。"""
+        return self.role == ROLE_ADMIN
 
     @property
     def user_id(self) -> str:
@@ -79,6 +99,27 @@ def _normalize(value: str, field: str) -> str:
 
 # 本地/未认证时的兜底身份：代表"当前进程本机调用"。
 LOCAL_CALLER = TrustedCaller("local", "service", "local-client", "cli")
+
+
+def admin_principals(env: Mapping[str, str] | None = None) -> frozenset[str]:
+    """从 `WARDEN_ADMIN_PRINCIPALS` 解析管理员名单（逗号分隔的 principal id）。
+
+    **不配就没人是管理员**——这是刻意的 fail-closed：管理员能看全局审计、能切部署级模型，
+    让"忘了配"变成"人人都是管理员"是最糟的默认。
+    也刻意**不**接受通配符（`*`）：那等于把开关做成"一不小心全网开放"。
+    """
+    import os
+
+    src: Mapping[str, str] = os.environ if env is None else env
+    from warden_agent.core.settings import env_str
+
+    raw = env_str("WARDEN_ADMIN_PRINCIPALS", "", src)
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def role_for(principal_id: str, admins: frozenset[str]) -> str:
+    """按名单决定角色（名单里 → admin，否则 user）。"""
+    return ROLE_ADMIN if principal_id in admins else ROLE_USER
 
 
 class RunOperation(StrEnum):
