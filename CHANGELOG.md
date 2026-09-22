@@ -5,6 +5,75 @@
 
 ---
 
+## 2026-09-22（第十四批：交付侧"代码侧"补齐——SAST / 秘密扫描 / 覆盖率门槛 / 优雅停机 / API 版本政策 / 配置收口完成）
+
+> 顾问式盘点后挑出的"纯代码、不需要外部环境"的那几项。做完这批，
+> 剩下的只有"需要目标环境才能负责任地做完"的事了（真 KMS/OTLP/K8s/容量结论等）。
+
+### 0. ⚠️ 顺带抓到一个**会让 CI 立刻红**的真 bug：`pyyaml` 未声明
+
+`tests/test_alert_rules.py` 导入 `yaml`，但 `pyyaml` **既不在 pyproject、也不在 uv.lock**——
+本机恰好装着，所以本地一直绿；而 CI 跑的是 `uv run --frozen pytest`，会在**收集阶段**直接
+`ModuleNotFoundError: No module named 'yaml'`。**下一个 push 必挂**（此前从没在 CI 跑过这个文件，
+因为相关提交还没推送）。已把 `pyyaml` 加进 dev extra 并锁进 `uv.lock`，本地用 `uv run --frozen` 复现并验证通过。
+（与"pywin32 未声明"同一类问题：**依赖声明漏了，本机环境掩盖了它**。）
+
+### 1. SAST（bandit）与秘密扫描（gitleaks）进 CI
+
+- **bandit**：CI 里两条——一条 `|| true` **打印全部发现**（可见），一条
+  `--severity-level medium --confidence-level medium` 做**门禁**（有牙齿）。
+  基线实测：Medium 0 / Low 26。`migrations.py` 两处 `B608`（**常量表名**的 f-string）用
+  `# nosec B608` 显式接受并写明理由——表名在 SQL 里无法参数化，且来自模块常量。
+  Low 一档（B101 assert / B110 try-except-pass / B112 / B404 / B603 列表调用 subprocess / B107 空默认口令）
+  都是**有意写法或误报**，故只记录不拦截。
+- **gitleaks**：扫**全历史**（不只是工作区——凭据提交过就一直在历史里）。
+  用 CLI + 容器而不是 `gitleaks-action`：后者对**组织**仓库要 license，CLI 是 MIT 的。
+  本地实测：60 个 commit，无泄漏。
+
+### 2. 覆盖率门槛
+
+- 实测基线 **87%**（7680 statements），门槛定 **85%**（留余量——贴着当前值的门禁会变成
+  "改一行就红"的噪声门禁）。
+- `[tool.coverage.run] branch = true`：只测"行执行过"会漏掉"if 的另一半从没走过"。
+- 阈值**只写在 pyproject**（单一事实源），CI 只加 `--cov`；PG 断言那条步骤加 `--no-cov`
+  （它只跑子集，不能被覆盖率门槛误伤）。
+
+### 3. 优雅停机（此前完全没有）
+
+- `build_app` 加了 FastAPI **lifespan**：停机时关掉**事件总线 → 记忆库 → 主存储**
+  （原先 SIGTERM 后只靠进程退出"回收"，PG 侧容易留僵尸连接）。关停逐个 try，
+  **一个失败不影响关其余的**（停机路径里最忌讳"第一个 close 抛了后面全不关"）。
+- `run_server` 加 `timeout_graceful_shutdown`（`WARDEN_SHUTDOWN_GRACE_S`，默认 30s）：
+  不设上限时，一个卡住的请求能让停机无限期挂住（滚动升级表现为"旧副本不退"）。
+- 新增 4 条测试：关存储/事件总线、关记忆库、**一个失败仍关其余**、正常服务不受影响。
+
+### 4. API 版本协商与弃用政策
+
+- 政策文档 `docs/api-versioning.md`：什么算破坏性变更（→ 主版本）、弃用流程与过渡期。
+- 可执行部分：客户端可用 `X-Warden-Api-Version` 声明版本；**主版本不受支持 / 形态不对 → 400
+  `UNSUPPORTED_API_VERSION`**，不"尽力处理"（静默错读比明确报错危险得多）；
+  不带该头按当前版本处理。新增 `tests/test_api_versioning.py`（含一条自检：
+  `API_VERSION` 的主版本必须在支持列表里）。
+- 如实标注：**过渡期通知头（`Deprecation`）尚未实现**——至今只有 1.0 一个版本、未发生弃用，
+  真做第一次弃用时再补。
+
+### 5. 配置读取收口**完成**（此前只迁了"有解析的"）
+
+- 剩余约 40 处**纯字符串读取**全部改走访问器（`env_str` / `env_opt` / `env_bool` / `env_int`）。
+  现在 `src/` 里除了注释，**没有一处**直接 `os.environ.get(...)` 读配置。
+- 顺带消掉**又一处口径漂移**：`WARDEN_AUDIT` 原先手写 `in ("1","true","yes")`——**漏了 "on"**。
+- `cli.py` 里 7 个命令各写一遍的 `args.db or os.environ.get("WARDEN_DB_PATH") or "..."`
+  收成一个 `_db_from_args()`（同一个默认值散在多处 = 改一处漏一处）。
+- AST 守卫仍全绿：迁移后"谁读了哪个变量"照样可查。
+
+### 验证
+
+`812 passed / 3 skipped`（起了 PostgreSQL，共 815 项；跳过 = win32 无内核隔离档、当前权限不允许建符号链接、
+本机没装 pg_dump 时的 PG 备份端到端），`ruff` 全绿，`mypy --strict` 93 文件零错误，
+覆盖率 **87% ≥ 门槛 85%**，bandit Medium+ **0**，gitleaks **无泄漏**。
+
+---
+
 ## 2026-09-22（第十三批：SSRF 固定连接 / PG 备份+保留策略 / 压测脚本）
 
 > 承接第十二批：继续做"难度二里不需要外部环境"的三项。做完后审计留下的

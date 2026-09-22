@@ -35,6 +35,11 @@ dev = [
     "psycopg[binary]",
     # 依赖漏洞扫描（CI 里对 lock 固定的运行依赖做门禁；见 .github/workflows/ci.yml）
     "pip-audit>=2.7",
+    # 静态安全扫描（SAST）：CI 门禁为"Medium 及以上必须为 0"
+    "bandit>=1.7",
+    # 告警规则/仪表盘的 YAML 与 JSON 守卫测试要用（tests/test_alert_rules.py）——
+    # 此前**没声明**，本机恰好装着才没暴露；`uv run --frozen pytest` 会直接 ModuleNotFoundError
+    "pyyaml>=6.0",
 ]
 postgres = ["psycopg[binary]"]
 # 密钥托管（KMS/HSM）：aws-kms 模式需要 boto3。vault-transit 走 httpx（已在依赖里），无需额外包。
@@ -73,3 +78,13 @@ strict = true
 
 [tool.coverage.run]
 source = ["warden_agent"]
+# 分支覆盖也计入：只测"行执行过"会漏掉"if 的另一半从没走过"这类空洞。
+branch = true
+
+[tool.coverage.report]
+# 覆盖率门槛：基线 87%（2026-09-22 实测），门槛设在 85% 留 2 个点余量——
+# 门槛贴着当前值会变成"改一行就红"的噪声门禁（门禁要能活下去，见 CHANGELOG 第十批的教训）。
+# 低覆盖区域主要是启动装配（web/run_server.py 41%，靠端到端跑而不是单测）。
+fail_under = 85
+show_missing = true
+skip_covered = true

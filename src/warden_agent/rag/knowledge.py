@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from warden_agent.core.settings import env_opt
 from warden_agent.tool.catalog import ToolSpec, function_tool
 
 # 嵌入函数：输入一段文本，返回一个浮点向量（list[float]）
@@ -187,9 +188,9 @@ def embedder_from_env(env: Mapping[str, str]) -> tuple[Embedder, str]:
     明确写出当前用的是哪一个。在哈希词频嵌入下宣称"语义检索"是过度声称——
     这正是"玩具级 RAG"最容易被面试官戳穿的点。
     """
-    base = env.get("WARDEN_EMBED_BASE_URL")
-    key = env.get("WARDEN_EMBED_API_KEY")
-    model = env.get("WARDEN_EMBED_MODEL")
+    base = env_opt("WARDEN_EMBED_BASE_URL", env)
+    key = env_opt("WARDEN_EMBED_API_KEY", env)
+    model = env_opt("WARDEN_EMBED_MODEL", env)
     if base and key and model:
         return (
             openai_compatible_embedder(base_url=base, api_key=key, model=model),

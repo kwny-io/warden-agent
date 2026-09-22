@@ -23,6 +23,8 @@ from collections.abc import Iterable
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from warden_agent.core.settings import env_opt
+
 
 class CredentialCipher:
     """用一把外部提供的密钥做 AES-GCM 加解密。
@@ -129,7 +131,7 @@ def derive_key_from_env() -> bytes:
 
     没配置时不允许加密落库（宁可抛错，也不要有默认弱密钥悄悄上线）。
     """
-    key = os.environ.get("WARDEN_CREDENTIAL_KEY")
+    key = env_opt("WARDEN_CREDENTIAL_KEY")
     if not key:
         raise RuntimeError(
             "未配置 WARDEN_CREDENTIAL_KEY：凭证加密需要外部密钥。"

@@ -21,6 +21,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from warden_agent.core.settings import env_opt
 from warden_agent.web.coordination import InProcessRateLimitStore, RateLimitStore
 
 
@@ -112,7 +113,7 @@ def limiter_from_env(
     env: Mapping[str, str], *, store: RateLimitStore | None = None
 ) -> RateLimiter | None:
     """按环境变量造限流器。`WARDEN_RATE_LIMIT=600/60`；不设走默认，`0` 关闭。"""
-    raw = env.get("WARDEN_RATE_LIMIT")
+    raw = env_opt("WARDEN_RATE_LIMIT", env)
     if raw is None:
         return RateLimiter(600, 60, store=store)  # 生产默认：每调用者每分钟 600 次
     return parse_rate_limit(raw, store=store)

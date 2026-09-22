@@ -28,12 +28,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -44,6 +45,7 @@ from pydantic import BaseModel
 
 from warden_agent.core import tracing
 from warden_agent.core.metrics import metrics
+from warden_agent.core.settings import env_opt
 from warden_agent.credential.broker import CredentialBroker, SecretRedactor, default_broker
 from warden_agent.credential.vault import DEPLOYMENT_SCOPE, as_vault
 from warden_agent.model.model import AgentChatModel, Message
@@ -81,6 +83,19 @@ logger = logging.getLogger(__name__)
 
 # ---- HTTP contract：统一 API 版本（所有响应都带这个头，客户端可据此协商）----
 API_VERSION = "1.0"
+# 仍然支持协商的**主版本**（"1" 表示 1.x 都接受）。
+# 政策（见 docs/api-versioning.md）：主版本变更 = 破坏性变更；次版本只增不改。
+# 客户端可以带 `X-Warden-Api-Version` 声明它按哪个版本写的；主版本不被支持时**明确报 400**，
+# 而不是"装作没事"继续处理（那会让调用方拿着旧假设去读一个语义已经变了的响应）。
+API_SUPPORTED_MAJORS: tuple[str, ...] = ("1",)
+
+
+def _split_version(value: str) -> tuple[str, str] | None:
+    """把 `1.0` 拆成 `("1", "0")`；形态不对返回 None。"""
+    parts = value.strip().split(".")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return None
+    return parts[0], parts[1]
 
 
 async def _drain_and_rebuild(
@@ -489,7 +504,47 @@ def build_app(
         # 会话侧才能真正"记下跑到第几轮、正在哪一步"（见 _owner_of / recovery 端点）。
         checkpoint_store=_checkpoint_store_for(store),
     )
-    app = FastAPI(title="Warden Agent Python", version=API_VERSION)
+
+    def _close_quietly(resource: Any, what: str) -> None:
+        """尽力关闭一个资源；失败只记日志——**停机路径里绝不能再抛异常**。
+
+        为什么：关停时如果第一个 close 抛了，后面的资源就永远不会被关（连接泄漏、
+        下次启动可能因文件锁起不来）。所以逐个 try，坏一个不影响其余。
+        """
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+            logger.info("停机：已关闭 %s", what)
+        except Exception:  # noqa: BLE001 - 停机清理失败不该影响退出
+            logger.warning("停机：关闭 %s 失败（忽略，继续关其它的）", what, exc_info=True)
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """应用生命周期：启动只记一行，**停机负责把资源关掉**。
+
+        为什么需要它（此前没有）：进程收到 SIGTERM 时，uvicorn 会等请求排空再退出，
+        但我们持有的连接（存储、事件总线的 LISTEN 连接、记忆库）**没有任何地方关闭**——
+        依赖进程退出时的资源回收。单副本影响有限，但重启/滚动升级时更容易暴露问题
+        （PG 侧留下僵尸连接、SQLite 的网络盘/文件锁场景更明显）。
+
+        顺序：先关"雨伞"再关"地基"——事件总线（可能持有独立连接）→ 记忆库 → 主存储。
+        """
+        logger.info("启动完成：v%s（停机时会关闭存储/事件总线/记忆库）", API_VERSION)
+        try:
+            yield
+        finally:
+            # 注：`bus` / `store` / `memory_repository` 都是在 build_app 里后于本闭包定义的，
+            # 但这里在**停机时**才取它们的值（闭包按调用时解析），所以顺序没问题。
+            _close_quietly(bus, "事件总线")
+            _close_quietly(memory_repository, "记忆库")
+            _close_quietly(store, "主存储")
+            logger.info("停机完成")
+
+    app = FastAPI(
+        title="Warden Agent Python", version=API_VERSION, lifespan=_lifespan,
+    )
 
     # ---- Run 级锁：同一会话同一时刻只允许一方驱动 ----
     # 多副本下两个副本同时处理同一个 run 会"后写覆盖前写"（历史分叉或丢失，且不报错）。
@@ -690,6 +745,20 @@ def build_app(
         )
         trace_ctx = trace_cm.__enter__()
         try:
+            # API 版本协商：客户端可用 `X-Warden-Api-Version` 声明它按哪个版本写的。
+            # 主版本不被支持 → **明确 400**（而不是装作没事继续处理：调用方拿着旧假设去读
+            # 语义已经变了的响应，比直接报错危险得多）。只认主版本，次版本差异不拒绝。
+            requested_version = request.headers.get("X-Warden-Api-Version")
+            if requested_version:
+                parsed = _split_version(requested_version)
+                if parsed is None or parsed[0] not in API_SUPPORTED_MAJORS:
+                    status_code = 400
+                    return _problem(
+                        400, "UNSUPPORTED_API_VERSION",
+                        f"不支持的 API 版本 {requested_version!r}；"
+                        f"当前版本 {API_VERSION}，支持的主版本 {list(API_SUPPORTED_MAJORS)}",
+                        correlation_id,
+                    )
             if authenticator is not None and not _is_public(path):
                 try:
                     caller = authenticator.authenticate(request)
@@ -932,8 +1001,9 @@ def build_app(
     def _web_dist_dir() -> str:
         import os
 
-        if os.environ.get("WARDEN_WEB_DIST"):
-            return os.environ["WARDEN_WEB_DIST"]
+        dist = env_opt("WARDEN_WEB_DIST")
+        if dist:
+            return dist
         return os.path.join(_repo_dir(), "web", "dist")
 
     def _find_spa_index() -> str | None:

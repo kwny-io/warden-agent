@@ -152,9 +152,9 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
     单 key 模式（`WARDEN_API_KEY`）的身份取 `WARDEN_API_USER`（默认 `demo-user`，
     与控制台默认账号一致）。租户取 `WARDEN_TENANT`（默认 `local`）。
     """
-    tenant = (env.get("WARDEN_TENANT") or "local").strip() or "local"
+    tenant = env_str("WARDEN_TENANT", "local", env).strip() or "local"
 
-    raw_keys = (env.get("WARDEN_API_KEYS") or "").strip()
+    raw_keys = env_str("WARDEN_API_KEYS", "", env).strip()
     if raw_keys:
         keys: dict[str, TrustedCaller] = {}
         for pair in raw_keys.split(","):
@@ -209,7 +209,7 @@ def _knowledge_from_env(env: Mapping[str, str]) -> Any:
     开了会在启动日志里写明用的是**哪种嵌入器**——词频嵌入与语义嵌入质量差别很大，
     不写清楚就有"过度声称语义检索"的风险。
     """
-    raw = (env.get("WARDEN_KNOWLEDGE") or "").strip()
+    raw = env_str("WARDEN_KNOWLEDGE", "", env).strip()
     if not raw or raw.lower() in ("0", "false", "no", "off"):
         return None
     if raw.lower() in ("1", "true", "yes", "on"):
@@ -291,7 +291,7 @@ def main() -> None:
 
     # 模型：有 key 用真 DeepSeek，否则用假模型（离线可跑）
     model: AgentChatModel
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    api_key = env_opt("DEEPSEEK_API_KEY")
     if api_key:
         model = DeepSeekModel(api_key=api_key)
         logger.info("使用真实 DeepSeek 模型")
@@ -315,7 +315,7 @@ def main() -> None:
     logger.debug("生效配置：\n%s", "\n".join(describe(os.environ)))
 
     # 鉴权（fail-closed）。监听地址与鉴权要一起决定：对外监听却不鉴权 = 直接拒绝启动。
-    host = os.environ.get("WARDEN_HOST", "127.0.0.1")
+    host = env_str("WARDEN_HOST", "127.0.0.1")
     try:
         api_keys, auth_mode = resolve_auth(os.environ)
     except AuthConfigError as exc:
@@ -337,7 +337,9 @@ def main() -> None:
         )
 
     audit_store: Any = None
-    if os.environ.get("WARDEN_AUDIT") in ("1", "true", "yes"):
+    # 统一走 env_bool：此前这里是手写的 `in ("1","true","yes")`——**漏了 "on"**，
+    # 与其它布尔开关的口径不一致（同一个变量的两种写法本来是这轮要消灭的东西）。
+    if env_bool("WARDEN_AUDIT", False):
         audit_store = SqliteAuditStore(_db_path())
         logger.info("已开启审计（写入 SQLite audit_log 表）")
 
@@ -441,9 +443,9 @@ def main() -> None:
         knowledge=knowledge,
         web=True,
         web_providers=web_providers,
-        skills=os.environ.get("SKILLS_DIR") or None,
-        mcp_server=os.environ.get("MCP_SERVER") or None,
-        git_workdir=os.environ.get("GIT_WORKDIR") or None,
+        skills=env_opt("SKILLS_DIR"),
+        mcp_server=env_opt("MCP_SERVER"),
+        git_workdir=env_opt("GIT_WORKDIR"),
         api_keys=api_keys,
         audit_store=audit_store,
         model_id=("deepseek" if api_key else "fake"),
@@ -461,7 +463,13 @@ def main() -> None:
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)
     logger.info("OpenAPI 文档:  http://127.0.0.1:%s/docs", port)
     logger.info("健康检查:      /health/live  /health/ready")
-    uvicorn.run(app, host=host, port=port)
+    # `timeout_graceful_shutdown`：收到 SIGTERM 后**最多等 30 秒**把在飞的请求跑完，
+    # 然后强制退出（app 的 lifespan 随后关闭存储/事件总线/记忆库）。
+    # 不设这个上限的话，一个卡住的请求能让停机无限期挂住——滚动升级时表现为"旧副本不退"。
+    uvicorn.run(
+        app, host=host, port=port,
+        timeout_graceful_shutdown=env_positive_int("WARDEN_SHUTDOWN_GRACE_S", 30, os.environ),
+    )
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
+from warden_agent.core.settings import env_str
 from warden_agent.web.auth import LOCAL_CALLER, RunOperation, TrustedCaller
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ def audit_chain_key(env: Mapping[str, str] | None = None) -> bytes | None:
     不生成"进程内临时密钥"，因为审计链要跨重启校验，临时密钥会让昨天的链今天就验不过。
     """
     src = env if env is not None else os.environ
-    material = (src.get("WARDEN_AUDIT_KEY") or "").strip()
+    material = env_str("WARDEN_AUDIT_KEY", "", src).strip()
     return material.encode("utf-8") if material else None
 
 

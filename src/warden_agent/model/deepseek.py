@@ -21,10 +21,10 @@ DeepSeek 官方推荐的接法就是用 openai 官方 Python SDK，把 base_url 
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Iterator
 from typing import Any
 
+from warden_agent.core.settings import env_opt, env_str
 from warden_agent.model.model import (
     AgentChatModel,
     ChatRequest,
@@ -69,7 +69,7 @@ class OpenAiCompatibleModel(AgentChatModel):
         max_retries: int = 2,
     ) -> None:
         # api_key 可显式传入；否则从环境变量取；SSO 厂商也可用无 key（走 AZURE）——这里只处理标准 key
-        key = api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+        key = api_key or env_opt("OPENAI_API_KEY") or env_opt("DEEPSEEK_API_KEY")
         if not key:
             raise ModelCallError(
                 "缺少 API Key：请设置环境变量 OPENAI_API_KEY 或 DEEPSEEK_API_KEY，"
@@ -354,7 +354,7 @@ class DeepSeekModel(OpenAiCompatibleModel):
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_DEEPSEEK_MODEL,
                  **kwargs: Any) -> None:
         # 默认读 DEEPSEEK_API_KEY；OpenAiCompatibleModel 已兼容读取
-        key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+        key = api_key or env_opt("DEEPSEEK_API_KEY")
         super().__init__(api_key=key, model=model,
                          base_url=kwargs.pop("base_url", DEEPSEEK_BASE_URL), **kwargs)
 
@@ -373,7 +373,7 @@ class ZhipuModel(OpenAiCompatibleModel):
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_ZHIPU_MODEL,
                  **kwargs: Any) -> None:
-        key = api_key or os.environ.get("ZHIPU_API_KEY")
+        key = api_key or env_opt("ZHIPU_API_KEY")
         super().__init__(api_key=key, model=model,
                          base_url=kwargs.pop("base_url", ZHIPU_BASE_URL), **kwargs)
 
@@ -383,7 +383,7 @@ class BailianModel(OpenAiCompatibleModel):
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_BAILIAN_MODEL,
                  **kwargs: Any) -> None:
-        key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+        key = api_key or env_opt("DASHSCOPE_API_KEY")
         super().__init__(api_key=key, model=model,
                          base_url=kwargs.pop("base_url", BAILIAN_BASE_URL), **kwargs)
 
@@ -423,11 +423,10 @@ def create_model(provider: str, api_key: str | None = None, **kwargs: Any) -> Op
         model = create_model("custom")  # 读 WARDEN_MODEL_API_KEY / WARDEN_BASE_URL / WARDEN_MODEL
     """
     if provider == "custom":
-        import os
-        key = api_key or os.environ.get("WARDEN_MODEL_API_KEY")
-        base_url = kwargs.pop("base_url", os.environ.get("WARDEN_BASE_URL"))
+        key = api_key or env_opt("WARDEN_MODEL_API_KEY")
+        base_url = kwargs.pop("base_url", env_opt("WARDEN_BASE_URL"))
         model = kwargs.pop("model",
-                           os.environ.get("WARDEN_MODEL") or DEFAULT_DEEPSEEK_MODEL)
+                           env_str("WARDEN_MODEL", DEFAULT_DEEPSEEK_MODEL))
         if not base_url:
             raise ModelCallError(
                 "custom 接入需要 WARDEN_BASE_URL（OpenAI 兼容端点）。"

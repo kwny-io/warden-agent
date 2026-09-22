@@ -46,11 +46,23 @@ def default_base_url(env: Mapping[str, str] | None = None) -> str:
     刻意**不**读 `WARDEN_BASE_URL`——那是模型端点（custom provider）；
     混用的后果是 CLI 把请求发到模型网关上去。
     """
-    src: Mapping[str, str] = env if env is not None else os.environ
-    return src.get("WARDEN_SERVER_URL") or "http://127.0.0.1:8000"
+    from warden_agent.core.settings import env_str
+
+    return env_str("WARDEN_SERVER_URL", "http://127.0.0.1:8000", env)
 
 
 DEFAULT_BASE = default_base_url()
+
+
+def _db_from_args(args: argparse.Namespace) -> str:
+    """解析要操作的数据库路径：`--db` 优先 → `WARDEN_DB_PATH` → 本机默认文件。
+
+    抽出来是因为**七个命令**原本各写一遍同一个表达式（`args.db or os.environ.get(...) or ...`）——
+    同一个默认值散在多处正是"改一处漏一处"的来源。
+    """
+    from warden_agent.core.settings import env_str
+
+    return args.db or env_str("WARDEN_DB_PATH", "warden-agent-local.db")
 
 
 def _client() -> httpx.Client:
@@ -194,7 +206,7 @@ def _cmd_recover(args: argparse.Namespace) -> None:
     from warden_agent.runtime.recovery import RecoveryController
     from warden_agent.store.sqlite import SqliteStore
 
-    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    db = _db_from_args(args)
     try:
         store = SqliteStore(db)
     except Exception as e:  # 打不开库（路径不对/损坏）
@@ -256,7 +268,7 @@ def _cmd_backup(args: argparse.Namespace) -> None:
     """做一份一致性备份（SQLite 在线备份 API，不需要停服务）。"""
     from warden_agent.runtime.backup import BackupError, backup_sqlite
 
-    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    db = _db_from_args(args)
     try:
         info = backup_sqlite(db, args.dest or None)
     except BackupError as e:
@@ -341,7 +353,7 @@ def _cmd_restore(args: argparse.Namespace) -> None:
     """从备份恢复。目标库已存在时必须显式 --force（恢复是破坏性操作）。"""
     from warden_agent.runtime.backup import BackupError, restore_sqlite
 
-    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    db = _db_from_args(args)
     try:
         info = restore_sqlite(args.backup, db, overwrite=args.force)
     except BackupError as e:
@@ -359,7 +371,7 @@ def _cmd_stuck(args: argparse.Namespace) -> None:
     from warden_agent.runtime.checkpoint import checkpoint_store_for
     from warden_agent.store.sqlite import SqliteStore
 
-    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    db = _db_from_args(args)
     try:
         store = SqliteStore(db)
     except Exception as e:  # 打不开库
@@ -394,7 +406,7 @@ def _cmd_audit_verify(args: argparse.Namespace) -> None:
 
     from warden_agent.web.audit import SqliteAuditStore
 
-    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    db = _db_from_args(args)
     try:
         store = SqliteAuditStore(db_path=db)
     except Exception as e:  # 打不开库（路径不对/损坏）
@@ -452,7 +464,7 @@ def _cmd_audit_export(args: argparse.Namespace) -> None:
 
     from warden_agent.web.audit import SqliteAuditStore
 
-    db = args.db or os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    db = _db_from_args(args)
     try:
         store = SqliteAuditStore(db_path=db)
     except Exception as e:  # 打不开库（路径不对/损坏）
@@ -508,19 +520,18 @@ def _cmd_rotate_credentials(args: argparse.Namespace) -> None:
     不做这一步直接换密钥 = 存量凭证全部解不开。
     """
     import json
-    import os as _os
 
     from warden_agent.credential.broker import default_broker
     from warden_agent.credential.vault import rotate_credentials
     from warden_agent.store.sqlite import SqliteStore
 
-    db = args.db or _os.environ.get("WARDEN_DB_PATH") or "warden-agent-local.db"
+    db = _db_from_args(args)
     try:
         store = SqliteStore(db)
     except Exception as e:  # 打不开库
         _die(f"无法打开凭证库 {db}: {e}")
 
-    broker = default_broker(_os.environ, vault=store)
+    broker = default_broker(os.environ, vault=store)
     # 作用域：默认只处理部署级；多用户各自导入的 key 用 --scope 逐个指定（或 --all-scopes）
     scopes = [s for s in (args.scope or "").split(",") if s]
     extra = _scopes_in_store(store) if args.all_scopes else ()

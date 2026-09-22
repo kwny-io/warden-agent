@@ -43,15 +43,18 @@ def version_of(conn: sqlite3.Connection) -> int:
     if row is None:
         return 0
     r = conn.execute(
-        f"SELECT MAX(version) FROM {_MIGRATIONS_TABLE}"
+        # 表名是模块常量（不是用户输入），且 SQL 里表名无法用占位符参数化；值仍走占位符。
+        f"SELECT MAX(version) FROM {_MIGRATIONS_TABLE}"  # nosec B608
     ).fetchone()
     return int(r[0]) if r and r[0] is not None else 0
 
 
 def _ensure_record_table(conn: sqlite3.Connection) -> None:
     conn.execute(
+        # 同上：常量表名，建表语句里表名也没法参数化。
         f"""
-        CREATE TABLE IF NOT EXISTS {_MIGRATIONS_TABLE} (
+        CREATE TABLE IF NOT EXISTS {_MIGRATIONS_TABLE} ("""  # nosec B608
+        """
             version INTEGER PRIMARY KEY,
             name     TEXT NOT NULL,
             applied_at TEXT NOT NULL
@@ -65,7 +68,8 @@ def record_migration(
 ) -> None:
     _ensure_record_table(conn)
     conn.execute(
-        f"INSERT INTO {_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",
+        # 常量表名（值全部走占位符）——表名在 SQL 里无法参数化。
+        f"INSERT INTO {_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",  # nosec B608
         (version, name, now),
     )
 

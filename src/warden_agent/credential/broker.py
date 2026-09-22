@@ -30,6 +30,7 @@ import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from warden_agent.core.settings import env_opt, env_str
 from warden_agent.credential.crypto import CredentialCipher
 from warden_agent.credential.kms import KeyProvider, resolve_key_provider
 from warden_agent.credential.vault import (
@@ -248,12 +249,12 @@ def default_broker(
             logger.info("托管 provider 提供了 %d 把历史密钥（仅用于解密兜底）",
                         len(provider.historical_keys()))
         return CredentialBroker(cipher, ttl_seconds=ttl_seconds, vault=vault, scope=scope)
-    material = src.get("WARDEN_CREDENTIAL_KEY")
+    material = env_opt("WARDEN_CREDENTIAL_KEY", src)
     # 密钥轮换：主密钥之外可挂历史密钥（逗号分隔），**只用于解密兜底**。
     # 轮换流程见 vault.rotate_credentials：配新主密钥 + 旧密钥进 OLD_KEYS → 重加密 → 摘掉旧密钥。
     old_materials = [
         item.strip().encode("utf-8")
-        for item in (src.get("WARDEN_CREDENTIAL_OLD_KEYS") or "").split(",")
+        for item in env_str("WARDEN_CREDENTIAL_OLD_KEYS", "", src).split(",")
         if item.strip()
     ]
     if material:

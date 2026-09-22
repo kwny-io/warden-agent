@@ -26,6 +26,7 @@ import os
 from typing import Any
 
 from warden_agent.core.logging_setup import get_logger, setup_logging
+from warden_agent.core.settings import env_opt
 from warden_agent.loop.intent import ToolIntentRouter
 from warden_agent.loop.loop import AgentLoop
 from warden_agent.loop.planner import ModelPlanner, build_plan, plan_as_context
@@ -57,7 +58,7 @@ trust: trusted
 
 
 def _build_model() -> AgentChatModel:
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    key = env_opt("DEEPSEEK_API_KEY")
     if key:
         logger.info("使用真实 DeepSeek 模型")
         return DeepSeekModel(api_key=key)
@@ -358,7 +359,7 @@ def _live_demo() -> None:
 def run_demo() -> None:
     setup_logging()
     _section("Warden Agent · 端到端完整演示")
-    if os.environ.get("DEEPSEEK_API_KEY"):
+    if env_opt("DEEPSEEK_API_KEY"):
         _live_demo()
     else:
         # 离线：先"自主闭环"真跑一条任务，再分节拆解每一层能力（加深理解）。

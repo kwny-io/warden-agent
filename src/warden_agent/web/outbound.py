@@ -33,6 +33,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from warden_agent.core.settings import env_opt, env_str
 from warden_agent.web.coordination import InProcessRateLimitStore, RateLimitStore
 
 # 全局桶的键（所有 host 共用）
@@ -208,12 +209,12 @@ def outbound_from_env(
     配置项都在，要放宽直接调环境变量。日配额默认 0（不限）——硬性停机上限应当由运维
     显式决定，与"Agent 能不能出网"同一个取向。
     """
-    global_spec = parse_outbound_limit(env.get("WARDEN_OUTBOUND_LIMIT", ""))
+    global_spec = parse_outbound_limit(env_str("WARDEN_OUTBOUND_LIMIT", "", env))
     max_requests, window_seconds = global_spec or (120, 60)
-    host_spec = parse_outbound_limit(env.get("WARDEN_OUTBOUND_HOST_LIMIT", ""))
+    host_spec = parse_outbound_limit(env_str("WARDEN_OUTBOUND_HOST_LIMIT", "", env))
     host_max, host_window = host_spec or (20, 60)
-    concurrency_raw = env.get("WARDEN_OUTBOUND_MAX_CONCURRENCY")
-    quota_raw = env.get("WARDEN_OUTBOUND_DAILY_QUOTA")
+    concurrency_raw = env_opt("WARDEN_OUTBOUND_MAX_CONCURRENCY", env)
+    quota_raw = env_opt("WARDEN_OUTBOUND_DAILY_QUOTA", env)
     config = OutboundConfig(
         max_requests=max_requests,
         window_seconds=window_seconds,

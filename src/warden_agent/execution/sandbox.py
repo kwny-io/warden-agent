@@ -28,7 +28,6 @@ ExecutionBroker 已经管住"怎么跑、能跑多久、输出多大、最多并
 from __future__ import annotations
 
 import contextlib
-import os
 import re
 import shutil
 import subprocess
@@ -38,6 +37,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from warden_agent.core.settings import env_str
 from warden_agent.execution.broker import ExecutionBroker, ExecutionBudget, ExecutionResult
 
 # 常见的"会碰网络"的命令/参数片断（小写匹配）。用于 NetworkPolicy 语义层判断。
@@ -95,7 +95,7 @@ def _net_isolation_prefix() -> list[str] | None:
     宁可少隔离一层、也不要把可预期性搭进去。
     **要完整边界就用容器**（`network_mode: none` + 只读 rootfs），那才是这类需求的正确答案。
     """
-    override = os.environ.get("WARDEN_ISOLATION_PREFIX", "").strip()
+    override = env_str("WARDEN_ISOLATION_PREFIX", "").strip()
     if override:
         return override.split()
     if shutil.which("unshare") is None:

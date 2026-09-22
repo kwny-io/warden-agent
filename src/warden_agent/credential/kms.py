@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from warden_agent.core.settings import env_str
+from warden_agent.core.settings import env_opt, env_str
 
 
 @runtime_checkable
@@ -79,7 +79,7 @@ class EnvKeyProvider:
     name: str = "env"
 
     def current_key(self) -> bytes:
-        material = self.env.get("WARDEN_CREDENTIAL_KEY")
+        material = env_opt("WARDEN_CREDENTIAL_KEY", self.env)
         if not material:
             raise KeyProviderError(
                 "env 模式需要 WARDEN_CREDENTIAL_KEY（或改用 WARDEN_KMS_PROVIDER 接 KMS）"
@@ -89,7 +89,7 @@ class EnvKeyProvider:
     def historical_keys(self) -> list[bytes]:
         return [
             item.strip().encode("utf-8")
-            for item in (self.env.get("WARDEN_CREDENTIAL_OLD_KEYS") or "").split(",")
+            for item in env_str("WARDEN_CREDENTIAL_OLD_KEYS", "", self.env).split(",")
             if item.strip()
         ]
 
@@ -131,7 +131,7 @@ class AwsKmsKeyProvider:
         boto3 在**这时**才导入——没有 boto3 而误配了 aws-kms 会得到明确报错，
         而不是 import 期就把整个应用带崩。
         """
-        blob = env.get("WARDEN_KMS_WRAPPED_KEY")
+        blob = env_opt("WARDEN_KMS_WRAPPED_KEY", env)
         if not blob:
             raise KeyProviderError(
                 "aws-kms 模式需要 WARDEN_KMS_WRAPPED_KEY（base64 的被包装 DEK；"
@@ -187,10 +187,10 @@ class VaultTransitKeyProvider:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> VaultTransitKeyProvider:
-        addr = env.get("WARDEN_VAULT_ADDR")
-        token = env.get("WARDEN_VAULT_TOKEN")
-        key_name = env.get("WARDEN_VAULT_KEY_NAME")
-        wrapped = env.get("WARDEN_KMS_WRAPPED_KEY")
+        addr = env_opt("WARDEN_VAULT_ADDR", env)
+        token = env_opt("WARDEN_VAULT_TOKEN", env)
+        key_name = env_opt("WARDEN_VAULT_KEY_NAME", env)
+        wrapped = env_opt("WARDEN_KMS_WRAPPED_KEY", env)
         missing = [
             n
             for n, v in (

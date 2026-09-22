@@ -250,6 +250,13 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
              "但挡不住会重算整条链的人。审计链要跨重启校验，所以不生成临时密钥",
     ),
     EnvSpec(
+        "WARDEN_SHUTDOWN_GRACE_S", "收到 SIGTERM 后等多久把在飞请求跑完（秒），默认 30",
+        "web/run_server.py", ("web/run_server.py",),
+        default="30", kind="int",
+        note="超时后强制退出并关资源。不设上限时，一个卡住的请求会让停机无限期挂住"
+             "（滚动升级时表现为旧副本不退）",
+    ),
+    EnvSpec(
         "WARDEN_EVENT_KEEP", "【进程内事件总线】每个 run 最多保留的最近事件数（默认 500）",
         "web/run_server.py", ("web/run_server.py",),
         default="500", kind="int",

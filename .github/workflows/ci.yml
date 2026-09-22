@@ -48,20 +48,23 @@ jobs:
         run: uv run --frozen ruff check src tests
       - name: Mypy (strict)
         run: uv run --frozen mypy src/warden_agent
-      - name: Pytest
+      - name: Pytest（含覆盖率门槛）
         # `-rs` 让跳过原因也打进日志：CI 里"跳过"和"通过"看起来一样绿，
         # 不写原因就没法判断是不是该跑的被静默跳过了。
-        run: uv run --frozen pytest --tb=short -rs -p no:cacheprovider
+        # `--cov` 同时**执行覆盖率门禁**：`fail_under` 配在 pyproject.toml（单一事实源，
+        # 基线 87% / 门槛 85%），这里不再重复写数字——避免"两个地方各写一个阈值"漂移。
+        run: uv run --frozen pytest --tb=short -rs -p no:cacheprovider --cov=warden_agent
       - name: 断言 PostgreSQL 集成测试真的执行了（防静默跳过）
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
         # 副作用是——**如果 CI 里的 service 没连上，它们会静默跳过、CI 依然绿**，
         # 于是"在 CI 里验证 PG"这句话就是空的。这条把那种情况变成明确失败。
         # 三个文件都要列上：只要有 PG 依赖的测试漏进来就会静默跳过，守卫必须覆盖全。
+        # `--no-cov`：这条只看"跑没跑"，跑子集必然覆盖不足，不能让它被覆盖率门槛误伤。
         run: |
           set -o pipefail
           out=$(uv run --frozen pytest tests/test_postgres_integration.py \
                 tests/test_store_interface.py tests/test_notify_event_bus.py \
-                -p no:cacheprovider 2>&1 | tail -1)
+                -p no:cacheprovider --no-cov 2>&1 | tail -1)
           echo "$out"
           case "$out" in
             *skipped*)
@@ -119,3 +122,24 @@ jobs:
         run: |
           uv export --frozen --no-emit-project --no-dev -o /tmp/req.txt
           uv run --frozen pip-audit -r /tmp/req.txt --strict
+
+      - name: SAST（bandit）—— 打印全部发现（含 Low，只记录不拦截）
+        # 为什么不让这条失败：Low 一档里多是**有意写法或误报**——
+        # B101 assert、B110 try/except/pass、B112 try/except/continue、
+        # B404/B603 subprocess 列表调用（无 shell）、B107 空默认口令。
+        # 打印出来是为了"看得见"，拦截交给下一条（只看 Medium+）。
+        run: uv run --frozen bandit -r src/warden_agent || true
+
+      - name: SAST 门禁：Medium 及以上必须为 0
+        # 基线（2026-09-22）：Medium 0、Low 26。
+        # migrations.py 里两处 B608（常量表名的 f-string）已用 `# nosec B608` **显式接受**——
+        # 表名在 SQL 里无法参数化，且它来自模块常量而非用户输入。
+        run: uv run --frozen bandit -r src/warden_agent --severity-level medium --confidence-level medium
+
+      - name: 秘密扫描（gitleaks，扫全历史）
+        # 扫 **history** 而不只是工作区：已提交过的凭据也要能发现（就算后来删掉，历史里还在）。
+        # 用 CLI 而不是 gitleaks-action：后者对**组织**仓库需要 license；CLI 是 MIT 的，没这个限制。
+        # 本地实测：60 个 commit 扫完，无泄漏。
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            detect --source /repo --no-banner --redact -v
