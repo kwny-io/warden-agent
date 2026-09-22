@@ -81,8 +81,8 @@ spec:
             - { name: tmp, mountPath: /tmp }
       volumes:
         # ⚠️ 多副本下**不要**给 SQLite 用共享卷（跨主机共享文件系统不支持 SQLite）。
-        # 这里只用于审计/记忆（当前仅 SQLite 实现，多副本下应关掉，见 configmap 注释）
-        # 以及临时文件。真要多副本 + 审计/记忆，需要它们的 PG 实现。
+        # 配了 WARDEN_PG_HOST 时审计/记忆都走 PG，这里的卷只用于临时文件（/tmp）。
+        # 单副本（不配 PG）时它才承载 SQLite 的审计/记忆。
         - name: data
           emptyDir: {}
         - name: tmp

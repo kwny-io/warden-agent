@@ -308,6 +308,171 @@ class SqliteMemoryStore:
         self._conn.close()
 
 
+class PostgresMemoryStore:
+    """落 PG 的记忆库：实现 `MemoryRepository`，多副本共享同一份记忆。
+
+    为什么需要它：`SqliteMemoryStore` 是单机文件——多副本部署时每个副本一份记忆，
+    `USER` 作用域（"跨会话的用户级记忆"）会在副本 A 记得、副本 B 读不到，语义直接崩掉。
+    企业级多副本交付必须让记忆也进共享库。
+
+    行结构与 `SqliteMemoryStore` 完全对齐（同列、同序列化），SQL 占位符换成 `%s`。
+    构造：`conn` 给一条 psycopg 连接（run_server 用 `store.new_connection()` 另开），
+    或给 `connect_kwargs`。
+    """
+
+    def __init__(
+        self,
+        conn: Any = None,
+        *,
+        connect_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        if conn is not None:
+            self._conn = conn
+        elif connect_kwargs is not None:
+            import psycopg
+
+            self._conn = psycopg.connect(**connect_kwargs, autocommit=True)
+        else:
+            raise ValueError("PostgresMemoryStore 需要 conn 或 connect_kwargs")
+        self._lock = threading.Lock()
+        self._init()
+
+    def _init(self) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memories (
+                    uid            TEXT PRIMARY KEY,
+                    scope          TEXT NOT NULL,
+                    key            TEXT NOT NULL,
+                    content_kind   TEXT NOT NULL,
+                    content_text   TEXT NOT NULL,
+                    content_data   TEXT NOT NULL,
+                    status         TEXT NOT NULL,
+                    actor_kind     TEXT NOT NULL,
+                    actor_id       TEXT NOT NULL,
+                    version        INTEGER NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    updated_at     TEXT NOT NULL,
+                    expires_at     TEXT,
+                    conflicts_with TEXT,
+                    supersedes     TEXT,
+                    audit          TEXT NOT NULL,
+                    owner          TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_ref ON memories (scope, key)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (scope, status)"
+            )
+            # 老库补列（与 SQLite 版对齐）
+            cur.execute(
+                "ALTER TABLE memories ADD COLUMN IF NOT EXISTS owner TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories (owner, scope)"
+            )
+        self._conn.commit()
+
+    def save(self, item: MemoryItem) -> None:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO memories (uid, scope, key, content_kind, content_text,"
+                " content_data, status, actor_kind, actor_id, version, created_at,"
+                " updated_at, expires_at, conflicts_with, supersedes, audit, owner)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (uid) DO UPDATE SET"
+                " scope=EXCLUDED.scope, key=EXCLUDED.key,"
+                " content_kind=EXCLUDED.content_kind, content_text=EXCLUDED.content_text,"
+                " content_data=EXCLUDED.content_data, status=EXCLUDED.status,"
+                " actor_kind=EXCLUDED.actor_kind, actor_id=EXCLUDED.actor_id,"
+                " version=EXCLUDED.version, updated_at=EXCLUDED.updated_at,"
+                " expires_at=EXCLUDED.expires_at, conflicts_with=EXCLUDED.conflicts_with,"
+                " supersedes=EXCLUDED.supersedes, audit=EXCLUDED.audit,"
+                " owner=EXCLUDED.owner",
+                (
+                    item.uid,
+                    item.scope.name,
+                    item.key,
+                    item.content.kind.name,
+                    item.content.text,
+                    json.dumps(item.content.data, ensure_ascii=False),
+                    item.status.name,
+                    item.actor.kind,
+                    item.actor.id,
+                    item.version,
+                    item.created_at.isoformat(),
+                    item.updated_at.isoformat(),
+                    SqliteMemoryStore._iso(item.expires_at),
+                    item.conflicts_with,
+                    item.supersedes,
+                    json.dumps(_audit_to_json(item.audit), ensure_ascii=False),
+                    item.owner,
+                ),
+            )
+            self._conn.commit()
+
+    def find(self, uid: str) -> MemoryItem | None:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT * FROM memories WHERE uid = %s", (uid,))
+            row = cur.fetchone()
+        return None if row is None else SqliteMemoryStore._row_to_item(row)
+
+    def find_ref(
+        self, scope: MemoryScope, key: str, owner: str | None = None
+    ) -> list[MemoryItem]:
+        sql = "SELECT * FROM memories WHERE scope = %s AND key = %s"
+        params: list[Any] = [scope.name, key]
+        if owner is not None:
+            sql += " AND owner = %s"
+            params.append(owner)
+        with self._conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        return [SqliteMemoryStore._row_to_item(r) for r in rows]
+
+    def latest(
+        self, scope: MemoryScope, key: str, owner: str | None = None
+    ) -> MemoryItem | None:
+        items = self.find_ref(scope, key, owner)
+        if not items:
+            return None
+        active = [
+            i for i in items
+            if i.status in (MemoryStatus.ACTIVE, MemoryStatus.PENDING)
+        ]
+        candidates = active or items
+        return max(candidates, key=lambda i: i.updated_at)
+
+    def search(
+        self,
+        scope: MemoryScope,
+        text_like: str | None = None,
+        limit: int = 20,
+        owner: str | None = None,
+    ) -> list[MemoryItem]:
+        sql = "SELECT * FROM memories WHERE scope = %s AND status = %s"
+        params: list[Any] = [scope.name, MemoryStatus.ACTIVE.name]
+        if owner is not None:
+            sql += " AND owner = %s"
+            params.append(owner)
+        sql += " ORDER BY updated_at DESC"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        items = [SqliteMemoryStore._row_to_item(r) for r in rows]
+        if text_like:
+            needle = text_like.lower()
+            items = [i for i in items if needle in i.content.text.lower()]
+        return items[:limit]
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 def _now() -> _dt.datetime:
     return _dt.datetime.now(_dt.UTC)
 

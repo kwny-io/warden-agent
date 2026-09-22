@@ -95,7 +95,9 @@ def test_多副本前提写在配置里_共享状态与PG() -> None:
     cfg = _by_kind("ConfigMap")["data"]
     assert cfg.get("WARDEN_PG_HOST"), "多副本必须配 PostgreSQL"
     assert cfg.get("WARDEN_SHARED_STATE") == "1", "多副本必须开共享协调状态"
-    assert cfg.get("WARDEN_AUDIT") == "0", "审计目前只有 SQLite 实现，多副本下应先关（见已知边界）"
+    # 审计/记忆的后端跟着主存储走：PG 主存储 → PG 审计/记忆（多副本共享同一账本），
+    # 所以多副本**必须**开审计（关掉等于多副本交付没有审计）。
+    assert cfg.get("WARDEN_AUDIT") == "1", "PG 后端下审计应开启（多副本共享同一账本）"
 
 
 def test_模糊重启策略_先起后停() -> None:

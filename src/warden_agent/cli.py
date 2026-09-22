@@ -70,6 +70,46 @@ def _client() -> httpx.Client:
     return httpx.Client(base_url=DEFAULT_BASE, timeout=60.0, trust_env=False)
 
 
+def _open_audit_store(args: argparse.Namespace) -> tuple[object, str]:
+    """打开审计后端：默认 SQLite（`--db`）；`--pg` 则连 PostgreSQL（读 `WARDEN_PG_*`）。
+
+    返回 (store, 展示标签)。多副本部署审计落在 PG 上，`audit-verify`/`audit-export`
+    必须也能连 PG，否则"链校验"在最需要它的多副本场景用不了。
+    """
+    import os
+
+    from warden_agent.core.settings import env_int, env_opt, env_str
+    from warden_agent.web.audit import PostgresAuditStore
+
+    if getattr(args, "pg", False):
+        host = env_str("WARDEN_PG_HOST", "", os.environ).strip()
+        if not host:
+            _die("--pg 需要设置 WARDEN_PG_HOST（其余 WARDEN_PG_* 可选）")
+        label = f"postgres://{host}/{env_str('WARDEN_PG_DB', 'warden', os.environ)}"
+        store: Any
+        try:
+            store = PostgresAuditStore(connect_kwargs={
+                "host": host,
+                "port": env_int("WARDEN_PG_PORT", 5432, os.environ),
+                "dbname": env_str("WARDEN_PG_DB", "warden", os.environ),
+                "user": env_str("WARDEN_PG_USER", "postgres", os.environ),
+                "password": env_opt("WARDEN_PG_PASSWORD", os.environ) or "",
+            })
+        except Exception as e:  # noqa: BLE001 - 连不上就是打不开库
+            _die(f"无法连接审计库 {label}: {e}")
+        return store, label
+
+    from warden_agent.web.audit import SqliteAuditStore
+
+    db = _db_from_args(args)
+    sqlite_store: Any
+    try:
+        sqlite_store = SqliteAuditStore(db_path=db)
+    except Exception as e:  # 打不开库（路径不对/损坏）
+        _die(f"无法打开审计库 {db}: {e}")
+    return sqlite_store, db
+
+
 def _die(msg: str, code: int = 1) -> None:
     print(f"warden: 错误: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -404,17 +444,11 @@ def _cmd_audit_verify(args: argparse.Namespace) -> None:
     """
     import json
 
-    from warden_agent.web.audit import SqliteAuditStore
+    store, label = _open_audit_store(args)
 
-    db = _db_from_args(args)
-    try:
-        store = SqliteAuditStore(db_path=db)
-    except Exception as e:  # 打不开库（路径不对/损坏）
-        _die(f"无法打开审计库 {db}: {e}")
-
-    ok, detail = store.verify_chain()
+    ok, detail = store.verify_chain()  # type: ignore[attr-defined]
     if args.json:
-        print(json.dumps({"ok": ok, "detail": detail, "db": db}, ensure_ascii=False))
+        print(json.dumps({"ok": ok, "detail": detail, "db": label}, ensure_ascii=False))
     else:
         print(("✅ " if ok else "❌ ") + detail)
     if not ok:
@@ -462,16 +496,10 @@ def _cmd_audit_export(args: argparse.Namespace) -> None:
     import json
     from pathlib import Path
 
-    from warden_agent.web.audit import SqliteAuditStore
+    store, label = _open_audit_store(args)
 
-    db = _db_from_args(args)
-    try:
-        store = SqliteAuditStore(db_path=db)
-    except Exception as e:  # 打不开库（路径不对/损坏）
-        _die(f"无法打开审计库 {db}: {e}")
-
-    chain_ok, detail = store.verify_chain()
-    rows = store.export_records(after_id=args.after_id, limit=args.limit)
+    chain_ok, detail = store.verify_chain()  # type: ignore[attr-defined]
+    rows = store.export_records(after_id=args.after_id, limit=args.limit)  # type: ignore[attr-defined]
 
     suffix = "csv" if args.format == "csv" else "jsonl"
     try:
@@ -681,6 +709,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_audit = sub.add_parser("audit-verify", help="校验审计链是否完整（防篡改巡检）")
     p_audit.add_argument("--db", default="", help="审计库路径（默认取 WARDEN_DB_PATH）")
+    p_audit.add_argument("--pg", action="store_true",
+                         help="连 PostgreSQL 审计库（读 WARDEN_PG_*；多副本部署用）")
     p_audit.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_audit.set_defaults(func=_cmd_audit_verify)
 
@@ -688,6 +718,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "audit-export", help="导出审计记录（JSONL/CSV，顺带校验链是否完整）"
     )
     p_export.add_argument("--db", default="", help="审计库路径（默认取 WARDEN_DB_PATH）")
+    p_export.add_argument("--pg", action="store_true",
+                          help="连 PostgreSQL 审计库（读 WARDEN_PG_*；多副本部署用）")
     p_export.add_argument(
         "--out-dir", default="audit-exports", help="导出目录（默认 ./audit-exports）"
     )

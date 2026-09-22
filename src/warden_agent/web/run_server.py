@@ -65,7 +65,7 @@ from warden_agent.policy.policy import PolicyEngine, ask_when_tool_in
 from warden_agent.runtime.locking import run_lock_for
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog, function_tool
-from warden_agent.web.audit import SqliteAuditStore
+from warden_agent.web.audit import audit_store_for_backend
 from warden_agent.web.auth import ROLE_USER, TrustedCaller, admin_principals, role_for
 from warden_agent.web.coordination import coordination_for
 from warden_agent.web.outbound import outbound_from_env
@@ -397,8 +397,10 @@ def main() -> None:
     # 统一走 env_bool：此前这里是手写的 `in ("1","true","yes")`——**漏了 "on"**，
     # 与其它布尔开关的口径不一致（同一个变量的两种写法本来是这轮要消灭的东西）。
     if env_bool("WARDEN_AUDIT", False):
-        audit_store = SqliteAuditStore(_db_path())
-        logger.info("已开启审计（写入 SQLite audit_log 表）")
+        # 审计后端**跟着主存储走**：PG 主存储 → PG 审计（多副本共享同一账本，链写入跨副本串行）；
+        # 否则 SQLite。这样存储换 PG 时审计自动跟过去，不再需要"多副本记得关审计"这种部署约定。
+        audit_store = audit_store_for_backend(store, sqlite_db_path=_db_path())
+        logger.info("已开启审计（后端=%s）", type(audit_store).__name__)
 
     catalog = _build_catalog()
     planner, intent, ctx_chars = _cognition_from_env(os.environ, catalog, model)
@@ -416,11 +418,17 @@ def main() -> None:
             embedder_from_env(os.environ)[1],
         )
     # 记忆落盘：USER 作用域是"跨会话的用户级记忆"，进程内实现会让它在语义上成立、
-    # 实现上落空（重启即丢）。产品路径默认给一个 SQLite 记忆库。
-    from warden_agent.memory import SqliteMemoryStore
+    # 实现上落空（重启即丢）。产品路径默认给一个落盘记忆库；后端同样跟着主存储走——
+    # PG 主存储 → PG 记忆（多副本共享同一份记忆，否则 A 副本写的记忆 B 副本读不到）。
+    from warden_agent.memory import PostgresMemoryStore, SqliteMemoryStore
 
-    memory_repository = SqliteMemoryStore(_db_path())
-    logger.info("记忆：SqliteMemoryStore（落盘 %s，重启不丢）", _db_path())
+    memory_repository: Any
+    if getattr(store, "backend", "") == "postgres":
+        memory_repository = PostgresMemoryStore(conn=store.new_connection())
+        logger.info("记忆：PostgresMemoryStore（多副本共享同一份记忆）")
+    else:
+        memory_repository = SqliteMemoryStore(_db_path())
+        logger.info("记忆：SqliteMemoryStore（落盘 %s，重启不丢）", _db_path())
 
     # Web 工具：默认离线 mock；WARDEN_WEB_FETCH=1 才换成真实联网抓取
     web_providers = providers_from_env(os.environ)

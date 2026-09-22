@@ -5,6 +5,46 @@
 
 ---
 
+## 2026-09-23（第十七批：多副本一致性——审计与记忆落 PostgreSQL，关掉"多副本必须关审计"这个洞）
+
+> 此前多副本交付有个**自相矛盾**的地方：`deploy/k8s/configmap.yaml` 被迫写 `WARDEN_AUDIT=0`，
+> 因为审计只有 SQLite 实现、多副本下每副本一本账。等于"多副本对外交付**没有审计**"——
+> 合规上不可接受。记忆同理（`USER` 作用域在副本 A 记得、副本 B 读不到）。本批把两者接进共享库。
+
+### 1. 审计落 PostgreSQL（`PostgresAuditStore`）
+
+- 与 `SqliteAuditStore` 同语义：`append` / `query` / `verify_chain` / `export_records`，同一套 HMAC 链。
+- **跨副本链串行（关键）**：防篡改链要求新记录接在**唯一链头**之后；多副本并发写时两个副本
+  可能读到同一链头 → 链分叉、`verify_chain()` 从此报断链。用 Postgres 事务级咨询锁
+  `pg_advisory_xact_lock` 把"读链头 + 插入 + 回填哈希"整段串行化（锁随事务自动释放）。
+  → 新增真库测试 `test_多副本并发写链不分叉`：6 副本 × 5 条并发写，验链仍完整。
+- 审计后端**跟着主存储后端走**（`audit_store_for_backend`）：PG 主存储 → PG 审计，否则 SQLite。
+  存储换 PG 时审计自动跟过去，不再需要"多副本记得关审计"这种部署约定。
+
+### 2. 记忆落 PostgreSQL（`PostgresMemoryStore`）
+
+- 实现 `MemoryRepository`（save/find/find_ref/latest/search），行结构与 SQLite 版对齐，
+  按 `owner` 严格隔离。多副本共享同一份记忆，`USER` 作用域不再因副本而异。
+
+### 3. 装配与部署
+
+- `run_server`：审计/记忆后端均按主存储 `backend` 选择；启动日志报出实际用的后端。
+- `SqliteStore`/`PostgresStore` 增加 `backend` 标识（装配层据此判断，避免"存储换了、审计记忆没跟"）。
+- `deploy/k8s`：`WARDEN_AUDIT` 由 `0` 改为 `1`（PG 后端下多副本应开审计）；
+  secret 示例已含 `WARDEN_AUDIT_KEY`。对应离线结构守卫同步更新。
+- CLI：`warden audit-verify` / `audit-export` 新增 `--pg`，多副本（审计在 PG）时也能校验/导出链。
+
+### 4. 测试
+
+- 新增 `tests/test_postgres_audit_memory.py`（6 条，真库）：链完整 / 篡改必被发现（改回即恢复）/
+  **多副本并发写不分叉** / 记忆跨实例读回与归属隔离 / 状态与过期时间往返 / 后端选择正确。
+- 回归：`test_audit_chain` / `test_audit_export` / `test_memory*` / `test_k8s_manifests` /
+  `test_cli` / `test_postgres_*` / `test_run_server_wiring` 共 112 条全绿。
+
+> 仍未覆盖（需目标环境）：真 KMS 联云、OTLP 后端、LB 切流、目标 K8s 实部署与容量结论、真模型端到端。
+
+---
+
 ## 2026-09-22（第十六批：A 项收尾——可观测性实测 / 压测曲线 / K8s 参考部署，并抓出三个真 bug）
 
 > "部分完成"的三项：Grafana 看板、压测、K8s。**这次把它们从"文件已交付"推进到"实测过"**——

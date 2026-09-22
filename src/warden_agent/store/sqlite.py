@@ -69,11 +69,16 @@ def _now_iso() -> str:
 class SqliteStore:
     """一个最简单的 SQLite 存档点。存 Run 状态 + 对话历史。
 
+    `backend` 是给装配层看的后端标识：`run_server` 据此决定审计/记忆该用 SQLite 还是
+    跟着换到 PG（避免"存储换了、审计记忆还各自留在 SQLite"这种静默不一致）。
+
     线程安全说明：FastAPI 的同步接口跑在线程池里，SQLite 连接默认是"线程绑定"的
     （在哪线程创建就只能在哪线程用）。所以这里用 check_same_thread=False 允许跨线程，
     并用一把 Lock 串行化所有写操作，避免并发写冲突——这是 SQLite 在多线程 Web 服务里的
     标准做法。
     """
+
+    backend = "sqlite"
 
     def __init__(self, db_path: str | Path) -> None:
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)

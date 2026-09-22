@@ -28,10 +28,12 @@ data:
   # 事件总线用 LISTEN/NOTIFY 唤醒（仅 Postgres 有效）；它只降低延迟，正确性仍靠落表读表。
   WARDEN_EVENT_BUS: "notify"
 
-  # ---- 审计与记忆（⚠️ 目前只有 SQLite 实现）----
-  # 多副本下这两个**每副本一份、彼此不一致**（审计链各自独立、记忆各自一套）。
-  # 所以参考配置里先关掉；单副本可以开。见 docs/operations.md 的已知边界。
-  WARDEN_AUDIT: "0"
+  # ---- 审计与记忆 ----
+  # 后端**跟着主存储走**：配了 WARDEN_PG_HOST（上面）→ 审计落 PG（多副本共享同一账本，
+  # 链写入用 pg_advisory_xact_lock 跨副本串行），记忆落 PG（多副本共享同一份记忆）。
+  # 所以多副本可以（也应该）开审计；SQLite 后端只在单副本下用。
+  # ⚠️ 审计链密钥 WARDEN_AUDIT_KEY 必须在 Secret 里配，否则链退化为无密钥（挡不住重算整链）。
+  WARDEN_AUDIT: "1"
 
   # ---- 停机 ----
   # 收到 SIGTERM 后最多等 30s 把在飞请求跑完，然后关资源并退出。

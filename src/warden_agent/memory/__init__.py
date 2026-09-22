@@ -21,6 +21,7 @@ from warden_agent.memory.service import MemoryProposal, MemoryService
 from warden_agent.memory.store import (
     InMemoryMemoryStore,
     MemoryRepository,
+    PostgresMemoryStore,
     SqliteMemoryStore,
 )
 from warden_agent.memory.tools import (
@@ -40,6 +41,7 @@ __all__ = [
     "MemoryRepository",
     "InMemoryMemoryStore",
     "SqliteMemoryStore",
+    "PostgresMemoryStore",
     "MemoryProposal",
     "MemoryService",
     "current_owner",

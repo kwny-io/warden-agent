@@ -400,6 +400,267 @@ class SqliteAuditStore:
         self._conn.close()
 
 
+# 审计链在 Postgres 上的**事务级咨询锁**键：保证多副本写链串行（见 PostgresAuditStore）。
+# 取值本身无意义，只要是全局唯一的固定大整数即可。
+_AUDIT_CHAIN_LOCK = 0x7761_7264_656E_01
+
+
+def _pg_row_to_record(row: tuple[Any, ...]) -> AuditRecord:
+    """把一行 audit_log 变成 AuditRecord（列序与建表一致，PG 与 SQLite 同序）。"""
+    return AuditRecord(
+        correlation_id=row[1],
+        tenant_id=row[2],
+        principal_type=row[3],
+        principal_id=row[4],
+        product_id=row[5],
+        operation=row[6],
+        run_id=row[7],
+        method=row[8],
+        path=row[9],
+        status=row[10],
+        at=row[11],
+    )
+
+
+class PostgresAuditStore:
+    """PostgreSQL 落盘审计：与 `SqliteAuditStore` 同语义，但**多副本共享同一本账**。
+
+    为什么需要它：审计若只落 SQLite，多副本部署时每个副本各写各的库、账本互相不一致，
+    于是只能把审计关掉（`deploy/k8s` 里此前被迫写 `WARDEN_AUDIT=0`）——
+    等于"多副本对外交付"没有审计可言。企业级交付不能留这个洞。
+
+    **跨副本链串行（关键）**：防篡改链要求新记录接在**唯一链头**之后。多副本并发写时，
+    两个副本可能读到同一个链头 → 各写一条、链分叉，`verify_chain()` 从此报断链。
+    这里用 Postgres 的事务级咨询锁 `pg_advisory_xact_lock` 把
+    "读链头 + 插入 + 回填哈希"整段串行化：锁随事务结束自动释放，持有者崩溃也不留死锁。
+    （SQLite 版靠进程内锁，只在"单写入者"下成立——这正是它撑不起多副本的原因。）
+
+    构造：`conn` 给一条 psycopg 连接（run_server 用 `store.new_connection()` 另开一条，
+    避免与 Run 读写抢同一连接），或给 `connect_kwargs` 自行连接。
+    """
+
+    def __init__(
+        self,
+        conn: Any = None,
+        *,
+        connect_kwargs: Mapping[str, Any] | None = None,
+        chain_key: bytes | str | None = "env",
+    ) -> None:
+        if conn is not None:
+            self._conn = conn
+        elif connect_kwargs is not None:
+            import psycopg
+
+            self._conn = psycopg.connect(**connect_kwargs, autocommit=True)
+        else:
+            raise ValueError("PostgresAuditStore 需要 conn 或 connect_kwargs")
+        if chain_key == "env":
+            self._chain_key: bytes | None = audit_chain_key()
+        elif isinstance(chain_key, str):
+            self._chain_key = chain_key.encode("utf-8")
+        else:
+            self._chain_key = chain_key
+        if self._chain_key is None:
+            logger.warning(
+                "未配置 WARDEN_AUDIT_KEY：审计链退化为**不带密钥**的哈希链。"
+                "仍能发现「手改/删行」，但挡不住会重算整条链的人——生产环境请配置该密钥。"
+            )
+        self._init()
+
+    def _init(self) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id             BIGSERIAL PRIMARY KEY,
+                    correlation_id TEXT NOT NULL,
+                    tenant_id      TEXT NOT NULL,
+                    principal_type TEXT NOT NULL,
+                    principal_id   TEXT NOT NULL,
+                    product_id     TEXT NOT NULL,
+                    operation      TEXT NOT NULL,
+                    run_id         TEXT,
+                    method         TEXT NOT NULL,
+                    path           TEXT NOT NULL,
+                    status         INTEGER NOT NULL,
+                    at             DOUBLE PRECISION NOT NULL,
+                    prev_hash      TEXT NOT NULL DEFAULT '',
+                    hash           TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            # 老库补列（与 SQLite 版对齐；列加在末尾不影响 _row_to_record 的位置索引）
+            cur.execute(
+                "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT ''"
+            )
+        self._conn.commit()
+
+    def append(self, record: AuditRecord) -> None:
+        # 整段放进一个事务 + 咨询锁：多副本并发写时链头只被一方推进（见类说明）。
+        with self._conn.transaction(), self._conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_AUDIT_CHAIN_LOCK,))
+            cur.execute("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1")
+            head = cur.fetchone()
+            prev_hash = str(head[0]) if head and head[0] else GENESIS
+            # 行号要等插入后才知道，而哈希又必须写进该行 → 先插占位再回填（同 SQLite 版）
+            cur.execute(
+                "INSERT INTO audit_log ("
+                " correlation_id, tenant_id, principal_type, principal_id, product_id,"
+                " operation, run_id, method, path, status, at, prev_hash, hash)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, '')"
+                " RETURNING id",
+                (
+                    record.correlation_id,
+                    record.tenant_id,
+                    record.principal_type,
+                    record.principal_id,
+                    record.product_id,
+                    record.operation,
+                    record.run_id,
+                    record.method,
+                    record.path,
+                    record.status,
+                    record.at,
+                    prev_hash,
+                ),
+            )
+            row_id = int(cur.fetchone()[0])
+            digest = chain_hash(self._chain_key, record, prev_hash, row_id)
+            cur.execute(
+                "UPDATE audit_log SET hash = %s WHERE id = %s", (digest, row_id)
+            )
+
+    def verify_chain(self) -> tuple[bool, str]:
+        """整条链走一遍，校验每条记录的哈希与前后衔接。返回 (是否完整, 说明)。"""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, correlation_id, tenant_id, principal_type, principal_id,"
+                " product_id, operation, run_id, method, path, status, at,"
+                " prev_hash, hash FROM audit_log ORDER BY id"
+            )
+            rows = cur.fetchall()
+
+        prev_hash = GENESIS
+        for index, row in enumerate(rows):
+            row_id = int(row[0])
+            record = _pg_row_to_record(row)
+            stored_prev, stored_hash = str(row[12] or ""), str(row[13] or "")
+            if stored_hash == "":
+                return False, (
+                    f"第 {index + 1} 条（id={row_id}）没有链哈希——"
+                    "可能是加链之前写下的历史记录；无法证明它未被改动"
+                )
+            if stored_prev != prev_hash:
+                return False, (
+                    f"链条在 id={row_id} 处断开：它的 prev_hash={stored_prev[:12]}… "
+                    f"与上一条的 hash={prev_hash[:12]}… 不一致（该条之前有记录被删/被改）"
+                )
+            expect = chain_hash(self._chain_key, record, prev_hash, row_id)
+            if expect != stored_hash:
+                return False, (
+                    f"id={row_id} 的内容与它的哈希不符——这条记录被改动过"
+                    "（字段、时间或行号任一被改都会导致不匹配）"
+                )
+            prev_hash = stored_hash
+        return True, f"链完整：{len(rows)} 条记录，链头 {prev_hash[:12]}…"
+
+    def export_records(
+        self, *, after_id: int = 0, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """按 id 升序导出审计记录（含链字段），供归档/取证（语义同 SQLite 版）。"""
+        if limit is not None and limit > 0:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, correlation_id, tenant_id, principal_type, principal_id,"
+                    " product_id, operation, run_id, method, path, status, at,"
+                    " prev_hash, hash FROM audit_log WHERE id > %s ORDER BY id LIMIT %s",
+                    (int(after_id), int(limit)),
+                )
+                rows = cur.fetchall()
+        else:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, correlation_id, tenant_id, principal_type, principal_id,"
+                    " product_id, operation, run_id, method, path, status, at,"
+                    " prev_hash, hash FROM audit_log WHERE id > %s ORDER BY id",
+                    (int(after_id),),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "correlation_id": r[1],
+                "tenant_id": r[2],
+                "principal_type": r[3],
+                "principal_id": r[4],
+                "product_id": r[5],
+                "operation": r[6],
+                "run_id": r[7],
+                "method": r[8],
+                "path": r[9],
+                "status": r[10],
+                "at": r[11],
+                "prev_hash": r[12],
+                "hash": r[13],
+            }
+            for r in rows
+        ]
+
+    def query(
+        self,
+        *,
+        tenant_id: str | None = None,
+        run_id: str | None = None,
+        operation: str | None = None,
+        principal_id: str | None = None,
+        limit: int = 200,
+    ) -> list[AuditRecord]:
+        where: list[str] = []
+        params: list[Any] = []
+        if tenant_id is not None:
+            where.append("tenant_id = %s")
+            params.append(tenant_id)
+        if run_id is not None:
+            where.append("run_id = %s")
+            params.append(run_id)
+        if operation is not None:
+            where.append("operation = %s")
+            params.append(operation)
+        if principal_id is not None:
+            where.append("principal_id = %s")
+            params.append(principal_id)
+        # 子句是常量字面量、值走占位符——不做任何值拼接（本仓库硬约定）。
+        sql = "SELECT * FROM audit_log"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT %s"
+        params.append(int(limit) if limit and limit > 0 else 200)
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [_pg_row_to_record(r) for r in rows][::-1]
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def audit_store_for_backend(
+    store: Any, *, sqlite_db_path: str, chain_key: bytes | str | None = "env"
+) -> AuditStore:
+    """按**主存储后端**造配套的审计后端。
+
+    PG 主存储 → PG 审计（多副本共享同一账本，且链写入跨副本串行）；
+    否则 SQLite 审计（单副本默认）。这样"存储换 PG"时审计自动跟着走，
+    不用在部署里单独记得改——少一个"忘了就静默降级"的开关。
+    """
+    if getattr(store, "backend", "") == "postgres":
+        return PostgresAuditStore(conn=store.new_connection(), chain_key=chain_key)
+    return SqliteAuditStore(db_path=sqlite_db_path, chain_key=chain_key)
+
+
 class AuditLogger:
     """App 层的审计写入门面：决定"是否记录 + 记到哪个后端"。"""
 

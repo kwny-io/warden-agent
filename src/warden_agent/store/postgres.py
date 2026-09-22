@@ -35,6 +35,8 @@ def _now_iso() -> str:
 class PostgresStore:
     """PostgreSQL 持久化实现，接口与 SqliteStore 一致（见 store/base.py）。"""
 
+    backend = "postgres"
+
     def __init__(
         self,
         host: str = "localhost",
