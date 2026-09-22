@@ -89,15 +89,31 @@ warden backup /backup/warden.db     # 指定路径
 
 ### PostgreSQL 的备份
 
-本项目的 PG 备份**没有进代码**，用标准运维工具：
-
 ```bash
-pg_dump -Fc -h <host> -U <user> -d warden -f warden-$(date +%Y%m%d).dump   # 自定义格式
+# 备份（pg_dump -Fc + 产物校验；默认不覆盖已有文件）
+# 密码走 PGPASSWORD 环境变量（**不放命令行**，命令行会进 ps/history）
+PGPASSWORD=... warden backup-pg --host db --dbname warden --user warden
+
+# 恢复（标准工具；--clean --if-exists 会先清对象再导入）
 pg_restore -h <host> -U <user> -d warden --clean --if-exists warden-20260101.dump
 ```
 
-为什么没进代码：`pg_dump` 是运维工具、和本机是否装了那个客户端有关（**本机就没有**），
-与其塞一段没验证过的包装，不如把流程写清楚——**没验证过的东西不进代码**。
+- **为什么要装 postgresql-client**：`backup-pg` 依赖 `pg_dump`/`pg_restore`。
+  找不到时会**明确报错**（不会假装成功，更不会退化成 `cp` 数据目录——直接拷 PG 的数据目录是错的）。
+- **产物校验**：备份完立刻用 `pg_restore --list` 列一遍内容，列不出来就报错——不会留下
+  "看起来有、其实坏了"的备份（对应 SQLite 那边的 `PRAGMA integrity_check`）。
+
+### 备份保留策略（别让备份把盘撑满）
+
+```bash
+warden backup --keep 7                    # 备份后只留最近 7 份
+warden backup-pg --dbname warden --keep 7 # 同上（PG）
+warden backup-prune --dir /backup --keep 7          # 只演练：列出要删什么，**不删**
+warden backup-prune --dir /backup --keep 7 --yes    # 确认真删
+```
+
+删除**不可逆**，所以 `backup-prune` 默认只演练；`--keep` 不接受 0/负数（不提供"全删"这种危险解读）。
+排序用文件名里的时间戳（`<库名>.backup-<UTC时间戳>`），拿不到才退回文件修改时间。
 
 ---
 
@@ -205,7 +221,8 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | 熔断/出站并发/`InProcessRunLock` 的**进程内语义** | 每副本各一份 | 已文档化（多副本须用共享实现） |
 | **记忆按 `owner` 隔离**（2026-09-22 起） | 升级前写入的记忆 `owner` 为空串，**用户在 `/memory/{scope}` 与召回里看不到** | 空串 = 部署级共享；需要保留的旧数据应补写 `owner`（`UPDATE memories SET owner=? WHERE uid=?`） |
 | 幂等并发时返回 **409**（`IDEMPOTENCY_IN_FLIGHT`） | 同 `Idempotency-Key` 的第二个并发请求不再重复执行，改为明确拒绝 | 客户端应按幂等语义重试（带 `Retry-After`） |
-| SSRF 的 DNS 二次解析 TOCTOU | 校验用的 IP 与实际连接的 IP 可能不同（需攻击者控制权威 DNS 且赢下竞态） | 已知未消除；其余 SSRF 防护经审计确认有效 |
+| ~~SSRF 的 DNS 二次解析 TOCTOU~~ | **已消除（2026-09-22）**：校验与"要连哪个 IP"出自**同一次解析**，请求被固定到该 IP（`Host` 头 + `sni_hostname` 保留原主机名） | 回归测试：解析器第一次给公网、之后给 `127.0.0.1`，断言连的是公网且**只解析一次** |
+| **并发上升后 p95 明显变差** | 本机实测（离线假模型、单副本 SQLite）：并发 1 时 p50 0.83s，并发 8 时 p95 12.3s，像有串行化点 | **不是容量结论**，只是现象；要容量数字请在目标环境跑 `scripts/load_test.py` |
 
 ---
 

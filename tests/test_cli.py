@@ -20,6 +20,8 @@ _EXPECTED = {
     "coding": "_cmd_coding",
     "recover": "_cmd_recover",
     "backup": "_cmd_backup",
+    "backup-pg": "_cmd_backup_pg",
+    "backup-prune": "_cmd_backup_prune",
     "restore": "_cmd_restore",
     "stuck": "_cmd_stuck",
     "audit-verify": "_cmd_audit_verify",

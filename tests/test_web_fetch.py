@@ -46,16 +46,35 @@ def _resolver(mapping: dict[str, list[str]] | None = None):  # type: ignore[no-u
     return resolve
 
 
+class _Seen(list):
+    """记录请求的**逻辑 URL**（按 Host 头还原），并附带"实际连到哪"等物理信息。
+
+    为什么要分两栏：现在连接被固定到**已校验的 IP**（防 DNS rebinding），
+    所以"用户看到的 URL"和"实际连的地址"不再相同。
+    断言"请求了哪些 URL"看逻辑 URL；断言"连到哪个 IP / SNI 是什么"看 physical / sni。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.physical: list[str] = []
+        self.sni: list[str | None] = []
+
+
 def _mock(routes: dict[str, tuple[int, dict[str, str], str]]):  # type: ignore[no-untyped-def]
-    """造一个 MockTransport + 已请求 URL 列表。routes: url -> (status, headers, body)。"""
-    seen: list[str] = []
+    """造一个 MockTransport + 请求记录。routes: 逻辑URL -> (status, headers, body)。"""
+    seen = _Seen()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        seen.append(url)
-        if url not in routes:
-            return httpx.Response(500, content=f"未预置的路由: {url}")
-        status, headers, body = routes[url]
+        host = request.headers.get("host", "")
+        logical = f"{request.url.scheme}://{host}{request.url.path}"
+        if request.url.query:
+            logical += f"?{request.url.query}"
+        seen.append(logical)
+        seen.physical.append(str(request.url))
+        seen.sni.append(request.extensions.get("sni_hostname"))  # type: ignore[arg-type]
+        if logical not in routes:
+            return httpx.Response(500, content=f"未预置的路由: {logical}")
+        status, headers, body = routes[logical]
         return httpx.Response(status, headers=headers, content=body.encode("utf-8"))
 
     return httpx.MockTransport(handler), seen
@@ -189,6 +208,76 @@ def test_重定向到公网正常跟随() -> None:
     result = provider.fetch("https://a.example.com/")
     assert result.content == "到了"
     assert seen == ["https://a.example.com/", "https://b.example.com/ok"]
+
+
+# ---------- 连接固定到已校验 IP（防 DNS rebinding）----------
+
+
+def test_连接固定到已校验IP_防DNS重绑定() -> None:
+    """核心回归：域名"校验时解析到公网、连接时改解析到环回"必须无效。
+
+    做法：resolver 第一次返回公网 IP，之后一律返回 127.0.0.1（模拟 rebinding）。
+    实现若"校验一次、连接时再解析一次"，连接就会打到 127.0.0.1 —— 这正是审计指出的口子。
+    现在连接用的是**校验时那个 IP**，所以：
+      - 实际连的是公网 IP；
+      - resolver 只被调用一次（证明没有二次解析）。
+    """
+    calls = {"n": 0}
+
+    def rebinding_resolver(host: str) -> list[str]:
+        calls["n"] += 1
+        return [PUBLIC_IP] if calls["n"] == 1 else ["127.0.0.1"]
+
+    transport, seen = _mock({
+        "https://example.com/": (200, {"content-type": "text/plain"}, "ok"),
+    })
+    provider = HttpFetchProvider(transport=transport, resolver=rebinding_resolver)
+
+    assert provider.fetch("https://example.com/").content == "ok"
+    assert seen.physical == [f"https://{PUBLIC_IP}/"], f"连到了 {seen.physical}"
+    assert "127.0.0.1" not in " ".join(seen.physical)
+    assert calls["n"] == 1, "校验与连接必须同源：不该再解析第二次"
+
+
+def test_固定连接时保留主机名与SNI() -> None:
+    """换成 IP 连之后，Host 头与 TLS SNI 必须仍是原主机名——否则虚拟主机/证书校验会挂。"""
+    transport, seen = _mock({
+        "https://example.com/x": (200, {"content-type": "text/plain"}, "ok"),
+    })
+    provider = HttpFetchProvider(transport=transport, resolver=_resolver())
+    assert provider.fetch("https://example.com/x").content == "ok"
+    assert seen == ["https://example.com/x"]        # 逻辑 URL（按 Host 头还原）不变
+    assert seen.sni == ["example.com"]              # HTTPS 带上了 sni_hostname
+
+
+def test_解析失败时拒绝而不是回落成不固定连接() -> None:
+    """解析不出来时必须**拒绝**：回落到"不 pin 的连接"等于把 SSRF 的洞重新打开。"""
+    transport, seen = _mock({})
+    provider = HttpFetchProvider(transport=transport, resolver=lambda host: [])
+    result = provider.fetch("https://example.com/")
+    assert result.error is not None and "[拒绝]" in result.error
+    assert seen == [], "被拒的请求不该发出去"
+
+
+def test_IPv6地址固定时加方括号() -> None:
+    """IPv6 字面量在 URL 里必须加方括号，否则拼出来的 URL 是非法的。"""
+    v6 = "2606:2800:220:1:248:1893:25c8:1946"
+    transport, seen = _mock({
+        "https://v6.example.com/": (200, {"content-type": "text/plain"}, "ok"),
+    })
+    provider = HttpFetchProvider(transport=transport, resolver=lambda host: [v6])
+    assert provider.fetch("https://v6.example.com/").content == "ok"
+    assert seen.physical == [f"https://[{v6}]/"]
+
+
+def test_带端口的URL固定后端口保留() -> None:
+    transport, seen = _mock({
+        "https://example.com:8443/a": (200, {"content-type": "text/plain"}, "ok"),
+    })
+    provider = HttpFetchProvider(transport=transport, resolver=_resolver())
+    assert provider.fetch("https://example.com:8443/a").content == "ok"
+    assert seen.physical == [f"https://{PUBLIC_IP}:8443/a"]
+    assert seen == ["https://example.com:8443/a"]
 
 
 def test_跳转次数超上限() -> None:

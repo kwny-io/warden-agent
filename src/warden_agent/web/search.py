@@ -125,6 +125,33 @@ def html_to_text(raw: str) -> str:
     return "\n".join(line.strip() for line in text.splitlines()).strip()
 
 
+def _pin_to_validated_ip(
+    url: str, ip: str
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """把请求固定到**已校验的那个 IP**，返回 `(请求URL, 额外头, extensions)`。
+
+    入参 `ip` 必须来自**同一次**解析校验（见 `WebUrlPolicy.resolve_for_connection`）——
+    这里**不再解析 DNS**。这是关键：如果这里重新解析一次，"校验时是公网、连接时是内网"
+    的 DNS rebinding 窗口就又打开了。
+
+    从 URL 里把主机名拆出去、换成 IP，同时：
+      - `Host` 头保留原名（虚拟主机 / 签名要用）；
+      - HTTPS 用 `sni_hostname` 扩展保留 SNI 与**证书校验的主机名**。
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    netloc = f"[{ip}]" if ":" in ip else ip          # IPv6 要加方括号
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    request_url = parsed._replace(netloc=netloc).geturl()
+    host_header = host if parsed.port is None else f"{host}:{parsed.port}"
+    extra_headers = {"Host": host_header}
+    extensions: dict[str, Any] = (
+        {"sni_hostname": host} if parsed.scheme.lower() == "https" else {}
+    )
+    return request_url, extra_headers, extensions
+
+
 class HttpFetchProvider:
     """**真实联网抓取**：httpx GET 一个公网 URL，返回可读的文本正文。
 
@@ -179,23 +206,34 @@ class HttpFetchProvider:
         """
         current = url
         for _ in range(self.max_redirects + 1):
-            ok, reason = WebUrlPolicy.check_for_network(current, self._resolver)
+            # 校验与"要连哪个 IP"出自**同一次解析**，随后直接把请求固定到该 IP——
+            # 这样就不存在"校验一次、连接再解析一次"的 DNS rebinding 窗口。
+            ok, reason, ip = WebUrlPolicy.resolve_for_connection(current, self._resolver)
             if not ok:
                 raise ValueError(f"[拒绝] {reason}")
-            result, location = self._fetch_once(current)
+            result, location = self._fetch_once(current, ip)
             if location is None:
                 return result
             current = urljoin(current, location)
         raise ValueError(f"跳转次数超过上限 {self.max_redirects}（起始 {url}）")
 
-    def _fetch_once(self, url: str) -> tuple[WebFetchResult, str | None]:
-        """抓一跳。返回 (结果, 下一跳地址或 None)。"""
+    def _fetch_once(self, url: str, ip: str | None) -> tuple[WebFetchResult, str | None]:
+        """抓一跳。返回 (结果, 下一跳地址或 None)。
+
+        `ip` 是**已校验**的连接目标（来自 `resolve_for_connection`）；请求会固定到它，
+        同时用 `Host` 头与 `sni_hostname` 保留原主机名。
+        """
         headers = {"User-Agent": self.user_agent, "Accept": "text/*,application/json"}
         # 链路追踪：把当前链路的 traceparent 带给出站请求，下游（若也支持 W3C trace）
         # 的日志才能和我们的这次调用对上。没有开启追踪时 current_traceparent() 返回 None。
         traceparent = current_traceparent()
         if traceparent:
             headers["traceparent"] = traceparent
+        request_url = url
+        extensions: dict[str, Any] = {}
+        if ip:
+            request_url, extra_headers, extensions = _pin_to_validated_ip(url, ip)
+            headers.update(extra_headers)
         with (
             httpx.Client(
                 timeout=self.timeout_s,
@@ -203,7 +241,7 @@ class HttpFetchProvider:
                 follow_redirects=False,   # 见 _follow：绝不自动跳
                 transport=self._transport,
             ) as client,
-            client.stream("GET", url) as resp,
+            client.stream("GET", request_url, extensions=extensions) as resp,
         ):
             if resp.is_redirect:
                 return (
@@ -378,18 +416,33 @@ class WebUrlPolicy:
         """静态检查 + DNS 解析校验。真实联网 provider 发请求前必须调用。
 
         校验**所有**解析结果：任意一个落到内网/环回/保留段就整体拒绝。
+
+        ⚠️ 但"先查后连"本身不够——**连接必须用这次校验出来的那个 IP**
+        （见 `resolve_for_connection`）。只查不 pin，域名可以在两次解析之间改指向。
+        """
+        ok, reason, _ip = WebUrlPolicy.resolve_for_connection(url, resolver)
+        return ok, reason
+
+    @staticmethod
+    def resolve_for_connection(
+        url: str, resolver: Callable[[str], Iterable[str]] | None = None
+    ) -> tuple[bool, str, str | None]:
+        """静态检查 + DNS 校验，并**返回这次连接要用的 IP**（校验与连接同源）。
+
+        返回 `(是否允许, 原因, 要连接的 IP)`。这是消除 SSRF 里 DNS rebinding 窗口的关键：
+        调用方拿到这个 IP 后必须**直接连它**，不能再解析一次。
         """
         ok, reason = WebUrlPolicy.check(url)
         if not ok:
-            return ok, reason
+            return False, reason, None
         host = urlparse(url).hostname or ""
         ips = _resolve_all(host, resolver)
-        if ips is None:
-            return False, f"域名 {host!r} 解析失败"
+        if not ips:
+            return False, f"域名 {host!r} 解析失败", None
         bad = [ip for ip in ips if not _is_public_ip(ip)]
         if bad:
-            return False, f"域名 {host!r} 解析到非公网地址 {bad}（拒绝，防 SSRF）"
-        return True, "ok"
+            return False, f"域名 {host!r} 解析到非公网地址 {bad}（拒绝，防 SSRF）", None
+        return True, "ok", ips[0]
 
 
 # ---- 工具集 ----

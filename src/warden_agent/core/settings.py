@@ -271,6 +271,11 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
             "execution/sandbox.py", ("execution/sandbox.py",)),
     # ---- CLI ----
     EnvSpec(
+        "PGPASSWORD", "PostgreSQL 密码（`warden backup-pg` 传给 pg_dump 用）",
+        "cli.py", ("cli.py",), sensitive=True,
+        note="**不放命令行**（命令行会进 ps/history）；这是 libpq 的标准变量名",
+    ),
+    EnvSpec(
         "WARDEN_SERVER_URL", "CLI 要连的 Warden 服务地址",
         "cli.py", ("cli.py",), default="http://127.0.0.1:8000",
         note="**不是** WARDEN_BASE_URL（那是 custom 模型的端点）",

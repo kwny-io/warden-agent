@@ -11,6 +11,8 @@
   warden coding "<需求>"             本地编码任务（读代码 → 出 diff → 门禁落地）
   warden recover                    本地读存档点，输出跨 Run 恢复计划（只判断不执行）
   warden backup [dest]              做一份一致性备份（SQLite 在线备份 API）
+  warden backup-pg --dbname X       PostgreSQL 备份（pg_dump -Fc + 产物校验）
+  warden backup-prune --dir D --keep N  按保留策略清理备份（默认只演练，--yes 才真删）
   warden restore <backup> [--force] 从备份恢复（破坏性，会覆盖目标库）
   warden stuck [--older-than-min N] 列出等待人工处理超时的 run（接告警用，有则退出码 3）
   warden audit-verify               校验审计链是否完整（被动过则退出码 4）
@@ -32,6 +34,7 @@ import argparse
 import os
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -261,6 +264,77 @@ def _cmd_backup(args: argparse.Namespace) -> None:
     print(f"备份完成：{info['backup']}")
     print(f"  源库：{info['source']}")
     print(f"  大小：{info['bytes']} 字节｜校验：{info['verified']}")
+    if args.keep:
+        _prune_after_backup(Path(str(info["backup"])).parent, args.keep, args.dry_run)
+
+
+def _prune_after_backup(directory: Path, keep: int, dry_run: bool) -> None:
+    """备份后按保留策略清理旧备份（`--keep N`）。"""
+    from typing import cast
+
+    from warden_agent.runtime.backup import BackupError, prune_backups
+
+    try:
+        result = prune_backups(directory, keep, dry_run=dry_run)
+    except BackupError as e:
+        _die(str(e))
+    tail = "（演练，未真删）" if result["dry_run"] else ""
+    removed = cast("list[str]", result["removed"])
+    print(f"保留策略 keep={keep}{tail}：目录内 {result['found']} 份，保留 {result['kept']}，"
+          f"待删/已删 {len(removed)}")
+    for path in removed:
+        print(f"  - {path}")
+
+
+def _cmd_backup_prune(args: argparse.Namespace) -> None:
+    """按保留策略清理备份目录（默认**只演练**，加 `--yes` 才真删）。
+
+    删除不可逆，所以默认干跑：先看清要删什么，再决定。
+    """
+    from typing import cast
+
+    from warden_agent.runtime.backup import BackupError, prune_backups
+
+    dry_run = not args.yes
+    try:
+        result = prune_backups(args.dir, args.keep, pattern=args.pattern, dry_run=dry_run)
+    except BackupError as e:
+        _die(str(e))
+    removed = cast("list[str]", result["removed"])
+    print(f"目录：{result['directory']}（匹配 {result['pattern']}）")
+    print(f"共 {result['found']} 份，保留最近 {args.keep} 份，"
+          f"{'待删' if dry_run else '已删'} {len(removed)} 份"
+          + ("（演练，未真删；确认无误加 --yes）" if dry_run else ""))
+    for path in removed:
+        print(f"  - {path}")
+
+
+def _cmd_backup_pg(args: argparse.Namespace) -> None:
+    """PostgreSQL 备份（`pg_dump -Fc` + 产物校验）。
+
+    密码走 `PGPASSWORD` 环境变量（libpq 的标准变量名），**不放命令行**——
+    命令行参数会出现在 `ps` 与 shell history 里。
+    """
+    from warden_agent.core.settings import env_opt
+    from warden_agent.runtime.backup import BackupError, backup_postgres
+
+    params = {
+        "host": args.host, "port": args.port,
+        "dbname": args.dbname, "user": args.user,
+        "password": env_opt("PGPASSWORD"),
+    }
+    try:
+        info = backup_postgres(
+            params, args.dest or None,
+            pg_dump_bin=args.pg_dump, pg_restore_bin=args.pg_restore,
+        )
+    except BackupError as e:
+        _die(str(e))
+    print(f"备份完成：{info['backup']}")
+    print(f"  源库：{info['source']}")
+    print(f"  大小：{info['bytes']} 字节｜格式：{info['format']}｜校验：{info['verified']}")
+    if args.keep:
+        _prune_after_backup(Path(str(info["backup"])).parent, args.keep, args.dry_run)
 
 
 def _cmd_restore(args: argparse.Namespace) -> None:
@@ -554,6 +628,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "dest", nargs="?", default="", help="备份文件路径（默认带时间戳自动命名）"
     )
     p_backup.add_argument("--db", default="", help="源库路径（默认取 WARDEN_DB_PATH）")
+    p_backup.add_argument("--keep", type=int, default=0, help="备份后只保留最近 N 份（0 = 不清）")
+    p_backup.add_argument("--dry-run", action="store_true", help="保留策略只演练、不真删")
     p_backup.set_defaults(func=_cmd_backup)
 
     p_restore = sub.add_parser("restore", help="从备份恢复（破坏性：会覆盖目标库）")
@@ -561,6 +637,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p_restore.add_argument("--db", default="", help="目标库路径（默认取 WARDEN_DB_PATH）")
     p_restore.add_argument("--force", action="store_true", help="目标库已存在时确认覆盖")
     p_restore.set_defaults(func=_cmd_restore)
+
+    p_bpg = sub.add_parser("backup-pg", help="PostgreSQL 备份（pg_dump -Fc + 产物校验）")
+    p_bpg.add_argument("--host", default="localhost", help="数据库主机（默认 localhost）")
+    p_bpg.add_argument("--port", default="5432", help="端口（默认 5432）")
+    p_bpg.add_argument("--dbname", required=True, help="库名")
+    p_bpg.add_argument("--user", default="", help="用户名")
+    p_bpg.add_argument("--dest", default="", help="备份文件路径（默认按时间自动命名）")
+    p_bpg.add_argument("--pg-dump", default="pg_dump", help="pg_dump 可执行文件（默认取 PATH）")
+    p_bpg.add_argument("--pg-restore", default="pg_restore", help="pg_restore（用于校验产物）")
+    p_bpg.add_argument("--keep", type=int, default=0, help="备份后只保留最近 N 份（0 = 不清）")
+    p_bpg.add_argument("--dry-run", action="store_true", help="保留策略只演练、不真删")
+    p_bpg.set_defaults(func=_cmd_backup_pg)
+
+    p_prune = sub.add_parser(
+        "backup-prune", help="按保留策略清理备份目录（默认只演练，--yes 才真删）"
+    )
+    p_prune.add_argument("--dir", required=True, help="备份目录")
+    p_prune.add_argument("--keep", type=int, required=True, help="保留最近 N 份")
+    p_prune.add_argument("--pattern", default="*.backup-*", help="匹配的备份文件名模式")
+    p_prune.add_argument("--yes", action="store_true", help="确认真删（不加则只演练）")
+    p_prune.set_defaults(func=_cmd_backup_prune)
 
     p_stuck = sub.add_parser("stuck", help="列出等待人工处理超时的 run（接告警用）")
     p_stuck.add_argument(
