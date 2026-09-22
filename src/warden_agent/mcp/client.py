@@ -193,3 +193,24 @@ class McpClient:
 def node_available() -> bool:
     """检测 node 是否可用（MCP 客户端依赖它）。"""
     return shutil.which("node") is not None
+
+
+def client_ready() -> tuple[bool, str]:
+    """本机能不能**真正**连上 MCP server：需要 node + ts 客户端的依赖已安装。
+
+    返回 `(可用, 原因)`。运维排查「MCP 工具为什么没导入」时也直接用它。
+
+    为什么要有这个函数（而不是"跑起来试试、失败再跳过"）：
+      MCP 集成测试原先在连接失败时 `pytest.skip()` ——这会让"到底跑没跑"变得不确定：
+      跳过数在不同环境、甚至不同次运行之间漂移，而「该跑的被静默跳过」和「通过了」在 CI 里
+      看起来一样绿（同一个坑在 PG 集成测试上也踩过，见 CI 里那条防静默跳过的断言）。
+      把可用性**提前判定**，判定为可跑之后连接失败就应当**失败**——那才是真问题。
+    """
+    if not node_available():
+        return False, "没有 node"
+    cli = Path(_DEFAULT_CLI)
+    if not cli.exists():
+        return False, f"ts 客户端入口不存在：{cli}"
+    if not (cli.parent / "node_modules").is_dir():
+        return False, "ts 客户端依赖未安装（在 ts/mcp-client 下执行 npm install）"
+    return True, "ok"

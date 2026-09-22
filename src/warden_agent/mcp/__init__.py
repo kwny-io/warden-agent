@@ -12,6 +12,7 @@ from warden_agent.mcp.client import (
     McpImportReport,
     McpImportReview,
     McpToolBinding,
+    client_ready,
     node_available,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "McpImportReport",
     "McpImportReview",
     "McpToolBinding",
+    "client_ready",
     "node_available",
 ]
