@@ -83,31 +83,19 @@ logger = logging.getLogger(__name__)
 API_VERSION = "1.0"
 
 
-def _cache_idem_response(
-    store: IdempotencyStore, key: str, response: Any
-) -> None:
-    """把响应缓存进幂等表。
-
-    注意：本函数不消费 body 流——因为中间件里拿到 response 时 body 尚未被消费，
-    但流只能消费一次。这里只把"可缓存"的信息结构记下，真正的 body 读取同步在
-    _gateway 里用 async for 完成并重建 response。
-    """
-    store.put(key, {
-        "status_code": response.status_code,
-        "headers": dict(response.headers),
-        # body 由调用方（_gateway）填充
-        "body": None,
-    })
-
-
 async def _drain_and_rebuild(
     response: Any, store: IdempotencyStore, key: str
 ) -> Any:
-    """消费 response 的 body 流，缓存进幂等表，返回一个可重放的新 Response。"""
+    """消费 body 流，把**完整快照**（状态码/头/body）写进幂等表，返回可重放的新 Response。
+
+    注意快照以**这次响应自己**为准，而不是去改那条"处理中"占位——占位的 status_code 是 0。
+    """
     body_bytes = b"".join([chunk async for chunk in response.body_iterator])
-    item = store.get(key) or {}
-    item["body"] = body_bytes
-    store.put(key, item)
+    store.put(key, {
+        "status_code": response.status_code,
+        "headers": dict(response.headers),
+        "body": body_bytes,
+    })
 
     headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
     return JSONResponse(
@@ -257,6 +245,7 @@ class SessionRegistry:
         store: SqliteStore,
         system_prompt: str = "你是一个能使用工具的助手。",
         extra: dict[str, Any] | None = None,
+        default_model_id: str = "",
         stability: Any = None,
         planner: Any = None,
         intent: Any = None,
@@ -264,6 +253,10 @@ class SessionRegistry:
         checkpoint_store: Any = None,
     ) -> None:
         self._model = model
+        self._default_model_id: str = default_model_id
+        # 按归属者（用户）记的模型选择：多用户下不能让任一个人切走所有人的模型
+        # （那是跨租户影响：全体对话改走他的 key，或被他切成离线假模型）。
+        self._owner_models: dict[str, tuple[str, AgentChatModel]] = {}
         self._catalog = catalog
         self._policy = policy
         self._store = store
@@ -275,7 +268,9 @@ class SessionRegistry:
         self._checkpoint_store = checkpoint_store
         self.extra = extra or {}  # 额外能力（如 memory_service / skill_catalog）
         self._sessions: dict[str, AgentSession] = {}
-        self._lock = threading.Lock()
+        # RLock（可重入）：`get()` 持锁时还要调 `model_for()` 解析归属者模型，
+        # 用普通 Lock 会自锁死。
+        self._lock = threading.RLock()
 
     def get(self, run_id: str) -> AgentSession:
         """取会话；没有就基于数据库恢复/新建一个。"""
@@ -300,6 +295,10 @@ class SessionRegistry:
                     checkpoint_store=self._checkpoint_store,
                 )
                 self._sessions[run_id] = sess
+            else:
+                # 已有会话：按它的归属者解析模型（这也是 approve/reject 等驱动路径
+                # 不需要各自再解析一次的原因）
+                sess.model = self.model_for(sess.run.user_id or None)[1]
             return sess
 
     def remove(self, run_id: str) -> None:
@@ -312,12 +311,35 @@ class SessionRegistry:
         with self._lock:
             return list(self._sessions.keys())
 
-    def set_model(self, model: AgentChatModel) -> None:
-        """运行时切换模型：替换默认模型，并同步到所有已缓存的会话。"""
+    def set_model(self, model: AgentChatModel, *, model_id: str = "",
+                  owner: str | None = None) -> None:
+        """切换模型。
+
+        `owner=None` → 部署默认（所有会话）；给定时 → **只切该归属者的会话**，
+        并把选择记在该用户名下。多用户部署里普通用户只能影响自己的会话。
+        """
         with self._lock:
-            self._model = model
+            if owner is None:
+                self._model = model
+                self._default_model_id = model_id
+            else:
+                self._owner_models[owner] = (model_id, model)
             for sess in self._sessions.values():
-                sess.model = model
+                if owner is None or sess.run.user_id == owner:
+                    sess.model = model
+
+    def model_for(self, owner: str | None = None) -> tuple[str, AgentChatModel]:
+        """解析某归属者当前该用的 (model_id, model)：没选过就回落到部署默认。"""
+        with self._lock:
+            if owner:
+                got = self._owner_models.get(owner)
+                if got is not None:
+                    return got
+            return (self._default_model_id, self._model)
+
+    def apply_owner_model(self, sess: AgentSession) -> None:
+        """把会话的模型同步成"它的归属者选的那个"（首次绑定归属后调一次）。"""
+        sess.model = self.model_for(sess.run.user_id or None)[1]
 
 
 def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
@@ -458,6 +480,7 @@ def build_app(
     )
     registry = SessionRegistry(
         model, catalog, policy, store, system_prompt, extra,
+        default_model_id=model_id,
         stability=build_stability_executor(stability),
         planner=planner,
         intent=intent,
@@ -551,8 +574,10 @@ def build_app(
         `configured` 按调用者视角计算：自己导入过、或部署级配过，都算已配置。
         """
         scope = _credential_scope(request)
+        owner = _identity(request, None)
         return {
-            "current": current_model_id,
+            # 当前模型按**调用者自己的选择**报（没选过则显示部署默认）
+            "current": registry.model_for(owner)[0] or current_model_id,
             "models": [
                 {
                     "id": mid,
@@ -571,8 +596,10 @@ def build_app(
 
         导入的 key 记在**调用者自己的作用域**下：同租户的其他用户读不到、用不了；
         部署级（启动配置）的那把则全体可见。
+
+        **切换只作用于调用者自己**：否则任一认证用户就能把所有人的对话切成离线假模型
+        （跨租户 DoS），或切到用自己的 key 计费（把别人的额度记到自己头上）。
         """
-        nonlocal current_model_id
         scope = _credential_scope(request)
         info = model_catalog.get(body.id)
         if info is None:
@@ -582,12 +609,12 @@ def build_app(
             raise HTTPException(
                 status_code=400, detail=f"{info['name']} 需要先导入 API Key"
             )
-        registry.set_model(info["make"](key))
+        owner = _identity(request, None)
+        registry.set_model(info["make"](key), model_id=body.id, owner=owner)
         if body.api_key:
             broker.register(_model_key_name(body.id), {"api_key": body.api_key}, scope)
             redactor.add(body.api_key)
-        current_model_id = body.id
-        return {"ok": True, "current": current_model_id}
+        return {"ok": True, "current": registry.model_for(owner)[0] or body.id}
 
     # ---- T8 可观测性：指标定义（全局注册表，Prometheus 文本输出）----
     m = metrics()
@@ -697,10 +724,23 @@ def build_app(
             # 流式端点(SSE)不参与幂等缓存（消费流会破坏它）。
             idem_key = request.headers.get("Idempotency-Key")
             is_stream = path.startswith("/events") or path.startswith("/chat/stream")
+            # 幂等：带 Idempotency-Key 的 POST，同 key 重复请求返回同一结果。
+            # 关键在**先原子占位再执行**——"先查后做后写"有 TOCTOU：两个同 key 请求
+            # 会都在"查"处读到空，于是各执行一次副作用（正是网关重试/多副本要防的）。
+            idem_reserved = False
             if idem_key and method == "POST" and not is_stream:
                 cached_resp = _idem_response_from_store(idem_store, idem_key)
                 if cached_resp is not None:
                     return cached_resp
+                if not idem_store.reserve(idem_key):
+                    # 另一个同 key 请求正在处理中：明确回 409，别让它并发执行第二遍
+                    status_code = 409
+                    return _problem(
+                        409, "IDEMPOTENCY_IN_FLIGHT",
+                        "同一 Idempotency-Key 的请求正在处理中，请稍后重试",
+                        correlation_id, extra_headers={"Retry-After": "1"},
+                    )
+                idem_reserved = True
             response = await call_next(request)
             status_code = response.status_code
             response.headers["X-Correlation-Id"] = correlation_id
@@ -708,16 +748,21 @@ def build_app(
             if trace_ctx is not None:
                 # 把本链路的 traceparent 回给调用方：它可作为"这次请求在链上的位置"的对账凭据
                 response.headers["traceparent"] = trace_ctx.to_traceparent()
-            if idem_key and method == "POST" and not is_stream and status_code < 500:
-                # 仅缓存成功结果；5xx 不缓存以便重试。消费流并重建可重放响应。
-                _cache_idem_response(idem_store, idem_key, response)
-                response = await _drain_and_rebuild(response, idem_store, idem_key)
+            if idem_key and method == "POST" and not is_stream:
+                if status_code < 500:
+                    # 只缓存成功结果；5xx 不缓存，并**释放占位**以便客户端重试
+                    response = await _drain_and_rebuild(response, idem_store, idem_key)
+                elif idem_reserved:
+                    idem_store.release(idem_key)
             return response
         except Exception as exc:  # noqa: BLE001 - 网关兜底，不泄漏内部细节
             # 异常信息可能带上请求体/URL 里的密钥，落日志前先脱敏
             logger.exception(
                 "网关异常 method=%s path=%s err=%s", method, path, redactor.redact(str(exc))
             )
+            # 执行失败要释放占位，否则这个 key 会永久卡在"处理中"，客户端永远重试不了
+            if idem_reserved and idem_key:
+                idem_store.release(idem_key)
             return _problem(500, "INTERNAL_ERROR", "请求未能完成", correlation_id)
         finally:
             # T8 指标：请求数 + 耗时分布 + 5xx 错误数（耗时直方图：桶已在注册时绑定）
@@ -783,14 +828,20 @@ def build_app(
     def audit_view(request: Request) -> list[dict[str, Any]]:
         """返回最近的审计轨迹（含 correlation_id / 调用者 / 操作 / 结果状态）。
 
-        认证模式下只返回**调用者所在租户**的记录——审计是合规数据，
-        跨租户读取等于把别人家的操作账本交出去。
+        认证模式下只返回**调用者自己**的记录。为什么是"按人"而不是"按租户"：
+        本项目的多用户配置（`WARDEN_API_KEYS`）默认共用同一个 `WARDEN_TENANT`（默认 `local`），
+        即**租户 ≠ 用户**——只按 tenant 过滤，等于把同租户其他人的操作账本（含 run_id、
+        身份、访问路径）交给任意一个认证用户，既能窥探又能枚举账号。
+        这里与 `/runs`、`/approvals` 保持同一口径：按调用者收敛。
         """
         if audit is None:
             raise HTTPException(status_code=404, detail="未开启审计(audit_store=None)")
         caller: TrustedCaller | None = getattr(request.state, "caller", None)
         tenant = caller.tenant_id if caller is not None else None
-        records = audit_store.query(limit=200, tenant_id=tenant)  # type: ignore[union-attr]
+        principal = caller.user_id if caller is not None else None
+        records = audit_store.query(  # type: ignore[union-attr]
+            limit=200, tenant_id=tenant, principal_id=principal
+        )
         return [r.to_dict() for r in records]
 
     # ---- 跨 Run 恢复：崩溃/重启后"哪些该续、哪些该重试、哪些该等人" ----
@@ -901,6 +952,8 @@ def build_app(
             if not sess.run.user_id:
                 # 首轮对话建立归属：认证模式下身份来自凭证（user_id 参数被忽略）
                 sess.run.user_id = _identity(request, user_id)
+                # 归属刚定下来 → 把模型同步成"这个用户选的那个"（没选过就是部署默认）
+                registry.apply_owner_model(sess)
             try:
                 outcome = sess.start(body.text)
             except Exception as e:  # 工具未注册 / 被 DENY 等
@@ -1113,7 +1166,7 @@ def build_app(
 
     @app.post("/chat/stream/{run_id}")
     def chat_stream(
-        run_id: str, body: ChatRequestIn, user_id: str = "demo-user"
+        request: Request, run_id: str, body: ChatRequestIn, user_id: str = "demo-user"
     ) -> StreamingResponse:
         """流式对话（SSE 打字机）：模型边生成边把增量推给前端。
         前端拿到增量直接渲染，就能看到"逐字打出"的效果。"""
@@ -1123,7 +1176,10 @@ def build_app(
         lease = _acquire_run(run_id)
         sess = registry.get(run_id)
         if not sess.run.user_id:
-            sess.run.user_id = user_id  # 首次对话的会话归属当前用户
+            # 归属只能用 `_identity` 派生（认证模式下来自凭证，忽略查询参数），
+            # 与非流式 `/chat` 一致——否则客户端能用 `?user_id=alice` 把消息写进别人名下。
+            sess.run.user_id = _identity(request, user_id)
+            registry.apply_owner_model(sess)  # 用该用户自己选的模型
 
         def generate() -> Any:
             try:
@@ -1202,8 +1258,12 @@ def build_app(
         }
 
     @app.get("/memory/{scope}")
-    def memory_view(scope: str) -> list[dict[str, Any]]:
-        """查看某作用域（run/session/user）下已确认的记忆。"""
+    def memory_view(request: Request, scope: str) -> list[dict[str, Any]]:
+        """查看某作用域（run/session/user/workspace）下**调用者自己**的记忆。
+
+        归属边界：记忆按 `owner`（用户 id）严格隔离——认证模式下只看得到自己写的，
+        否则任一用户就能读到全部署所有人的记忆（跨租户泄露），甚至无从发现被投毒。
+        """
         mem = registry.extra.get("memory_service")
         if mem is None:
             raise HTTPException(status_code=404, detail="未启用记忆(memory=True)")
@@ -1213,9 +1273,11 @@ def build_app(
             enum_scope = MemoryScope[scope.upper()]
         except KeyError:
             raise HTTPException(status_code=400, detail=f"未知作用域: {scope}") from None
+        owner = _identity(request, None)   # 身份来自凭证，不接受查询参数自称
         return [
-            {"scope": i.scope.name, "key": i.key, "text": i.content.text, "status": i.status.name}
-            for i in mem.recall(enum_scope, limit=100)
+            {"scope": i.scope.name, "key": i.key, "text": i.content.text,
+             "status": i.status.name, "owner": i.owner}
+            for i in mem.recall(enum_scope, limit=100, owner=owner)
         ]
 
     # ---- T10：托管 React 构建产物的静态资源（/assets/...）----

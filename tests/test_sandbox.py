@@ -109,3 +109,25 @@ def test_make_limiter_有内存限制则构造() -> None:
 
     limiter = make_limiter(ExecutionBudget(max_memory_mb=256))
     assert limiter is not None
+
+
+def test_每个托管进程各持有自己的limiter_不互相覆盖() -> None:
+    """回归：limiter（Windows 上是 Job Object 句柄）原先只存在一个 `_last_limiter` 槽位里，
+    并发执行时后一个覆盖前一个 → 前一个失去引用可能被 GC、限制提前失效。
+    现在 limiter 跟着**进程条目**一起持有。这里用内部接口直接验证"不互相覆盖"。
+    """
+    from warden_agent.execution.broker import ExecutionBroker
+
+    class _FakeProc:
+        pid = 1
+
+        def poll(self) -> None:
+            return None
+
+    broker = ExecutionBroker(ExecutionBudget(max_processes=10))
+    limiter_a, limiter_b = object(), object()
+    broker._track(_FakeProc(), limiter=limiter_a)  # type: ignore[arg-type]
+    broker._track(_FakeProc(), limiter=limiter_b)  # type: ignore[arg-type]
+    held = [m.limiter for m in broker._active]
+    assert held == [limiter_a, limiter_b], f"两个进程的 limiter 必须都在，实际 {held}"
+

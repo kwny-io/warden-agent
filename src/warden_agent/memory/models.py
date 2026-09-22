@@ -78,6 +78,10 @@ class MemoryItem:
     scope: MemoryScope
     key: str
     content: MemoryContent
+    # 归属者（用户 id）。记忆必须带归属，否则 scope 只区分"哪一类"、不区分"谁的"，
+    # 同一个 SESSION/RUN 作用域是全部署共享的——A 写的记忆会被所有人的对话召回（跨租户投毒）。
+    # 空串表示"部署级共享"（历史数据/管理用途）。
+    owner: str = ""
     status: MemoryStatus = MemoryStatus.ACTIVE
     actor: MemoryActor = MemoryActor()
     version: int = 1

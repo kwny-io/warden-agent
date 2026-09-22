@@ -83,14 +83,35 @@ async def test_runs_返回对话列表() -> None:
 
 @pytest.mark.asyncio
 async def test_重复消息不重复入库() -> None:
-    """入库查重：同一会话里完全相同的消息（重发同一句话）不重复落库。"""
+    """重发同一句 = 新的一轮（多轮对话里用户完全可能重复同一句话）。
+
+    注意"去重"的正确姿势是 `Idempotency-Key`（重试同一请求返回缓存），而不是按内容猜
+    ——按内容去重会把第二轮静默吞掉：模型照样被驱动了、历史里却没有那条用户消息
+    （历史与执行不同步）。见 `test_同key重发_命中缓存不产生新的一轮`。
+    """
+    client = await _client_with(
+        [ChatResponse(content="一", finish_reason="stop"),
+         ChatResponse(content="二", finish_reason="stop")], PolicyEngine())
+    await client.post("/chat/run-dup", json={"text": "hi"})
+    await client.post("/chat/run-dup", json={"text": "hi"})  # 再发一次，是新一轮
+    msgs = (await client.get("/messages/run-dup")).json()
+    user_turns = [m for m in msgs if m["role"] == "user"]
+    assert len(user_turns) == 2, f"两轮都应落库，实际 {user_turns}"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_同key重发_命中缓存不产生新的一轮() -> None:
+    """真正的"重发去重"用 Idempotency-Key：同 key 返回缓存结果，不产生新一轮。"""
     client = await _client_with(
         [ChatResponse(content="你好！", finish_reason="stop")], PolicyEngine())
-    await client.post("/chat/run-dup", json={"text": "hi"})
-    await client.post("/chat/run-dup", json={"text": "hi"})  # 重发同一句
-    msgs = (await client.get("/messages/run-dup")).json()
-    contents = [(m["role"], m["content"]) for m in msgs]
-    assert len(contents) == len(set(contents)), f"出现重复消息: {contents}"
+    headers = {"Idempotency-Key": "same-turn"}
+    r1 = await client.post("/chat/run-idem2", json={"text": "hi"}, headers=headers)
+    r2 = await client.post("/chat/run-idem2", json={"text": "hi"}, headers=headers)
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json() == r2.json()  # 命中缓存，结果一致
+    msgs = (await client.get("/messages/run-idem2")).json()
+    assert len([m for m in msgs if m["role"] == "user"]) == 1, msgs
     await client.aclose()
 
 

@@ -116,6 +116,10 @@ class ManagedProcess:
     pid: int
     started_at: float
     proc: subprocess.Popen  # type: ignore[type-arg]
+    # 该进程的资源限制器（Windows 上是 Job Object 句柄）。**必须跟着进程条目一起持有**：
+    # 只用一个 `self._last_limiter` 槽位的话，并发执行时后一个会覆盖前一个，
+    # 前一个 limiter 失去引用可能被 GC、Job 句柄随之关闭 → 那个子进程的限制提前失效。
+    limiter: ProcessLimiter | None = None
 
     def terminate(self) -> None:
         """请求进程终止（先 SIGTERM 语义，Windows 上是 terminate）。"""
@@ -130,7 +134,6 @@ class ExecutionBroker:
         self.budget = budget or ExecutionBudget()
         self._active: list[ManagedProcess] = []
         self._lock = threading.Lock()
-        self._last_limiter: ProcessLimiter | None = None  # 保持 Windows Job 句柄存活到进程结束
 
     @property
     def active_processes(self) -> int:
@@ -163,8 +166,6 @@ class ExecutionBroker:
             )
             if limiter is not None:
                 limiter.attach(proc)
-            # limiter（及它持有的 Windows Job）保持引用到进程结束，避免限制失效
-            self._last_limiter = limiter
         except FileNotFoundError:
             return ExecutionResult(
                 command=" ".join(command),
@@ -180,7 +181,7 @@ class ExecutionBroker:
                 exit_code=126,
             )
 
-        self._track(proc)
+        self._track(proc, limiter)
         try:
             # communicate 内部正确地排空两条管道直到 EOF，不受我们这里卡死；
             # timeout 超时抛 TimeoutExpired，由下面强制终止。
@@ -229,7 +230,7 @@ class ExecutionBroker:
                 m.proc.kill()
 
     # ---- 内部 ----
-    def _track(self, proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
+    def _track(self, proc: subprocess.Popen, limiter: ProcessLimiter | None = None) -> None:  # type: ignore[type-arg]
         with self._lock:
             running = sum(1 for m in self._active if m.proc.poll() is None)
             if running >= self.budget.max_processes:
@@ -237,7 +238,9 @@ class ExecutionBroker:
                 oldest = self._active[0]
                 oldest.terminate()
                 self._active.pop(0)
-            self._active.append(ManagedProcess(proc.pid, time.monotonic(), proc))
+            self._active.append(
+                ManagedProcess(proc.pid, time.monotonic(), proc, limiter=limiter)
+            )
 
     def _untrack(self, proc: subprocess.Popen) -> None:  # type: ignore[type-arg]
         with self._lock:

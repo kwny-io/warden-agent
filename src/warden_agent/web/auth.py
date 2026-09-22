@@ -191,8 +191,10 @@ def owner_authorizer(load_owner: Callable[[str], str | None]) -> AuthorizeFn:
             return
         owner = load_owner(run_id)
         if owner and owner != caller.user_id:
+            # 不把"归属者是谁"写进错误信息：调用者拿到别人的 user_id 就能枚举账号
+            # （错误信息里的每个字都是给攻击者的情报）。run_id 是他自己提交的，可以回显。
             raise HttpAuthorizationError(
-                f"调用者 {caller.user_id!r} 无权操作归属 {owner!r} 的会话 {run_id!r}"
+                f"无权操作会话 {run_id!r}：它不属于当前调用者"
             )
 
     return authorize_owner

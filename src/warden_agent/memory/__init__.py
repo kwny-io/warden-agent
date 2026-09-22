@@ -16,6 +16,7 @@ from warden_agent.memory.models import (
     MemoryScope,
     MemoryStatus,
 )
+from warden_agent.memory.owner import current_owner, owner_scope
 from warden_agent.memory.service import MemoryProposal, MemoryService
 from warden_agent.memory.store import (
     InMemoryMemoryStore,
@@ -41,6 +42,8 @@ __all__ = [
     "SqliteMemoryStore",
     "MemoryProposal",
     "MemoryService",
+    "current_owner",
+    "owner_scope",
     "extract_facts",
     "make_memory_tools",
     "propose_from_text",

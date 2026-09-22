@@ -496,6 +496,26 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    def reserve_idempotent(self, key: str, payload: str) -> bool:
+        """原子占位：`ON CONFLICT DO NOTHING` + rowcount 判断是否占到（防并发 TOCTOU）。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO idempotency (key, payload, created_at) VALUES (%s, %s, %s) "
+                "ON CONFLICT (key) DO NOTHING",
+                (key, payload, _now_iso()),
+            )
+            reserved = cur.rowcount == 1
+        self.conn.commit()
+        return reserved
+
+    def release_idempotent(self, key: str, payload: str) -> None:
+        """仅当内容仍是那条占位时才删（否则会把已缓存的响应快照删掉）。"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM idempotency WHERE key = %s AND payload = %s", (key, payload)
+            )
+        self.conn.commit()
+
     def append_event(self, run_id: str, payload: str) -> int:
         with self.conn.cursor() as cur:
             cur.execute(

@@ -70,19 +70,23 @@ def manage_context(messages: list[Message], max_context_chars: int) -> list[Mess
 # ---------------- 记忆：按需取用 ----------------
 
 
-def recall_context(memory: Any, scope: Any, user_text: str) -> str:
+def recall_context(memory: Any, scope: Any, user_text: str,
+                   owner: Any = None) -> str:
     """按当前问题检索相关记忆，返回可注入系统提示的记忆上下文（无命中返回空串）。
 
     【取舍】不是全量塞记忆，而是按 `user_text` 与每条记忆做**关键词重叠**判断，
     只把"和当前问题相关"的拼成一段注入；不相关的丢弃（省 token、不干扰）。
 
     `scope` 可以是取值函数（如 `self.memory_scope`）或作用域对象本身。
+    `owner` 是**归属者**（用户 id，同样支持取值函数）：面向用户的路径必须传，
+    否则会把别人的记忆召回进当前用户的提示词（跨租户投毒）。None = 不过滤（SDK/测试）。
     """
     if memory is None:
         return ""
     scope_value = scope() if callable(scope) else scope
+    owner_value = owner() if callable(owner) else owner
     try:
-        items = memory.recall(scope_value)
+        items = memory.recall(scope_value, owner=owner_value)
     except Exception:  # noqa: BLE001 - 记忆不可用绝不拖垮主循环
         return ""
     q_tokens = _tokens(user_text)

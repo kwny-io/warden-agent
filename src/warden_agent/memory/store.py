@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import sqlite3
@@ -34,15 +35,30 @@ from warden_agent.memory.models import (
 
 
 class MemoryRepository(Protocol):
-    """任何"能存记忆"的存储都要实现这个接口。"""
+    """任何"能存记忆"的存储都要实现这个接口。
+
+    `owner` 是**归属者过滤**（用户 id）：
+      - 传字符串 → 只返回该归属者的记忆（严格隔离，这是产品路径的用法）；
+      - 传 None   → 不过滤（管理/清理/测试用；不要用在面向用户的读路径上）。
+    """
 
     def save(self, item: MemoryItem) -> None: ...
     def find(self, uid: str) -> MemoryItem | None: ...
-    def find_ref(self, scope: MemoryScope, key: str) -> list[MemoryItem]: ...
-    def latest(self, scope: MemoryScope, key: str) -> MemoryItem | None: ...
-    def search(
-        self, scope: MemoryScope, text_like: str | None = None, limit: int = 20
+    def find_ref(
+        self, scope: MemoryScope, key: str, owner: str | None = None
     ) -> list[MemoryItem]: ...
+    def latest(
+        self, scope: MemoryScope, key: str, owner: str | None = None
+    ) -> MemoryItem | None: ...
+    def search(
+        self, scope: MemoryScope, text_like: str | None = None, limit: int = 20,
+        owner: str | None = None,
+    ) -> list[MemoryItem]: ...
+
+
+def _owned(item: MemoryItem, owner: str | None) -> bool:
+    """归属过滤：owner=None 放行全部；否则要求精确匹配。"""
+    return owner is None or item.owner == owner
 
 
 class InMemoryMemoryStore:
@@ -59,12 +75,19 @@ class InMemoryMemoryStore:
     def find(self, uid: str) -> MemoryItem | None:
         return self._items.get(uid)
 
-    def find_ref(self, scope: MemoryScope, key: str) -> list[MemoryItem]:
+    def find_ref(
+        self, scope: MemoryScope, key: str, owner: str | None = None
+    ) -> list[MemoryItem]:
         ref = make_ref(scope, key)
-        return [i for i in self._items.values() if make_ref(i.scope, i.key) == ref]
+        return [
+            i for i in self._items.values()
+            if make_ref(i.scope, i.key) == ref and _owned(i, owner)
+        ]
 
-    def latest(self, scope: MemoryScope, key: str) -> MemoryItem | None:
-        items = self.find_ref(scope, key)
+    def latest(
+        self, scope: MemoryScope, key: str, owner: str | None = None
+    ) -> MemoryItem | None:
+        items = self.find_ref(scope, key, owner)
         if not items:
             return None
         # 按 updated_at 取最新，排除已过期/已删除的「优先返回有效项」
@@ -77,10 +100,11 @@ class InMemoryMemoryStore:
         scope: MemoryScope,
         text_like: str | None = None,
         limit: int = 20,
+        owner: str | None = None,
     ) -> list[MemoryItem]:
         items = [
             i for i in self._items.values()
-            if i.scope == scope and i.status == MemoryStatus.ACTIVE
+            if i.scope == scope and i.status == MemoryStatus.ACTIVE and _owned(i, owner)
         ]
         if text_like:
             items = [i for i in items if text_like.lower() in i.content.text.lower()]
@@ -131,11 +155,24 @@ class SqliteMemoryStore:
                 expires_at     TEXT,
                 conflicts_with TEXT,
                 supersedes     TEXT,
-                audit          TEXT NOT NULL    -- JSON 数组
+                audit          TEXT NOT NULL,   -- JSON 数组
+                owner          TEXT NOT NULL DEFAULT ''   -- 归属者（用户 id）；''=部署级共享
             );
             CREATE INDEX IF NOT EXISTS idx_memories_ref ON memories (scope, key);
             CREATE INDEX IF NOT EXISTS idx_memories_status ON memories (scope, status);
             """
+        )
+        self._conn.commit()
+        # 老库补列（迁移）：`CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列，所以要显式 ALTER；
+        # 重复加列会报错（列已存在），忽略即可（幂等）。
+        # ⚠️ 索引必须在 ALTER **之后单独建**：旧库上若把 `CREATE INDEX ... (owner, scope)` 放进上面的
+        #    脚本，会在"列还不存在"时先报错；而放进同一个 try 里则 ALTER 一失败就跳过了索引。
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN owner TEXT NOT NULL DEFAULT ''"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories (owner, scope)"
         )
         self._conn.commit()
 
@@ -173,6 +210,8 @@ class SqliteMemoryStore:
             conflicts_with=None if row[13] is None else str(row[13]),
             supersedes=None if row[14] is None else str(row[14]),
             audit=_audit_from_json(row[15]),
+            # owner 列在迁移里后加，老行读出来是 ''；行长度不足时按 '' 处理
+            owner=str(row[16]) if len(row) > 16 and row[16] is not None else "",
         )
 
     # ---- 接口实现 ----
@@ -181,8 +220,8 @@ class SqliteMemoryStore:
             self._conn.execute(
                 "INSERT INTO memories (uid, scope, key, content_kind, content_text,"
                 " content_data, status, actor_kind, actor_id, version, created_at,"
-                " updated_at, expires_at, conflicts_with, supersedes, audit)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " updated_at, expires_at, conflicts_with, supersedes, audit, owner)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(uid) DO UPDATE SET"
                 " scope=excluded.scope, key=excluded.key,"
                 " content_kind=excluded.content_kind, content_text=excluded.content_text,"
@@ -190,7 +229,8 @@ class SqliteMemoryStore:
                 " actor_kind=excluded.actor_kind, actor_id=excluded.actor_id,"
                 " version=excluded.version, updated_at=excluded.updated_at,"
                 " expires_at=excluded.expires_at, conflicts_with=excluded.conflicts_with,"
-                " supersedes=excluded.supersedes, audit=excluded.audit",
+                " supersedes=excluded.supersedes, audit=excluded.audit,"
+                " owner=excluded.owner",
                 (
                     item.uid,
                     item.scope.name,
@@ -208,6 +248,7 @@ class SqliteMemoryStore:
                     item.conflicts_with,
                     item.supersedes,
                     json.dumps(_audit_to_json(item.audit), ensure_ascii=False),
+                    item.owner,
                 ),
             )
             self._conn.commit()
@@ -218,16 +259,22 @@ class SqliteMemoryStore:
         ).fetchone()
         return None if row is None else self._row_to_item(row)
 
-    def find_ref(self, scope: MemoryScope, key: str) -> list[MemoryItem]:
-        rows = self._conn.execute(
-            "SELECT * FROM memories WHERE scope = ? AND key = ?",
-            (scope.name, key),
-        ).fetchall()
+    def find_ref(
+        self, scope: MemoryScope, key: str, owner: str | None = None
+    ) -> list[MemoryItem]:
+        sql = "SELECT * FROM memories WHERE scope = ? AND key = ?"
+        params: list[Any] = [scope.name, key]
+        if owner is not None:
+            sql += " AND owner = ?"
+            params.append(owner)
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [self._row_to_item(r) for r in rows]
 
-    def latest(self, scope: MemoryScope, key: str) -> MemoryItem | None:
+    def latest(
+        self, scope: MemoryScope, key: str, owner: str | None = None
+    ) -> MemoryItem | None:
         """与内存版语义一致：优先返回有效项（ACTIVE / PENDING），取 updated_at 最新。"""
-        items = self.find_ref(scope, key)
+        items = self.find_ref(scope, key, owner)
         if not items:
             return None
         active = [
@@ -242,12 +289,15 @@ class SqliteMemoryStore:
         scope: MemoryScope,
         text_like: str | None = None,
         limit: int = 20,
+        owner: str | None = None,
     ) -> list[MemoryItem]:
-        rows = self._conn.execute(
-            "SELECT * FROM memories WHERE scope = ? AND status = ?"
-            " ORDER BY updated_at DESC",
-            (scope.name, MemoryStatus.ACTIVE.name),
-        ).fetchall()
+        sql = "SELECT * FROM memories WHERE scope = ? AND status = ?"
+        params: list[Any] = [scope.name, MemoryStatus.ACTIVE.name]
+        if owner is not None:
+            sql += " AND owner = ?"
+            params.append(owner)
+        sql += " ORDER BY updated_at DESC"
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
         items = [self._row_to_item(r) for r in rows]
         if text_like:
             needle = text_like.lower()

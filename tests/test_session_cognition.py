@@ -60,7 +60,8 @@ class _StubMemory:
     def __init__(self, items: list[_Item]) -> None:
         self._items = items
 
-    def recall(self, scope: Any) -> list[_Item]:
+    def recall(self, scope: Any, owner: Any = None) -> list[_Item]:
+        # owner 是会话传下来的"归属者"；这个桩不做过筛，直接返回固定条目
         return self._items
 
 

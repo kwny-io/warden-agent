@@ -110,20 +110,104 @@ def test_慢工具_超时返回不卡死() -> None:
     assert elapsed < 2.0, f"应在时限内返回,实际 {elapsed:.2f}s"
 
 
-def test_超时属于瞬时故障_会重试() -> None:
+def test_pure工具_超时算瞬时故障_会重试() -> None:
+    """pure（无副作用）工具超时可以安全重试。"""
     calls = {"n": 0}
 
-    def first_slow_then_fast() -> str:
+    def slow() -> str:
         calls["n"] += 1
         time.sleep(0.15)
-        return "第二次OK"
+        return "ok"
 
-    # 第一次 0.15s 超过 0.1s 超时 → 重试；第二次仍 0.15s … 这里用 max_attempts=2 且后一次也超时,
-    # 改为:一次超时(retry)后下一次正常返回,验证"超时被当瞬时故障重试"
     r = StableToolExecutor(StabilityConfig(
-        timeout_seconds=0.05, max_attempts=2, backoff_base=0.01)).execute(
-        _tool(first_slow_then_fast), {})
-    assert r.attempts >= 1
+        timeout_seconds=0.05, max_attempts=3, backoff_base=0.01)).execute(
+        _tool(slow, pure=True), {})
+    assert r.timed_out is True
+    assert calls["n"] == 3, "pure 工具超时应重试到上限"
+
+
+def test_非pure工具_超时不重试_防高危操作执行两次() -> None:
+    """安全底线：超时只是"放弃等待"，被卡的那次调用仍在后台跑。
+
+    若对非 pure 工具重试，一次人工审批会换来两次执行（如 `fs.delete` 删两次）。
+    所以非 pure 工具超时必须**只执行一次**。
+    """
+    calls = {"n": 0}
+
+    def slow_impure() -> str:
+        calls["n"] += 1
+        time.sleep(0.15)
+        return "ok"
+
+    r = StableToolExecutor(StabilityConfig(
+        timeout_seconds=0.05, max_attempts=3, backoff_base=0.01)).execute(
+        _tool(slow_impure, pure=False), {})
+    assert r.timed_out is True
+    assert calls["n"] == 1, f"非 pure 工具不得因超时重放，实际执行 {calls['n']} 次"
+
+
+# ---- 卡死线程的收尾（不阻塞退出、有上限）----
+
+
+def test_卡死的工作线程是daemon_不拖住进程退出() -> None:
+    """ThreadPoolExecutor 的工作线程是非守护的，且会在解释器退出时被 join——
+    卡死的工具会拖住进程退出。改用守护线程 + Event 后不应再有这个问题。"""
+    import threading
+
+    release = threading.Event()
+    before = {t.ident for t in threading.enumerate()}
+
+    def block_forever() -> str:
+        release.wait(5)
+        return "done"
+
+    try:
+        r = StableToolExecutor(StabilityConfig(
+            timeout_seconds=0.05, max_attempts=1)).execute(_tool(block_forever, pure=True), {})
+        assert r.timed_out is True
+        new_threads = [t for t in threading.enumerate() if t.ident not in before]
+        assert new_threads, "应当看到一条被放弃的工作线程"
+        assert all(t.daemon for t in new_threads), "工作线程必须是 daemon"
+    finally:
+        release.set()  # 放行，别把线程一直挂着
+
+
+def test_卡死线程数达上限后拒绝新调用(monkeypatch) -> None:
+    """卡死的工具被反复调用时，宁可拒绝新调用，也不让线程无界增长。
+
+    直接把计数置到上限来测这条守卫（不依赖"真的造出卡死线程再数"，
+    那样会受先前用例遗留线程的干扰而变得不确定）。
+    """
+    from warden_agent.tool import stability as st
+
+    monkeypatch.setattr(st, "_MAX_STUCK_THREADS", 2)
+    monkeypatch.setattr(st, "_stuck_threads", 2)
+
+    r = StableToolExecutor(StabilityConfig(
+        timeout_seconds=0.05, max_attempts=1)).execute(_tool(lambda: "ok", pure=True), {})
+    assert r.timed_out is False
+    assert "拒绝再启动" in (r.error or "")
+
+
+def test_超时会把该次记为卡死(monkeypatch) -> None:
+    import threading
+
+    from warden_agent.tool import stability as st
+
+    monkeypatch.setattr(st, "_stuck_threads", 0)
+    release = threading.Event()
+
+    def block_forever() -> str:
+        release.wait(5)
+        return "done"
+
+    try:
+        r = StableToolExecutor(StabilityConfig(
+            timeout_seconds=0.02, max_attempts=1)).execute(_tool(block_forever, pure=True), {})
+        assert r.timed_out is True
+        assert st._stuck_threads >= 1, "超时放弃的那次应被记为卡死"
+    finally:
+        release.set()
 
 
 # ---- 降级兜底 ----

@@ -74,6 +74,17 @@ class RunStore(Protocol):
 
     def save_idempotent(self, key: str, payload: str) -> None: ...
 
+    def reserve_idempotent(self, key: str, payload: str) -> bool:
+        """**仅当 key 不存在时**写入 payload（原子），返回是否占到。
+
+        用来堵幂等的 TOCTOU：两个同 `Idempotency-Key` 的并发请求，只有占到位的那个执行。
+        """
+        ...
+
+    def release_idempotent(self, key: str, payload: str) -> None:
+        """删除"处理中"占位（`payload` 匹配时才删，避免误删已写好的响应快照）。"""
+        ...
+
     def append_event(self, run_id: str, payload: str) -> int: ...
 
     def list_events_after(

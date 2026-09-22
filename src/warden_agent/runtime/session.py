@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -29,6 +30,7 @@ from warden_agent.loop.cognition import (
     recall_context,
 )
 from warden_agent.loop.loop import exec_tool
+from warden_agent.memory.owner import owner_scope
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
 from warden_agent.runtime.checkpoint import CheckpointManager, CheckpointStore
@@ -360,6 +362,30 @@ class AgentSession:
         """类型化推进：循环跑完，最终内容校验还原成 reply_type 对象返回。"""
         return self._run_loop(self._finalize_typed)
 
+    def _mark_failed(self) -> None:
+        """把"驱动失败"落到 Run 状态上（非终态才置 FAILED）。
+
+        为什么必须有这一步：驱动过程抛异常（模型报错 / 迭代超上限 / 策略拒绝）时，
+        若只是把异常抛给调用方、状态仍停在 `RUNNING`，那么崩溃恢复会把它算作
+        **可续跑**（`recovery.plan()` 只对 `FAILED` 走"重试 + attempts 上限"分支），
+        于是 `attempts` 永不递增、重试上限形同虚设——一个坏 Run 会被**无限重试**，
+        每一轮恢复都白跑一次。把状态置为 `FAILED` 后，"重试计数 + 上限"才真正生效。
+        """
+        if self.run.status in (RunStatus.COMPLETED, RunStatus.FAILED,
+                               RunStatus.CANCELLED, RunStatus.TIMED_OUT):
+            return  # 已终态（例如收尾 on_content 抛错时已 COMPLETED）——不改写
+        self.run.fail()
+        self._persist_run()
+
+    @contextmanager
+    def _fail_run_on_error(self) -> Iterator[None]:
+        """驱动期异常 → 先标记 FAILED 再原样抛出（见 `_mark_failed` 的说明）。"""
+        try:
+            yield
+        except Exception:
+            self._mark_failed()
+            raise
+
     def _last_user_text(self) -> str:
         """取当前这一轮的用户输入（各入口都会把它 append 进 messages）。"""
         for m in reversed(self.messages):
@@ -387,7 +413,10 @@ class AgentSession:
         history = _ensure_tool_results(self.messages)
         user_text = self._last_user_text()
         extra: list[Message] = []
-        mem = recall_context(self.memory, self._memory_scope, user_text)
+        # 记忆按**归属者**过滤：只召回当前用户自己的记忆（owner=run.user_id），
+        # 否则会把别人的记忆注入本用户提示词（跨租户投毒）。
+        mem = recall_context(self.memory, self._memory_scope, user_text,
+                             owner=self.run.user_id)
         if mem:
             extra.append(Message(role="system", content=mem))
         plan = plan_context(self.planner, user_text)
@@ -410,50 +439,51 @@ class AgentSession:
                                RunStatus.CANCELLED, RunStatus.TIMED_OUT):
             raise RuntimeError(f"会话已结束，不能继续({self.run.status.name})")
 
-        for iteration in range(self.max_iterations):
-            self._checkpoint("model_call", iteration)
-            response = self.model.chat(ChatRequest(
-                messages=self._request_messages(),
-                tools=[t.to_openai_schema() for t in self.catalog.all()],
-                structured_output=self._reply_schema,
-            ))
+        with owner_scope(self.run.user_id), self._fail_run_on_error():
+            for iteration in range(self.max_iterations):
+                self._checkpoint("model_call", iteration)
+                response = self.model.chat(ChatRequest(
+                    messages=self._request_messages(),
+                    tools=[t.to_openai_schema() for t in self.catalog.all()],
+                    structured_output=self._reply_schema,
+                ))
 
-            if response.tool_calls:
-                for call in response.tool_calls:
-                    note = Message(role="assistant",
-                                   content=f"[调用工具 {call.name}]", tool_call=call)
-                    self.messages.append(note)
-                    self.store.append_message(self.run_id, note)
+                if response.tool_calls:
+                    for call in response.tool_calls:
+                        note = Message(role="assistant",
+                                       content=f"[调用工具 {call.name}]", tool_call=call)
+                        self.messages.append(note)
+                        self.store.append_message(self.run_id, note)
 
-                    verdict = self.policy.evaluate(call.name, call.arguments)
-                    if verdict.decision == Decision.DENY:
-                        logger.warning("策略 DENY 工具 %s: %s", call.name, verdict.reason)
-                        raise PolicyDenied(
-                            f"策略拒绝执行 {call.name!r}: {verdict.reason}"
-                        )
-                    if verdict.decision == Decision.ASK:
-                        return self._hold_for_approval(call, verdict.reason, iteration)
-                    # 【认知】调用前的意图校验：疑似误调就提示模型，不执行
-                    hint = self._cognition_hint(call)
-                    if hint is not None:
-                        hint_msg = Message(role="tool", content=hint, tool_call=call)
-                        self.messages.append(hint_msg)
-                        self.store.append_message(self.run_id, hint_msg)
-                        continue
-                    self._checkpoint("tool_exec", iteration)
-                    self._execute(call)
-                continue  # 本批工具都执行完，回到循环让模型再想
+                        verdict = self.policy.evaluate(call.name, call.arguments)
+                        if verdict.decision == Decision.DENY:
+                            logger.warning("策略 DENY 工具 %s: %s", call.name, verdict.reason)
+                            raise PolicyDenied(
+                                f"策略拒绝执行 {call.name!r}: {verdict.reason}"
+                            )
+                        if verdict.decision == Decision.ASK:
+                            return self._hold_for_approval(call, verdict.reason, iteration)
+                        # 【认知】调用前的意图校验：疑似误调就提示模型，不执行
+                        hint = self._cognition_hint(call)
+                        if hint is not None:
+                            hint_msg = Message(role="tool", content=hint, tool_call=call)
+                            self.messages.append(hint_msg)
+                            self.store.append_message(self.run_id, hint_msg)
+                            continue
+                        self._checkpoint("tool_exec", iteration)
+                        self._execute(call)
+                    continue  # 本批工具都执行完，回到循环让模型再想
 
-            if response.content is not None:
-                self.messages.append(Message(role="assistant", content=response.content))
-                self.store.append_message(self.run_id, self.messages[-1])
-                self.run.begin_completing()
-                self.run.complete()
-                self._persist_run()
-                self._checkpoint("done", iteration)
-                return on_content(response.content)
+                if response.content is not None:
+                    self.messages.append(Message(role="assistant", content=response.content))
+                    self.store.append_message(self.run_id, self.messages[-1])
+                    self.run.begin_completing()
+                    self.run.complete()
+                    self._persist_run()
+                    self._checkpoint("done", iteration)
+                    return on_content(response.content)
 
-        raise RuntimeError("AgentLoop 迭代超过上限，任务未收敛（可能模型一直在调用工具）")
+            raise RuntimeError("AgentLoop 迭代超过上限，任务未收敛（可能模型一直在调用工具）")
 
     def _finalize_plain(self, content: str) -> SessionOutcome:
         """普通收尾：内容直接作为最终回答。"""
@@ -486,6 +516,18 @@ class AgentSession:
     #   {"type":"final","text":"..."}       最终回答（模型说完了）
     #   {"type":"needs_approval","approval":{...}}       需要审批
     def stream(self, user_text: str) -> Iterator[dict[str, Any]]:
+        """流式入口：包一层"失败即标记 FAILED"，实现体见 `_stream_impl`。"""
+        try:
+            # owner_scope：让 memory.remember 这类共享工具知道"当前是谁在用"
+            with owner_scope(self.run.user_id):
+                yield from self._stream_impl(user_text)
+        except Exception:
+            # 与 `_run_loop` 同理：流式路径抛错也必须把 Run 置为 FAILED，
+            # 否则它会停在 RUNNING、被恢复计划当成"可续跑"而无限重试。
+            self._mark_failed()
+            raise
+
+    def _stream_impl(self, user_text: str) -> Iterator[dict[str, Any]]:
         """以生成器方式处理一句用户指令，逐增量产出事件（配合 SSE 打字机）。"""
         # 多轮对话：上一轮已结束（COMPLETED 等），新消息就开启新一轮执行周期。
         # 注意：stream() 不走 _run_loop 的终态拦截，必须在这里先重开，
@@ -636,8 +678,18 @@ class AgentSession:
         self.store.clear_pending_approval(self.run_id)
 
     def _already_has_user_turn(self, user_text: str) -> bool:
-        # 简化判断：防止同一句重复入队（教学版）
-        return any(m.role == "user" and m.content == user_text for m in self.messages)
+        """**当前这一轮**是否已经记过这条用户消息（防止崩溃后重发同一句而重复落库）。
+
+        只检查**最后一条**消息，而不是扫描全历史：历史里更早出现过同样的话，那属于
+        **上一轮**——多轮对话里用户完全可能重复说同一句（"再试一次"），
+        按全历史匹配会把这一轮静默吞掉：模型照样被驱动了，但对话历史里少了一条用户消息
+        （历史与执行不同步）。真正的"重发去重"应该用 `Idempotency-Key`（见 HTTP 层），
+        而不是按内容猜。
+        """
+        if not self.messages:
+            return False
+        last = self.messages[-1]
+        return last.role == "user" and (last.content or "") == user_text
 
     # ---------- 只读查询 ----------
     def status(self) -> RunStatus:

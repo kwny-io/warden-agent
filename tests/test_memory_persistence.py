@@ -185,11 +185,15 @@ def test_augment_catalog不传记忆库时用进程内() -> None:
 
 @pytest.mark.asyncio
 async def test_http能读到落盘的记忆() -> None:
-    """产品路径验证：预先落盘一条 USER 记忆，HTTP 的 /memory/user 应能查到。"""
+    """产品路径验证：预先落盘一条**属于调用者**的 USER 记忆，HTTP 的 /memory/user 应能查到。
+
+    匿名开发模式下调用者身份是 `demo-user`（`_identity` 的缺省），所以记忆必须带这个归属。
+    """
     repository = SqliteMemoryStore(_db())
     service = MemoryService(repository)
     service.approve(service.propose(
-        MemoryScope.USER, "city", MemoryContent(text="用户常驻上海")
+        MemoryScope.USER, "city", MemoryContent(text="用户常驻上海"),
+        owner="demo-user",
     ))
 
     app = build_app(
@@ -210,3 +214,84 @@ async def test_http能读到落盘的记忆() -> None:
         caps = (await c.get("/capabilities")).json()
         assert caps["features"]["memory"] is True
         assert caps["features"]["memory_persistent"] is True
+
+
+@pytest.mark.asyncio
+async def test_http读不到别人的记忆_跨租户隔离() -> None:
+    """安全回归：`/memory/{scope}` 只返回**调用者自己**的记忆。
+
+    此前 endpoint 不做任何归属过滤，任一用户就能读到全部署所有人的记忆
+    （以及被投毒的记忆）——scope 只区分"哪一类"、不区分"谁的"。
+    """
+    repository = SqliteMemoryStore(_db())
+    service = MemoryService(repository)
+    service.approve(service.propose(
+        MemoryScope.USER, "secret", MemoryContent(text="别人的私事"),
+        owner="someone-else",
+    ))
+
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")]),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=SqliteStore(Path(tempfile.mkdtemp()) / "t.db"),
+        memory=True,
+        memory_repository=repository,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        items = (await c.get("/memory/user")).json()
+        assert items == [], f"不应看到他人记忆，实际：{items}"
+
+
+def test_老库没有owner列_按迁移路径仍可读(tmp_path: Path) -> None:
+    """升级兼容：`owner` 列是后加的，老库（没有该列）必须能被自动迁移且数据不丢。
+
+    迁移口径：老行的 owner 视为空串（部署级共享）。所以按 owner='' 查得到、
+    按具体用户查不到（这是有意的隔离行为，不是什么 bug）。
+    """
+    import sqlite3
+
+    from warden_agent.memory import MemoryScope
+    from warden_agent.memory.store import SqliteMemoryStore
+
+    db_path = tmp_path / "old-memory.db"
+    conn = sqlite3.connect(str(db_path))
+    # 旧 schema：没有 owner 列
+    conn.executescript(
+        """
+        CREATE TABLE memories (
+            uid            TEXT PRIMARY KEY,
+            scope          TEXT NOT NULL,
+            key            TEXT NOT NULL,
+            content_kind   TEXT NOT NULL,
+            content_text   TEXT NOT NULL,
+            content_data   TEXT NOT NULL,
+            status         TEXT NOT NULL,
+            actor_kind     TEXT NOT NULL,
+            actor_id       TEXT NOT NULL,
+            version        INTEGER NOT NULL,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL,
+            expires_at     TEXT,
+            conflicts_with TEXT,
+            supersedes     TEXT,
+            audit          TEXT NOT NULL
+        );
+        """
+    )
+    now = "2026-01-01T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("old-1", "USER", "city", "TEXT", "老记忆", "{}", "ACTIVE",
+         "service", "default", 1, now, now, None, None, None, "[]"),
+    )
+    conn.commit()
+    conn.close()
+
+    repo = SqliteMemoryStore(db_path=db_path)   # 打开时自动补 owner 列
+    item = repo.latest(MemoryScope.USER, "city", owner="")
+    assert item is not None and item.content.text == "老记忆"
+    assert item.owner == "", "老行的 owner 迁移后应为空串（部署级共享）"
+    # 隔离口径：具体用户查不到这条（老数据不属于任何用户）
+    assert repo.latest(MemoryScope.USER, "city", owner="alice") is None

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 from warden_agent.memory.models import (
     MemoryActor,
@@ -15,6 +16,7 @@ from warden_agent.memory.models import (
     MemoryKind,
     MemoryScope,
 )
+from warden_agent.memory.owner import current_owner
 from warden_agent.memory.service import MemoryService
 from warden_agent.tool.catalog import ToolSpec, function_tool
 
@@ -69,8 +71,21 @@ def propose_from_text(
 def make_memory_tools(
     service: MemoryService,
     scope: MemoryScope = MemoryScope.SESSION,
+    owner: str | Callable[[], str] | None = None,
 ) -> list[ToolSpec]:
-    """造两张记忆技能卡：memory.remember（存）+ memory.recall（取）。"""
+    """造两张记忆技能卡：memory.remember（存）+ memory.recall（取）。
+
+    `owner` 决定这张卡存/取的记忆归谁：
+      - 不传（None）→ 运行期从 `memory.owner.current_owner()` 读（会话驱动时设置）——
+        这是产品路径的用法：目录只建一次，归属在运行期确定；
+      - 传字符串 / 取值函数 → 固定归属（SDK/测试用）。
+    **归属不来自工具入参**，模型无法通过参数声称"我是别人"。
+    """
+
+    def _owner() -> str:
+        if owner is None:
+            return current_owner()
+        return owner() if callable(owner) else owner
 
     @function_tool(
         "memory.remember",
@@ -83,6 +98,7 @@ def make_memory_tools(
     def remember(key: str, text: str) -> str:
         proposal = service.propose(
             scope, key, MemoryContent(kind=MemoryKind.TEXT, text=text),
+            owner=_owner(),
         )
         # 有冲突就先挂着；否则直接确认生效（学习版简化：默认直接 approve）
         if proposal.item.conflicts_with:
@@ -100,7 +116,7 @@ def make_memory_tools(
         pure=True,
     )
     def recall(key: str) -> str:
-        text = service.recall_text(scope, key=key)
+        text = service.recall_text(scope, key=key, owner=_owner())
         return text if text else f"没有找到 [{scope.name}:{key}] 相关记忆"
 
     return [remember, recall]

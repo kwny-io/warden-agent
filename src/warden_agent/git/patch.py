@@ -76,6 +76,25 @@ class PatchConflict(Exception):
 
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
+# Windows 盘符（`C:` / `c:/`）——绝对路径的另一种写法，也必须当成逃逸
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _reject_unsafe_path(path: str) -> None:
+    """拒绝会逃出工作区的路径：绝对路径 / 盘符 / `..` 段 / 反斜杠。
+
+    反斜杠也拒（而不是"在 Windows 上正好当分隔符"）：git diff 用正斜杠，
+    出现反斜杠基本就是有人想借平台差异绕过检查。
+    """
+    if not path.strip():
+        raise PatchConflict("diff 里出现空路径")
+    if "\\" in path:
+        raise PatchConflict(f"拒绝含反斜杠的路径：{path!r}")
+    if path.startswith("/") or _DRIVE_RE.match(path):
+        raise PatchConflict(f"拒绝绝对路径：{path!r}")
+    segments = [seg for seg in path.split("/") if seg not in ("", ".")]
+    if ".." in segments:
+        raise PatchConflict(f"拒绝含 '..' 的路径：{path!r}")
 
 
 class UnifiedPatchParser:
@@ -155,12 +174,22 @@ class UnifiedPatchParser:
 
     @staticmethod
     def _norm_path(p: str) -> str:
-        """去掉 a/、b/ 前缀（保持 /dev/null 原样）。"""
+        """去掉 a/、b/ 前缀（保持 /dev/null 原样），并**拒绝逃出工作区根的路径**。
+
+        安全边界（这是必校验项，不是清洁工作）：补丁的路径来自**不可信输入**——
+        模型生成的 diff，或 `web.fetch` 抓到的网页正文经提示注入诱导出的 diff。
+        若不校验，`--- a/../../<任意路径>` 就能把文件写到工作区之外（任意写），
+        配合 `+++ /dev/null` 还能删任意文件。所以 `..`、绝对路径、Windows 盘符/反斜杠
+        一律在这里拒绝（`PatchApplier.apply` 里还有一道 resolve 后的包含校验兜底，
+        用来挡符号链接指向外部的情况）。
+        """
         if p in ("/dev/null", "a/dev/null", "b/dev/null"):
             return "/dev/null"
         for prefix in ("a/", "b/"):
             if p.startswith(prefix):
-                return p[len(prefix):]
+                p = p[len(prefix):]
+                break
+        _reject_unsafe_path(p)
         return p
 
     @staticmethod
@@ -183,8 +212,14 @@ class PatchApplier:
     def apply(self, document: PatchDocument, root: str,
               expected_hashes: dict[str, str] | None = None) -> list[str]:
         changed: list[str] = []
+        root_resolved = Path(root).resolve()
         for fp in document.files:
-            abs_path = Path(root) / fp.target_path
+            # 第二道防线：parser 已拒 `..`/绝对路径，这里再用 resolve 后的**包含校验**兜底——
+            # resolve() 会跟随符号链接，所以"仓库内有个指向外部的软链"这种绕法也会被挡下。
+            abs_path = (root_resolved / fp.target_path).resolve()
+            if not abs_path.is_relative_to(root_resolved):
+                raise PatchConflict(
+                    f"{fp.target_path}: 路径越出工作区根", path=fp.target_path)
             if fp.deleted:
                 if abs_path.exists():
                     abs_path.unlink()

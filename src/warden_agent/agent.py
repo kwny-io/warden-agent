@@ -168,6 +168,17 @@ class InMemoryRunStore:
     def save_idempotent(self, key: str, payload: str) -> None:
         self._idempotency[key] = payload
 
+    def reserve_idempotent(self, key: str, payload: str) -> bool:
+        """仅在 key 不存在时写入（内存版单线程语义下也保持"占位"一致性）。"""
+        if key in self._idempotency:
+            return False
+        self._idempotency[key] = payload
+        return True
+
+    def release_idempotent(self, key: str, payload: str) -> None:
+        if self._idempotency.get(key) == payload:
+            self._idempotency.pop(key, None)
+
     def append_event(self, run_id: str, payload: str) -> int:
         self._events_seq += 1
         self._events.append((self._events_seq, run_id, payload))

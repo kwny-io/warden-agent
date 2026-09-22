@@ -71,10 +71,20 @@ def _ask_policy() -> PolicyEngine:
 
 
 def _crash_a_run(store: SqliteStore, run_id: str = "r-crash") -> None:
-    """制造一个"崩在 RUNNING"的 Run（模型抛错，状态停在 RUNNING）。"""
-    sess = _session(store, run_id, BoomModel())
-    with pytest.raises(RuntimeError):
-        sess.start("hi")
+    """模拟"进程被硬杀"：状态与存档点都停在半途（RUNNING / model_call），无人收尾。
+
+    ⚠️ **不能用"模型抛异常"来制造这个状态**：可捕获的异常属于"失败"，会被标记为 FAILED，
+    走的是"重试 + attempts 上限"那条路（见 `test_驱动失败会被标记FAILED`），
+    而不是"崩溃续跑"。硬杀是进程来不及做任何收尾——状态原样停在那里。
+    """
+    run = AgentRun(run_id=run_id)
+    run.mark_queued()
+    run.start()
+    store.save_run(run)
+    store.append_message(run_id, Message(role="user", content="hi"))
+    cp = checkpoint_store_for(store)
+    assert cp is not None
+    cp.save(Checkpoint(run_id=run_id, status=RunStatus.RUNNING, iteration=0, step="model_call"))
 
 
 # ---------- resume() 行为 ----------
@@ -90,6 +100,36 @@ def test_resume从崩溃处接着跑() -> None:
     assert isinstance(outcome, FinalReply)
     assert outcome.text == "续跑完成"
     assert store.load_run("r-crash").status == RunStatus.COMPLETED
+
+
+def test_驱动失败会被标记FAILED而非停在RUNNING() -> None:
+    """驱动期抛异常 = "失败"，必须落到 FAILED 状态。
+
+    否则它会停在 RUNNING，被恢复计划当成"可续跑"，而 `resume()` 只在 FAILED 分支给
+    `attempts` +1 —— 于是重试上限形同虚设，同一个坏 Run 被**无限重试**。
+    """
+    store = _store()
+    sess = _session(store, "r-boom", BoomModel())
+    with pytest.raises(RuntimeError, match="模拟崩溃"):
+        sess.start("hi")
+    assert store.load_run("r-boom").status == RunStatus.FAILED
+
+
+def test_失败run重试时attempts递增_重试上限才有意义() -> None:
+    store = _store()
+    sess = _session(store, "r-retry", BoomModel())
+    with pytest.raises(RuntimeError):
+        sess.start("hi")
+    cp = _cp(store)
+    first = cp.load("r-retry")
+    assert first is not None and first.attempts == 1
+
+    # FAILED → resume() 是"重试"：attempts +1（仍失败，所以再次 FAILED）
+    with pytest.raises(RuntimeError):
+        _session(store, "r-retry", BoomModel()).resume()
+    again = cp.load("r-retry")
+    assert again is not None and again.attempts == 2, "重试必须使 attempts 递增"
+    assert store.load_run("r-retry").status == RunStatus.FAILED
 
 
 def test_完成态不可续跑() -> None:

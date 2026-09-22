@@ -225,6 +225,13 @@ def test_共享状态三件套在真库上可用() -> None:
         store.save_idempotent(key, "p2")
         assert store.get_idempotent(key) == "p2"
 
+        # 原子占位（真库上的 ON CONFLICT DO NOTHING）：第一次占到、第二次占不到、释放后可再占
+        rkey = "rsv-" + secrets.token_hex(5)
+        assert store.reserve_idempotent(rkey, "PENDING") is True
+        assert store.reserve_idempotent(rkey, "PENDING") is False
+        store.release_idempotent(rkey, "PENDING")
+        assert store.reserve_idempotent(rkey, "PENDING") is True
+
         first = store.append_event(rid, '{"n":1}')
         second = store.append_event(rid, '{"n":2}')
         assert second > first, "事件序号没有自增"

@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-741%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-772%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -52,7 +52,7 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——742 项测试零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——774 项测试零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -505,11 +505,11 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**716 项通过**（共 742 项；不配数据库时跳过 26 项，含 win32 无内核隔离档）。
-  ⭐ **起了 PostgreSQL 的话是 741 项通过、仅 1 项跳过**（PG 相关测试不再跳过；唯一剩的跳过项是
-  win32 没有内核网络命名空间、生产隔离交给容器）——
+- **测试**：**747 项通过**（共 774 项；不配数据库时跳过 27 项，含 win32 无内核隔离档与符号链接权限）。
+  ⭐ **起了 PostgreSQL 的话是 772 项通过、仅 2 项跳过**（PG 相关测试不再跳过；剩的跳过项是
+  win32 没有内核网络命名空间、以及当前权限不允许建符号链接——生产隔离交给容器）——
   真库测试会在没有 PG 时自动跳过、CI 保持绿（**CI 里已经起了 PG service**，见 `.github/workflows/ci.yml`）。
-  其余按环境跳过的还有：未构建前端时的 SPA、无 node 时的 MCP。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、多租户越权拦截、**入站限流**、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**凭证密钥托管（KMS/HSM 信封加密：env 与两条 provider 接入路径）**、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘（换实例读同一库仍在）**、**真实联网抓取的 SSRF 防护（含重定向绕过）与出站限速/配额（全局、单 host、并发、日配额，含多副本共享与"策略先于限速"的顺序保证）**、**链路追踪（W3C traceparent 解析/生成/传播）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等
+  其余按环境跳过的还有：未构建前端时的 SPA、无 node 时的 MCP。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、**多租户越权拦截（含 403 不回显他人身份、审计/模型按调用者收敛）**、**patch 路径边界（防越出工作区）**、**幂等并发原子占位（409 而非重复执行）**、**入站限流**、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**凭证密钥托管（KMS/HSM 信封加密：env 与两条 provider 接入路径）**、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘 + 按 `owner` 归属隔离（换实例读同一库仍在、跨用户不可见）**、**真实联网抓取的 SSRF 防护（含重定向绕过）与出站限速/配额（全局、单 host、并发、日配额，含多副本共享与"策略先于限速"的顺序保证）**、**链路追踪（W3C traceparent 解析/生成/传播）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等
 - **Agent 评测**：内置黄金评测集（30 例，三类），通过率作为 CI 质量门禁
 - **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告，并**逐条打印首现排名**（离线词频嵌入实测 **top-1 85.7% / MRR 0.905**）。⚠️ 报告里的 `recall@3 = 100%` **被小语料抬高**——7 块库、k=3 一次返回 43% 的库，命中几乎是必然的，**该数字不代表检索器强**；报告在 k 覆盖率 ≥25% 时会主动提示。换真语义嵌入只需配三个环境变量，同一套标注集可对比相对提升
 - **类型检查**：`mypy --strict` 零错误（92 个源文件）

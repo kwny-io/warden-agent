@@ -89,6 +89,17 @@ async def test_首轮对话归属取凭证身份() -> None:
         assert runs and runs[0]["user_id"] == "bob"
 
 
+@pytest.mark.asyncio
+async def test_流式对话归属也取凭证身份_查询参数被忽略() -> None:
+    """回归：`/chat/stream` 曾直接用 `?user_id=` 写归属，绕过了"身份来自凭证"这条不变量
+    （非流式的 `/chat` 走 `_identity` 是对的，只有流式这条漏了）。"""
+    async with _client(_app()) as c:
+        await c.post("/chat/stream/run-s?user_id=bob", headers=A_ALICE, json={"text": "hi"})
+        # run-s 的归属必须是 alice（凭证身份）；bob 读它应 403
+        assert (await c.get("/status/run-s", headers=A_BOB)).status_code == 403
+        assert (await c.get("/status/run-s", headers=A_ALICE)).status_code == 200
+
+
 # ---------- 越权拦截 ----------
 
 
@@ -188,6 +199,42 @@ async def test_审计按租户隔离() -> None:
         # 只看得到自己租户的记录（/audit 自身那条尚未落库）
         assert a and all(r["tenant_id"] == "tenant-a" for r in a)
         assert b and all(r["tenant_id"] == "tenant-b" for r in b)
+
+
+@pytest.mark.asyncio
+async def test_审计按调用者收敛_同租户也看不到彼此() -> None:
+    """回归：多用户默认共用同一租户（`WARDEN_TENANT=local`），只按 tenant 过滤
+    等于把同租户别人的操作账本（run_id/身份/路径）交出去，还能枚举账号。"""
+    audit = InMemoryAuditStore()
+    async with _client(_app(api_keys=CALLERS, audit=audit)) as c:
+        await c.get("/status/run-a", headers=A_ALICE)  # alice 与 bob 同属 tenant-a
+        await c.get("/status/run-b", headers=A_BOB)
+        a = (await c.get("/audit", headers=A_ALICE)).json()
+        assert a, "alice 应看到自己的审计记录"
+        assert all(r["principal_id"] == "alice" for r in a), a
+
+
+@pytest.mark.asyncio
+async def test_越权403不回显他人身份() -> None:
+    """错误信息里的每个字都是给攻击者的情报：不能回显"归属者是谁"（可用于枚举账号）。"""
+    async with _client(_app()) as c:
+        # run id 故意不含用户名，这样"消息里出现 bob"就只可能来自归属者信息
+        await c.post("/chat/run-x", json={"text": "hi"}, headers=A_BOB)
+        r = await c.get("/status/run-x", headers=A_ALICE)
+        assert r.status_code == 403
+        assert "bob" not in r.text, r.text
+
+
+@pytest.mark.asyncio
+async def test_模型切换只影响调用者自己() -> None:
+    """回归：`/models/select` 曾调用全局 `set_model`，任一认证用户就能把**所有人**的
+    对话切成离线假模型（跨租户 DoS），或切到用自己的 key 计费。"""
+    async with _client(_app()) as c:
+        r = await c.post("/models/select", json={"id": "fake"}, headers=A_BOB)
+        assert r.status_code == 200
+        assert (await c.get("/models", headers=A_BOB)).json()["current"] == "fake"
+        # alice 不受影响，仍是部署默认
+        assert (await c.get("/models", headers=A_ALICE)).json()["current"] != "fake"
 
 
 @pytest.mark.asyncio

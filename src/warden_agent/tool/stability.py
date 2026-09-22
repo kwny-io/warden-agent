@@ -20,7 +20,8 @@
     `_AttemptOutcome`（result / exc / timed_out），而不是每类错误抛一种异常。loop 拿它
     组装 `(result, error)`，和 `_safe_execute` 的契约一致，下游零改动。
   - **可重试信号复用 `ToolSpec.pure`**：pure=True（无副作用）的工具失败可放心重试；
-    非 pure 只对 `retry_on_errors` 里的瞬时错误重试（避免重放有副作用的操作）。
+    非 pure 工具只对**抛出的瞬时异常**（`retry_on_errors`）重试，**超时不重试**——
+    超时只是"放弃等待"，被卡调用仍在后台跑，重放会让有副作用的操作执行两次。
   - **默认关闭、向后兼容**：`StabilityConfig()` 全是"不超时(0)/不重试(1)/无退避"，
     不配就不会改变原有行为；现有测试零影响。
   - **超时实现说明**：真函数工具卡死时，进程内线程无法被"强杀"。我们用一个**工作线程 +
@@ -31,9 +32,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,13 @@ _CIRCUIT_PREFIX = "[熔断]"
 _TIMEOUT_MSG = "TimeoutError: 工具执行超时"
 _CIRCUIT_MSG = "工具连续失败，熔断保护，暂不调用"
 
+# 被"放弃等待"的工具调用数（超时后线程仍在后台跑）。Python 无法强杀线程，
+# 所以只能：① 用**守护线程**（不阻塞进程退出）；② 给这个数设**上限**——
+# 卡死的工具被反复调用时，宁可拒绝新调用，也不让线程无界增长拖垮进程。
+_stuck_lock = threading.Lock()
+_stuck_threads = 0
+_MAX_STUCK_THREADS = 8
+
 
 @dataclass
 class StabilityConfig:
@@ -58,8 +66,8 @@ class StabilityConfig:
     backoff_max: float = 8.0                                  # 退避上限，防无限拉长
     retry_on_errors: tuple[type[BaseException], ...] = (
         TimeoutError, ConnectionError, OSError,
-    )                                          # 命中这些瞬时错误才重试
-    retryable_pure: bool = True                               # pure 工具失败额外允许重试
+    )                                    # 命中这些"瞬时异常"才重试（超时另算，见 _should_retry）
+    retryable_pure: bool = True                # pure（无副作用）工具失败额外允许重试
     fallback: Callable[[], Any] | None = None                 # 重试耗尽后的显式降级兜底
     circuit_threshold: int = 0                                # 熔断：连续失败 N 次触发短路(0=关)
     circuit_cooldown: float = 0.0                             # 熔断持续秒数，过后半开试一次
@@ -213,9 +221,14 @@ class StableToolExecutor:
     def _run_once(self, fn: Callable[..., Any], arguments: dict[str, Any]) -> _AttemptOutcome:
         """执行 fn(**arguments)；超时则返回"超时"信号而不卡死。
 
-        用一个单工作线程 + deadline 执行：`future.result(timeout)` 到点即抛超时，
-        我们在 finally 里 `shutdown(wait=False)` 立即交还控制权（不 join 那条被卡线程）。
-        这是进程内线程无法真杀的限制下，"保证调用方不悬挂"的工程解法。
+        用**守护线程 + Event** 执行（不用 ThreadPoolExecutor：它的工作线程是非守护的，
+        超时后 `shutdown(wait=False)` 只是不 join，线程仍活着，而且 concurrent.futures
+        会注册 atexit 钩子在解释器退出时 join 它们——卡死的工具会**拖住进程退出**）。
+
+        超时后的线程无法强杀（进程内线程的固有限制），所以配套两条兜底：
+          - 线程是 **daemon**：不阻塞进程退出；
+          - 卡死线程数有**上限**：达到上限后拒绝新调用并给出明确原因，
+            避免"卡死的工具被反复调用 → 线程无界增长"把进程拖垮。
         """
         timeout = self.config.timeout_seconds
         if timeout <= 0:
@@ -224,37 +237,79 @@ class StableToolExecutor:
             except Exception as e:  # noqa: BLE001 - 工具错误要转成可读信号
                 return _AttemptOutcome(exc=e)
 
-        ex = ThreadPoolExecutor(max_workers=1)
-        try:
-            fut = ex.submit(fn, **arguments)
+        global _stuck_threads
+        with _stuck_lock:
+            if _stuck_threads >= _MAX_STUCK_THREADS:
+                return _AttemptOutcome(exc=RuntimeError(
+                    f"已有 {_stuck_threads} 个工具调用卡死未返回，拒绝再启动新调用"
+                    "（防线程无界增长；卡死的工具应尽快修掉或调大超时）"
+                ))
+
+        done = threading.Event()
+        box: dict[str, Any] = {}
+        # 用锁保护的共享状态协调"谁负责加减计数"，避免"线程刚好在超时瞬间结束"的竞态
+        state = {"finished": False, "counted": False}
+
+        def _target() -> None:
+            global _stuck_threads
             try:
-                return _AttemptOutcome(result=fut.result(timeout=timeout))
-            except TimeoutError:
-                return _AttemptOutcome(timed_out=True)
-            except Exception as e:  # noqa: BLE001
-                return _AttemptOutcome(exc=e)
-        finally:
-            # wait=False：不等待被卡的工作线程，立刻把控制权还回 loop
-            ex.shutdown(wait=False, cancel_futures=False)
+                box["result"] = fn(**arguments)
+            except BaseException as e:  # noqa: BLE001 - 含 KeyboardInterrupt 也要让 wait 返回
+                box["exc"] = e
+            finally:
+                done.set()
+                with _stuck_lock:
+                    state["finished"] = True
+                    if state["counted"] and _stuck_threads > 0:
+                        _stuck_threads -= 1
+
+        worker = threading.Thread(target=_target, name="warden-tool-call", daemon=True)
+        worker.start()
+        if done.wait(timeout):
+            if "exc" in box:
+                return _AttemptOutcome(exc=box["exc"])
+            return _AttemptOutcome(result=box["result"])
+
+        # 超时：放弃等待。线程转后台；若它此刻还没结束，就把这次记为"卡死"，
+        # 等它将来真正返回时再自减（若它已经结束，就不计——见 state 的协调）。
+        with _stuck_lock:
+            if not state["finished"]:
+                state["counted"] = True
+                _stuck_threads += 1
+        return _AttemptOutcome(timed_out=True)
 
     # ---- 重试决策 ----
 
     def _should_retry(self, out: _AttemptOutcome, is_pure: bool) -> bool:
-        """失败后问：还重试吗？瞬时错误 或（pure 且允许 pure 重试）→ 重试。"""
+        """失败后问：还重试吗？
+
+        三种情况分开判定，**关键是"超时"不能和"抛错"同等对待**：
+
+          - **超时（timed_out）**：我们只是"放弃等待"，被卡的那次调用**仍在后台线程里跑**
+            （见 `_run_once` 的 `shutdown(wait=False)`），副作用照常发生。此时重放会让
+            `fs.delete` 这类工具**执行两次** —— 一次人工审批换来两次删除。所以超时**只有
+            pure（无副作用）工具能重试**。
+          - **抛瞬时异常**（`retry_on_errors`：连接类/OSError 等）：工具"抛错"表示这次调用
+            没完成；重试是抗抖动的主要手段。这里沿用原有设计（非 pure 也可重试），
+            前提是**有副作用的工具要保证幂等**——否则应由工具自己处理，别抛瞬时异常。
+          - pure 工具：任何失败都可安全重试。
+        """
         if out.error_str is None:
             return False  # 成功
         if out.timed_out:
-            return True  # 超时是典型的瞬时故障
+            # 超时 != 没副作用：被卡调用还在跑，重放 = 有副作用操作执行两次
+            return bool(is_pure and self.config.retryable_pure)
         if out.exc is not None and isinstance(out.exc, self.config.retry_on_errors):
-            return True
+            return True  # 瞬时异常：这次没成功，重试抗抖动
         return bool(is_pure and self.config.retryable_pure)
 
 
 # 工具稳定性层的"生产默认值"：保守，只做**防卡死 + 抗瞬时故障**，不激进重试。
 #
 # 关键点：重试对**有副作用**的工具是危险的（`fs.delete` 重试 = 删两次）。这里依赖
-# 上面的 `pure` 判定 —— 非 pure 工具只对瞬时错误（Timeout / 连接类 / OSError）
-# 重试，逻辑错误不重放。所以开这套默认值不会导致"删两次"。
+# `pure` 判定 —— **非 pure 工具一律不自动重试**（含超时：超时只是"放弃等待"，
+# 被卡的那次调用还在后台跑，重放会让高危操作执行两次）。要重试就把工具声明成 `pure=True`，
+# 或由工具自己实现幂等。所以开这套默认值不会导致"删两次"。
 DEFAULT_STABILITY_CONFIG = StabilityConfig(
     timeout_seconds=30.0,   # 单次调用硬时限，防工具卡死拖住整个会话
     max_attempts=2,         # 只多试一次，避免放大瞬时故障

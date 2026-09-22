@@ -161,3 +161,42 @@ def test_workspace_工具可写读() -> None:
     catalog.execute("memory.remember", {"key": "结论", "text": "建议采用方案B"})
     out = catalog.execute("memory.recall", {"key": "结论"})
     assert "方案B" in str(out)
+
+
+# ---- 归属隔离（安全回归）----
+
+
+def test_记忆按归属隔离_互不可见() -> None:
+    """scope 只区分"哪一类"，owner 才区分"谁的"——没有 owner，记忆就是全部署共享的。"""
+    svc = _service()
+    for owner, text in (("alice", "A 的偏好"), ("bob", "B 的偏好")):
+        svc.approve(svc.propose(
+            MemoryScope.USER, "preference", MemoryContent(text=text), owner=owner))
+
+    assert [i.content.text for i in
+            svc.recall(MemoryScope.USER, key="preference", owner="alice")] == ["A 的偏好"]
+    assert [i.content.text for i in
+            svc.recall(MemoryScope.USER, key="preference", owner="bob")] == ["B 的偏好"]
+    # 不过滤（owner=None）才看得到全部——那是管理路径，不能用在面向用户的读路径上
+    # （注意按 key 查走的是"取该键最新一条"的语义，所以要按文本搜才能数出两条）
+    assert len(svc.recall(MemoryScope.USER, text_like="偏好")) == 2
+
+
+def test_记忆工具按运行期上下文归属_不来自入参() -> None:
+    """memory.remember/recall 是装配期建好、全局共享的；归属来自会话上下文，模型改不了。"""
+    from warden_agent.memory import owner_scope
+    from warden_agent.tool.catalog import ToolCatalog
+
+    svc = _service()
+    catalog = ToolCatalog()
+    for spec in make_memory_tools(svc, MemoryScope.SESSION):
+        catalog.register(spec)
+
+    with owner_scope("alice"):
+        catalog.execute("memory.remember", {"key": "city", "text": "常驻上海"})
+        assert "上海" in str(catalog.execute("memory.recall", {"key": "city"}))
+
+    with owner_scope("bob"):
+        # bob 在同一作用域下也查不到 alice 的记忆（否则就是跨租户投毒/泄露）
+        assert "上海" not in str(catalog.execute("memory.recall", {"key": "city"}))
+

@@ -51,13 +51,17 @@ class MemoryService:
         actor: MemoryActor | None = None,
         expires_at: _dt.datetime | None = None,
         reason: str = "",
+        owner: str = "",
     ) -> MemoryProposal:
         """把一条记忆放进"候选区"（PENDING），等 approve 才生效。
 
         若已有同 key 有效记忆，则新候选标 CONFLICTED（冲突），
         由 resolve_conflicts / approve 决定是否替代。
+
+        `owner` 是**归属者**（用户 id）：冲突检测与存储都按它隔离，
+        否则 A 的 "preference" 会和 B 的 "preference" 互相覆盖。
         """
-        existing = self._repo.latest(scope, key)
+        existing = self._repo.latest(scope, key, owner)
         status = MemoryStatus.PENDING
         conflicts_with = None
         if existing is not None and existing.is_active:
@@ -69,6 +73,7 @@ class MemoryService:
             scope=scope,
             key=key,
             content=content,
+            owner=owner,
             status=status,
             actor=actor or self._actor,
             expires_at=expires_at,
@@ -104,21 +109,25 @@ class MemoryService:
 
     # ---- 检索（按权限过滤）----
     def recall(self, scope: MemoryScope, key: str | None = None,
-               text_like: str | None = None, limit: int = 20) -> list[MemoryItem]:
+               text_like: str | None = None, limit: int = 20,
+               owner: str | None = None) -> list[MemoryItem]:
         """取回当前作用域下有效的记忆。key 给定时取该键最新；否则按文本模糊搜。
 
         这是 Agent 查记忆的主入口：它只会看到 ACTIVE 且未过期的（权限过滤）。
+
+        `owner` 传**调用者 id** 时只返回该调用者自己的记忆——**面向用户的读路径必须传**，
+        否则 scope 只区分"哪一类"、不区分"谁的"，等于把所有人的记忆合在一起看。
         """
         if key is not None:
-            item = self._repo.latest(scope, key)
+            item = self._repo.latest(scope, key, owner)
             return [item] if item is not None and self._is_usable(item) else []
-        return [i for i in self._repo.search(scope, text_like, limit)
+        return [i for i in self._repo.search(scope, text_like, limit, owner)
                 if self._is_usable(i)]
 
     def recall_text(self, scope: MemoryScope, key: str | None = None,
-                    text_like: str | None = None) -> str:
+                    text_like: str | None = None, owner: str | None = None) -> str:
         """把命中的记忆拼成一段可读文本，方便塞给模型。"""
-        items = self.recall(scope, key=key, text_like=text_like)
+        items = self.recall(scope, key=key, text_like=text_like, owner=owner)
         if not items:
             return ""
         return "\n".join(

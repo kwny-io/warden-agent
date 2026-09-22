@@ -39,11 +39,32 @@ logger = logging.getLogger(__name__)
 # 协议（Port）
 # ---------------------------------------------------------------------------
 class IdempotencyStore(Protocol):
-    """`Idempotency-Key` → 缓存的响应快照。"""
+    """`Idempotency-Key` → 缓存的响应快照。
+
+    幂等必须**防并发**：只做"先查后写"会有 TOCTOU——两个同 key 的请求在"查"处都读到空、
+    于是**各执行一次副作用**（正是多副本/网关重试要防的场景）。所以提供"占位"原语：
+    执行前先 `reserve`（原子地"仅当不存在时占位"），只有占到位的那个请求才真正执行。
+    """
 
     def get(self, key: str) -> dict[str, Any] | None: ...
 
     def put(self, key: str, value: dict[str, Any]) -> None: ...
+
+    def reserve(self, key: str) -> bool:
+        """原子占位：**仅当该 key 尚不存在时**写入一条"处理中"标记，返回是否占到。"""
+        ...
+
+    def release(self, key: str) -> None:
+        """释放占位（仅当它仍是"处理中"标记时）——失败请求要允许后续重试。"""
+        ...
+
+
+# "处理中"占位标记：body 为 None（正常响应一定有 body 或至少 status）。
+_PENDING: dict[str, Any] = {"status_code": 0, "headers": {}, "body": None}
+
+
+def _is_pending(item: dict[str, Any] | None) -> bool:
+    return item is not None and item.get("body") is None and item.get("status_code") == 0
 
 
 class EventBus(Protocol):
@@ -81,7 +102,21 @@ class InProcessIdempotencyStore:
 
     def put(self, key: str, value: dict[str, Any]) -> None:
         with self._lock:
-            self._data[key] = value
+            self._data[key] = dict(value)
+
+    def reserve(self, key: str) -> bool:
+        """原子占位（锁内 check-and-set），防"两个同 key 请求都读到空"的 TOCTOU。"""
+        with self._lock:
+            if key in self._data:
+                return False
+            self._data[key] = dict(_PENDING)
+            return True
+
+    def release(self, key: str) -> None:
+        """只在仍是"处理中"标记时删除——别把已经写好的响应快照误删。"""
+        with self._lock:
+            if _is_pending(self._data.get(key)):
+                self._data.pop(key, None)
 
 
 class InProcessEventBus:
@@ -189,6 +224,13 @@ class SqlIdempotencyStore:
 
     def put(self, key: str, value: dict[str, Any]) -> None:
         self._store.save_idempotent(key, _encode_idempotent(value))
+
+    def reserve(self, key: str) -> bool:
+        """原子占位——落在存储层用 `INSERT ... ON CONFLICT DO NOTHING`（跨副本也原子）。"""
+        return bool(self._store.reserve_idempotent(key, _encode_idempotent(_PENDING)))
+
+    def release(self, key: str) -> None:
+        self._store.release_idempotent(key, _encode_idempotent(_PENDING))
 
 
 class SqlEventBus:

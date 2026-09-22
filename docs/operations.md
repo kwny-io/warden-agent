@@ -199,6 +199,9 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | ~~没有告警规则库 / SLO / 链路追踪 / 灰度~~ | **已补齐**（规则库+SLO、traceparent 链路、健康门控灰度） | 见第九～十一节；span 送后端仍需接 OTel exporter |
 | `warden_stuck_runs` 抓取时现算 | 每次抓取对存储做一次只读扫描 | 本规模可接受；规模大改用物化视图/后台刷新 |
 | 熔断/出站并发/`InProcessRunLock` 的**进程内语义** | 每副本各一份 | 已文档化（多副本须用共享实现） |
+| **记忆按 `owner` 隔离**（2026-09-22 起） | 升级前写入的记忆 `owner` 为空串，**用户在 `/memory/{scope}` 与召回里看不到** | 空串 = 部署级共享；需要保留的旧数据应补写 `owner`（`UPDATE memories SET owner=? WHERE uid=?`） |
+| 幂等并发时返回 **409**（`IDEMPOTENCY_IN_FLIGHT`） | 同 `Idempotency-Key` 的第二个并发请求不再重复执行，改为明确拒绝 | 客户端应按幂等语义重试（带 `Retry-After`） |
+| SSRF 的 DNS 二次解析 TOCTOU | 校验用的 IP 与实际连接的 IP 可能不同（需攻击者控制权威 DNS 且赢下竞态） | 已知未消除；其余 SSRF 防护经审计确认有效 |
 
 ---
 

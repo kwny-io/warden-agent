@@ -551,6 +551,25 @@ class SqliteStore:
             )
             self.conn.commit()
 
+    def reserve_idempotent(self, key: str, payload: str) -> bool:
+        """原子占位：`ON CONFLICT DO NOTHING` + rowcount 判断是否占到（防并发 TOCTOU）。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO idempotency (key, payload, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (key, payload, _now_iso()),
+            )
+            self.conn.commit()
+            return cur.rowcount == 1
+
+    def release_idempotent(self, key: str, payload: str) -> None:
+        """仅当内容仍是那条占位时才删（否则会把已缓存的响应快照删掉）。"""
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM idempotency WHERE key = ? AND payload = ?", (key, payload)
+            )
+            self.conn.commit()
+
     def append_event(self, run_id: str, payload: str) -> int:
         with self._lock:
             cur = self.conn.execute(
