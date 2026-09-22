@@ -67,8 +67,10 @@ from warden_agent.web.auth import (
     HttpAuthorizationError,
     RunOperationAuthorizer,
     TrustedCaller,
+    combine_authorizers,
     operation_for,
     owner_authorizer,
+    permission_authorizer,
 )
 from warden_agent.web.coordination import (
     EventBus,
@@ -717,10 +719,13 @@ def build_app(
         run = store.load_run(run_id)
         return run.user_id if run is not None and run.user_id else None
 
-    # 认证开启 → 启用"按归属授权"：调用者只能操作自己名下的 Run。
+    # 认证开启 → 启用授权：先过**角色权限**（能不能做这类动作），
+    # 再过**按归属**（能不能碰这个 Run）。
     # 未认证（anon-dev）→ 保持旧的开放行为，本地开发不该被租户边界挡死。
     authorizer = (
-        RunOperationAuthorizer(owner_authorizer(_owner_of))
+        RunOperationAuthorizer(
+            combine_authorizers(permission_authorizer(), owner_authorizer(_owner_of))
+        )
         if authenticator is not None
         else RunOperationAuthorizer()
     )

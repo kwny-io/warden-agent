@@ -25,9 +25,13 @@ from warden_agent.web.audit import InMemoryAuditStore
 from warden_agent.web.auth import (
     ROLE_ADMIN,
     ROLE_USER,
+    ROLE_VIEWER,
+    RunOperation,
     TrustedCaller,
     admin_principals,
+    role_allows,
     role_for,
+    viewer_principals,
 )
 from warden_agent.web.run_server import resolve_auth
 from warden_agent.web.server import build_app
@@ -170,3 +174,62 @@ async def test_普通用户无法通过请求把自己变成管理员() -> None:
         r = await c.post("/models/select", json={"id": "fake", "scope": "deployment"},
                          headers={**A_BOB, "X-Warden-Role": "admin", "X-Admin": "1"})
         assert r.status_code == 403
+
+
+# ---------- 细粒度 RBAC：只读角色 viewer ----------
+
+
+def test_只读名单解析与优先级() -> None:
+    assert viewer_principals({}) == frozenset()
+    assert viewer_principals({"WARDEN_VIEWER_PRINCIPALS": " vera ,,fan ,"}) == {"vera", "fan"}
+    # admin 优先于 viewer：同在两份名单里 → 仍按 admin（否则会悄悄削掉运维的全局视图）
+    assert role_for("ops", frozenset({"ops"}), frozenset({"ops"})) == ROLE_ADMIN
+    assert role_for("vera", frozenset(), frozenset({"vera"})) == ROLE_VIEWER
+    assert role_for("bob", frozenset(), frozenset({"vera"})) == ROLE_USER
+
+
+def test_角色权限映射_只读角色只能读() -> None:
+    assert role_allows(ROLE_VIEWER, RunOperation.QUERY)
+    assert role_allows(ROLE_VIEWER, RunOperation.READ_EVENTS)
+    assert not role_allows(ROLE_VIEWER, RunOperation.SUBMIT_INPUT)
+    assert not role_allows(ROLE_VIEWER, RunOperation.START)
+    assert not role_allows(ROLE_VIEWER, RunOperation.COMMAND)
+    # user / admin 保持原有能力（读写 + 审批）
+    for role in (ROLE_USER, ROLE_ADMIN):
+        assert all(role_allows(role, op) for op in RunOperation)
+    # 未知角色 fail-closed
+    assert not role_allows("ghost", RunOperation.QUERY)
+
+
+def test_配置面接线_只读角色来自环境() -> None:
+    keys, mode = resolve_auth({
+        "WARDEN_API_KEYS": "alice:k-alice,vera:k-view",
+        "WARDEN_VIEWER_PRINCIPALS": "vera",
+    })
+    assert mode == "bearer" and keys is not None
+    assert keys["k-view"].role == ROLE_VIEWER
+    assert keys["k-alice"].role == ROLE_USER
+
+
+@pytest.mark.asyncio
+async def test_只读角色能读但不能发起或修改() -> None:
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")] * 4),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=SqliteStore(Path(tempfile.mkdtemp()) / "t.db"),
+        api_keys={"k-view": TrustedCaller("tenant-a", "user", "vera", role=ROLE_VIEWER)},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        hdr = {"Authorization": "Bearer k-view"}
+        # 读：放行
+        assert (await c.get("/status/run-x", headers=hdr)).status_code == 200
+        # 写 / 审批 / 切模型：一律 403
+        assert (await c.post("/chat/run-x", json={"text": "hi"}, headers=hdr)).status_code == 403
+        assert (await c.post("/approve/run-x", headers=hdr)).status_code == 403
+        assert (await c.post("/reject/run-x", headers=hdr)).status_code == 403
+        assert (
+            await c.post("/models/select", json={"id": "fake"}, headers=hdr)
+        ).status_code == 403

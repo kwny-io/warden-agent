@@ -108,6 +108,13 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "web/run_server.py", ("web/run_server.py",),
         default="local", note="注意它整租户共用，不能当用户级隔离用",
     ),
+    EnvSpec(
+        "WARDEN_VIEWER_PRINCIPALS",
+        "只读角色名单（逗号分隔）；名单里的人不能发起/修改/审批，只能读",
+        "web/auth.py", ("web/run_server.py", "web/auth.py"),
+        note="用于给审计方/观察者只读访问。不配就没人被降为只读；"
+             "同时出现在 admin 名单里时按 admin 处理（admin 优先）",
+    ),
     # ---- 服务与存储 ----
     EnvSpec(
         "WARDEN_HOST", "监听地址（对外应设 0.0.0.0，但无鉴权时会拒绝启动）",

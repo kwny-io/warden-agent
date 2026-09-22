@@ -66,7 +66,13 @@ from warden_agent.runtime.locking import run_lock_for
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog, function_tool
 from warden_agent.web.audit import audit_store_for_backend
-from warden_agent.web.auth import ROLE_USER, TrustedCaller, admin_principals, role_for
+from warden_agent.web.auth import (
+    ROLE_USER,
+    TrustedCaller,
+    admin_principals,
+    role_for,
+    viewer_principals,
+)
 from warden_agent.web.coordination import coordination_for
 from warden_agent.web.outbound import outbound_from_env
 from warden_agent.web.ratelimit import limiter_from_env
@@ -170,8 +176,9 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
     与控制台默认账号一致）。租户取 `WARDEN_TENANT`（默认 `local`）。
     """
     tenant = env_str("WARDEN_TENANT", "local", env).strip() or "local"
-    # 管理员名单来自配置（不配 ⇒ 没有管理员；见 auth.admin_principals 的 fail-closed 说明）。
+    # 管理员/只读名单来自配置（不配 ⇒ 没有管理员、没有只读；见 auth 的 fail-closed 说明）。
     admins = admin_principals(env)
+    viewers = viewer_principals(env)
 
     raw_keys = env_str("WARDEN_API_KEYS", "", env).strip()
     if raw_keys:
@@ -187,14 +194,15 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
                     "例如 alice:sk-aaa,bob:sk-bbb"
                 )
             uid = user_id.strip()
-            keys[key.strip()] = _caller_for(uid, tenant, role_for(uid, admins))
+            keys[key.strip()] = _caller_for(uid, tenant, role_for(uid, admins, viewers))
         if keys:
             return keys, "bearer"
 
     single_key = env_opt("WARDEN_API_KEY", env)
     if single_key:
         user_id = env_str("WARDEN_API_USER", "demo-user", env).strip() or "demo-user"
-        return {single_key: _caller_for(user_id, tenant, role_for(user_id, admins))}, "bearer"
+        role = role_for(user_id, admins, viewers)
+        return {single_key: _caller_for(user_id, tenant, role)}, "bearer"
 
     if env_bool("WARDEN_ALLOW_ANON", False, env):
         return None, "anon-dev"

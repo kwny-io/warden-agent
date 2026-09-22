@@ -19,14 +19,17 @@ from enum import StrEnum
 
 from starlette.requests import Request
 
-# 角色：目前只有两档——**够用且不引入猜测**。
-#   user  ：普通调用者。所有"面向用户"的读路径按归属收敛（只看得到自己的）。
-#   admin ：运维/管理员。能看**全局**视图（审计/挂起/恢复计划）与切**部署级**默认模型。
-# 为什么不做"租户内细粒度角色"：现在只有 API Key → principal 这一层身份，
-# 没有组织/团队模型；先立"谁是运维"这一条最必要的边界，需要时再扩（见 operations.md）。
+# 角色：三档。此前只有 user/admin，中间缺"只读"这一档——审计方/观察者需要能看、
+# 但绝不能动（不能发起对话、不能批准高危操作）。补上 viewer 后：
+#   viewer ：只读。QUERY / READ_EVENTS / SUBSCRIBE_EVENTS 之外一律 403。
+#   user   ：普通调用者（默认）。读写 + 审批都行，但读路径按归属收敛（只看得到自己的）。
+#   admin  ：运维/管理员。能看**全局**视图（审计/挂起/恢复计划）与切**部署级**默认模型。
+# 默认（不在任何名单里）是 **user**，与历史行为一致——新增 viewer 是**加法**，不收紧既有部署。
+# 角色一律来自**配置**（`WARDEN_ADMIN_PRINCIPALS` / `WARDEN_VIEWER_PRINCIPALS`），不来自请求。
 ROLE_USER = "user"
+ROLE_VIEWER = "viewer"
 ROLE_ADMIN = "admin"
-_ROLES = (ROLE_USER, ROLE_ADMIN)
+_ROLES = (ROLE_USER, ROLE_VIEWER, ROLE_ADMIN)
 
 
 class HttpAuthenticationError(Exception):
@@ -117,9 +120,32 @@ def admin_principals(env: Mapping[str, str] | None = None) -> frozenset[str]:
     return frozenset(item.strip() for item in raw.split(",") if item.strip())
 
 
-def role_for(principal_id: str, admins: frozenset[str]) -> str:
-    """按名单决定角色（名单里 → admin，否则 user）。"""
-    return ROLE_ADMIN if principal_id in admins else ROLE_USER
+def viewer_principals(env: Mapping[str, str] | None = None) -> frozenset[str]:
+    """从 `WARDEN_VIEWER_PRINCIPALS` 解析只读名单（逗号分隔的 principal id）。
+
+    同样 fail-closed 取向：不配就没人被降为只读。admin 名单优先于 viewer —— 同时出现在
+    两份名单里时按 admin 处理（否则"把运维误写进 viewer"会悄悄削掉他的全局视图）。
+    """
+    import os
+
+    src: Mapping[str, str] = os.environ if env is None else env
+    from warden_agent.core.settings import env_str
+
+    raw = env_str("WARDEN_VIEWER_PRINCIPALS", "", src)
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def role_for(
+    principal_id: str,
+    admins: frozenset[str],
+    viewers: frozenset[str] = frozenset(),
+) -> str:
+    """按名单决定角色。优先级：admin > viewer > user（默认）。"""
+    if principal_id in admins:
+        return ROLE_ADMIN
+    if principal_id in viewers:
+        return ROLE_VIEWER
+    return ROLE_USER
 
 
 class RunOperation(StrEnum):
@@ -154,11 +180,77 @@ def operation_for(method: str, path: str) -> RunOperation:
         return RunOperation.SUBSCRIBE_EVENTS
     if method == "POST" and path.startswith("/runs"):
         return RunOperation.START
+    if method == "POST" and path.startswith("/models"):
+        # 切换/导入模型是一次**写**动作（会改会话的模型与凭证库），不是只读查询
+        return RunOperation.COMMAND
     if method == "POST" and (path.startswith("/chat/stream") or path.startswith("/chat")):
         return RunOperation.SUBMIT_INPUT
     if method == "GET" and (path.startswith("/memory") or path == "/audit"):
         return RunOperation.QUERY
     return RunOperation.QUERY
+
+
+# ---- 角色 → 权限（细粒度 RBAC 的落点）----
+# 把操作归成三组权限，角色映射到权限集合。viewer 只拿 READ，于是"能看不能动"成为硬边界，
+# 而不是靠"端点恰好没写检查"。
+_READ_OPS = frozenset({
+    RunOperation.QUERY,
+    RunOperation.READ_EVENTS,
+    RunOperation.SUBSCRIBE_EVENTS,
+})
+_WRITE_OPS = frozenset({
+    RunOperation.START,
+    RunOperation.SUBMIT_INPUT,
+})
+_APPROVE_OPS = frozenset({RunOperation.COMMAND})
+
+ROLE_PERMISSIONS: dict[str, frozenset[RunOperation]] = {
+    ROLE_VIEWER: _READ_OPS,
+    ROLE_USER: _READ_OPS | _WRITE_OPS | _APPROVE_OPS,
+    ROLE_ADMIN: _READ_OPS | _WRITE_OPS | _APPROVE_OPS,
+}
+
+
+def role_allows(role: str, operation: RunOperation) -> bool:
+    """该角色是否允许执行该操作（未知角色一律不放行——fail-closed）。"""
+    return operation in ROLE_PERMISSIONS.get(role, frozenset())
+
+
+def permission_authorizer() -> AuthorizeFn:
+    """按**角色权限**授权的回调：角色不够就 403。
+
+    与归属授权（`owner_authorizer`）叠加使用：先过权限（能不能做这类动作），
+    再过归属（能不能碰这个 Run）。两者都在中间件的 authorize() 里跑。
+    """
+    def authorize_permission(
+        caller: TrustedCaller,
+        operation: RunOperation,
+        run_id: str | None,
+    ) -> None:
+        if not role_allows(caller.role, operation):
+            raise HttpAuthorizationError(
+                f"角色 {caller.role!r} 无权执行 {operation.value} 操作"
+                "（只读角色不能发起/修改）"
+            )
+
+    return authorize_permission
+
+
+def combine_authorizers(*fns: AuthorizeFn) -> AuthorizeFn:
+    """把多个授权回调串成一条：任一不放行即拒绝（**全部通过才放行**）。
+
+    顺序有意义（先便宜/先粗后细）：角色权限 → Run 归属。任一步抛
+    `HttpAuthorizationError` 就中断返回 403。
+    """
+    def combined(
+        caller: TrustedCaller,
+        operation: RunOperation,
+        run_id: str | None,
+    ) -> None:
+        for fn in fns:
+            fn(caller, operation, run_id)
+
+    return combined
 
 
 class ApiKeyAuthenticator:
