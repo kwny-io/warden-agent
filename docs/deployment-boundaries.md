@@ -58,9 +58,10 @@ Warden Agent 是一个**有状态的 Agent 运行时**，支持两种部署形�
 | 出站并发信号量 | `web/outbound.py` | 每副本各 N（不全局） | 如需全局并发上限，把"在飞请求数"也放共享存储 |
 | 会话缓存 `SessionRegistry._sessions` | `web/server.py` | 各副本各自缓存（会从库重建，**正确但不省内存**） | 可保留（纯缓存） |
 | 凭证密文与租约 | `credential/vault.py` | 已落库（`credentials` / `credential_leases` 表）→ 多副本共用一个库 | ✅ 可切共享存储；密钥材料仍需各副本统一 |
-| 工具稳定性层熔断状态 | `tool/stability.py` | 每个副本各自熔断（不全局） | 如需全局语义，换外置熔断 |
+| 工具稳定性层熔断状态 | `tool/stability.py` | 每个副本各自熔断（**刻意不全局**） | 熔断器按实例隔离是常见做法：全局熔断会造成"一个副本抖动、全体熔断"的同步失败。如需全局语义，换外置熔断 |
 | RAG 向量库 | `rag/knowledge.py` | 各副本各自索引（同一份文档索引结果一致，**不共享但等价**） | 索引成本 × 副本数；大语料建议外置向量库 |
-| 记忆库 | `memory/store.py` | 默认已落盘（`SqliteMemoryStore`）→ 用 PostgreSQL 时需同库 | 多副本共用一个库；并发写同一 key 无分布式锁 |
+| 记忆库 | `memory/store.py` | PG 主存储 → `PostgresMemoryStore`（多副本共享）；否则 SQLite（每副本一份） | 多副本配 PG 即共享；并发写同一 key 无分布式锁（后写覆盖前写） |
+| 审计账本 | `web/audit.py` | PG 主存储 → `PostgresAuditStore`（多副本共享，链写入跨副本串行）；否则 SQLite（每副本一本账） | 多副本配 PG 即共享；链密钥 `WARDEN_AUDIT_KEY` 各副本必须一致 |
 
 **持久化本身是可共享的**：`RunStore`（SQLite / PostgreSQL 同接口）、审计表、存档点表、
 记忆表都在数据库里。
@@ -115,7 +116,9 @@ Warden Agent 是一个**有状态的 Agent 运行时**，支持两种部署形�
 | RAG 知识库 | **关闭** | `WARDEN_KNOWLEDGE=1\|<目录>` 开启；默认**词频嵌入（词面匹配，非语义）**，要语义配 `WARDEN_EMBED_*` |
 | 出网抓取 | **关闭** | `WARDEN_WEB_FETCH=1` 开启真实 HTTP 抓取；每跳重定向都过 URL 策略（拒内网/环回/云元数据） |
 | 出站限速/配额 | **开启**（全局 120/60s、单 host 20/60s、并发 8、日配额不限） | `WARDEN_OUTBOUND_*` 可调；URL 策略先于闸门（被拒 URL 不占配额）；离线 provider 不占配额 |
-| 记忆 | **落盘**（产品入口） | `run_server` 用 `SqliteMemoryStore`；`build_agent(memory=True)` 不传记忆库则进程内（重启即丢） |
+| 记忆 | **落盘**（产品入口）；后端跟着主存储走 | PG 主存储 → `PostgresMemoryStore`（多副本共享同一份记忆）；否则 `SqliteMemoryStore`。`build_agent(memory=True)` 不传记忆库则进程内（重启即丢） |
+| 审计 | **落盘**；后端跟着主存储走 | PG 主存储 → `PostgresAuditStore`（多副本共享同一账本，链写入用 `pg_advisory_xact_lock` 跨副本串行）；否则 `SqliteAuditStore`。`WARDEN_AUDIT=1` 开启 |
+| 链路导出 | **关闭** | 设 `OTEL_EXPORTER_OTLP_ENDPOINT`（或 `..._TRACES_ENDPOINT`）即把 span 送到 OTLP 收集器；未配则只打结构化日志 |
 | 凭证加密 | **密文落库**（`credentials` 表）；密钥材料未配 `WARDEN_CREDENTIAL_KEY` 时用进程内临时密钥 | 落库的是 AES-GCM 密文，明文不落盘；临时密钥下密文重启即解不开，启动时告警 |
 | 凭证隔离 | 按**调用者身份**（`user_id`）分作用域 | 同租户多用户互不可见；启动配置的 key 记为部署级，全体共用 |
 | 沙箱隔离 | 内核档需 `SYS_ADMIN`，拿不到就**如实降级** | 见 README |
