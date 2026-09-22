@@ -51,7 +51,7 @@ _NON_ENV_CONSTANTS: frozenset[str] = frozenset()
 # `core/settings.py` 里的类型化访问器：`env_int("PORT", 8000)` 也是"读了这个变量"，
 # 守卫必须认（否则模块改用访问器之后，守卫就"看不见"它读了什么，等于自废武功）。
 _ENV_ACCESSORS = frozenset({
-    "env_str", "env_opt", "env_int", "env_bool", "env_positive_int",
+    "env_str", "env_opt", "env_int", "env_bool", "env_positive_int", "secret_bytes",
 })
 
 

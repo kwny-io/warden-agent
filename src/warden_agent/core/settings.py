@@ -301,11 +301,12 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
              "它只降低延迟，正确性仍靠落表+读表——丢通知不会丢事件",
     ),
     EnvSpec(
-        "WARDEN_AUDIT_KEY", "审计链的 HMAC 密钥材料（防篡改）",
-        "web/audit.py", ("web/audit.py",),
+        "WARDEN_AUDIT_KEY", "审计链 / 归档清单的 HMAC 密钥材料（防篡改）",
+        "core/settings.py", ("web/audit.py", "runtime/archive.py"),
         sensitive=True,
         note="不设则审计链退化为**不带密钥**的哈希链并告警：仍能发现「手改/删行」，"
-             "但挡不住会重算整条链的人。审计链要跨重启校验，所以不生成临时密钥",
+             "但挡不住会重算整条链的人。审计链要跨重启校验，所以不生成临时密钥。"
+             "读取走 core/settings.secret_bytes（tier 0），web/audit 与 runtime/archive 共用",
     ),
     EnvSpec(
         "WARDEN_SHUTDOWN_GRACE_S", "收到 SIGTERM 后等多久把在飞请求跑完（秒），默认 30",
@@ -419,6 +420,17 @@ def env_str(name: str, default: str = "", env: Mapping[str, str] | None = None) 
 def env_opt(name: str, env: Mapping[str, str] | None = None) -> str | None:
     """读一个字符串配置，但**区分"未设置"(None) 与"空串"**（需要这个区分时用它）。"""
     return _source(env).get(name)
+
+
+def secret_bytes(name: str, env: Mapping[str, str] | None = None) -> bytes | None:
+    """把一个环境变量当**密钥材料**读成 bytes；未配置（或空串）返回 None。
+
+    放在 tier-0 是为了让不同层的模块共用同一份"密钥材料怎么读"的口径，
+    又不破坏分层（审计链在 `web/audit.py`、归档清单在 `runtime/archive.py`，
+    两者都要用同一个 `WARDEN_AUDIT_KEY`——低层不能反向 import 高层）。
+    """
+    material = env_str(name, "", env).strip()
+    return material.encode("utf-8") if material else None
 
 
 def env_int(name: str, default: int = 0, env: Mapping[str, str] | None = None) -> int:

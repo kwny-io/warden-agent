@@ -40,7 +40,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import sqlite3
 import threading
 import time
@@ -48,7 +47,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
-from warden_agent.core.settings import env_str
+from warden_agent.core.settings import secret_bytes
 from warden_agent.web.auth import LOCAL_CALLER, RunOperation, TrustedCaller
 
 logger = logging.getLogger(__name__)
@@ -68,10 +67,9 @@ def audit_chain_key(env: Mapping[str, str] | None = None) -> bytes | None:
 
     只用环境变量。未配置时返回 None（调用方会退化为不带密钥的哈希链并告警）——
     不生成"进程内临时密钥"，因为审计链要跨重启校验，临时密钥会让昨天的链今天就验不过。
+    读取口径统一在 `core.settings.secret_bytes`（tier 0，供审计与归档共用）。
     """
-    src = env if env is not None else os.environ
-    material = env_str("WARDEN_AUDIT_KEY", "", src).strip()
-    return material.encode("utf-8") if material else None
+    return secret_bytes("WARDEN_AUDIT_KEY", env)
 
 
 def chain_hash(key: bytes | None, record: AuditRecord, prev_hash: str, row_id: int) -> str:

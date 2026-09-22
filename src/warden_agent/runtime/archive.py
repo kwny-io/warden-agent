@@ -63,9 +63,11 @@ def _manifest_hash(
 
 def _chain_key(chain_key: bytes | str | None) -> bytes | None:
     if chain_key == "env":
-        from warden_agent.web.audit import audit_chain_key
+        # 与审计链共用同一份密钥材料，读取口径收在 tier-0 的 secret_bytes
+        # （runtime 是 tier 2，不能反向 import tier 3 的 web/audit.py）
+        from warden_agent.core.settings import secret_bytes
 
-        return audit_chain_key()
+        return secret_bytes("WARDEN_AUDIT_KEY")
     if isinstance(chain_key, str):
         return chain_key.encode("utf-8")
     return chain_key
