@@ -28,6 +28,7 @@ _EXPECTED = {
     "audit-export": "_cmd_audit_export",
     "audit-archive": "_cmd_audit_archive",
     "audit-archive-verify": "_cmd_audit_archive_verify",
+    "prune": "_cmd_prune",
     "rotate-credentials": "_cmd_rotate_credentials",
 }
 

@@ -23,6 +23,7 @@ Prometheus text exposition 格式（`/metrics` 能被 Prometheus / Grafana 直�
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections import defaultdict
 from collections.abc import Iterable
@@ -285,3 +286,13 @@ _registry = MetricsRegistry()
 def metrics() -> MetricsRegistry:
     """取全局指标注册表。"""
     return _registry
+
+
+def note(name: str, help_text: str, amount: int = 1) -> None:
+    """便捷计数（无标签）。**绝不抛异常**——埋点不能影响业务。
+
+    用于"静默失败"类事件（锁续租失败、事件丢弃、审计写失败、OTLP 丢弃）：
+    这些原先只有日志、没有指标，于是告警规则也接不上。因子在哪儿都能调它。
+    """
+    with contextlib.suppress(Exception):  # 埋点失败不能拖垮调用方
+        _registry.counter(name, help_text).inc(amount)

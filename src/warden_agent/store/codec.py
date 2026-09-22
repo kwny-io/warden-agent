@@ -1,6 +1,7 @@
 """版本化 Payload Codec —— 让"存进去的每一条数据"都自带版本号。
 
-  - 数据库迁移（migrations.py）管的是"表结构"的版本；
+  - 数据库 schema 的版本由各存储自身的 `__schema_version__` 记录（见 sqlite.py / postgres.py 的
+    `_init_migrations` / `_init_schema`）；
   - PayloadCodec 管的是"表里某一行内容"的版本。
   - 同一个表里的老行（旧结构）和新行（新结构）可以共存，各自按自己的版本去读。
 

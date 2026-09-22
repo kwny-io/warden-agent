@@ -237,6 +237,12 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
             note="`warden stuck --notify` 把'等待人工超时'的 Run POST 到这里"),
     EnvSpec("WARDEN_ALERT_WEBHOOK_HEADERS", "告警 webhook 请求头（`k=v,k2=v2`）",
             "runtime/notify.py", ("runtime/notify.py",), sensitive=True),
+    EnvSpec("WARDEN_MAINTENANCE_INTERVAL_S",
+            "后台维护清扫间隔（秒）；默认 300，0 = 关闭（保留策略见 runtime/maintenance.py）",
+            "web/run_server.py", ("web/run_server.py",), default="300", kind="int"),
+    EnvSpec("WARDEN_IDEMPOTENCY_TTL_S",
+            "幂等记录保留时长（秒）；默认 86400（超期由维护清扫删除）",
+            "web/run_server.py", ("web/run_server.py",), default="86400", kind="int"),
     EnvSpec("GIT_WORKDIR", "把指定 git 仓库暴露为 git.apply_patch 工具",
             "web/run_server.py", ("web/run_server.py",), kind="path"),
     EnvSpec("SKILLS_DIR", "技能目录（加载 SKILL.md）",
@@ -322,6 +328,24 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         note="这是**保留条数**上限：消费者在两次轮询之间积累超过它会丢最早的几条"
              "（只影响进度展示；结果与消息走 messages/存档，不受影响）。丢弃时会打警告，"
              "消费者侧也会收到「事件流存在缺口」的提示。多副本用 SqlEventBus 时此项不生效",
+    ),
+    # ---- 入站请求保护（体积上限 / SSE 并发上限）----
+    EnvSpec(
+        "WARDEN_MAX_REQUEST_BYTES",
+        "【入站】请求体大小上限（字节）；超过返 413。默认 1048576（1 MiB），0 = 关闭",
+        "web/run_server.py", ("web/run_server.py",),
+        default="1048576", kind="int",
+        note="只对带 body 的方法（POST/PUT/PATCH）生效：先看 Content-Length，"
+             "没有（如 chunked）就边读边计数。防的是超大 body 把内存/解析打爆，"
+             "与 WARDEN_RATE_LIMIT（限次数）互补。0 = 关闭（不建议对外监听时关）",
+    ),
+    EnvSpec(
+        "WARDEN_SSE_MAX_CONNECTIONS",
+        "【入站】/chat/stream（SSE 长连接）并发上限；超过返 503。默认 100，0 = 关闭",
+        "web/run_server.py", ("web/run_server.py",),
+        default="100", kind="int",
+        note="长连接会一直占着线程/连接，不限并发时少量客户端就能耗尽连接池。"
+             "到上限**立刻 503**（不排队，避免请求堆着一起超时）；流结束（含客户端断开）才释放名额",
     ),
     # ---- 可观测性 ----
     EnvSpec(

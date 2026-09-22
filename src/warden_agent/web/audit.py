@@ -705,3 +705,6 @@ class AuditLogger:
             self._store.append(record)
         except Exception:  # noqa: BLE001 - 审计失败不能炸掉业务
             logger.warning("审计写入失败 correlation=%s", correlation_id)
+            from warden_agent.core.metrics import note
+
+            note("warden_audit_write_failures_total", "审计写入失败次数（账本可能缺条）")

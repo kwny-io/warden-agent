@@ -179,10 +179,23 @@ class InMemoryRunStore:
         if self._idempotency.get(key) == payload:
             self._idempotency.pop(key, None)
 
-    def append_event(self, run_id: str, payload: str) -> int:
+    def append_event(self, run_id: str, payload: str, keep: int | None = None) -> int:
         self._events_seq += 1
         self._events.append((self._events_seq, run_id, payload))
+        if keep and keep > 0:
+            # 保留策略：只留该 run 最近 keep 条
+            cutoff = self._events_seq - keep
+            self._events = [
+                e for e in self._events if e[1] != run_id or e[0] > cutoff
+            ]
         return self._events_seq
+
+    def purge_expired_idempotency(self, before_iso: str) -> int:
+        """内存版不做时间清理（进程内本就随进程消失）——返回 0。"""
+        return 0
+
+    def purge_stale_rate_limits(self, before_epoch: float) -> int:
+        return 0
 
     def list_events_after(
         self, run_id: str, after_seq: int, limit: int = 200

@@ -1,0 +1,82 @@
+{
+  "tables": {
+    "__schema_version__": [
+      "applied_at",
+      "version"
+    ],
+    "approval_history": [
+      "approval_id",
+      "arguments",
+      "created_at",
+      "decision",
+      "id",
+      "run_id",
+      "tool_name"
+    ],
+    "checkpoints": [
+      "data",
+      "run_id"
+    ],
+    "credential_leases": [
+      "expires_at",
+      "issued_at",
+      "lease_id",
+      "name",
+      "scope"
+    ],
+    "credentials": [
+      "data",
+      "name",
+      "scope",
+      "updated_at"
+    ],
+    "idempotency": [
+      "created_at",
+      "key",
+      "payload"
+    ],
+    "messages": [
+      "content",
+      "id",
+      "role",
+      "run_id",
+      "tool_call"
+    ],
+    "pending_approvals": [
+      "approval_id",
+      "arguments",
+      "created_at",
+      "reason",
+      "run_id",
+      "tool_name"
+    ],
+    "rate_limits": [
+      "bucket_key",
+      "count",
+      "window_start"
+    ],
+    "run_events": [
+      "created_at",
+      "data",
+      "id",
+      "run_id"
+    ],
+    "run_locks": [
+      "acquired_at",
+      "expires_at",
+      "owner",
+      "run_id"
+    ],
+    "runs": [
+      "run_id",
+      "status",
+      "updated_at",
+      "user_id"
+    ],
+    "users": [
+      "created_at",
+      "user_id"
+    ]
+  },
+  "version": 4
+}

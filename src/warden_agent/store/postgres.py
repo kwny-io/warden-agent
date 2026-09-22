@@ -37,6 +37,8 @@ class PostgresStore:
     """PostgreSQL 持久化实现，接口与 SqliteStore 一致（见 store/base.py）。"""
 
     backend = "postgres"
+    # 目标 schema 版本（与 SqliteStore 对齐；每次加表/加列 +1）
+    _SCHEMA_VERSION = 4
 
     def __init__(
         self,
@@ -218,7 +220,28 @@ class PostgresStore:
                     expires_at  DOUBLE PRECISION NOT NULL
                 )
             """)
+            # schema 版本（与 SqliteStore 对齐）：单行表，每次启动记录目标版本。
+            # PG 的补列用 `ADD COLUMN IF NOT EXISTS`——它本身就是幂等的、不会用异常做控制流，
+            # 所以不需要 SQLite 那套 pragma 判定。
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS __schema_version__ (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("DELETE FROM __schema_version__")
+            cur.execute(
+                "INSERT INTO __schema_version__ (version, applied_at) VALUES (%s, %s)",
+                (self._SCHEMA_VERSION, _now_iso()),
+            )
         self.conn.commit()
+
+    def schema_version(self) -> int:
+        """当前 schema 版本（真实记录，不再硬编码在别处）。"""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT version FROM __schema_version__ LIMIT 1")
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
 
     # ---- Run 状态 ----
     def save_run(self, run: AgentRun) -> None:
@@ -538,7 +561,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
-    def append_event(self, run_id: str, payload: str) -> int:
+    def append_event(self, run_id: str, payload: str, keep: int | None = None) -> int:
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO run_events (run_id, data, created_at) VALUES (%s, %s, %s) "
@@ -546,8 +569,31 @@ class PostgresStore:
                 (run_id, payload, _now_iso()),
             )
             row = cur.fetchone()
+            seq = int(row[0]) if row is not None else 0
+            if keep and keep > 0:
+                # 保留策略：只留该 run 最近 keep 条（否则共享事件表会无界增长）
+                cur.execute(
+                    "DELETE FROM run_events WHERE run_id = %s AND id <= %s",
+                    (run_id, seq - keep),
+                )
         self.conn.commit()
-        return int(row[0]) if row is not None else 0
+        return seq
+
+    def purge_expired_idempotency(self, before_iso: str) -> int:
+        """删掉早于 `before_iso` 的幂等记录（成功快照原先永不删除）。"""
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM idempotency WHERE created_at < %s", (before_iso,))
+            count = cur.rowcount
+        self.conn.commit()
+        return int(count or 0)
+
+    def purge_stale_rate_limits(self, before_epoch: float) -> int:
+        """删掉窗口起始早于 `before_epoch` 的限流计数行（行永不自己消失）。"""
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM rate_limits WHERE window_start < %s", (before_epoch,))
+            count = cur.rowcount
+        self.conn.commit()
+        return int(count or 0)
 
     def list_events_after(
         self, run_id: str, after_seq: int, limit: int = 200

@@ -188,45 +188,51 @@ class SqliteStore:
         )
         self.conn.commit()
 
+    # 目标 schema 版本：每次加表/加列就 +1。老库补完列后版本被更新到它。
+    _SCHEMA_VERSION = 4
+
+    def _has_column(self, table: str, column: str) -> bool:
+        """该表是否已有某列（用 `pragma_table_info` 表值函数 + 参数化查询，不拼 SQL）。"""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", (table, column)
+        ).fetchone()
+        return bool(row and row[0])
+
     def _init_migrations(self) -> None:
-        """运维 schema 版本：记录这套表结构当前是第几版，供未来迁移判断起点。"""
+        """schema 迁移：按 `pragma_table_info` 判定**是否缺列**，缺了才加。
+
+        为什么不再用 `try: ALTER ... except OperationalError: pass`（这是修过的一个真问题）：
+        那种写法把"列已存在"和**真失败**（磁盘满、库被锁、权限不足）混为一谈——
+        真失败会被静默吞掉，于是老库"以为升级了、其实没加列"，之后所有写入按新 schema
+        走就会静默出错。改成显式判定后，真失败会**抛出**，启动即暴露。
+        """
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS __schema_version__ ("
             " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-        cur = self.conn.execute("SELECT version FROM __schema_version__")
-        row = cur.fetchone()
-        if row is None:
-            self.conn.execute(
-                "INSERT INTO __schema_version__ (version, applied_at) VALUES (1, ?)",
-                ("now",),
-            )
         self.conn.commit()
-        # v2：runs 表加 updated_at（会话列表展示"最后活跃时间"用）。老库补列，已存在则跳过。
-        try:
+
+        # v2：runs 加 updated_at（会话列表展示"最后活跃时间"）
+        if not self._has_column("runs", "updated_at"):
             self.conn.execute("ALTER TABLE runs ADD COLUMN updated_at TEXT")
             self.conn.commit()
-        except sqlite3.OperationalError:
-            pass  # 列已存在
-        # v3：runs 表加 user_id（多用户隔离）。老库补列，并把无归属的历史会话归到 demo-user。
-        try:
+        # v3：runs 加 user_id（多用户隔离）；无归属的历史会话归到 demo-user
+        if not self._has_column("runs", "user_id"):
             self.conn.execute("ALTER TABLE runs ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
-            self.conn.execute(
-                "UPDATE runs SET user_id = 'demo-user' WHERE user_id = ''"
-            )
+            self.conn.execute("UPDATE runs SET user_id = 'demo-user' WHERE user_id = ''")
             self.conn.commit()
-        except sqlite3.OperationalError:
-            pass  # 列已存在
-        # v4：pending_approvals 表加 created_at，记"进入等待审批的时刻"——
-        # 供挂起超时告警算准确时长（用 run 的最后活动时间近似会低估）。
-        # 老库补列后历史行为 NULL → 告警侧退回用最后活动时间近似（只会低估，不会虚报）。
-        try:
-            self.conn.execute(
-                "ALTER TABLE pending_approvals ADD COLUMN created_at TEXT"
-            )
+        # v4：pending_approvals 加 created_at（挂起超时告警算准确时长；历史行为 NULL 时退回近似）
+        if not self._has_column("pending_approvals", "created_at"):
+            self.conn.execute("ALTER TABLE pending_approvals ADD COLUMN created_at TEXT")
             self.conn.commit()
-        except sqlite3.OperationalError:
-            pass  # 列已存在
+
+        # 记录当前版本（单行表：先清再写，避免多行）
+        self.conn.execute("DELETE FROM __schema_version__")
+        self.conn.execute(
+            "INSERT INTO __schema_version__ (version, applied_at) VALUES (?, ?)",
+            (self._SCHEMA_VERSION, _now_iso()),
+        )
+        self.conn.commit()
 
     @_locked
     def schema_version(self) -> int:
@@ -613,14 +619,40 @@ class SqliteStore:
             )
             self.conn.commit()
 
-    def append_event(self, run_id: str, payload: str) -> int:
+    def append_event(self, run_id: str, payload: str, keep: int | None = None) -> int:
         with self._lock:
             cur = self.conn.execute(
                 "INSERT INTO run_events (run_id, data, created_at) VALUES (?, ?, ?)",
                 (run_id, payload, _now_iso()),
             )
             self.conn.commit()
-            return int(cur.lastrowid or 0)
+            seq = int(cur.lastrowid or 0)
+            if keep and keep > 0:
+                # 保留策略：只留该 run 最近 keep 条（否则共享事件表会无界增长）
+                self.conn.execute(
+                    "DELETE FROM run_events WHERE run_id = ? AND id <= ?",
+                    (run_id, seq - keep),
+                )
+                self.conn.commit()
+            return seq
+
+    def purge_expired_idempotency(self, before_iso: str) -> int:
+        """删掉早于 `before_iso` 的幂等记录（成功快照原先永不删除）。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM idempotency WHERE created_at < ?", (before_iso,)
+            )
+            self.conn.commit()
+            return int(cur.rowcount or 0)
+
+    def purge_stale_rate_limits(self, before_epoch: float) -> int:
+        """删掉窗口起始早于 `before_epoch` 的限流计数行（行永不自己消失）。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM rate_limits WHERE window_start < ?", (before_epoch,)
+            )
+            self.conn.commit()
+            return int(cur.rowcount or 0)
 
     @_locked
     def list_events_after(

@@ -91,6 +91,45 @@ API_VERSION = "1.0"
 # 而不是"装作没事"继续处理（那会让调用方拿着旧假设去读一个语义已经变了的响应）。
 API_SUPPORTED_MAJORS: tuple[str, ...] = ("1",)
 
+# ---- 入站请求保护默认值（可在 build_app 覆盖；0 = 关闭）----
+# 请求体上限：默认 1 MiB。防的是超大 body 把内存/JSON 解析打爆（与限流互补：限流管次数）。
+DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
+# SSE 长连接并发上限：默认 100。长连接一直占线程/连接，不限并发时少量客户端就能耗尽连接池。
+DEFAULT_SSE_MAX_CONCURRENCY = 100
+
+
+class SseConcurrencyGate:
+    """SSE 长连接并发闸门：到上限**立刻拒绝**（不排队），名额用完释放才回收。
+
+    用 `threading.Lock`：流的生成器在 Starlette 的线程池里迭代，释放可能发生在工作线程，
+    `asyncio.Lock` 跨线程不安全；临界区只做自增/自减，开销可忽略。
+    `limit <= 0` 表示不限并发（`acquire()` 永远成功）。
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._active = 0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> bool:
+        """名额占得到返回 True；已到上限返回 False（调用方应立刻回 503）。"""
+        with self._lock:
+            if self.limit > 0 and self._active >= self.limit:
+                return False
+            self._active += 1
+            return True
+
+    def release(self) -> None:
+        """归还名额（幂等石旁：多发/多减不会把计数打到负）。"""
+        with self._lock:
+            self._active = max(0, self._active - 1)
+
+    @property
+    def active(self) -> int:
+        """当前在飞的长连接数（供运维/测试观察）。"""
+        with self._lock:
+            return self._active
+
 
 def _split_version(value: str) -> tuple[str, str] | None:
     """把 `1.0` 拆成 `("1", "0")`；形态不对返回 None。"""
@@ -469,6 +508,9 @@ def build_app(
     event_bus: EventBus | None = None,
     outbound_limiter: OutboundLimiter | None = None,
     run_lock: RunLock | None = None,
+    maintenance: Any = None,
+    max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+    sse_max_concurrency: int = DEFAULT_SSE_MAX_CONCURRENCY,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
@@ -545,6 +587,10 @@ def build_app(
             _close_quietly(bus, "事件总线")
             _close_quietly(memory_repository, "记忆库")
             _close_quietly(store, "主存储")
+            # 后台维护清扫线程：停机时先让它退出（它自己带 stop(timeout)）
+            if maintenance is not None:
+                with contextlib.suppress(Exception):
+                    maintenance.stop()
             # OTLP 导出器：停机前尽量把队列里的 span 冲刷掉（未开启时是空操作）
             from warden_agent.core import otel
 
@@ -585,6 +631,12 @@ def build_app(
             )
         return lease
 
+    # ---- SSE 长连接并发闸门 ----
+    # 长连接（/chat/stream）会一直占着连接与工作线程，不限并发时少量客户端就能把服务
+    # 拖到连健康探针都探不到。到上限**立刻 503**（不排队，排队只会让一堆请求一起超时），
+    # 名额在该请求的 SSE 流结束时释放（含客户端断开触发的 GeneratorExit）。
+    sse_gate = SseConcurrencyGate(sse_max_concurrency)
+    app.state.sse_gate = sse_gate  # 挂到 app 上，便于运维/测试观察当前占用量
 
     # ---- 模型切换：傻瓜式接入的模型目录，/models 查询、/models/select 切换/导入 ----
     from warden_agent.model import deepseek as _ds
@@ -785,6 +837,39 @@ def build_app(
         )
         trace_ctx = trace_cm.__enter__()
         try:
+            # 请求体大小上限：超限返 413。
+            # 只对带 body 的方法判定；先看 Content-Length（廉价），没有（chunked）就边读边计数——
+            # 否则一个不声明长度的客户端能把任意大的 body 灌进来。读完（未超限）后把已读字节
+            # 挂回 `request._body`：Starlette 的 BaseHTTPMiddleware 会把它透给下游，
+            # 下游照常能读到 body（口径与 request.body() 一致，但内存被上限封顶）。
+            if max_request_bytes > 0 and method in ("POST", "PUT", "PATCH"):
+                declared = request.headers.get("content-length")
+                too_big = (
+                    declared is not None
+                    and declared.isdigit()
+                    and int(declared) > max_request_bytes
+                )
+                if too_big:
+                    status_code = 413
+                    return _problem(
+                        413, "PAYLOAD_TOO_LARGE",
+                        f"请求体超过上限 {max_request_bytes} 字节",
+                        correlation_id,
+                    )
+                if declared is None:
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in request.stream():
+                        total += len(chunk)
+                        if total > max_request_bytes:
+                            status_code = 413
+                            return _problem(
+                                413, "PAYLOAD_TOO_LARGE",
+                                f"请求体超过上限 {max_request_bytes} 字节",
+                                correlation_id,
+                            )
+                        chunks.append(chunk)
+                    request._body = b"".join(chunks)  # 透传给下游（见上）
             # API 版本协商：客户端可用 `X-Warden-Api-Version` 声明它按哪个版本写的。
             # 主版本不被支持 → **明确 400**（而不是装作没事继续处理：调用方拿着旧假设去读
             # 语义已经变了的响应，比直接报错危险得多）。只认主版本，次版本差异不拒绝。
@@ -1302,26 +1387,40 @@ def build_app(
         raise HTTPException(status_code=500, detail="未知结果类型")
 
     @app.post("/chat/stream/{run_id}")
-    def chat_stream(
+    async def chat_stream(
         request: Request, run_id: str, body: ChatRequestIn, user_id: str = "demo-user"
     ) -> StreamingResponse:
         """流式对话（SSE 打字机）：模型边生成边把增量推给前端。
         前端拿到增量直接渲染，就能看到"逐字打出"的效果。"""
+        # 并发闸门：到上限立刻 503，不排队（排队只会让一堆请求一起超时）。
+        if not sse_gate.acquire():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"SSE 长连接已达并发上限 {sse_max_concurrency}，请稍后重试"
+                    "（WARDEN_SSE_MAX_CONNECTIONS 可调）"
+                ),
+            )
         # 流式用**手动 start/stop** 的租约：锁在端点里取（抢不到就地 423），
         # 但必须活到 SSE 流结束——所以释放放在生成器的 finally 里，而不是端点作用域。
         # 租约自带心跳续租，所以"流很久"也不会中途过期被接管。
-        lease = _acquire_run(run_id)
         try:
-            sess = registry.get(run_id)
-            if not sess.run.user_id:
-                # 归属只能用 `_identity` 派生（认证模式下来自凭证，忽略查询参数），
-                # 与非流式 `/chat` 一致——否则客户端能用 `?user_id=alice` 把消息写进别人名下。
-                sess.run.user_id = _identity(request, user_id)
-                registry.apply_owner_model(sess)  # 用该用户自己选的模型
+            lease = _acquire_run(run_id)
+            try:
+                sess = registry.get(run_id)
+                if not sess.run.user_id:
+                    # 归属只能用 `_identity` 派生（认证模式下来自凭证，忽略查询参数），
+                    # 与非流式 `/chat` 一致——否则客户端能用 `?user_id=alice` 把消息写进别人名下。
+                    sess.run.user_id = _identity(request, user_id)
+                    registry.apply_owner_model(sess)  # 用该用户自己选的模型
+            except Exception:
+                # 建流**之前**出错也必须释放租约：租约带后台心跳续租，漏掉的话这个 run
+                # 会被永久占住（一直回 423），直到进程重启。流内的释放见 generate() 的 finally。
+                lease.stop()
+                raise
         except Exception:
-            # 建流**之前**出错也必须释放租约：租约带后台心跳续租，漏掉的话这个 run
-            # 会被永久占住（一直回 423），直到进程重启。流内的释放见 generate() 的 finally。
-            lease.stop()
+            # 建流前任何失败（含上面抢不到 Run 锁的 423）都要把并发名额还回去。
+            sse_gate.release()
             raise
 
         def generate() -> Any:
@@ -1336,7 +1435,9 @@ def build_app(
             finally:
                 # 流结束（含客户端断开触发 GeneratorExit）才释放：
                 # 整段流式期间都在驱动这个 run，提前释放等于开门让人并发写。
+                # 并发名额同生共死：与租约一起在这里还回去。
                 lease.stop()
+                sse_gate.release()
 
         # 关键响应头：no-cache 防止代理缓冲；X-Accel-Buffering 关掉 nginx 缓冲，
         # 否则增量会被攒住不实时发出（部署必配）。

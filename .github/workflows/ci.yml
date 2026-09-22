@@ -138,9 +138,10 @@ jobs:
         run: uv run --frozen bandit -r src/warden_agent || true
 
       - name: SAST 门禁：Medium 及以上必须为 0
-        # 基线（2026-09-22）：Medium 0、Low 26。
-        # migrations.py 里两处 B608（常量表名的 f-string）已用 `# nosec B608` **显式接受**——
-        # 表名在 SQL 里无法参数化，且它来自模块常量而非用户输入。
+        # 基线（2026-09-23）：Medium 0、Low 28。
+        # 此前 `migrations.py` 里两处 B608（常量表名的 f-string）用 `# nosec B608` 显式接受；
+        # item 4 已把该文件删除（迁移改成显式 schema 版本），现在**无任何 #nosec 压制**，
+        # Medium 0 是真实扫描结果。将来若出现必须压制的项，要在本注释里写明理由。
         run: uv run --frozen bandit -r src/warden_agent --severity-level medium --confidence-level medium
 
       - name: 秘密扫描（gitleaks，扫全历史）
@@ -150,3 +151,103 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
             detect --source /repo --no-banner --redact -v
+
+  migration:
+    runs-on: ubuntu-latest
+    # 交付面缺口 item 5：migration 检查。
+    # item 4 删掉 `store/migrations.py` 后，迁移改成**显式 schema 版本**（启动补列 +
+    # 把目标版本写进 `__schema_version__` 单行表）。这套机制缺一个守门人：谁加了表/列
+    # 却忘了 `_SCHEMA_VERSION += 1`，启动照旧成功，老库停在上一个版本，
+    # "记录版本"和"真实结构"就悄悄分叉——直到某次写入按新 schema 静默出错。
+    # `scripts/check_migrations.py` 真起一个新库、读出结构指纹与签入快照对比，
+    # 把这个分叉变成红灯（结构变了而版本没升 = 明确失败）。
+    # 和 quality 一样起**真 PG**：两个后端的目标版本与结构必须一致，
+    # 只查 SQLite 会漏掉 PG 侧漂移（"可换存储"是本仓库的明确承诺）。
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: warden
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      WARDEN_TEST_PG_HOST: localhost
+      WARDEN_TEST_PG_DB: warden
+      WARDEN_TEST_PG_USER: postgres
+      WARDEN_TEST_PG_PASSWORD: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install (按 uv.lock 固定版本)
+        run: uv sync --frozen --extra dev
+      - name: SQLite 迁移检查（新库版本 + 结构指纹对比签入快照）
+        run: uv run --frozen python scripts/check_migrations.py --backend sqlite
+      - name: PostgreSQL 迁移检查（同一份快照，验证两后端结构一致）
+        run: uv run --frozen python scripts/check_migrations.py --backend postgres
+
+  sbom:
+    runs-on: ubuntu-latest
+    # 交付面缺口 item 5：SBOM（软件物料清单）。
+    # 为什么要有它：trivy 只回答"**当前**基镜像里有没有已知漏洞"，不回答"这个镜像里
+    # 到底装了什么"。SBOM 是**成分清单**（OS 包 + Python 依赖 + 版本 + 许可证），
+    # 它让"某天爆出一个新 CVE、我受不受影响"变成一次本地查询，而不是重建镜像再扫。
+    # 扫的是**真镜像**（不是源码树）：交付出去的是镜像，OS 层的包只有镜像里才有。
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建镜像（SBOM 的扫描对象就是交付镜像本身）
+        # 与 container job 的构建重复是有意的：SBOM 必须描述"按当前源码构建出的那个镜像"，
+        # 不能描述一个可能过期的缓存产物。将来 publish 步骤落地后，
+        # 这里换成按 registry 里的 digest 扫描即可（那时不必再本地 build）。
+        run: docker build --pull -t warden-agent:sbom .
+      - name: 生成 SBOM（syft / SPDX JSON）并上传为构建产物
+        # anchore/sbom-action 底层就是 syft；用 action 而不是手写 `docker run syft`，
+        # 是为了顺带处理"产物上传"（upload-artifact: true）与版本固定。
+        uses: anchore/sbom-action@v0
+        with:
+          image: warden-agent:sbom
+          format: spdx-json
+          output-file: warden-agent.spdx.json
+          artifact-name: warden-agent-sbom
+          upload-artifact: true
+
+  image-signing:
+    # 交付面缺口 item 5：镜像签名。
+    # 只对**打 tag（v*）的 push** 触发：cosign keyless 需要把签名推到 registry，
+    # 而现在仓库**还没有 publish 步骤**（container job 只 build 本地镜像、不 push）。
+    # 所以这里把"发布"也一并做了：先 push 到 GHCR 再签。将来 publish 独立成步骤后，
+    # 把这里的 build+push 换成引用那一步产出的 digest 即可（签名对象是 digest，不是 tag）。
+    # ⚠️ PR 上**不会**触发（if 已限定 push tag）：没有可发布对象，硬签只会把 PR 弄红——
+    # 这与"新门禁不得误伤 PR"的取向一致。
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write     # 推镜像到 GHCR
+      id-token: write     # cosign keyless：用 GitHub OIDC 换**短期**签名证书，无长期私钥可泄露
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建并推送到 GHCR
+        # GHCR 的仓库路径必须小写，而 github.repository 保留大小写 → 显式转小写。
+        run: |
+          repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${repo}:${{ github.ref_name }}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker build --pull -t "$image" .
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+          docker push "$image"
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@v3
+      - name: cosign keyless 签名（签名存回 registry，与镜像 digest 绑定）
+        # keyless：不管理任何长期私钥；cosign 用 OIDC 身份换 Fulcio 短期证书，
+        # 签名与证书进 Rekor 透明日志，事后可审计"谁在什么时候签的"。
+        run: cosign sign --yes "$IMAGE"

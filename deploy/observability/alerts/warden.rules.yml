@@ -111,3 +111,62 @@ groups:
           summary: "入站限流拒绝量激增"
           description: "近 5 分钟被拒 > 100 次。先区分是「恶意刷」还是「容量不够」：按 path 看分布，再决定收紧还是扩容。"
           runbook: "docs/operations.md"
+
+  # ---- 静默失败：这些错不会让请求报错，却会**悄悄丢掉正确性** ----
+  # 为什么单列一组：以前它们**只有日志、没有指标**，于是告警接不上、线上以"没人知道"的方式坏掉。
+  - name: warden-silent-failures
+    rules:
+      - alert: WardenLockRenewFailures
+        # 租约续租失败 = 丢锁：同一 Run 可能被两个副本并发驱动（后写覆盖前写）。
+        expr: increase(warden_lock_renew_failures_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Run 锁续租失败（可能已被接管）"
+          description: "某 Run 的租约续租失败，说明锁被别的副本接管或存储抖动 → 该 Run 可能被并发驱动。查日志「租约续租失败」拿 run/owner，核对是否发生重复执行。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenEventDropped
+        # 事件因保留上限被丢弃：只影响进度展示，不影响最终结果与消息。
+        expr: increase(warden_event_dropped_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SSE 事件被丢弃（保留上限被突破）"
+          description: "事件总线超出每个 run 的保留条数，慢消费者会看到进度不连续。最终结果不受影响；频繁发生可调大 WARDEN_EVENT_KEEP。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenAuditWriteFailures
+        # 审计写失败：账本会缺条——合规上不可接受。
+        expr: increase(warden_audit_write_failures_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "审计写入失败（账本可能缺条）"
+          description: "审计落库失败，correlation_id 见日志。先查存储是否不可写/锁冲突，再评估缺失范围（`warden audit-verify` 校验链完整性）。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenOtlpExportFailing
+        # 链路数据送不出去：排查能力受影响，业务不受影响。
+        expr: increase(warden_otlp_export_failures_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTLP 链路导出失败"
+          description: "span 送不到收集器。检查 OTEL_EXPORTER_OTLP_ENDPOINT 可达性与收集器状态；未配 OTLP 时不会有此指标。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenOtlpDropping
+        # 队列满丢弃：收集器跟不上（持续失败）时会发生。
+        expr: increase(warden_otlp_dropped_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTLP span 因队列满被丢弃"
+          description: "导出队列积压，通常是收集器不可达或太慢。链路数据不完整，业务不受影响。"
+          runbook: "docs/operations.md"

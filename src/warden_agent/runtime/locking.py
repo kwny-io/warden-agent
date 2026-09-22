@@ -256,6 +256,9 @@ class RunLease:
             if self._lock.renew(self.run_id, self.owner, self._ttl):
                 continue
             self._lost = True
+            from warden_agent.core.metrics import note
+
+            note("warden_lock_renew_failures_total", "Run 锁续租失败次数（丢锁）")
             logger.warning(
                 "Run 租约续租失败：run=%s owner=%s —— 租约可能已被接管，"
                 "本次工作不再独占该 run（不会再自动续租）",

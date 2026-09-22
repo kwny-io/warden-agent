@@ -552,6 +552,70 @@ def _cmd_audit_export(args: argparse.Namespace) -> None:
         raise SystemExit(4)
 
 
+def _open_run_store(args: argparse.Namespace) -> tuple[object, object]:
+    """打开主存储 + 配套记忆库：默认 SQLite（`--db`）；`--pg` 则连 PostgreSQL。"""
+    import os
+
+    from warden_agent.core.settings import env_int, env_opt, env_str
+
+    if getattr(args, "pg", False):
+        host = env_str("WARDEN_PG_HOST", "", os.environ).strip()
+        if not host:
+            _die("--pg 需要设置 WARDEN_PG_HOST（其余 WARDEN_PG_* 可选）")
+        from warden_agent.memory import PostgresMemoryStore
+        from warden_agent.store.postgres import PostgresStore
+
+        params = {
+            "host": host,
+            "port": env_int("WARDEN_PG_PORT", 5432, os.environ),
+            "dbname": env_str("WARDEN_PG_DB", "warden", os.environ),
+            "user": env_str("WARDEN_PG_USER", "postgres", os.environ),
+            "password": env_opt("WARDEN_PG_PASSWORD", os.environ) or "",
+        }
+        try:
+            store: object = PostgresStore(**params)  # type: ignore[arg-type]
+        except Exception as e:  # noqa: BLE001
+            _die(f"无法连接 {host}: {e}")
+        return store, PostgresMemoryStore(conn=store.new_connection())  # type: ignore[attr-defined]
+
+    from warden_agent.memory import SqliteMemoryStore
+    from warden_agent.store.sqlite import SqliteStore
+
+    db = _db_from_args(args)
+    try:
+        store = SqliteStore(db)
+    except Exception as e:  # noqa: BLE001
+        _die(f"无法打开存档库 {db}: {e}")
+    return store, SqliteMemoryStore(db)
+
+
+def _cmd_prune(args: argparse.Namespace) -> None:
+    """按保留策略清扫：幂等表（TTL）/ 限流计数 / 过期记忆。可接 cron 定时跑。"""
+    import contextlib
+    import json
+
+    from warden_agent.runtime.maintenance import sweep
+
+    store, memory = _open_run_store(args)
+    try:
+        counts = sweep(
+            store,
+            idempotency_ttl_s=args.ttl_hours * 3600.0,
+            memory_repository=memory,
+        )
+    finally:
+        for obj in (memory, store):
+            with contextlib.suppress(Exception):
+                obj.close()  # type: ignore[attr-defined]
+    if args.json:
+        print(json.dumps(counts, ensure_ascii=False))
+    else:
+        print(
+            f"清扫完成：幂等 {counts['idempotency']} 条"
+            f"｜限流 {counts['rate_limits']} 条｜记忆 {counts['memories']} 条"
+        )
+
+
 def _cmd_audit_archive(args: argparse.Namespace) -> None:
     """把审计记录归档成**只追加**的证据包（新文件 + 清单登记，绝不覆盖已有归档）。
 
@@ -799,6 +863,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_archive_v.add_argument("--dir", required=True, help="归档目录")
     p_archive_v.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_archive_v.set_defaults(func=_cmd_audit_archive_verify)
+
+    p_prune = sub.add_parser(
+        "prune", help="按保留策略清扫（幂等表 TTL / 限流计数 / 过期记忆）"
+    )
+    p_prune.add_argument("--db", default="", help="存档库路径（默认取 WARDEN_DB_PATH）")
+    p_prune.add_argument("--pg", action="store_true",
+                         help="连 PostgreSQL（读 WARDEN_PG_*；多副本部署用）")
+    p_prune.add_argument("--ttl-hours", type=float, default=24.0,
+                         help="幂等记录保留小时数（默认 24）")
+    p_prune.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p_prune.set_defaults(func=_cmd_prune)
 
     p_rotate = sub.add_parser(
         "rotate-credentials", help="把存量凭证密文重加密到当前密钥（密钥轮换的第二半）"

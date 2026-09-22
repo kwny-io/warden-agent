@@ -307,6 +307,21 @@ class SqliteMemoryStore:
     def close(self) -> None:
         self._conn.close()
 
+    def purge_expired(self, now: _dt.datetime) -> int:
+        """物理删除已过期 / 已墓碑化的记忆，返回删除条数（保留策略）。
+
+        为什么需要：`MemoryService.execute_purge` 只把状态标成 TOMBSTONED、**不物理删**；
+        若没有清扫，过期记忆会一直留在表里（内存与磁盘都只增不减）。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM memories WHERE status IN (?, ?)"
+                " OR (expires_at IS NOT NULL AND expires_at <= ?)",
+                (MemoryStatus.EXPIRED.name, MemoryStatus.TOMBSTONED.name, now.isoformat()),
+            )
+            self._conn.commit()
+            return int(cur.rowcount or 0)
+
 
 class PostgresMemoryStore:
     """落 PG 的记忆库：实现 `MemoryRepository`，多副本共享同一份记忆。
@@ -471,6 +486,18 @@ class PostgresMemoryStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    def purge_expired(self, now: _dt.datetime) -> int:
+        """物理删除已过期 / 已墓碑化的记忆，返回删除条数（保留策略，同 SQLite 版）。"""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM memories WHERE status IN (%s, %s)"
+                " OR (expires_at IS NOT NULL AND expires_at <= %s)",
+                (MemoryStatus.EXPIRED.name, MemoryStatus.TOMBSTONED.name, now.isoformat()),
+            )
+            count = cur.rowcount
+        self._conn.commit()
+        return int(count or 0)
 
 
 def _now() -> _dt.datetime:

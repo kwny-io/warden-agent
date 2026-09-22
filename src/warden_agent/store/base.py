@@ -85,7 +85,13 @@ class RunStore(Protocol):
         """删除"处理中"占位（`payload` 匹配时才删，避免误删已写好的响应快照）。"""
         ...
 
-    def append_event(self, run_id: str, payload: str) -> int: ...
+    def append_event(self, run_id: str, payload: str, keep: int | None = None) -> int:
+        """追加一个事件，返回序号。
+
+        `keep` 给定时，追加后把该 run 的早期事件删掉、只留最近 `keep` 条
+        （**保留策略**：共享事件总线若无上限，多副本长跑会把表撑大）。
+        """
+        ...
 
     def list_events_after(
         self, run_id: str, after_seq: int, limit: int = 200
@@ -94,3 +100,15 @@ class RunStore(Protocol):
     def hit_rate_limit(
         self, bucket_key: str, window_seconds: int, now: float
     ) -> tuple[int, float]: ...
+
+    # ---- 保留策略（维护清扫用；见 runtime/maintenance.py）----
+    def purge_expired_idempotency(self, before_iso: str) -> int:
+        """删掉 `created_at < before_iso` 的幂等记录，返回删除条数。
+
+        为什么需要：**成功的响应快照原先永不删除**——每个不同的 Idempotency-Key 都永久留一条。
+        """
+        ...
+
+    def purge_stale_rate_limits(self, before_epoch: float) -> int:
+        """删掉窗口早已结束的限流计数行，返回删除条数（行永远不会自己消失）。"""
+        ...

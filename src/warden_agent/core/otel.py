@@ -163,6 +163,9 @@ class OtlpExporter:
             self._q.put_nowait(span)
         except queue.Full:
             self._dropped += 1
+            from warden_agent.core.metrics import note
+
+            note("warden_otlp_dropped_total", "OTLP span 因队列满被丢弃的次数")
             if self._dropped == 1 or self._dropped % 100 == 0:
                 logger.warning(
                     "OTLP 队列已满，丢弃 span（累计 %d 条）——收集器跟不上或不可达", self._dropped
@@ -197,11 +200,17 @@ class OtlpExporter:
             )
             if resp.status_code >= 300:
                 self._failed += 1
+                from warden_agent.core.metrics import note
+
+                note("warden_otlp_export_failures_total", "OTLP 导出失败批次数")
                 logger.warning(
                     "OTLP 导出返回 status=%s（累计失败 %d 批）", resp.status_code, self._failed
                 )
         except Exception:  # noqa: BLE001 - 收集器不可达不能拖垮业务
             self._failed += 1
+            from warden_agent.core.metrics import note
+
+            note("warden_otlp_export_failures_total", "OTLP 导出失败批次数")
             logger.warning(
                 "OTLP 导出异常（累计失败 %d 批）——只记日志，不影响业务", self._failed
             )

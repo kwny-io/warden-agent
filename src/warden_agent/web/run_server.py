@@ -15,6 +15,8 @@
     WARDEN_ALLOW_ANON=1             **仅本机开发**：显式声明接受"无鉴权"
     WARDEN_AUDIT=1                   开启审计（写进 SQLite 审计表，重启不丢）
     WARDEN_RATE_LIMIT=600/60         限流：每 60 秒最多 600 次（默认；设 0 关闭）
+    WARDEN_MAX_REQUEST_BYTES=1048576 请求体上限（字节）；超限返 413（默认 1 MiB；0 关闭）
+    WARDEN_SSE_MAX_CONNECTIONS=100   /chat/stream 并发上限；超限返 503（默认 100；0 关闭）
     WARDEN_STABILITY=0              关闭工具稳定性层（**默认开启**：超时 + 退避重试 + 熔断）
     GIT_WORKDIR=path                指定 git 仓库目录 → 注册 git.apply_patch 工具
     SKILLS_DIR=path                 启用技能系统（SKILL.md 目录）
@@ -77,7 +79,11 @@ from warden_agent.web.coordination import coordination_for
 from warden_agent.web.outbound import outbound_from_env
 from warden_agent.web.ratelimit import limiter_from_env
 from warden_agent.web.search import providers_from_env
-from warden_agent.web.server import build_app
+from warden_agent.web.server import (
+    DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_SSE_MAX_CONCURRENCY,
+    build_app,
+)
 
 logger = get_logger("run_server")
 
@@ -519,6 +525,35 @@ def main() -> None:
         "Run 锁：%s（HTTP 对话 / 审批路径；抢不到返回 423，让客户端稍后重试）",
         type(run_lock).__name__,
     )
+    # 后台维护清扫（保留策略）：按 TTL 清理幂等表 / 限流表 / 过期记忆，避免库无界增长。
+    from warden_agent.runtime.maintenance import MaintenanceSweeper
+
+    maintenance = MaintenanceSweeper(
+        store,
+        interval_s=env_int("WARDEN_MAINTENANCE_INTERVAL_S", 300, os.environ),
+        memory_repository=memory_repository,
+        idempotency_ttl_s=float(env_int("WARDEN_IDEMPOTENCY_TTL_S", 86400, os.environ)),
+    )
+    maintenance.start()
+    logger.info(
+        "维护清扫：%s（间隔 %s 秒；WARDEN_MAINTENANCE_INTERVAL_S=0 可关）",
+        "开" if maintenance.interval > 0 else "关",
+        maintenance.interval,
+    )
+    # 入站请求保护：体积上限（413）与 SSE 长连接并发上限（503）。
+    # 与限流（WARDEN_RATE_LIMIT，管“次数”）互补：一个管“一次能送多大”，一个管“同时多少条流”。
+    max_request_bytes = env_int(
+        "WARDEN_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES, os.environ
+    )
+    sse_max_concurrency = env_int(
+        "WARDEN_SSE_MAX_CONNECTIONS", DEFAULT_SSE_MAX_CONCURRENCY, os.environ
+    )
+    logger.info(
+        "入站保护：请求体上限 %s｜SSE 并发上限 %s（WARDEN_MAX_REQUEST_BYTES / "
+        "WARDEN_SSE_MAX_CONNECTIONS，0 = 关闭）",
+        f"{max_request_bytes} 字节" if max_request_bytes > 0 else "关闭",
+        sse_max_concurrency if sse_max_concurrency > 0 else "关闭",
+    )
     app = build_app(
         model=model,
         catalog=catalog,
@@ -545,6 +580,9 @@ def main() -> None:
         shared_state=shared_state,
         outbound_limiter=outbound,
         run_lock=run_lock,
+        maintenance=maintenance,
+        max_request_bytes=max_request_bytes,
+        sse_max_concurrency=sse_max_concurrency,
     )
     port = env_int("PORT", 8000)
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)

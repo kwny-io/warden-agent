@@ -1,6 +1,7 @@
 """Git 集成测试：revision 探测、unified-diff 应用、合并门禁、git 工具。"""
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import tempfile
 from pathlib import Path
@@ -11,8 +12,9 @@ from warden_agent.git.coordinator import (
     GitWorktreeCoordinator,
     PatchConflictCode,
     WorktreeMergeRequest,
+    hash_file,
 )
-from warden_agent.git.patch import PatchDocument, UnifiedPatchParser
+from warden_agent.git.patch import PatchConflict, PatchDocument, UnifiedPatchParser
 from warden_agent.git.revision import (
     DirectGitProbe,
     GitCommandContextError,
@@ -194,6 +196,32 @@ def test_coordinator_revision_conflict(tdir) -> None:
     req = WorktreeMergeRequest(GitRepositoryRef(tmp), "deadbeef", doc)
     result = GitWorktreeCoordinator().merge(req, probe=DirectGitProbe())
     assert result.code == PatchConflictCode.REVISION_CONFLICT
+
+
+def test_coordinator_patch_conflict(tmp_path: Path) -> None:
+    """应用 patch 抛 PatchConflict 时 → PATCH_CONFLICT，并带回冲突原因。"""
+
+    class _Probe:
+        def inspect_head(self, context, repo):  # noqa: ANN001, ARG002
+            return GitRevision(repository=True, commit="abc123")
+
+    class _Applier:
+        def apply(self, doc, root):  # noqa: ANN001, ARG002
+            raise PatchConflict(reason="上下文不匹配")
+
+    coordinator = GitWorktreeCoordinator()
+    coordinator.applier = _Applier()  # type: ignore[assignment]
+    doc = UnifiedPatchParser().parse("--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+a\n")
+    req = WorktreeMergeRequest(GitRepositoryRef(str(tmp_path)), None, doc)
+    result = coordinator.merge(req, probe=_Probe())
+    assert result.code == PatchConflictCode.PATCH_CONFLICT
+    assert result.reason == "上下文不匹配"
+
+
+def test_hash_file_sha256(tmp_path: Path) -> None:
+    target = tmp_path / "f.bin"
+    target.write_bytes(b"abc")
+    assert hash_file(str(target)) == hashlib.sha256(b"abc").hexdigest()
 
 
 def test_coordinator_not_a_repo(tmp_path: Path) -> None:

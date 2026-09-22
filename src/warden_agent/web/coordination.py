@@ -162,6 +162,13 @@ class InProcessEventBus:
                 del bucket[:overflow]
                 before = self._dropped.get(run_id, 0)
                 self._dropped[run_id] = before + overflow
+                from warden_agent.core.metrics import note
+
+                note(
+                    "warden_event_dropped_total",
+                    "事件因保留上限被丢弃的次数",
+                    overflow,
+                )
                 if before == 0:
                     # 首次丢弃才告警（避免刷屏），并说明"只影响进度展示"
                     logger.warning(
@@ -279,14 +286,18 @@ class SqlEventBus:
     """存储版事件总线：事件落库，多副本按 id 增量轮询。
 
     轮询间隔默认 250ms——比 Pub/Sub 慢，但零新依赖且对 SQLite/Postgres 通用。
+    `keep` 给定后，每个 run 只保留最近 `keep` 条事件（保留策略）——共享事件表若
+    无上限，多副本长跑会把库撑大。
     """
 
-    def __init__(self, store: Any, poll_interval: float = 0.25) -> None:
+    def __init__(self, store: Any, poll_interval: float = 0.25,
+                 *, keep: int | None = None) -> None:
         self._store = store
         self._poll_interval = poll_interval
+        self._keep = keep
 
     def publish(self, run_id: str, event: dict[str, Any]) -> None:
-        self._store.append_event(run_id, json.dumps(event, ensure_ascii=False))
+        self._store.append_event(run_id, json.dumps(event, ensure_ascii=False), self._keep)
 
     def poll(
         self, run_id: str, after_seq: int, timeout: float
@@ -339,8 +350,9 @@ class PostgresNotifyEventBus(SqlEventBus):
         *,
         notify_timeout: float = 1.0,
         listener: Any = None,
+        keep: int | None = None,
     ) -> None:
-        super().__init__(store, poll_interval)
+        super().__init__(store, poll_interval, keep=keep)
         self._notify_timeout = notify_timeout
         # LISTEN 需要**独占一条连接**（等待通知期间它被占住，不能与 store 的读写共用）
         self._listener = listener if listener is not None else store.new_connection()
@@ -411,16 +423,16 @@ class SqlRateLimitStore:
 # ---------------------------------------------------------------------------
 # 装配
 # ---------------------------------------------------------------------------
-def _event_bus_for(store: Any, mode: str) -> EventBus:
+def _event_bus_for(store: Any, mode: str, keep: int | None = None) -> EventBus:
     """按需造事件总线：`notify` 用 LISTEN/NOTIFY 唤醒，其余用纯轮询。
 
     LISTEN/NOTIFY 只有 Postgres 有，且需要能"再开一条连接"（`new_connection`）——
     不满足就**回落为轮询并告警**：能力不够要说出来，而不是假装用了通知。
     """
     if mode != "notify":
-        return SqlEventBus(store)
+        return SqlEventBus(store, keep=keep)
     if callable(getattr(store, "new_connection", None)):
-        return PostgresNotifyEventBus(store)
+        return PostgresNotifyEventBus(store, keep=keep)
     logger.warning(
         "请求 WARDEN_EVENT_BUS=notify，但存储 %s 不支持另开监听连接（LISTEN 需要 Postgres）"
         "——回落为轮询实现。事件不会丢，只是延迟等于轮询间隔。",
@@ -440,7 +452,8 @@ def coordination_for(
     （`get_idempotent` / `append_event` / `hit_rate_limit`），否则回落到进程内并告警。
     `event_bus="notify"`：多副本时用 LISTEN/NOTIFY 唤醒（只对 Postgres 生效，见
     `PostgresNotifyEventBus`）；不满足条件时回落为轮询并告警——**能力不够就明说**。
-    `event_keep`：进程内事件总线**每个 run 保留的最近事件数**（默认 500）。
+    `event_keep`：每个 run 保留的最近事件数（默认 500）。进程内总线在内存里裁剪；
+    共享总线在库里裁剪（`append_event(..., keep=)`），两者同一口径、同一变量。
     """
     if shared and all(
         hasattr(store, m)
@@ -448,7 +461,7 @@ def coordination_for(
     ):
         return (
             SqlIdempotencyStore(store),
-            _event_bus_for(store, event_bus),
+            _event_bus_for(store, event_bus, event_keep),
             SqlRateLimitStore(store),
         )
     if shared:
