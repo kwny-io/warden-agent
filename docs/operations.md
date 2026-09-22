@@ -3,8 +3,9 @@
 > 这份文档回答"**接手之后怎么把它跑住**"：平时看什么、出问题怎么查、备份怎么恢复、
 > 怎么升级与回滚。它和 `deployment-boundaries.md`（能怎么部署、边界在哪）互补。
 >
-> 定位先说清楚：**本项目的运维面是从 2026-09 才开始补的**。已有备份/恢复、健康探针、
-> 指标、挂起告警；**还没有**链路追踪、告警规则库、SLO、灰度发布。下面每节都标了现状。
+> 定位先说清楚：**本项目的运维面分两步补的**。第一阶段（2026-09 上旬）备齐备份/恢复、健康探针、
+> 指标、挂起告警；第二阶段（2026-09-22）补齐了**链路追踪、告警规则库、SLO/错误预算、
+> 灰度发布与健康门控回滚、凭证密钥的 KMS/HSM 托管**。下面每节都标了现状与边界。
 
 ---
 
@@ -15,10 +16,12 @@
 | 进程活着 | `GET /health/live` | 200 |
 | 依赖可达（DB） | `GET /health/ready` | 200；DB 断了返 503（**别只看 live**） |
 | 当前能力与关键开关 | `GET /capabilities` | 尤其看 `features.run_lock`——**多副本下必须是 `SqlRunLock`**，`InProcessRunLock` 等于没锁 |
-| 指标 | `GET /metrics`（Prometheus 文本） | 请求数/耗时分布/5xx/限流拒绝数 |
+| 指标 | `GET /metrics`（Prometheus 文本） | 请求数/耗时分布/5xx/限流拒绝数/`warden_stuck_runs` |
 | **挂太久没人管的会话** | `GET /alerts/stuck?older_than_min=60` | `count=0` |
 | **审计有没有被动过** | `warden audit-verify`（被动过退出码 4） | `✅ 链完整：N 条记录` |
 | 恢复计划 | `GET /recovery/plan` | 该续/该重试/等人工/终态四类 |
+| **请求在链上的位置** | 响应头 `traceparent` / 日志里的 `trace_id=` | 与上游传入的 `trace_id` 一致（见「十、链路追踪」） |
+| **告警规则是否加载** | Prometheus UI → Status/Rules | 两组规则都在（`deploy/observability/alerts/`） |
 
 启动日志里会打印**生效配置**：协调状态（共享/进程内）、入站限流、**出站限速**、
 Run 锁实现、认知能力开关。排查"为什么行为和预期不一致"时先看这几行。
@@ -126,7 +129,8 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 
 ## 五、升级与回滚
 
-本项目**没有**灰度发布/自动回滚，下面是手工流程。
+本项目提供**健康门控的灰度脚本**（`scripts/canary_rollout.sh`，见第十一节），但**没有内置网关/LB**
+——真正切流量仍是部署侧的事。下面是手工流程与脚本的配合方式。
 
 ### 升级
 
@@ -167,10 +171,10 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 
 - 模型的 API Key 经 `CredentialBroker` **加密落库**（`credentials` / `credential_leases` 表），
   明文不落盘；按**调用者身份**隔离（同租户的 A、B 互不可见）。
-- `WARDEN_CREDENTIAL_KEY` 是加密材料的**唯一来源**（只从环境变量读）。
+- `WARDEN_CREDENTIAL_KEY` 是加密材料的默认来源（只从环境变量读）。
   - 不配 → 用"进程内临时密钥"并告警：**能加密，但重启后旧密文解不开**。
-  - 换密钥 → **存量密文无法解密**（当前没有轮换工具）。轮换需要：先解出明文、
-    用新密钥重新加密写回。这一步**还没做**。
+  - 换密钥 → 走下面的**轮换流程**（先挂旧密钥兜底、重加密、再摘掉）。
+  - **要"托管"而不是"明文放 env"** → 配 `WARDEN_KMS_PROVIDER`（见第十二节）。
 - 审计表**已是防篡改链**：每条记录带 HMAC 链哈希（改字段 / 删中间行 / 重排都会断链），
   巡检用 `warden audit-verify`。⚠️ **必须配 `WARDEN_AUDIT_KEY`**：不配则退化为不带密钥的
   哈希链（能查出手改/删行，但挡不住「改完重算整条链」）并告警。
@@ -192,3 +196,90 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | 真实搜索 provider 未实现 | `web.search` 仍是离线 mock | 见 README 路线图 |
 | 默认嵌入是**词频匹配** | 换个说法就掉分 | 配 `WARDEN_EMBED_*` 才是语义 |
 | 抓取只有去标签粗提取 | 拿不到 SPA / 正文抽取 | 需要 headless 浏览器 |
+| ~~没有告警规则库 / SLO / 链路追踪 / 灰度~~ | **已补齐**（规则库+SLO、traceparent 链路、健康门控灰度） | 见第九～十一节；span 送后端仍需接 OTel exporter |
+| `warden_stuck_runs` 抓取时现算 | 每次抓取对存储做一次只读扫描 | 本规模可接受；规模大改用物化视图/后台刷新 |
+| 熔断/出站并发/`InProcessRunLock` 的**进程内语义** | 每副本各一份 | 已文档化（多副本须用共享实现） |
+
+---
+
+## 九、告警规则库与 SLO（错误预算）
+
+规则与接线都在 `deploy/observability/`（含 README、Prometheus/Alertmanager 配置、一键起栈）。
+
+- **告警规则库** `alerts/warden.rules.yml`：可用性（服务下线/就绪失败）、错误率（5xx 占比、
+  预算快烧）、延迟（p95）、业务（**挂起 Run**、限流激增）。每条都写了"为什么响、先看哪"。
+- **SLO/错误预算** `alerts/warden.slo.yml`：可用性 99.5%/30d、延迟 p95<1s 两条 SLI 的记录规则，
+  以及**多窗口燃烧率**告警（快窗口发现快、慢窗口防误报）。
+- **抓取要带 Bearer**：`/metrics` 与其他业务接口一样受鉴权保护；`prometheus.yml` 用
+  `bearer_token_file` 从文件读 key（**别把 key 写进配置文件**）。
+- **本地演练**：`deploy/observability/docker-compose.yml` 一键起 Prometheus+Alertmanager，
+  人为制造错误率/挂起 Run 看告警是否按预期触发。
+- **守卫**：`tests/test_alert_rules.py` 断言规则引用的每个指标都真实存在、记录规则都被告警引用
+  （防"改了指标名、规则悄悄指向不存在的指标"）；CI 另用 `promtool` 校验语法。
+
+**阈值是起点，不是真理**——先按默认跑，再按业务真实水位调。
+
+---
+
+## 十、链路追踪（traceparent）
+
+**是什么**：W3C Trace Context。请求带 `traceparent: 00-<trace-id>-<span-id>-<flags>` 进来，
+本服务**沿用同一个 `trace_id`**、生成自己的 `span_id`，并在调下游时把新的 `traceparent` 透传出去。
+于是"这次请求经过了哪些步骤、我调下游那一次对应下游哪条日志"才连得起来。
+
+- **开关**：`WARDEN_TRACING`（默认开；`0` 关闭，关闭后 `span()` 不碰上下文、开销接近零）。
+- **怎么看**：响应头会回写 `traceparent`；日志里每个 span 一行，含
+  `name= trace_id= span_id= parent_span_id= duration_ms=`。用 `trace_id` 即可串起一次请求的全部步骤。
+- **出站透传**：`web.fetch` 等出站请求会带上当前 `traceparent`（下游若支持 W3C 即可接链）。
+- **不合法的入站头**（版本错/全零 id/长度不对）一律**当作没有**、重新起链——不因上游脏头把链路带崩。
+- **边界**：本项目**不引入 opentelemetry**（保持零重依赖）。这里做的是上下文传播 + 结构化 span 日志；
+  要把 span 送进 Jaeger/Tempo，接一个 OTLP exporter 即可（"上下文不断"这个前提已由本层保证）。
+
+---
+
+## 十一、灰度发布与健康门控回滚
+
+此前升级是"停旧、起新，坏了再换回来"，全靠人盯。现在有一条**自动化判据**：
+
+```bash
+# 起金丝雀 → 等 /health/ready → 校验鉴权仍 fail-closed → 通过才允许放量
+scripts/canary_rollout.sh <新版镜像>            # 只做门控，不动旧版
+scripts/canary_rollout.sh <新版镜像> --promote  # 门控通过后自动停旧容器
+```
+
+- **退出码 0 = 可以放量；非 0 = 别切**（旧版仍在服务，等于"自动不升级"）。
+  金丝雀不健康时会打印它的日志并就地拆掉。
+- **切流量是部署侧的事**：本项目没有内置网关/LB，脚本只做门控。拿到 0 之后按
+  `5% → 25% → 100%` 放量，每个档位盯第九节的告警（错误率/延迟/预算燃烧）。
+- **回滚**：异常时**不执行切流**，或把网关切回旧实例（旧实例未被销毁时零成本）。
+  用 `--promote` 时旧容器会被删——若想保留即可回滚的旧实例，就别用 `--promote`。
+
+---
+
+## 十二、密钥托管（KMS/HSM 信封加密）
+
+默认 `WARDEN_KMS_PROVIDER=env`（材料来自 `WARDEN_CREDENTIAL_KEY`）。要"托管"就换成：
+
+- `aws-kms`：根密钥待在 AWS KMS 里，应用用 `kms:Decrypt` 解开被包装的 DEK。
+- `vault-transit`：根密钥待在 Vault transit 引擎里，解密在 Vault 内完成，密钥不出 Vault。
+
+两种都是**信封加密**：根密钥（KEK）永不出 KMS/HSM，被包装的数据密钥（DEK）随配置分发，
+应用解开 DEK 后用它对凭证做 AES-GCM。轮换只换 DEK 并重新包装，KEK 不动。
+
+**一次性准备**（部署侧执行，产物放进 `WARDEN_KMS_WRAPPED_KEY`）：
+
+```bash
+# AWS KMS：生成一个 DEK，拿回被包装的那份（明文那份用完即弃）
+aws kms generate-data-key --key-id <kek-id> --key-spec AES_256 \
+  --query 'CiphertextBlob' --output text        # 输出 base64 → WARDEN_KMS_WRAPPED_KEY
+
+# Vault transit：先确保 transit 引擎里有一把 KEK（key），用它加密 DEK
+vault write -format=json transit/encrypt/warden plaintext=$(head -c 32 /dev/urandom | base64) \
+  | jq -r '.data.ciphertext'                     # vault:v1:... → WARDEN_KMS_WRAPPED_KEY
+```
+
+`vault-transit` 还需 `WARDEN_VAULT_ADDR` / `WARDEN_VAULT_TOKEN` / `WARDEN_VAULT_KEY_NAME`。
+取值写错会**直接报错、不静默回落**——否则会"以为在托管、其实没托管"。
+
+**边界**：本层保证"接入 KMS/HSM 的形状与逻辑"（解开被包装的 DEK、历史密钥兜底）。
+仓库测试用桩替身验证逻辑，**不联真实云**；真用起来需要你有一个可用的 KMS/Vault。

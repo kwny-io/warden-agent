@@ -28,6 +28,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from warden_agent.core.tracing import current_traceparent
 from warden_agent.tool.catalog import ToolSpec, function_tool
 from warden_agent.web.outbound import OutboundLimiter
 
@@ -189,6 +190,11 @@ class HttpFetchProvider:
     def _fetch_once(self, url: str) -> tuple[WebFetchResult, str | None]:
         """抓一跳。返回 (结果, 下一跳地址或 None)。"""
         headers = {"User-Agent": self.user_agent, "Accept": "text/*,application/json"}
+        # 链路追踪：把当前链路的 traceparent 带给出站请求，下游（若也支持 W3C trace）
+        # 的日志才能和我们的这次调用对上。没有开启追踪时 current_traceparent() 返回 None。
+        traceparent = current_traceparent()
+        if traceparent:
+            headers["traceparent"] = traceparent
         with (
             httpx.Client(
                 timeout=self.timeout_s,

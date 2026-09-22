@@ -193,16 +193,46 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     # ---- 凭证 ----
     EnvSpec(
         "WARDEN_CREDENTIAL_KEY", "凭证加密的密钥材料（只从环境变量读）",
-        "credential/crypto.py", ("credential/crypto.py", "credential/broker.py"),
+        "credential/crypto.py", ("credential/crypto.py", "credential/broker.py",
+                                  "credential/kms.py"),
         sensitive=True,
         note="不设则用进程内临时密钥（能加密，但重启后解不开）并告警",
     ),
     EnvSpec(
         "WARDEN_CREDENTIAL_OLD_KEYS", "凭证密钥轮换期的历史密钥（逗号分隔，仅用于解密）",
-        "credential/broker.py", ("credential/broker.py",),
+        "credential/broker.py", ("credential/broker.py", "credential/kms.py"),
         sensitive=True,
         note="配新主密钥 + 旧密钥放这里 → 跑 `warden rotate-credentials` 重加密 → 摘掉旧密钥。"
-             "不配它而直接换主密钥 = 存量密文全部解不开",
+             "不配它而直接换主密钥 = 存量密文全部解不开。"
+             "kms.py 也读它：env 模式的 provider 需要解析历史密钥做解密兜底",
+    ),
+    # ---- 密钥托管（KMS/HSM 信封加密）----
+    EnvSpec(
+        "WARDEN_KMS_PROVIDER", "凭证主密钥的托管方式：env（默认）/ aws-kms / vault-transit",
+        "credential/kms.py", ("credential/kms.py",),
+        default="env",
+        note="env = 材料直接来自 WARDEN_CREDENTIAL_KEY（演进前行为）。配成 KMS 后，"
+             "根密钥待在 KMS/HSM 里，应用只解开被包装的 DEK（信封加密）。取值不认识会直接报错，"
+             "**不静默回落**——否则会「以为在托管、其实没托管」",
+    ),
+    EnvSpec(
+        "WARDEN_KMS_WRAPPED_KEY",
+        "被 KMS 包装过的数据密钥（DEK）：aws-kms 为 base64，vault-transit 为密文串",
+        "credential/kms.py", ("credential/kms.py",),
+        sensitive=True,
+        note="生成方式见 docs/operations.md（AWS CLI / vault CLI 各一条命令）",
+    ),
+    EnvSpec(
+        "WARDEN_VAULT_ADDR", "HashiCorp Vault 地址（vault-transit 模式）",
+        "credential/kms.py", ("credential/kms.py",),
+    ),
+    EnvSpec(
+        "WARDEN_VAULT_TOKEN", "Vault 访问令牌（vault-transit 模式）",
+        "credential/kms.py", ("credential/kms.py",), sensitive=True,
+    ),
+    EnvSpec(
+        "WARDEN_VAULT_KEY_NAME", "Vault transit 的密钥名（vault-transit 模式）",
+        "credential/kms.py", ("credential/kms.py",),
     ),
     EnvSpec(
         "WARDEN_EVENT_BUS", "事件总线实现：poll（轮询，默认）或 notify（LISTEN/NOTIFY 唤醒）",
@@ -217,6 +247,13 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         sensitive=True,
         note="不设则审计链退化为**不带密钥**的哈希链并告警：仍能发现「手改/删行」，"
              "但挡不住会重算整条链的人。审计链要跨重启校验，所以不生成临时密钥",
+    ),
+    # ---- 可观测性 ----
+    EnvSpec(
+        "WARDEN_TRACING", "链路追踪（W3C traceparent 传播 + span 日志），默认开，0 关",
+        "core/tracing.py", ("core/tracing.py",),
+        default="1", kind="bool",
+        note="关掉后 span() 不碰 contextvar、开销接近零；出站与入站的链路上下文也随之不再生成",
     ),
     # ---- 前端与沙箱 ----
     EnvSpec("WARDEN_WEB_DIST", "前端静态文件目录", "web/server.py",

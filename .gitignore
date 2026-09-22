@@ -31,6 +31,8 @@ local-tmp/
 .env
 *.key
 *.pem
+# Prometheus 抓取用的 Bearer token（内容 = WARDEN_API_KEY）
+deploy/observability/warden_token
 
 # IDE / 系统
 .idea/

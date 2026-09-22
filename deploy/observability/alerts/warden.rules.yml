@@ -1,0 +1,113 @@
+# Warden Agent —— Prometheus 告警规则库
+#
+# 为什么要有"规则库"而不是零散几条：告警的价值取决于**覆盖面**——每个"需要人管"的
+# 失效模式都得有一条规则兜着，否则线上会以"没人知道"的方式坏掉。本文件按失效模式分组，
+# 每组都写明"为什么响"和"响了先看哪"。
+#
+# 加载方式（promtool 可静态校验）：
+#   promtool check rules deploy/observability/alerts/warden.rules.yml
+#   # prometheus.yml 里 rule_files: ["alerts/*.rules.yml", "alerts/*.slo.yml"]
+#
+# 阈值都是**起点**，不是真理：先按它跑，再按自己业务的真实水位调。
+groups:
+  # ---- 可用性：进程/抓取本身 ----
+  - name: warden-availability
+    rules:
+      - alert: WardenServiceDown
+        # up 是 Prometheus 自己产生的指标：抓不到目标就是 0。
+        expr: up{job="warden-agent"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Warden 服务已下线（抓取不到）"
+          description: "Prometheus 连续 2 分钟抓不到 {{ $labels.instance }}。先看容器/进程是否还活着、端口是否可达。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenReadinessFailing
+        # 存活但未就绪：通常是底层存储断了（/health/ready 返 503）。
+        expr: |
+          probe_success{job="warden-ready"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Warden 就绪探针失败（依赖可能断了）"
+          description: "服务活着但 /health/ready 不通过，多半是数据库连不上。**别只看存活探针**。"
+          runbook: "docs/operations.md"
+
+  # ---- 正确性：错误率 ----
+  - name: warden-errors
+    rules:
+      - alert: WardenHighErrorRate
+        # 5xx 占比。clamp_min 防止"零流量时分母为 0"造成的假告警。
+        expr: |
+          sum(rate(warden_http_errors_total[5m]))
+            /
+          clamp_min(sum(rate(warden_http_requests_total[5m])), 0.001)
+            > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Warden 5xx 错误率 > 5%"
+          description: "近 10 分钟 5xx 占比持续高于 5%。查 /audit 最近失败请求的 correlation_id，再按它捞日志。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenErrorBudgetBurnFast
+        # 快烧：短窗口错误率超过预算允许速率的 14.4 倍（多窗口燃烧率法的快窗口）。
+        expr: |
+          (
+            sum(rate(warden_http_errors_total[5m]))
+              /
+            clamp_min(sum(rate(warden_http_requests_total[5m])), 0.001)
+          ) > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "错误预算正在快速消耗（availability SLO 30d 目标 99.5%）"
+          description: "按当前速率，30 天预算可能在数小时内烧穿。优先止血（回滚/限流），再定位。"
+          runbook: "docs/operations.md"
+
+  # ---- 性能：延迟 ----
+  - name: warden-latency
+    rules:
+      - alert: WardenHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(warden_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Warden HTTP p95 延迟 > 2s"
+          description: "近 10 分钟 p95 超过 2 秒。先看是否模型链路/出站抓取变慢，再看 Run 锁是否存在等待。"
+          runbook: "docs/operations.md"
+
+  # ---- 业务：人工闸门与限流 ----
+  - name: warden-business
+    rules:
+      - alert: WardenStuckRuns
+        # 等待人工审批/交互超过 60 分钟的 Run。这些 Run 不会自愈——没人处理就永久挂着。
+        expr: warden_stuck_runs{older_than="60m"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "有 {{ $value }} 个 Run 等待人工处理超过 60 分钟"
+          description: "高危操作等在审批、或任务等用户回复。见 GET /alerts/stuck 拿明细（含 source 字段判断时长可信度）。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenRateLimitedSurge
+        # 被限流拒绝的请求激增：要么是有人在打，要么是正常业务超过了配置容量。
+        expr: increase(warden_rate_limited_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "入站限流拒绝量激增"
+          description: "近 5 分钟被拒 > 100 次。先区分是「恶意刷」还是「容量不够」：按 path 看分布，再决定收紧还是扩容。"
+          runbook: "docs/operations.md"

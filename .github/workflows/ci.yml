@@ -64,3 +64,24 @@ jobs:
               echo "::error::PostgreSQL 依赖的测试被跳过了——service 没连上？这条步骤就是防这个的"
               exit 1 ;;
           esac
+
+  container:
+    runs-on: ubuntu-latest
+    # 为什么单独一个 job：quality 里跑的全是"在源码树上"的检查——**镜像从来没被构建过**。
+    # 于是 Dockerfile 改坏了（漏拷文件、依赖装不上、前端产物没拷进去）CI 发现不了，
+    # 等真要交付时才发现"镜像构建不出来"。这个 job 真的 build + 起容器 + 打探针。
+    # 它此前真的抓到过 bug：依赖用未加引号的 $(...) 展开，被 pywin32 的环境标记（含空格）
+    # 切出一个 `==` 依赖名，pip 直接失败——镜像一直构建不出来而无人知晓。
+    steps:
+      - uses: actions/checkout@v4
+      - name: 容器构建冒烟（build + run + 健康探针 + 鉴权 fail-closed）
+        run: bash scripts/container_smoke.sh warden-agent:ci
+      - name: 校验 Prometheus 规则语法（promtool）
+        # 规则库的"引用是否存在"由 tests/test_alert_rules.py 守；这里补语法的官方校验。
+        # 注意 `--entrypoint promtool`：prom/prometheus 镜像的入口就是 prometheus 本体，
+        # 直接把它当命令后缀会被当成 prometheus 的参数（`unexpected promtool`）。
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/observability/alerts:/a:ro" \
+            prom/prometheus:v2.55.0 \
+            check rules /a/warden.rules.yml /a/warden.slo.yml

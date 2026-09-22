@@ -39,8 +39,14 @@ WORKDIR /app
 #    （原版 Dockerfile 只拷 pyproject.toml，所以镜像**构建不出来**——
 #      容器路径其实从未真正跑通过。）
 COPY pyproject.toml README.md ./
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
-    $(python -c "import tomllib; p = tomllib.load(open('pyproject.toml','rb'))['project']; print(' '.join(p['dependencies'] + p['optional-dependencies']['postgres']))")
+# ⚠️ 依赖先落成 requirements 文件再用 `-r` 装，**不能**用未加引号的 $(...) 展开成命令行参数：
+#    依赖里可能带环境标记（如 pywin32 的 `; sys_platform == 'win32'`），里面有空格，
+#    被 shell 按空格切开后 `==` 会变成一个独立的"依赖名"，pip 直接
+#    `Invalid requirement: '=='`。加上 pywin32 之后镜像就再也构建不出来了——
+#    这正是容器冒烟脚本测出来的（此前 CI 从不构建镜像，所以一直没暴露）。
+RUN python -c "import tomllib; p = tomllib.load(open('pyproject.toml','rb'))['project']; print('\n'.join(p['dependencies'] + p['optional-dependencies']['postgres']))" > /tmp/requirements.txt \
+    && pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r /tmp/requirements.txt \
+    && rm -f /tmp/requirements.txt
 
 # 再拷源码并安装本项目自身。--no-deps：依赖上面已装好，不重复装、也不再依赖网络上的依赖解析。
 COPY src ./src

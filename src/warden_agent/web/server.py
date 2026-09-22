@@ -42,6 +42,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from warden_agent.core import tracing
 from warden_agent.core.metrics import metrics
 from warden_agent.credential.broker import CredentialBroker, SecretRedactor, default_broker
 from warden_agent.credential.vault import DEPLOYMENT_SCOPE, as_vault
@@ -599,6 +600,9 @@ def build_app(
     )
     m_approvals = m.counter("warden_approvals_total", "审批决策数", ["action"])
     m_rate_limited = m.counter("warden_rate_limited_total", "被限流拒绝的请求数", ["path"])
+    # 运维告警用的 gauge：等待人工处理超过阈值的 Run 数。抓取时现算（见 _refresh_stuck_gauge），
+    # 不与写入路径耦合——这样重启/多副本都不会让这个数漂移。
+    m_stuck = m.gauge("warden_stuck_runs", "等待人工处理超过阈值的 Run 数", ["older_than"])
 
     # ---- 阶段13：认证 + 审计中间件 ----
     authenticator = ApiKeyAuthenticator(api_keys) if api_keys else None
@@ -649,6 +653,15 @@ def build_app(
         caller: TrustedCaller | None = None
         status_code = 200
         _start = time.monotonic()  # T8：请求开始计时
+        # 链路追踪：从入站 traceparent 接着上游的链（没有就起新链）。这里手动进入
+        # 上下文（而非 with），是为了不把后面整段网关逻辑重新缩进一层；退出放在 finally。
+        # 进入后 contextvar 里就有当前 trace，出站调用会用同一 trace_id 透传给下游。
+        trace_cm = tracing.server_span(
+            "http.request",
+            request.headers.get("traceparent"),
+            attributes={"method": method, "path": path},
+        )
+        trace_ctx = trace_cm.__enter__()
         try:
             if authenticator is not None and not _is_public(path):
                 try:
@@ -692,6 +705,9 @@ def build_app(
             status_code = response.status_code
             response.headers["X-Correlation-Id"] = correlation_id
             response.headers["X-Warden-Api-Version"] = API_VERSION
+            if trace_ctx is not None:
+                # 把本链路的 traceparent 回给调用方：它可作为"这次请求在链上的位置"的对账凭据
+                response.headers["traceparent"] = trace_ctx.to_traceparent()
             if idem_key and method == "POST" and not is_stream and status_code < 500:
                 # 仅缓存成功结果；5xx 不缓存以便重试。消费流并重建可重放响应。
                 _cache_idem_response(idem_store, idem_key, response)
@@ -719,6 +735,9 @@ def build_app(
                     path=path,
                     status=status_code,
                 )
+            # 结束 span（打一行带 trace_id / 耗时的结构化日志并还原上下文）。
+            # 放最后：这样 span 的耗时能覆盖到审计记录这一步。
+            trace_cm.__exit__(None, None, None)
 
     # ---- 阶段13：健康检查（liveness / readiness）----
     @app.get("/health/live", include_in_schema=False)
@@ -735,8 +754,28 @@ def build_app(
         )
 
     # ---- T8 可观测性：指标出口（Prometheus text，可被 Grafana 抓取）----
+    def _refresh_stuck_gauge() -> None:
+        """抓取时现算"挂太久的 Run 数"，写进 gauge。失败绝不让 /metrics 挂掉。
+
+        为什么现算而不是在写入路径累加：累加式 gauge 在重启、多副本下都会漂移
+        （每个副本只知道自己见过的那部分），而告警恰恰最怕"数不对"。抓取时对存储做一次
+        只读扫描得到的是**当前真实值**。代价是每次抓取扫一次库——本项目的规模下可接受；
+        规模上去后应改用物化视图/后台刷新（见运维手册"已知边界"）。
+        """
+        try:
+            from warden_agent.runtime.alerting import stuck_awaiting_human
+
+            cp_store = _checkpoint_store_for(store)
+            if cp_store is None:
+                return
+            stuck = stuck_awaiting_human(store, cp_store, older_than_seconds=3600.0)
+            m_stuck.set(float(len(stuck)), labels=("60m",))
+        except Exception:  # noqa: BLE001 - 指标刷新失败不能影响 /metrics 本身
+            logger.debug("刷新 warden_stuck_runs 失败（忽略，不影响 /metrics）", exc_info=True)
+
     @app.get("/metrics", include_in_schema=False)
     def metrics_view() -> PlainTextResponse:
+        _refresh_stuck_gauge()
         return PlainTextResponse(metrics().render())
 
     # ---- 阶段13：审计查询 ----

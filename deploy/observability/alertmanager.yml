@@ -1,0 +1,29 @@
+# Warden Agent —— Alertmanager 路由（示例）
+#
+# 默认把 critical 立刻发、warning 打包发。真实地址/凭据用环境变量或另挂文件，
+# **不要**把 webhook/邮箱口令写进版本库。
+route:
+  receiver: default
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="critical"']
+      receiver: default
+      group_wait: 10s
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    # 这里用 webhook 占位：把 <ALERT_WEBHOOK_URL> 换成你的企业微信/钉钉/Slack 网关。
+    # 起栈做演练时可以注释掉下面这段，日志里仍能看到告警（alertmanager 会记录触发）。
+    webhook_configs:
+      - url: "${ALERT_WEBHOOK_URL}"
+        send_resolved: true
+
+inhibit_rules:
+  # 服务整个下线时，别再刷它的错误率/延迟告警——先修下线。
+  - source_matchers: ['alertname="WardenServiceDown"']
+    target_matchers: ['severity=~"warning|critical"']
+    equal: ["instance"]

@@ -1,0 +1,104 @@
+# Warden Agent —— SLO（服务级目标）与错误预算
+#
+# 为什么单独一层：告警规则（warden.rules.yml）回答"现在有没有事"，SLO 回答
+# **"我们的可靠性承诺还好吗、还剩多少余量"**。没有 SLO，"要不要为一次抖动加班"
+# 就只能拍脑袋；有了 SLO，一切以"预算还剩多少"为准。
+#
+# 两条 SLO（数值是**起点**，按业务定）：
+#   1) 可用性：成功请求占比 ≥ 99.5% / 30 天（即 30 天允许约 3.6 小时"不成功"）
+#   2) 延迟  ：p95 < 1s（用 le="1" 桶近似"1 秒内完成的比例"）
+#
+# 校验：promtool check rules deploy/observability/alerts/warden.slo.yml
+groups:
+  - name: warden-slo-recording
+    interval: 30s
+    rules:
+      # ---- 可用性 SLI：成功占比（多窗口，越小窗口越灵敏）----
+      - record: warden:slo_availability:ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(warden_http_errors_total[5m]))
+              /
+            clamp_min(sum(rate(warden_http_requests_total[5m])), 0.001)
+          )
+      - record: warden:slo_availability:ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(warden_http_errors_total[1h]))
+              /
+            clamp_min(sum(rate(warden_http_requests_total[1h])), 0.001)
+          )
+      - record: warden:slo_availability:ratio_rate30d
+        expr: |
+          1 - (
+            sum(rate(warden_http_errors_total[30d]))
+              /
+            clamp_min(sum(rate(warden_http_requests_total[30d])), 0.001)
+          )
+
+      # ---- 延迟 SLI：1 秒内完成的比例 ----
+      # 直方图桶是累计的，le="1" 的累计计数 / 总计数 = "≤1s 的比例"。
+      - record: warden:slo_latency_fast:ratio_rate5m
+        expr: |
+          sum(rate(warden_http_request_duration_seconds_bucket{le="1"}[5m]))
+            /
+          clamp_min(sum(rate(warden_http_request_duration_seconds_count[5m])), 0.001)
+      - record: warden:slo_latency_fast:ratio_rate1h
+        expr: |
+          sum(rate(warden_http_request_duration_seconds_bucket{le="1"}[1h]))
+            /
+          clamp_min(sum(rate(warden_http_request_duration_seconds_count[1h])), 0.001)
+
+  - name: warden-slo-burn
+    rules:
+      # 多窗口燃烧率告警（Google SRE 的做法）：用"快窗口 + 慢窗口"同时越限来同时
+      # 兼顾"发现快"和"不误报"。1 倍 = 恰好按预算速率烧完；14.4 倍 ≈ 数小时烧穿。
+      - alert: WardenAvailabilityBudgetBurnFast
+        expr: |
+          (1 - warden:slo_availability:ratio_rate5m) > (14.4 * 0.005)
+            and
+          (1 - warden:slo_availability:ratio_rate1h) > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "可用性预算快速燃烧（5m+1h 双窗口越限）"
+          description: "按当前速率 30 天预算将在数小时内烧穿。先止血（回滚/限流/扩容），再定位。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenAvailabilityBudgetBurnSlow
+        expr: |
+          (1 - warden:slo_availability:ratio_rate1h) > (6 * 0.005)
+            and
+          (1 - warden:slo_availability:ratio_rate30d) > (6 * 0.005)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "可用性预算持续燃烧（1h+30d 双窗口越限）"
+          description: "不是瞬时抖动，是持续性的可靠性退化——排进本周处理，别拖到烧穿。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenLatencyBudgetBurnSlow
+        expr: |
+          (1 - warden:slo_latency_fast:ratio_rate1h) > 0.05
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "延迟 SLO：>1s 的请求占比持续超过 5%"
+          description: "用户可感知的变慢。先看哪条 path / 是否集中在模型调用或出站抓取。"
+          runbook: "docs/operations.md"
+
+      - alert: WardenLatencyBudgetBurnFast
+        expr: |
+          (1 - warden:slo_latency_fast:ratio_rate5m) > 0.05
+            and
+          (1 - warden:slo_latency_fast:ratio_rate1h) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "延迟预算快速燃烧（5m+1h 双窗口越限）"
+          description: "短窗口也越限，说明是**正在发生**的变慢而非统计噪声。先查下游依赖（模型/出站）与 Run 锁等待。"
+          runbook: "docs/operations.md"

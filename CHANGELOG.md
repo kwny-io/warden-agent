@@ -5,7 +5,57 @@
 
 ---
 
-## 2026-09-21（第八批：出站限速与配额）
+## 2026-09-22（第十批：对外交付级的三项收尾 —— 容器冒烟 / 可观测性 / 密钥托管）
+
+> 背景：成熟度评估把"对外/SaaS/多副本交付"还差的三项定为——① 真正的 KMS/HSM 托管
+> ② 容器构建冒烟 ③ 告警规则库/SLO/链路追踪/灰度。这批把三项都做了。
+
+### 本轮改动（工作区，尚未 commit）
+
+- **容器构建冒烟（CI 真的会 build 镜像了）**：新增 `scripts/container_smoke.sh`——
+  真的 `docker build`、真的起容器（只读 rootfs + `cap_drop ALL` + `no-new-privileges`）、
+  打 `/health/live`、带 Bearer 校验 `/metrics`、并验"无 key 时受保护接口必须 401/403"。
+  CI 新增 `container` job 调它。**此前 CI 全是"在源码树上"的检查，镜像从未被构建过**。
+  ⚠️ **本轮它当场抓到一个真 bug**：Dockerfile 用未加引号的 `$(...)` 展开依赖，被 `pywin32`
+  的环境标记（含空格）切成一个孤立的 `==` 依赖名，pip 报 `Invalid requirement: '=='`——
+  **镜像其实一直构建不出来**（此前没人构建，所以无人知晓）。改成"依赖落 requirements 文件再 `-r` 装"。
+  另修一处测试脚手架：/data 用 **数据卷**（与 compose 一致、从镜像继承属主）而非 tmpfs，
+  否则非 root 应用写不了 SQLite（那是脚手架问题，不是镜像问题）。
+- **链路追踪（W3C traceparent）**：新增 `core/tracing.py`——`traceparent` 的解析/生成、
+  `ContextVar` 承载上下文、`span()`/`server_span()` 记结构化 span 日志（含 `trace_id/span_id/
+  parent_span_id/duration_ms`）。接进 HTTP 中间件（入站接着上游的链、响应回写 `traceparent`）
+  与出站抓取（透传 `traceparent`）。**零新增依赖**（不引入 opentelemetry）；
+  开关 `WARDEN_TRACING`（默认开，关掉时上下文开销接近零）。脏入站头一律当没有、重新起链。
+- **告警规则库 + SLO/错误预算**：新增 `deploy/observability/`——`alerts/warden.rules.yml`
+  （可用性/错误率/延迟/业务共 7 条）、`alerts/warden.slo.yml`（可用性与延迟 SLI 记录规则 +
+  多窗口燃烧率告警 4 条）、`prometheus.yml`（**Bearer 抓取**）/`alertmanager.yml`/一键起栈 compose/README。
+  新增指标 `warden_stuck_runs`（抓取时现算，避免重启/多副本漂移）。新增 `tests/test_alert_rules.py`
+  守卫"规则引用的指标必须真实存在、记录规则必须被引用"——本轮它就抓出一条**定义了却没人引用的死规则**。
+  CI 用 `promtool check rules` 校验语法（本地实跑：7 + 9 条规则 SUCCESS）。
+- **灰度发布 + 健康门控回滚**：新增 `scripts/canary_rollout.sh`——起金丝雀 → 等 `/health/ready`
+  （含存储探活）→ 校验鉴权仍 fail-closed → 通过才允许放量，否则就地拆掉（旧版继续服务）。
+  明确边界：本项目无内置网关/LB，脚本只做**门控**，切流是部署侧的事。
+- **KMS/HSM 托管（信封加密）**：新增 `credential/kms.py`——`KeyProvider` 协议 +
+  `EnvKeyProvider`（演进前行为） + `AwsKmsKeyProvider`（AWS KMS 解包 DEK，可选依赖 boto3） +
+  `VaultTransitKeyProvider`（Vault transit，走 httpx，**零新增依赖**）。接进 `default_broker`
+  （新增 `key_provider` 注入点）。根密钥待在 KMS/HSM、只分发被包装的 DEK；未知 provider 取值
+  **直接报错不静默回落**。新增可选依赖 `aws = ["boto3>=1.34"]`（`uv.lock` 已同步）。
+- **配置面**：新增登记 `WARDEN_TRACING` / `WARDEN_KMS_PROVIDER` / `WARDEN_KMS_WRAPPED_KEY` /
+  `WARDEN_VAULT_ADDR` / `WARDEN_VAULT_TOKEN` / `WARDEN_VAULT_KEY_NAME`，并按其真实读取模块
+  授权 consumers（`tests/test_config_surface.py` 全程把关）。
+- **新增测试**：`tests/test_tracing.py`（12 条）、`tests/test_kms.py`（14 条）、
+  `tests/test_alert_rules.py`（4 条）。
+- **文档**：`docs/operations.md` 补第九～十二节（告警规则库与 SLO / 链路追踪 / 灰度与回滚 /
+  密钥托管），并更新巡检清单与"已知边界"表；`deploy/observability/README.md`。
+
+### 仍未做（诚实边界）
+
+- span 送进 Jaeger/Tempo 需要接 OTLP exporter（本层只保证上下文不断 + 结构化日志）。
+- 真实云 KMS/Vault 的联调需要凭据，仓库测试用桩替身，**不联真实云**。
+- `warden_stuck_runs` 抓取时扫库；规模大应改物化视图/后台刷新。
+- 告警阈值是起点，需按业务真实水位调。
+
+---
 
 ### 本轮改动（工作区，尚未 commit）
 

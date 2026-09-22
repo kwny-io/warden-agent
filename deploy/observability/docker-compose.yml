@@ -1,0 +1,45 @@
+# Warden Agent —— 可观测性整栈（Prometheus + Alertmanager [+ blackbox_exporter]）
+#
+# 用途：① 把 deploy/observability/alerts/*.rules.yml 真正加载起来（否则规则库只是摆设）；
+#       ② 本地演练告警：把 warden 起在本机 8000，起这套栈，人为制造错误率/挂起 Run，
+#          看告警是否按预期出现。
+#
+# 用法：
+#   # 1) 备好抓取用的 token（内容就是你的 WARDEN_API_KEY），只读挂进 prometheus
+#   printf '%s' "$WARDEN_API_KEY" > warden_token
+#   # 2) 起栈（ALERT_WEBHOOK_URL 可先留空/换成你的网关）
+#   ALERT_WEBHOOK_URL=https://example.invalid/hook docker compose -f docker-compose.yml up -d
+#   # 3) 打开 Prometheus UI -> Status/Rules，确认规则已加载；Alerts 页看触发情况
+#   注意：warden 应用要跑在宿主机 8000（本栈通过 host.docker.internal 抓它）。
+#   token 文件含密钥，**别提交**（已在 .gitignore 里）。
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts:/etc/prometheus/alerts:ro
+      - ./warden_token:/etc/prometheus/warden_token:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    environment:
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-https://example.invalid/hook}
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "127.0.0.1:9093:9093"
+
+  # 可选：给 /health/ready 做探测（产生 probe_success）。不用就删掉本服务与 prometheus.yml 里对应的 job。
+  blackbox:
+    image: prom/blackbox-exporter:v0.25.0
+    ports:
+      - "127.0.0.1:9115:9115"

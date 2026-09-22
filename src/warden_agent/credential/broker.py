@@ -31,6 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from warden_agent.credential.crypto import CredentialCipher
+from warden_agent.credential.kms import KeyProvider, resolve_key_provider
 from warden_agent.credential.vault import (
     DEPLOYMENT_SCOPE,
     CredentialVault,
@@ -221,19 +222,32 @@ def default_broker(
     ttl_seconds: int = 300,
     vault: CredentialVault | None = None,
     scope: str = DEPLOYMENT_SCOPE,
+    key_provider: KeyProvider | None = None,
 ) -> CredentialBroker:
     """按环境变量造一个凭证 broker（产品路径的默认入口）。
 
-    `WARDEN_CREDENTIAL_KEY` 提供密钥材料——**推荐每个部署单独生成一把**，
-    且**只从环境变量读取**（代码里不写死，也不接受调用方传入）。
-    未配置时退化为"进程内临时密钥"：加解密仍然是真加密（不是明文躺内存），
-    只是密钥随机生成、不落盘、进程退出即失效。这种情况明确打 warning，
-    不制造"已持久化加密"的假象。
+    密钥材料有两个来源，由 `WARDEN_KMS_PROVIDER` 决定：
+      - `env`（默认）：直接读 `WARDEN_CREDENTIAL_KEY`——**推荐每个部署单独生成一把**，
+        且只从环境变量读取（代码里不写死）。未配置时退化为"进程内临时密钥"：加解密仍是
+        真加密，只是密钥随机、不落盘、进程退出即失效（明确打 warning，不制造"已持久化加密"的假象）。
+      - `aws-kms` / `vault-transit`：走**信封加密**——根密钥待在 KMS/HSM 里，应用只解开
+        被包装的 DEK（见 credential/kms.py）。`key_provider` 参数供测试/显式注入覆盖。
 
     `vault` 决定密文与租约存哪：不传 = 进程内（重启即丢）；传 SQLite/PostgreSQL
     存储 = 真落库（见 vault.py）。产品路径由 build_app 自动把 store 传进来。
     """
     src: Mapping[str, str] = env if env is not None else os.environ
+    # 密钥托管：配了 KMS 就用它解出 DEK；没配（None）则回落到下面的环境变量分支。
+    provider = key_provider if key_provider is not None else resolve_key_provider(src)
+    if provider is not None:
+        cipher = CredentialCipher(provider.current_key(), provider.historical_keys())
+        logger.info(
+            "凭证密钥来自托管 provider=%s（信封加密：根密钥不出 KMS/HSM）", provider.name
+        )
+        if provider.historical_keys():
+            logger.info("托管 provider 提供了 %d 把历史密钥（仅用于解密兜底）",
+                        len(provider.historical_keys()))
+        return CredentialBroker(cipher, ttl_seconds=ttl_seconds, vault=vault, scope=scope)
     material = src.get("WARDEN_CREDENTIAL_KEY")
     # 密钥轮换：主密钥之外可挂历史密钥（逗号分隔），**只用于解密兜底**。
     # 轮换流程见 vault.rotate_credentials：配新主密钥 + 旧密钥进 OLD_KEYS → 重加密 → 摘掉旧密钥。

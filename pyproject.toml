@@ -35,6 +35,8 @@ dev = [
     "psycopg[binary]",
 ]
 postgres = ["psycopg[binary]"]
+# 密钥托管（KMS/HSM）：aws-kms 模式需要 boto3。vault-transit 走 httpx（已在依赖里），无需额外包。
+aws = ["boto3>=1.34"]
 
 [project.scripts]
 warden = "warden_agent.cli:main"
