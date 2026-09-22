@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 import socket
 from collections.abc import Callable, Iterable, Mapping
@@ -28,11 +29,13 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from warden_agent.core.settings import env_bool
+from warden_agent.core.settings import env_bool, env_opt, env_str
 from warden_agent.core.tracing import current_traceparent
 from warden_agent.tool.catalog import ToolSpec, function_tool
 from warden_agent.web.outbound import OutboundLimiter
 from warden_agent.web.readability import extract_main_text
+
+logger = logging.getLogger(__name__)
 
 
 # ---- 结果模型 ----
@@ -284,6 +287,103 @@ class HttpFetchProvider:
             return WebFetchResult(url=url, status=resp.status_code, content=body), None
 
 
+# 搜索 API 预设（第三方搜索服务的端点与方法）。`custom` 走 WARDEN_SEARCH_ENDPOINT。
+_SEARCH_PRESETS: dict[str, dict[str, str]] = {
+    "tavily": {"endpoint": "https://api.tavily.com/search", "method": "POST"},
+    "brave": {"endpoint": "https://api.search.brave.com/res/v1/web/search", "method": "GET"},
+}
+_SEARCH_UA = "warden-agent/0.1 (+https://github.com/kwny-io/warden-agent)"
+
+
+class HttpSearchProvider:
+    """**真实联网搜索**：调第三方搜索 API（Tavily / Brave / 自定义 JSON 端点）。
+
+    与 `HttpFetchProvider` 同一取向：**不抛异常**——网络/接口错误转成空结果并记日志，
+    工具层据此回"没搜到"，而不是把异常打进会话。
+
+    `requires_network = True` → 工具层会把它计入**出站限速/配额**（与抓取同一道闸门）。
+    端点来自配置（非用户输入），仍过一次静态 URL 策略校验，避免把 API key 发到内网地址。
+
+    测试可注入 `transport`（httpx.BaseTransport），全程离线、确定。
+    """
+
+    requires_network = True
+
+    def __init__(
+        self,
+        provider: str = "custom",
+        *,
+        api_key: str = "",
+        endpoint: str = "",
+        timeout_s: float = 10.0,
+        transport: Any = None,
+    ) -> None:
+        preset = _SEARCH_PRESETS.get(provider, {})
+        self.provider = provider
+        self.endpoint = endpoint or preset.get("endpoint", "")
+        self.method = preset.get("method", "GET")
+        self.api_key = api_key
+        self.timeout_s = timeout_s
+        self._transport = transport
+
+    def search(self, query: str, top_k: int = 5) -> list[WebSearchResult]:
+        if not self.endpoint:
+            return []
+        ok, reason = WebUrlPolicy().check(self.endpoint)
+        if not ok:
+            logger.warning("搜索端点被 URL 策略拒绝（%s）：%s", self.endpoint, reason)
+            return []
+        try:
+            resp = self._request(query, top_k)
+            resp.raise_for_status()
+            return self._parse(resp.json(), top_k)
+        except Exception as e:  # noqa: BLE001 - 搜索失败不该把异常打进会话
+            logger.warning("搜索失败（provider=%s）：%s", self.provider, e)
+            return []
+
+    def _request(self, query: str, top_k: int) -> httpx.Response:
+        headers = {"User-Agent": _SEARCH_UA, "Accept": "application/json"}
+        traceparent = current_traceparent()
+        if traceparent:
+            headers["traceparent"] = traceparent
+        with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+            if self.method == "POST":
+                body: dict[str, Any] = {"query": query, "max_results": top_k}
+                if self.api_key:
+                    body["api_key"] = self.api_key
+                return client.post(self.endpoint, json=body, headers=headers)
+            if self.api_key:
+                headers["X-Subscription-Token"] = self.api_key
+            return client.get(self.endpoint, params={"q": query, "count": top_k}, headers=headers)
+
+    @staticmethod
+    def _parse(data: Any, top_k: int) -> list[WebSearchResult]:
+        """兼容常见返回形态：`{"results":[...]}` 与 `{"web":{"results":[...]}}`（Brave）。"""
+        items: list[Any] = []
+        if isinstance(data, dict):
+            if isinstance(data.get("results"), list):
+                items = data["results"]
+            elif isinstance(data.get("web"), dict) and isinstance(
+                data["web"].get("results"), list
+            ):
+                items = data["web"]["results"]
+        out: list[WebSearchResult] = []
+        for item in items[:top_k]:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or item.get("link") or "")
+            if not url:
+                continue
+            out.append(WebSearchResult(
+                title=str(item.get("title") or ""),
+                url=url,
+                snippet=str(
+                    item.get("snippet") or item.get("content") or item.get("description") or ""
+                ),
+            ))
+        return out
+
+
 def providers_from_env(
     env: Mapping[str, str],
 ) -> tuple[WebSearchProvider, WebFetchProvider]:
@@ -292,15 +392,38 @@ def providers_from_env(
     - 默认（不设）：**离线 mock**——零网络、可测，演示与测试不受网络影响。
       这也是项目"不配任何 key 也能全链路跑通"的底线。
     - `WARDEN_WEB_FETCH=1`：`web.fetch` 换成**真实联网抓取**（`HttpFetchProvider`）。
-    - 搜索保持 mock：真实搜索 provider 需要第三方 API key（Tavily/Brave 等），
-      没有 key 时编不出结果——不硬塞一个假的"能搜"进去。
+    - `WARDEN_SEARCH_PROVIDER=tavily|brave|custom`：`web.search` 换成**真实联网搜索**
+      （`HttpSearchProvider`）。tavily/brave 需配 `WARDEN_SEARCH_API_KEY`；
+      custom 需配 `WARDEN_SEARCH_ENDPOINT`。**配不全就如实退回 mock 并告警**——
+      绝不假装"能搜"（那只会让模型拿着空结果硬编）。
 
-    为什么默认不开真实抓取：Agent 能主动访问外网是一个**应该由运维显式决定**的能力，
-    不该悄悄打开。开了之后每一跳仍受 WebUrlPolicy 约束（拒内网/环回/元数据地址）。
+    为什么默认不开真实抓取/搜索：Agent 能主动访问外网是一个**应该由运维显式决定**的能力，
+    不该悄悄打开。开了之后抓取每一跳仍受 WebUrlPolicy 约束（拒内网/环回/元数据地址）。
     """
     fetch_enabled = env_bool("WARDEN_WEB_FETCH", False, env)
     fetch: WebFetchProvider = HttpFetchProvider() if fetch_enabled else LocalMockFetchProvider()
-    return LocalMockSearchProvider(), fetch
+
+    kind = env_str("WARDEN_SEARCH_PROVIDER", "", env).strip().lower()
+    search: WebSearchProvider
+    if kind in ("", "off", "0", "false", "mock"):
+        search = LocalMockSearchProvider()
+    else:
+        api_key = env_opt("WARDEN_SEARCH_API_KEY", env) or ""
+        endpoint = env_opt("WARDEN_SEARCH_ENDPOINT", env) or ""
+        if kind in _SEARCH_PRESETS and not api_key:
+            logger.warning(
+                "WARDEN_SEARCH_PROVIDER=%s 但未配 WARDEN_SEARCH_API_KEY —— 搜索退回离线 mock"
+                "（不会假装能搜）", kind,
+            )
+            search = LocalMockSearchProvider()
+        elif kind == "custom" and not endpoint:
+            logger.warning(
+                "WARDEN_SEARCH_PROVIDER=custom 但未配 WARDEN_SEARCH_ENDPOINT —— 退回离线 mock"
+            )
+            search = LocalMockSearchProvider()
+        else:
+            search = HttpSearchProvider(kind, api_key=api_key, endpoint=endpoint)
+    return search, fetch
 
 
 # ---- URL 策略 ----

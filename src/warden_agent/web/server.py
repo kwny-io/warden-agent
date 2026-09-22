@@ -1377,6 +1377,8 @@ def build_app(
                 "mcp_server": registry.extra.get("mcp_server"),
                 # 真实联网抓取是否开启（默认是离线 mock）——运维需要能一眼看到外网出口状态
                 "web_fetch": registry.extra.get("web_fetch"),
+                # 搜索 provider（离线 mock vs 真实联网搜索）——同样要能看到
+                "web_search": registry.extra.get("web_search"),
                 # RAG：报出嵌入器名，避免"词频嵌入被当成语义检索"
                 "knowledge_embedder": registry.extra.get("knowledge_embedder"),
                 "knowledge_sources": len(knowledge_sources) if knowledge_sources else 0,

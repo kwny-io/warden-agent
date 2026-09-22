@@ -447,6 +447,13 @@ def main() -> None:
         )
     else:
         logger.info("web 工具为离线 mock（设 WARDEN_WEB_FETCH=1 可开启真实联网抓取）")
+    if type(web_providers[0]).__name__ == "HttpSearchProvider":
+        logger.warning(
+            "web.search 已开启**真实联网搜索**：Agent 可主动向搜索 API 发请求。"
+            "已计入出站限速/配额（WARDEN_OUTBOUND_*）。"
+        )
+    else:
+        logger.info("web.search 为离线 mock（设 WARDEN_SEARCH_PROVIDER 可接真实搜索 API）")
     # 多副本部署：把幂等 / 事件流 / 限流计数放进共享存储（同一个库），
     # 否则每个副本各算一份 —— 幂等失效、SSE 丢事件、限额翻倍。
     shared_state = _shared_state_from_env(os.environ)

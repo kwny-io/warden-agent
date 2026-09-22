@@ -365,6 +365,11 @@ def augment_catalog(
             if fetch_provider is not None
             else "LocalMockFetchProvider"
         )
+        extra["web_search"] = (
+            type(search_provider).__name__
+            if search_provider is not None
+            else "LocalMockSearchProvider"
+        )
 
     # 4. MCP（需 node；可用则导入经过审查的工具）
     if mcp_server:
