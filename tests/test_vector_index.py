@@ -8,13 +8,16 @@
 
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 
 import pytest
 
 from warden_agent.rag.knowledge import VectorStore
+from warden_agent.rag.loader import index_corpus
 from warden_agent.rag.vector_index import (
+    IVFIndex,
     LinearIndex,
     SparseInvertedIndex,
     build_index,
@@ -88,6 +91,28 @@ def test_按稀疏度自动选索引() -> None:
     assert isinstance(build_index(dense), LinearIndex)
     assert isinstance(build_index([]), LinearIndex)      # 空库
     assert sparsity([0.0, 0.0, 1.0]) == pytest.approx(2 / 3)
+
+
+def _dense_vectors(n: int, dim: int = 8, seed: int = 3) -> list[list[float]]:
+    """造一批**稠密**（无零）归一化向量，模拟真语义嵌入。"""
+    rng = random.Random(seed)
+    out: list[list[float]] = []
+    for _ in range(n):
+        vec = [rng.random() + 0.1 for _ in range(dim)]
+        norm = math.sqrt(sum(x * x for x in vec))
+        out.append([x / norm for x in vec])
+    return out
+
+
+def test_auto大稠密库选真ANN_小库仍线性() -> None:
+    """稠密大规模才轮到真 ANN（IVF）；小库仍走精确线性，不白丢召回。"""
+    assert isinstance(build_index(_dense_vectors(10)), LinearIndex)
+    big = _dense_vectors(600)
+    idx = build_index(big)
+    assert isinstance(idx, IVFIndex)
+    assert idx.size == 600
+    # 稀疏向量即使很大也仍走精确倒排（没有理由退成近似）
+    assert isinstance(build_index(_sparse_vectors(n=600, dim=256)), SparseInvertedIndex)
 
 
 def test_稀疏编码往返() -> None:
@@ -173,3 +198,23 @@ def test_未开持久化时不落盘(tmp_path: Path) -> None:
     assert store.size == 1
     assert not list(tmp_path.glob("*.db"))
     store.close()                               # 空操作，不该抛异常
+
+
+def test_loader二次加载复用落盘索引(tmp_path: Path) -> None:
+    """经 loader 索引（默认落盘）：第二次加载复用已落盘向量，**不重新嵌入**。"""
+    pairs = [
+        ("a.md", "年假十五天，需提前申请。"),
+        ("b.md", "报销流程：填表、经理审批、财务打款。"),
+    ]
+    db = tmp_path / "rag.db"
+    first = _CountingEmbedder()
+    store1, _names1 = index_corpus(pairs, embedder=first, persist_path=db)
+    assert first.calls == 2                     # 两块各嵌入一次
+    store1.close()
+
+    second = _CountingEmbedder()
+    store2, names2 = index_corpus(pairs, embedder=second, persist_path=db)
+    assert second.calls == 0, "二次加载不该重新嵌入已落盘的语料"
+    assert store2.size == store1.size           # 没有重复追加
+    assert "复用" in names2[0]                   # 走了复用分支
+    store2.close()

@@ -169,10 +169,6 @@ class McpClient:
         texts = [c.get("text", "") for c in contents if c.get("type") == "text"]
         return "\n".join(texts) if texts else result
 
-    def make_tool(self, binding: McpToolBinding) -> ToolSpec:
-        """把一个 MCP 工具转成 Python ToolSpec（不立即注册）。"""
-        return self._to_spec(binding)
-
     def _to_spec(self, binding: McpToolBinding) -> ToolSpec:
         schema = dict(binding.input_schema)
         schema.setdefault("type", "object")

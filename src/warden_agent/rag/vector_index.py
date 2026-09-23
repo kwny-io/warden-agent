@@ -248,13 +248,18 @@ def build_index(
     kind: str = "auto",
     nlist: int = 8,
     nprobe: int = 2,
+    auto_ivf_min: int = 512,
 ) -> VectorIndex:
     """构造向量索引。
 
     `kind`：
-      - `"auto"`（默认）：按稀疏度自动选——稀疏（>50% 是零）→ 倒排；稠密 → 线性。
-        为什么按稀疏度：倒排的收益来自"大部分维度是零"；真语义嵌入通常稠密，
-        倒排会退化成"几乎全量扫描"，那时线性更简单直接。
+      - `"auto"`（默认）：按稀疏度/规模自动选——
+          · 稀疏（>50% 是零）→ 倒排（能剪枝，且**精确**）；
+          · 稠密且条数 >= `auto_ivf_min` → **IVF（真 ANN）**：倒排对稠密向量没有收益，
+            线性扫描又随规模线性变贵，这时才轮到"用召回换速度"的近似索引；
+          · 稠密且规模小 → 线性（小库上 ANN 只会白白丢召回）。
+        为什么稀疏不选 IVF：倒排对词频哈希是**精确**剪枝，没有理由再退成近似。
+        为什么小稠密库不选 IVF：几十上百条时精确扫描本来就快，近似只会白掉分。
       - `"linear"`：暴力扫描（精确参照）。
       - `"inverted"`：稀疏倒排（精确剪枝）。
       - `"ivf"`：**真 ANN**（k-means + nprobe 探测；`nprobe>=nlist` 即精确）。
@@ -269,12 +274,12 @@ def build_index(
     elif kind == "ivf":
         index = IVFIndex(nlist=nlist, nprobe=nprobe)
     elif kind == "auto":
-        # 稀疏 → 倒排（能剪枝）；稠密 → 线性（倒排对稠密向量没有收益）
-        index = (
-            SparseInvertedIndex()
-            if sparsity(vectors[0]) >= sparse_threshold
-            else LinearIndex()
-        )
+        if sparsity(vectors[0]) >= sparse_threshold:
+            index = SparseInvertedIndex()          # 稀疏 → 精确倒排剪枝
+        elif len(vectors) >= auto_ivf_min:
+            index = IVFIndex(nlist=nlist, nprobe=nprobe)  # 稠密 + 大规模 → 真 ANN
+        else:
+            index = LinearIndex()                  # 稠密 + 小规模 → 精确扫描
     else:
         raise ValueError(f"未知的索引类型: {kind!r}")
     for vec in vectors:

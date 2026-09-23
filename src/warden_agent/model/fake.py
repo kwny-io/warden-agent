@@ -15,6 +15,9 @@
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+from typing import Any
+
 from warden_agent.model.model import (
     AgentChatModel,
     ChatRequest,
@@ -30,6 +33,32 @@ class FakeModel(AgentChatModel):
         self._counter = 0  # 给每次工具调用编个唯一的号
 
     def chat(self, request: ChatRequest) -> ChatResponse:
+        """与真模型对齐：`stream=True` 时同样在 `response.deltas` 里给出增量。"""
+        response = self._respond(request)
+        if request.stream:
+            response.deltas = self._split_deltas(response.content or "")
+        return response
+
+    def chat_stream_iter(self, request: ChatRequest) -> Iterator[dict[str, Any]]:
+        """真流式生成器：先逐段 yield 增量，最后 yield `done`（与 deepseek 同形状）。
+
+        为什么要与真模型同形状：会话循环（`runtime/session.py`）在模型**有**
+        `chat_stream_iter` 时走真流式分支。假模型补上它，离线就能把流式链路测到，
+        否则流式只能靠真模型的行为在线上暴露问题。
+        """
+        response = self._respond(request)
+        deltas = self._split_deltas(response.content or "")
+        response.deltas = deltas
+        for text in deltas:
+            yield {"type": "delta", "text": text}
+        yield {"type": "done", "response": response}
+
+    @staticmethod
+    def _split_deltas(text: str, size: int = 2) -> list[str]:
+        """把整段回答切成小增量（字符粒度），模拟真模型的 SSE 分段。"""
+        return [text[i:i + size] for i in range(0, len(text), size)]
+
+    def _respond(self, request: ChatRequest) -> ChatResponse:
         # 拿最后一条"用户"消息来"思考"
         last_user = next(
             (m for m in reversed(request.messages) if m.role == "user"),

@@ -21,7 +21,12 @@ from warden_agent.rag.knowledge import (
     make_knowledge_tool,
     openai_compatible_embedder,
 )
-from warden_agent.rag.loader import build_knowledge, index_corpus, index_directory
+from warden_agent.rag.loader import (
+    build_knowledge,
+    default_persist_path,
+    index_corpus,
+    index_directory,
+)
 
 __all__ = [
     "Embedder",
@@ -33,6 +38,7 @@ __all__ = [
     "make_knowledge_tool",
     "openai_compatible_embedder",
     "build_knowledge",
+    "default_persist_path",
     "index_corpus",
     "index_directory",
 ]

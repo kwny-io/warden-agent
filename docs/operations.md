@@ -224,10 +224,10 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | 熔断状态、出站并发上限**进程内** | 每副本各一份，不具全局语义 | 熔断按实例隔离是**刻意**的（全局熔断=同步失败）；出站全局/单host**速率**已可共享（`RateLimitStore`），仅**并发**是每进程 |
 | ~~审计与记忆只有 SQLite 实现~~ | **已补（2026-09-23）**：PG 主存储 → `PostgresAuditStore` / `PostgresMemoryStore`（多副本共享）；审计链用 `pg_advisory_xact_lock` 跨副本串行 | 多副本不再需要关审计（K8s `WARDEN_AUDIT` 已改 1）；`warden audit-verify/export --pg` 可核多副本链 |
 | ~~PostgreSQL 真库测试仅在本地~~ | **CI 里已实跑**（16 条零跳过，且有断言防静默跳过） | 已闭环 |
-| 真实搜索 provider 未实现 | `web.search` 仍是离线 mock | 见 README 路线图 |
+| ~~真实搜索 provider 未实现~~ | **已补**：`web.search` 可走真实联网搜索（`HttpSearchProvider`） | 设 `WARDEN_SEARCH_PROVIDER=tavily\|brave\|custom`（+ `WARDEN_SEARCH_API_KEY` / `WARDEN_SEARCH_ENDPOINT`）开启；不设或配不全则如实退回离线 mock 并告警；端点先过 URL 策略并计入出站配额 |
 | 默认嵌入是**词频匹配** | 换个说法就掉分 | 配 `WARDEN_EMBED_*` 才是语义 |
 | ~~抓取只有去标签粗提取~~ | **已补正文抽取（2026-09-22）**：`web/readability.py` 按块打分选正文，排掉导航/侧边栏/页脚 | 仍是启发式、不执行 JS（SPA 拿不到） |
-| ~~向量库进程内全量扫描、不落盘~~ | **已补（2026-09-22）**：稀疏向量走倒排索引剪枝（**精确**，非近似）+ 向量落 SQLite（重启不重新嵌入） | **真 ANN（HNSW/IVF）没做**——倒排是"更快的精确检索"，稠密大规模要外部向量库 |
+| ~~向量库进程内全量扫描、不落盘~~ | **已补**：稀疏向量走倒排索引剪枝（**精确**，非近似）；向量**默认落盘**（主库同目录 `<主库名>-rag*.db`，重启按来源指纹复用、不重新嵌入）；稠密大规模语料 `auto` 会选 **IVF（真 ANN）** | 倒排是"更快的精确检索"不是近似；IVF 才是用召回换速度的 ANN（`nprobe>=nlist` 即精确）。纯 Python 实现，百万级/超高维仍应换 FAISS/pgvector |
 | RBAC 只有两档角色 | 没有租户内细粒度角色（无组织/团队模型） | 见第十三节；管理员不读他人记忆 |
 | 抓取只有去标签粗提取 | 拿不到 SPA / 正文抽取 | 需要 headless 浏览器 |
 | ~~没有告警规则库 / SLO / 链路追踪 / 灰度~~ | **已补齐**（规则库+SLO、traceparent 链路、健康门控灰度） | 见第九～十一节；~~span 送后端仍需接 OTel exporter~~ **已补（2026-09-23）**：`core/otel.py` 零依赖 OTLP 导出，配 `OTEL_EXPORTER_OTLP_ENDPOINT` 即送收集器 |

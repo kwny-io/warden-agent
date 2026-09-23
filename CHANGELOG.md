@@ -439,6 +439,7 @@ SLO 的"1 秒内完成占比"这个 SLI 也失真。另外，计数为 0 的桶�
   - `LinearIndex`：暴力扫描（保留为参照与兜底）；`build_index()` 按稀疏度自动选
     （词频哈希是几千维几十非零 → 倒排；真语义嵌入通常稠密 → 线性）。
   - **诚实口径**：倒排是"更快的精确检索"，**不是 ANN**；真 ANN（HNSW/IVF）要外部库，本轮没做。
+    （后续批次已落地纯 Python `IVFIndex`，`build_index` 在稠密大规模时自动选之，见下方"真 ANN"条目。）
 - `VectorStore` 支持 `persist_path`：向量**落 SQLite**（**稀疏编码**——只存非零维度），
   重启**不用重新嵌入**。测试用"计数嵌入器"证明：重开实例后语料嵌入次数为 **0**，
   只有查询嵌入 1 次（真语义嵌入按量计费，重启重算既慢又花钱）。
@@ -501,8 +502,8 @@ SLO 的"1 秒内完成占比"这个 SLI 也失真。另外，计数为 0 的桶�
 - 实测基线 **87%**（7680 statements），门槛定 **85%**（留余量——贴着当前值的门禁会变成
   "改一行就红"的噪声门禁）。
 - `[tool.coverage.run] branch = true`：只测"行执行过"会漏掉"if 的另一半从没走过"。
-- 阈值**只写在 pyproject**（单一事实源），CI 只加 `--cov`；PG 断言那条步骤加 `--no-cov`
-  （它只跑子集，不能被覆盖率门槛误伤）。
+- 阈值**只写在 pyproject**（单一事实源），CI 只加 `--cov`；PG 断言那条步骤改为解析主 pytest 的
+  junit 报告（不再重跑子集，也就无需 `--no-cov`）。
 
 ### 3. 优雅停机（此前完全没有）
 
@@ -829,7 +830,7 @@ SLO 的"1 秒内完成占比"这个 SLI 也失真。另外，计数为 0 的桶�
   **8 个文件、24 处**，而 `core/config.py` 只有 34 行（仅 `load_env`）——没有任何地方声明
   "这个变量干什么、谁有权读"。这正是本批两个"同名两用"bug 的**根因**（`WARDEN_API_KEY`、
   `WARDEN_BASE_URL`）。新增 `core/settings.py`：
-  - `ENV_SPECS` 登记全部 **37 个**变量：用途 / 归属模块 / **允许读它的模块** / 默认值 / 类型 / 是否敏感；
+  - `ENV_SPECS` 登记全部环境变量（数量以 `ENV_SPECS` 当次为准）：用途 / 归属模块 / **允许读它的模块** / 默认值 / 类型 / 是否敏感；
   - `validate_env()`：启动时校验格式（写错**拒绝启动**，与鉴权 fail-closed 同一取向）；
   - `unknown_warden_variables()`：揪出**拼错的** `WARDEN_*`（如 `WARDEN_RATELIMIT`）并告警——
     原先会被静默忽略、悄悄用默认值，是最难查的一类问题；
@@ -880,7 +881,7 @@ SLO 的"1 秒内完成占比"这个 SLI 也失真。另外，计数为 0 的桶�
     连接参数可用 `WARDEN_TEST_PG_*` 环境变量覆盖（方便挂到 CI 的 service container）。
     **没起 PG 时整体自动跳过**（已实测：11 skip、0 failed），所以 CI 保持绿。
   - 测试数因此分两套：**无 PG = 591 passed / 13 skipped；起了 PG = 603 passed / 1 skipped**。
-  - ~~仍待做：把 PG service 加进 GitHub Actions~~ → **已做并在推送后确认**（2026-09-22）：CI 里 16 条 PG 测试零跳过，另加了一条断言防「静默跳过」。
+  - ~~仍待做：把 PG service 加进 GitHub Actions~~ → **已做并在推送后确认**（2026-09-22）：CI 里 16 条 PG 测试零跳过；防「静默跳过」的守卫改成 `scripts/check_pg_tests_ran.py`，按标记自动发现全部 PG 依赖测试文件并解析主 pytest 的 junit 报告断言零跳过。
 
 - **依赖锁定（企业级推进第 3 项）**。新增 `uv.lock`（48 个包全部固定版本）；CI 改为
   `uv sync --frozen` + `uv run --frozen ...`。**`--frozen` 是关键**：lock 与 pyproject 不一致时
@@ -1001,7 +1002,8 @@ SLO 的"1 秒内完成占比"这个 SLI 也失真。另外，计数为 0 的桶�
   **已在推送后确认（这一步原先标注为"无法本地验证"）**：CI 首跑 663 passed / 5 skipped 全绿，
   但"绿"本身**不能证明 PG 测试真跑了**（skipif 的副作用：service 连不上也会静默跳过、照样绿）。
   所以补了两处：pytest 加 `-rs`（跳过原因进日志）、并新增一步**断言**
-  （单独跑 PG 两个测试文件，输出里出现 `skipped` 就 exit 1；本地已双向验证该断言有效）。
+  （`scripts/check_pg_tests_ran.py`：按 `skipif` 标记自动发现 PG 依赖文件，
+  解析主 pytest 的 junit 报告，任一 PG 用例被跳过就 exit 1；本地已双向验证该断言有效）。
   第二次 CI 的结果给出直接证据——5 条跳过的原因分别是 MCP 连不上（3，CI 未构建 ts 客户端）、
   runner 容器不允许建命名空间（1）、前端未构建（1），**没有一条是 PG**；
   而断言步骤输出 **`16 passed`**：PG 的 16 条测试在 CI 里全部执行、零跳过。
@@ -1036,7 +1038,7 @@ SLO 的"1 秒内完成占比"这个 SLI 也失真。另外，计数为 0 的桶�
 
 ### 尚未实现（路线图）
 
-- **真实搜索 provider 仍未实现**：`web.search` 依旧是离线 mock。检索 API（Tavily / Brave /
+- **真实搜索 provider 仍未实现**→**已在后续批次实现**（`HttpSearchProvider`：`WARDEN_SEARCH_PROVIDER=tavily/brave/custom`，见上方"真实联网搜索 provider"条目）；本条保留为当时状态：`web.search` 依旧是离线 mock。检索 API（Tavily / Brave /
   阿里云 IQS 等）都要第三方 key；这次拿到的 DeepSeek key 是**对话模型**的，不提供搜索接口，
   补不了这一项。接口（`WebSearchProvider`）、URL 策略、出站闸门都已就位，补一个类即可接入。
 - **抓取仍是去标签的粗提取**：没有 Readability 那类正文抽取，也拿不到 JS 渲染的 SPA 页面

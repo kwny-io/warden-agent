@@ -34,7 +34,7 @@ from warden_agent.web.server import build_app
 
 def _offline_store() -> VectorStore:
     """内置离线语料的向量库（强制离线嵌入，不碰网络与环境变量）。"""
-    store, _name, _sources = build_knowledge(True, env={})
+    store, _name, _sources = build_knowledge(True, env={}, persist=False)
     return store
 
 
@@ -42,7 +42,7 @@ def _offline_store() -> VectorStore:
 
 
 def test_内置语料可建库() -> None:
-    store, embedder_name, sources = build_knowledge(True, env={})
+    store, embedder_name, sources = build_knowledge(True, env={}, persist=False)
     assert len(store) > 0
     assert embedder_name == "offline-term-frequency"
     assert "员工手册.pdf" in sources
@@ -56,9 +56,41 @@ def test_目录可建库() -> None:
         (base / "ignore.json").write_text("{}", encoding="utf-8")  # 非文本后缀应跳过
         (base / "empty.md").write_text("   \n", encoding="utf-8")   # 空文件应跳过
 
-        store, _name, sources = build_knowledge(base, env={})
+        store, _name, sources = build_knowledge(base, env={}, persist=False)
         assert sorted(sources) == ["notes.txt", "制度.md"]
         assert len(store) == 2
+
+
+def test_默认落盘并在二次加载时复用(tmp_path: Path) -> None:
+    """默认落盘：主库同目录；第二次 build_knowledge 复用已落盘索引（不重复索引）。"""
+    env = {"WARDEN_DB_PATH": str(tmp_path / "main.db")}
+    store1, _name, _sources = build_knowledge(True, env=env)
+    assert len(store1) > 0
+    # 落盘位置：主库同目录的 <主库名>-rag.db
+    assert (tmp_path / "main-rag.db").exists()
+    store1.close()
+
+    store2, _name, sources2 = build_knowledge(True, env=env)
+    assert len(store2) == len(store1)              # 没有重复追加
+    assert "复用" in sources2[0]                   # 走了复用分支
+    store2.close()
+
+
+def test_目录来源改了会重建索引(tmp_path: Path) -> None:
+    """来源指纹变化 → 丢弃旧索引重建，避免旧文档混进新语料。"""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.md").write_text("旧内容：年假 15 天。", encoding="utf-8")
+    env = {"WARDEN_DB_PATH": str(tmp_path / "main.db")}
+    store1, _n, _s = build_knowledge(docs, env=env)
+    assert len(store1) == 1
+    store1.close()
+
+    (docs / "a.md").write_text("新内容：年假 20 天，另行申请。", encoding="utf-8")
+    store2, _n, _s = build_knowledge(docs, env=env)
+    assert store2.size == 1                        # 重建而不是叠成 2 块
+    assert "20 天" in store2.search_hits("年假")[0].text
+    store2.close()
 
 
 def test_目录不存在时报错() -> None:
@@ -102,7 +134,9 @@ def test_不传knowledge就不注册工具() -> None:
     assert "knowledge_store" not in extra
 
 
-def test_目录路径直接可用() -> None:
+def test_目录路径直接可用(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # 默认落盘会写到主库同目录；把主库指到临时目录，避免测试往仓库里丢 .db
+    monkeypatch.setenv("WARDEN_DB_PATH", str(tmp_path / "main.db"))
     with tempfile.TemporaryDirectory() as d:
         Path(d, "a.md").write_text("差旅住宿：一线城市每晚不超过 600 元。", encoding="utf-8")
         catalog = ToolCatalog()

@@ -21,7 +21,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sys
 from dataclasses import dataclass
 
 from warden_agent.rag.corpus import POLICY_CORPUS
@@ -158,7 +160,7 @@ def format_report(report: RetrievalReport) -> str:
     if report.k_coverage >= 0.25:
         lines += [
             "-" * 62,
-            f"⚠️ recall@{report.k} 的口径：本库 {report.corpus_size} 块，k={report.k} "
+            f"[注意] recall@{report.k} 的口径：本库 {report.corpus_size} 块，k={report.k} "
             f"一次就返回全库的 {report.k_coverage:.0%}，",
             "   \"命中\"几乎是必然的——这个数字**不代表检索器强**。看 top-1 与 MRR 更有意义；",
             "   换真语义嵌入时比的是同一套用例的相对提升，不要拿这个绝对值对外说。",
@@ -167,6 +169,11 @@ def format_report(report: RetrievalReport) -> str:
 
 
 def main() -> None:
+    # Windows 控制台默认可能不是 UTF-8（GBK 下非 GBK 字符会 UnicodeEncodeError）；
+    # 把 stdout 切成 UTF-8 并对无法编码的字符退成代替符——报告里有中文与符号，
+    # 不能让一次编码错误把整个评测打成 traceback。
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     store, name = build_corpus_store()
     report = evaluate(store, embedder_name=name)
     print(format_report(report))

@@ -13,7 +13,8 @@ RAG 的完整流程（三句话）：
     以后想接入 FastEmbed / 真嵌入 API，只需传一个函数进来，其他地方不用改。
   - 检索：把问题向量与库里**每一个** chunk 向量算相似度，排序取 top-k。纯 Python 实现
     （不依赖 numpy），暴力全扫 O(N)；向量在嵌入阶段已 L2 归一化，所以点积即余弦。
-  - 存储：进程内两个平行 list（chunk 文本 + 向量），**不落盘**，重启靠重新索引。
+  - 存储：进程内两个平行 list（chunk 文本 + 向量）；**可选落盘**（`persist_path` → SQLite，
+    重启复用、不重新嵌入，见 `loader.py` 的默认落盘）。不落盘时重启靠重新索引。
     维度 4096 且用 Python float 存，单条向量约 130KB —— 适合中小知识库，上量需换向量库。
   - 通过 function_tool 暴露成 knowledge.search 技能卡，模型自动会用。
 """
@@ -272,6 +273,11 @@ class VectorStore:
             " source TEXT NOT NULL,"
             " source_id TEXT NOT NULL)"
         )
+        # 元数据表：存来源指纹等——用来判断落盘的索引是否仍是当前语料的，
+        # 是复用/重建的依据（见 loader._reuse_persisted）。
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS rag_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
         self._conn.commit()
 
     def _load_existing(self) -> None:
@@ -298,6 +304,38 @@ class VectorStore:
             (chunk, json.dumps(encode_sparse(vector)), source, source_id),
         )
         self._conn.commit()
+
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        """读一条元数据（没开持久化或键不存在时返回 `default`）。"""
+        if self._conn is None:
+            return default
+        row = self._conn.execute(
+            "SELECT value FROM rag_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row[0]) if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        """写一条元数据（幂等 UPSERT；没开持久化时是空操作）。"""
+        if self._conn is None:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO rag_meta (key, value) VALUES (?, ?)", (key, value)
+        )
+        self._conn.commit()
+
+    def reset(self) -> None:
+        """清空库内容（内存 + 已落盘的 chunk），用于来源变了、需要重建。
+
+        只清 `rag_chunks`，不动 `rag_meta`——调用方重建后会用新指纹覆盖它。
+        """
+        self._chunks.clear()
+        self._vectors.clear()
+        self._sources.clear()
+        self._source_ids.clear()
+        self._index = LinearIndex()
+        if self._conn is not None:
+            self._conn.execute("DELETE FROM rag_chunks")
+            self._conn.commit()
 
     def close(self) -> None:
         """关闭落盘连接（幂等；没开持久化时是空操作）。"""
