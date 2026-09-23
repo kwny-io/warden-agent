@@ -466,9 +466,13 @@ def main() -> None:
     # 事件总线：poll（默认，轮询）或 notify（LISTEN/NOTIFY 唤醒，仅 Postgres 有效）。
     # notify 不改变正确性——事件仍落表、订阅仍读表，通知只把"睡满间隔"变成"变化即醒"。
     event_bus_mode = env_str("WARDEN_EVENT_BUS", "poll", os.environ).strip().lower()
+    # 事件总线保留条数只解析一次，并且**同时**喂给 coordination_for 与 build_app：
+    # 否则 build_app 会用默认值另建一套总线/保留策略，run_server 打的日志（下面的
+    # `type(coordination[1])`）就与实际生效的那条总线对不上——日志在撒谎。
+    event_keep = _event_keep_from_env(os.environ)
     coordination = coordination_for(
         store, shared=shared_state, event_bus=event_bus_mode,
-        event_keep=_event_keep_from_env(os.environ),
+        event_keep=event_keep,
     )
     logger.info(
         "协调状态：%s（事件总线 %s）",
@@ -578,6 +582,11 @@ def main() -> None:
         max_context_chars=ctx_chars,
         rate_limiter=limiter,
         shared_state=shared_state,
+        # 把已经建好的事件总线与保留策略透传进去：`notify` 模式建的是
+        # PostgresNotifyEventBus，若这里不传，build_app 会另建一条默认轮询总线，
+        # 于是 LISTEN/NOTIFY 根本不生效，而启动日志却写着 notify。
+        event_bus=coordination[1],
+        event_keep=event_keep,
         outbound_limiter=outbound,
         run_lock=run_lock,
         maintenance=maintenance,

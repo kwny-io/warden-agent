@@ -506,6 +506,7 @@ def build_app(
     shared_state: bool = False,
     idempotency_store: IdempotencyStore | None = None,
     event_bus: EventBus | None = None,
+    event_keep: int | None = None,
     outbound_limiter: OutboundLimiter | None = None,
     run_lock: RunLock | None = None,
     maintenance: Any = None,
@@ -810,7 +811,9 @@ def build_app(
     # 协调状态：幂等表 / 事件总线。
     #   shared_state=False（默认）→ 进程内实现，单副本行为与历史一致；
     #   shared_state=True          → 存储实现，多副本读写同一张表，幂等与事件流才跨副本成立。
-    _coordination = coordination_for(store, shared=shared_state)
+    #   event_keep：进程内总线每个 run 保留的最近事件数（`WARDEN_EVENT_KEEP`）；
+    #   由 run_server 透传，避免这里用默认值"另起一套"——否则配置了也不生效。
+    _coordination = coordination_for(store, shared=shared_state, event_keep=event_keep)
     idem_store: IdempotencyStore = idempotency_store or _coordination[0]
     bus: EventBus = event_bus or _coordination[1]
     # 中间件闭包里带"当前是否开启"标志，`_is_public`/`_extract_run_id` 复用在端点里
@@ -888,6 +891,8 @@ def build_app(
                 try:
                     caller = authenticator.authenticate(request)
                 except HttpAuthenticationError as e:
+                    # 提前返回也要把状态码写回，否则 finally 会按 200 记指标/审计
+                    status_code = 401
                     return _problem(401, "AUTHENTICATION_REQUIRED", str(e), correlation_id)
                 if caller is not None:
                     # 把已认证身份挂到 request 上，端点据此解析归属（见 _identity）
@@ -895,6 +900,7 @@ def build_app(
                     try:
                         authorizer.authorize(caller, operation, run_id)
                     except HttpAuthorizationError as e:
+                        status_code = 403
                         return _problem(403, "AUTHORIZATION_DENIED", str(e), correlation_id)
             # 限流：健康探针等公开路径豁免（负载均衡探活不能被限流挡住），
             # 其余按调用者身份（匿名时按来源 IP）计数。
@@ -934,6 +940,7 @@ def build_app(
             if idem_key and method == "POST" and not is_stream:
                 cached_resp = _idem_response_from_store(idem_store, idem_key)
                 if cached_resp is not None:
+                    status_code = cached_resp.status_code
                     return cached_resp
                 if not idem_store.reserve(idem_key):
                     # 另一个同 key 请求正在处理中：明确回 409，别让它并发执行第二遍
@@ -952,10 +959,12 @@ def build_app(
                 # 把本链路的 traceparent 回给调用方：它可作为"这次请求在链上的位置"的对账凭据
                 response.headers["traceparent"] = trace_ctx.to_traceparent()
             if idem_key and method == "POST" and not is_stream:
-                if status_code < 500:
-                    # 只缓存成功结果；5xx 不缓存，并**释放占位**以便客户端重试
+                if 200 <= status_code < 300:
+                    # **只缓存 2xx 成功结果**。此前是 `<500` 就缓存，于是瞬时 423（Run 锁）/409
+                    # 会被永久写进幂等表——同 key 重试永远命中那条失败响应，客户端再也推进不了。
                     response = await _drain_and_rebuild(response, idem_store, idem_key)
                 elif idem_reserved:
+                    # 非 2xx（423/409/4xx/5xx）：不缓存，并释放占位，让同 key 可以重试
                     idem_store.release(idem_key)
             return response
         except Exception as exc:  # noqa: BLE001 - 网关兜底，不泄漏内部细节
@@ -966,13 +975,21 @@ def build_app(
             # 执行失败要释放占位，否则这个 key 会永久卡在"处理中"，客户端永远重试不了
             if idem_reserved and idem_key:
                 idem_store.release(idem_key)
+            # 兜底 500 也必须写回状态码：否则 finally 会把它当成 200 记进指标与审计，
+            # 于是"服务在报 500"这件事在可观测面上完全不可见。
+            status_code = 500
             return _problem(500, "INTERNAL_ERROR", "请求未能完成", correlation_id)
         finally:
+            # 指标 path 标签用**路由模板**（如 /status/{run_id}），而不是原始 URL：
+            # 原始 URL 带 run_id/scope，会让时间序列基数无界（每个 run 一条），Prometheus 会被打爆。
+            # 未匹配到路由（早期返回 / 未命中）时回落固定串 "other"，同样是有界的。
+            route = request.scope.get("route")
+            path_label = getattr(route, "path", None) or "other"
             # T8 指标：请求数 + 耗时分布 + 5xx 错误数（耗时直方图：桶已在注册时绑定）
-            m_http.inc(labels=(method, path))
+            m_http.inc(labels=(method, path_label))
             m_http_latency.observe(time.monotonic() - _start)
             if status_code >= 500:
-                m_http_errors.inc(labels=(method, path))
+                m_http_errors.inc(labels=(method, path_label))
             if audit_enabled:
                 audit.record(  # type: ignore[union-attr]
                     correlation_id=correlation_id,
@@ -1039,7 +1056,16 @@ def build_app(
         m_stuck.set(value, labels=("60m",))
 
     @app.get("/metrics", include_in_schema=False)
-    def metrics_view() -> PlainTextResponse:
+    def metrics_view(request: Request) -> PlainTextResponse:
+        """Prometheus 指标出口。**仅管理员**可读。
+
+        为什么收紧：指标是**运维面**（全局请求量/错误率/挂起数/各 path 延时），不是用户数据面。
+        此前只要求认证，viewer（只读角色）也能读——与"只读=能看用户数据但不能动"的契约不符。
+        本地匿名开发模式（未开启鉴权）保持开放，行为不变。
+        """
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        if authenticator is not None and (caller is None or not caller.is_admin):
+            raise HTTPException(status_code=403, detail="查看指标需要管理员角色")
         _refresh_stuck_gauge()
         return PlainTextResponse(metrics().render())
 
@@ -1458,21 +1484,37 @@ def build_app(
         走可插拔事件总线：单副本是进程内实现（条件变量唤醒、无延迟），
         多副本换成存储实现（多个副本订阅同一张事件表），客户端连任一副本都能收到。
         """
+        # 与 /chat/stream 共用同一并发闸门：否则只限 /chat/stream 是形同虚设——
+        # 用 /events 一样能无限量开长连接把连接池占满。名额在生成器 finally 里释放
+        # （含客户端断开触发的 GeneratorExit）。
+        if not sse_gate.acquire():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"SSE 长连接已达并发上限 {sse_max_concurrency}，请稍后重试"
+                    "（WARDEN_SSE_MAX_CONNECTIONS 可调）"
+                ),
+            )
+
         def generate() -> Any:
-            seq = 0
-            while True:
-                items = bus.poll(run_id, seq, timeout=15.0)
-                if not items:
-                    yield ": keep-alive\n\n"  # 心跳，防中间层掐连接
-                    continue
-                stop = False
-                for s, ev in items:
-                    seq = s
-                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                    if ev.get("event") in ("final", "error"):
-                        stop = True
-                if stop:
-                    break
+            try:
+                seq = 0
+                while True:
+                    items = bus.poll(run_id, seq, timeout=15.0)
+                    if not items:
+                        yield ": keep-alive\n\n"  # 心跳，防中间层掐连接
+                        continue
+                    stop = False
+                    for s, ev in items:
+                        seq = s
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        if ev.get("event") in ("final", "error"):
+                            stop = True
+                    if stop:
+                        break
+            finally:
+                # 流结束（含客户端断开）就归还并发名额，防泄漏
+                sse_gate.release()
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
