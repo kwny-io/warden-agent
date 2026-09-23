@@ -30,9 +30,9 @@ from typing import Any
 from warden_agent.loop.cognition import (
     intent_hint,
     manage_context,
-    plan_context,
     recall_context,
 )
+from warden_agent.loop.planner import PlanState, make_plan_state
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel, ChatRequest, Message
 from warden_agent.policy.policy import ApprovalRequired, Decision, PolicyDenied, PolicyEngine
@@ -88,6 +88,8 @@ class AgentReply:
 
     text: str
     messages: list[Message]  # 完整对话历史（可用于持久化/审计）
+    # 【loop 深度③】规划进度快照（可观察/可持久化）；无规划时为 None
+    plan: PlanState | None = None
 
 
 # PolicyDenied 统一在 policy/policy.py 定义（loop 与 session 共用），此处不再重复定义。
@@ -143,6 +145,8 @@ class AgentLoop:
         self.stability = stability
         # 【loop 深度③】阶段规划器（可选）。None 则不拆阶段（基础 loop）。
         self.planner = planner
+        # 最近一次 run 的规划进度（run() 结束时写入，供观察/审计；未拆阶段则 None）
+        self.last_plan: PlanState | None = None
         # 【loop 深度⑤】工具意图路由器（可选）。None 则不做"调用前意图校验"（只防打转）。
         self.intent = intent
 
@@ -156,9 +160,15 @@ class AgentLoop:
         memory_context = recall_context(self.memory, self.memory_scope, user_text)
         if memory_context:
             messages.append(Message(role="system", content=memory_context))
-        planned = plan_context(self.planner, user_text)
-        if planned:
-            messages.append(Message(role="system", content=planned))
+        # 【loop 深度③】分步推进：把规划包成可推进的 PlanState，并把"当前阶段"
+        # 作为一条 system 消息注入；每完成一步就更新它的内容（每步观察，而非一次性静态提示）。
+        # 步数有界（max_steps），且推进发生在下面的迭代循环里——受墙钟预算/取消检查约束。
+        plan_state = make_plan_state(self.planner, user_text)
+        self.last_plan = plan_state
+        plan_msg: Message | None = None
+        if plan_state is not None:
+            plan_msg = Message(role="system", content=plan_state.context(self.planner))
+            messages.append(plan_msg)
         messages.append(Message(role="user", content=user_text))
         tools = [t.to_openai_schema() for t in self.catalog.all()]
 
@@ -184,6 +194,9 @@ class AgentLoop:
 
             # 情况A：模型想调用工具
             if response.tool_calls:
+                # 【loop 深度③】本轮是否有"真正成功的执行"与"失败"，用于推进/冻结规划进度。
+                round_ok = False
+                round_failed = False
                 for call in response.tool_calls:
                     # 记录"模型想调工具"这句（可审计）
                     assistant_note = Message(
@@ -225,6 +238,7 @@ class AgentLoop:
                         deadline, what=f"工具 {call.name}",
                     )
                     if error is not None:
+                        round_failed = True
                         retry_key = _tool_signature(call.name, call.arguments)
                         count = tool_retries.get(retry_key, 0) + 1
                         tool_retries[retry_key] = count
@@ -264,15 +278,25 @@ class AgentLoop:
                         ))
                         continue
                     seen_calls.append(call_sig)
+                    round_ok = True
                     # 成功：把工具结果放回对话，让模型"看到"结果后再决定下一步。
                     # 必须携带 call 引用使 tool_call_id 与 assistant 一致，否则真实 API 报 400。
                     messages.append(Message(role="tool", content=str(result), tool_call=call))
+                # 【loop 深度③】推进阶段：本轮有成功执行才前进；只有失败则冻结并标记，
+                # 后续阶段绝不被静默标为已完成；重复调用/意图提示不算进展也不推进。
+                if plan_state is not None:
+                    if round_ok:
+                        plan_state.advance()
+                    elif round_failed:
+                        plan_state.mark_failed("工具执行失败")
+                    if plan_msg is not None:
+                        plan_msg.content = plan_state.context(self.planner)
                 continue  # 回到循环顶部，让模型基于结果再想
 
             # 情况B：模型直接给出了最终回答
             if response.content is not None:
                 messages.append(Message(role="assistant", content=response.content))
-                return AgentReply(text=response.content, messages=messages)
+                return AgentReply(text=response.content, messages=messages, plan=plan_state)
 
         # 3. 循环次数用尽还没结束 = 视为异常，防止死循环
         raise RuntimeError("AgentLoop 迭代超过上限，任务未收敛（可能模型一直在调用工具）")

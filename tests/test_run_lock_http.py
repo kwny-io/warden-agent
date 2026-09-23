@@ -78,6 +78,8 @@ async def test_锁被别的副本持有时返回423() -> None:
     async with _client(app) as c:
         r = await c.post("/chat/run-1", json={"text": "你好"})
         assert r.status_code == 423
+        # 统一 problem+json：状态码不变，但形状不再混 {"detail": ...}
+        assert r.json()["errorCode"] == "RUN_LOCKED"
         assert "other-replica" in r.json()["detail"]
         # 别的 run 不受影响（锁是按 run_id 分的）
         assert (await c.post("/chat/run-2", json={"text": "你好"})).status_code == 200

@@ -58,12 +58,23 @@ def _sqlite_tables(conn: sqlite3.Connection) -> dict[str, list[str]]:
 
 
 def read_sqlite() -> tuple[int, dict[str, list[str]]]:
-    """起一个全新的 SQLite 库，读回 (记录的 schema 版本, 结构指纹)。"""
+    """起一个全新的 SQLite 库，读回 (记录的 schema 版本, 结构指纹)。
+
+    除 RunStore 的库外，还**顺手建出 memories / audit_log**：它们与 Run 表同属一个
+    "存储 schema"，却各自在自己的 store 里建表；不在这里补上，它们的结构变更就落在
+    版本 + 指纹守门的盲区里。
+    """
+    from warden_agent.memory.store import SqliteMemoryStore
     from warden_agent.store.sqlite import SqliteStore
+    from warden_agent.web.audit import SqliteAuditStore
 
     db_path = Path(tempfile.mkdtemp()) / "fresh.db"
     store = SqliteStore(db_path)
     try:
+        # 复用同一条连接建表：指纹只关心"表 -> 列"，不关心连接归属。
+        SqliteMemoryStore(conn=store.conn)
+        # 传一个哑键，避免无 WARDEN_AUDIT_KEY 时打出"审计链退化为无键"告警。
+        SqliteAuditStore(conn=store.conn, chain_key=b"schema-fingerprint")
         version = store.schema_version()
         tables = _sqlite_tables(store.conn)
     finally:
@@ -88,10 +99,16 @@ def read_postgres() -> tuple[int, dict[str, list[str]]]:
     用 information_schema 而不是 pg_catalog：它跨版本稳定，且和 SQLite 的
     pragma_table_info 语义一致（都只给"表 → 列"），两个后端的指纹才能直接对比。
     """
+    from warden_agent.memory.store import PostgresMemoryStore
     from warden_agent.store.postgres import PostgresStore
+    from warden_agent.web.audit import PostgresAuditStore
 
     store = PostgresStore(**_pg_params())
     try:
+        # 与 SQLite 侧对齐：memories / audit_log 也必须建出来，否则 PG 指纹里少了这两张表，
+        # 会与快照（由 SQLite 侧写入）不一致而误报。
+        PostgresMemoryStore(conn=store.conn)
+        PostgresAuditStore(conn=store.conn, chain_key=b"schema-fingerprint")
         version = store.schema_version()
         with store.conn.cursor() as cur:
             cur.execute(

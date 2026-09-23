@@ -34,14 +34,17 @@ import logging
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from warden_agent.core import tracing
 from warden_agent.core.metrics import metrics
@@ -96,6 +99,9 @@ API_SUPPORTED_MAJORS: tuple[str, ...] = ("1",)
 DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
 # SSE 长连接并发上限：默认 100。长连接一直占线程/连接，不限并发时少量客户端就能耗尽连接池。
 DEFAULT_SSE_MAX_CONCURRENCY = 100
+# 会话内存缓存上限：默认 1000。任何 GET /status/<随机 id> 都会建一个 AgentSession，
+# 不透顶时内存可被客户端任意 run_id 撑爆；到上限按 LRU 淘汰最久未访问的会话。
+DEFAULT_SESSION_CACHE_MAX = 1000
 
 
 class SseConcurrencyGate:
@@ -180,16 +186,22 @@ def _idem_response_from_store(store: IdempotencyStore, key: str) -> Any | None:
 
 
 # ---- 阶段13：problem+json 错误（RFC 7807 problem+json）----
-# 统一错误码契约（对标 RuntimeApiErrorCode）：所有业务错误都用这里的 code + status
-API_ERROR_CODES = {
-    "BAD_REQUEST": 400,
-    "AUTHENTICATION_REQUIRED": 401,
-    "AUTHORIZATION_DENIED": 403,
-    "RUN_INVALID_STATE": 409,
-    "NOT_FOUND": 404,
-    "CONFLICT": 409,
-    "SERVICE_UNAVAILABLE": 503,
-    "INTERNAL_ERROR": 500,
+# 统一错误响应契约：**所有**错误（含端点里的 `raise HTTPException` 与请求体校验失败）
+# 都经下面的异常处理器变成同一种 problem+json 形状，不再混着 FastAPI 默认的 `{"detail": ...}`。
+# 状态码 → errorCode 的映射；端点需要更具体的 code 时可直接调 `_problem`。
+_STATUS_ERROR_CODES: dict[int, str] = {
+    400: "BAD_REQUEST",
+    401: "AUTHENTICATION_REQUIRED",
+    403: "AUTHORIZATION_DENIED",
+    404: "NOT_FOUND",
+    409: "CONFLICT",
+    413: "PAYLOAD_TOO_LARGE",
+    422: "VALIDATION_FAILED",
+    423: "RUN_LOCKED",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+    501: "NOT_IMPLEMENTED",
+    503: "SERVICE_UNAVAILABLE",
 }
 _API_TITLES: dict[int, str] = {
     400: "Bad Request",
@@ -197,8 +209,12 @@ _API_TITLES: dict[int, str] = {
     403: "Forbidden",
     404: "Not Found",
     409: "Conflict",
+    413: "Payload Too Large",
+    422: "Unprocessable Entity",
+    423: "Locked",
     429: "Too Many Requests",
     500: "Internal Server Error",
+    501: "Not Implemented",
     503: "Service Unavailable",
 }
 
@@ -228,6 +244,19 @@ def _problem(
             "X-Correlation-Id": correlation_id,
             **(extra_headers or {}),
         },
+    )
+
+
+def _problem_for_status(
+    status: int,
+    detail: str,
+    correlation_id: str,
+    extra_headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """按 HTTP 状态码给出统一的 problem+json（异常处理器用，errorCode 由状态码映射）。"""
+    return _problem(
+        status, _STATUS_ERROR_CODES.get(status, "ERROR"), detail,
+        correlation_id, extra_headers,
     )
 
 
@@ -310,6 +339,8 @@ class SessionRegistry:
         intent: Any = None,
         max_context_chars: int = 0,
         checkpoint_store: Any = None,
+        max_sessions: int = DEFAULT_SESSION_CACHE_MAX,
+        session_ttl_s: float = 0.0,
     ) -> None:
         self._model = model
         self._default_model_id: str = default_model_id
@@ -326,14 +357,76 @@ class SessionRegistry:
         self._max_context_chars = max_context_chars
         self._checkpoint_store = checkpoint_store
         self.extra = extra or {}  # 额外能力（如 memory_service / skill_catalog）
-        self._sessions: dict[str, AgentSession] = {}
+        # 有界 LRU 缓存：`_sessions` 是 OrderedDict（队尾=最近访问），`_max_sessions`
+        # 到上限时淘汰队首（最久未访问）。`_session_seen` 记访问时刻供 TTL 淘汰。
+        # 为什么必须有界：任何 `GET /status/<随机 id>` 都会新建一个 AgentSession，
+        # 不限的话客户端用一个循环就能把内存撑爆。
+        self._sessions: OrderedDict[str, AgentSession] = OrderedDict()
+        self._session_seen: dict[str, float] = {}
+        self._max_sessions = max_sessions
+        self._session_ttl_s = session_ttl_s
+        # 防 run_id 抢注：首个“看到”某个 Run 的 principal（进程内）。
+        # 客户端自带的 run_id 是先到先得，不记下来就能被另一 principal 后手接管。
+        self._created_by: dict[str, str] = {}
         # RLock（可重入）：`get()` 持锁时还要调 `model_for()` 解析归属者模型，
         # 用普通 Lock 会自锁死。
         self._lock = threading.RLock()
 
+    def note_creator(self, run_id: str, principal: str) -> None:
+        """记下某个 Run 的首个创建者（首次生效，后续调用不覆盖）。"""
+        with self._lock:
+            self._created_by.setdefault(run_id, principal)
+
+    def creator_of(self, run_id: str) -> str | None:
+        """某个 Run 在**本进程内**被谁首先创建；没记过则 None。"""
+        with self._lock:
+            return self._created_by.get(run_id)
+
+    def _evict_stale(self) -> None:
+        """清掉超过 TTL 未访问的会话（TTL<=0 则不做）。调用方须持锁。"""
+        if self._session_ttl_s <= 0:
+            return
+        now = time.monotonic()
+        for run_id in [
+            rid for rid, ts in self._session_seen.items()
+            if now - ts > self._session_ttl_s
+        ]:
+            self._evict(run_id)
+
+    def _evict_overflow(self) -> None:
+        """超过容量上限就淘汰队首（最久未访问）；`max_sessions<=0` = 不限。须持锁。"""
+        if self._max_sessions <= 0:
+            return
+        while len(self._sessions) > self._max_sessions:
+            run_id, sess = self._sessions.popitem(last=False)
+            self._session_seen.pop(run_id, None)
+            self._close_session(sess, run_id)
+
+    def _evict(self, run_id: str) -> None:
+        """按 run_id 淘汰一个会话（含关闭）。须持锁。"""
+        sess = self._sessions.pop(run_id, None)
+        if sess is not None:
+            self._session_seen.pop(run_id, None)
+            self._close_session(sess, run_id)
+
+    def _close_session(self, sess: AgentSession, run_id: str) -> None:
+        """关闭被淘汰的会话（释放它持有的资源）；关闭失败不得影响缓存淘汰。
+
+        注意：会话持有的模型/存储/记忆是**共享**的，`AgentSession.close()` 只做标记；
+        这里把“关闭”做成一个可覆盖的钩子（鸭子类型），方便扩展与测试。
+        """
+        close = getattr(sess, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - 关闭失败不能拖垮请求
+            logger.warning("关闭被淘汰的会话失败 run=%s", run_id, exc_info=True)
+
     def get(self, run_id: str) -> AgentSession:
         """取会话；没有就基于数据库恢复/新建一个。"""
         with self._lock:
+            self._evict_stale()
             sess = self._sessions.get(run_id)
             if sess is None:
                 sess = AgentSession(
@@ -358,12 +451,18 @@ class SessionRegistry:
                 # 已有会话：按它的归属者解析模型（这也是 approve/reject 等驱动路径
                 # 不需要各自再解析一次的原因）
                 sess.model = self.model_for(sess.run.user_id or None)[1]
+            # LRU：本次访问移到队尾；记下访问时刻供 TTL 淘汰；再按上限淘汰最久未访问的。
+            self._sessions.move_to_end(run_id)
+            self._session_seen[run_id] = time.monotonic()
+            self._evict_overflow()
             return sess
 
     def remove(self, run_id: str) -> None:
         """把会话从内存下线（删除会话时用，数据库由调用方清理）。"""
         with self._lock:
             self._sessions.pop(run_id, None)
+            self._session_seen.pop(run_id, None)
+            self._created_by.pop(run_id, None)
 
     def run_ids(self) -> list[str]:
         """当前在内存里的会话 id 快照（遍历用；不要在调用期间持有锁）。"""
@@ -512,6 +611,8 @@ def build_app(
     maintenance: Any = None,
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     sse_max_concurrency: int = DEFAULT_SSE_MAX_CONCURRENCY,
+    session_cache_max: int = DEFAULT_SESSION_CACHE_MAX,
+    session_ttl_s: float = 0.0,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
@@ -551,6 +652,8 @@ def build_app(
         # 存档点落库：把 SqliteStore 的 checkpoint 方法适配成 CheckpointStore 接口，
         # 会话侧才能真正"记下跑到第几轮、正在哪一步"（见 _owner_of / recovery 端点）。
         checkpoint_store=_checkpoint_store_for(store),
+        max_sessions=session_cache_max,
+        session_ttl_s=session_ttl_s,
     )
 
     def _close_quietly(resource: Any, what: str) -> None:
@@ -602,6 +705,27 @@ def build_app(
     app = FastAPI(
         title="Warden Agent Python", version=API_VERSION, lifespan=_lifespan,
     )
+    # 把会话注册表挂到 app 上：便于运维/测试观察缓存占用（有界 LRU 的容量与当前条数）。
+    app.state.session_registry = registry
+
+    # ---- 统一错误响应：所有错误都变成 problem+json（不再混 FastAPI 默认的 {"detail": ...}）----
+    # 同时拦住端点里的 `raise HTTPException(...)` 与 Starlette 自带的 404/405，
+    # 以及请求体校验失败（422）。HTTP 状态码保持不变，只统一**响应体形状**。
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error_handler(
+        request: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
+        cid = getattr(request.state, "correlation_id", "")
+        return _problem_for_status(
+            exc.status_code, str(exc.detail), cid, dict(exc.headers or {})
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        cid = getattr(request.state, "correlation_id", "")
+        return _problem_for_status(422, "请求体校验失败", cid)
 
     # ---- Run 级锁：同一会话同一时刻只允许一方驱动 ----
     # 多副本下两个副本同时处理同一个 run 会"后写覆盖前写"（历史分叉或丢失，且不报错）。
@@ -763,6 +887,13 @@ def build_app(
     # 运维告警用的 gauge：等待人工处理超过阈值的 Run 数。抓取时现算（见 _refresh_stuck_gauge），
     # 不与写入路径耦合——这样重启/多副本都不会让这个数漂移。
     m_stuck = m.gauge("warden_stuck_runs", "等待人工处理超过阈值的 Run 数", ["older_than"])
+    # 审计链未配密钥（退化为不带密钥哈希链）：暴露成 gauge，并在 /health/ready 上降级。
+    # 没配密钥不是错误（默认仍非致命），但必须**可观测**——否则会“以为在防篡改、其实没有”。
+    audit_unkeyed = audit_store is not None and getattr(audit_store, "keyed", True) is False
+    m_audit_unkeyed = m.gauge(
+        "warden_audit_unkeyed", "审计链未配置密钥（1=退化为不带密钥哈希链）"
+    )
+    m_audit_unkeyed.set(1 if audit_unkeyed else 0)
 
     # ---- 阶段13：认证 + 审计中间件 ----
     authenticator = ApiKeyAuthenticator(api_keys) if api_keys else None
@@ -770,7 +901,11 @@ def build_app(
     def _owner_of(run_id: str) -> str | None:
         """读某个 Run 的归属用户（不存在或尚无归属时返回 None）。"""
         run = store.load_run(run_id)
-        return run.user_id if run is not None and run.user_id else None
+        if run is not None and run.user_id:
+            return run.user_id
+        # 尚未落库归属时，回落到“本进程首个创建者”——否则客户端可先看一个无归属
+        # 的 run_id、再让另一 principal 通过 /chat 把它“接管”成自己的（抢注）。
+        return registry.creator_of(run_id)
 
     # 认证开启 → 启用授权：先过**角色权限**（能不能做这类动作），
     # 再过**按归属**（能不能碰这个 Run）。
@@ -823,6 +958,8 @@ def build_app(
     async def _gateway(request: Request, call_next: Any) -> Any:
         """统一入口：分配 correlation_id → 认证 → 授权 → 执行业务 → 落审计 + 记指标。"""
         correlation_id = request.headers.get("X-Correlation-Id") or uuid.uuid4().hex
+        # 把 correlation_id 挂到 request 上：异常处理器（统一 problem+json）能取到它
+        request.state.correlation_id = correlation_id
         method = request.method
         path = request.url.path
         run_id = _extract_run_id(path)
@@ -897,6 +1034,10 @@ def build_app(
                 if caller is not None:
                     # 把已认证身份挂到 request 上，端点据此解析归属（见 _identity）
                     request.state.caller = caller
+                    # 防 run_id 抢注：首个“看到”一个无归属 Run 的 principal 即它的创建者，
+                    # 后续别的 principal 再碰同一 run_id 会被 owner_authorizer（经 _owner_of）拒绝。
+                    if run_id is not None:
+                        registry.note_creator(run_id, caller.user_id)
                     try:
                         authorizer.authorize(caller, operation, run_id)
                     except HttpAuthorizationError as e:
@@ -1013,9 +1154,16 @@ def build_app(
     @app.get("/health/ready", include_in_schema=False)
     def health_ready() -> JSONResponse:
         r: HealthResult = readiness(store)
+        checks = dict(r.checks)
+        status = r.status
+        if audit_unkeyed:
+            # 审计开着却没有链密钥：能发现手改/删行，却挡不住会重算整条链的人。
+            # 就绪探针如实降级，让编排/监控能看见，而不是等出事才发现“以为在防篡改”。
+            checks["audit_chain"] = "unkeyed"
+            status = "degraded"
         return JSONResponse(
-            status_code=200 if r.status == "ok" else 503,
-            content={"status": r.status, "checks": r.checks},
+            status_code=200 if status == "ok" else 503,
+            content={"status": status, "checks": checks},
         )
 
     # ---- T8 可观测性：指标出口（Prometheus text，可被 Grafana 抓取）----
@@ -1399,6 +1547,12 @@ def build_app(
                 messages=_serialize_messages(outcome.messages),
             )
         if isinstance(outcome, NeedsApproval):
+            # 与 /chat 路径对齐：又遇到审批也要发事件。此前 approve/reject 这条路
+            # 拿到 NeedsApproval 只回响应、不发事件，/events 订阅方永远等不到它。
+            bus.publish(
+                run_id,
+                {"event": "needs_approval", "approval": outcome.approval.tool_name},
+            )
             return ChatResponseOut(
                 run_id=run_id,
                 status=sess.status().name,

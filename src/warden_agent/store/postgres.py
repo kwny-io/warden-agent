@@ -13,10 +13,13 @@
 """
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Concatenate, cast
 
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.credential.vault import (
@@ -38,12 +41,54 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def _reconnecting[**P, R](
+    method: Callable[Concatenate[PostgresStore, P], R],
+) -> Callable[Concatenate[PostgresStore, P], R]:
+    """给**会碰到连接**的方法套一层「连接坏了就重连并有限重试」。
+
+    为什么需要它（这是修过的一个真问题）：`PostgresStore` 是**单连接**设计，一条 `self.conn`
+    坏了（网络闪断、DB 重启、连接被服务端回收）之后，此前每个方法都会直接抛
+    `OperationalError`——而且**不会自愈**，直到进程重启。SQLite 版没有这个问题（本地文件
+    没有网络），所以这个坑只在 PG 上暴露。
+
+    为什么是装饰器而不是改每个方法体：和 `store/sqlite.py` 的 `_locked` 同款——diff 集中在
+    一处、不误伤方法体里的 SQL 与事务逻辑（那些正是"毒丸连接"防护的所在，不能动）。
+
+    边界（诚实说明）：只对**连接类错误**重连重试；SQL 语法错、约束冲突等非连接错误原样抛出，
+    不会被当成"连接坏了"而无限重试。重试用尽仍失败 → 原样 re-raise（不吞异常）。
+
+    泛型参数（PEP 695）必须保留签名，否则 mypy 会把被装饰方法的返回值退化成 Any、
+    连累所有调用点（`store/sqlite.py` 里那种错一次报了十几条）。
+    """
+    @functools.wraps(method)
+    def wrapper(self: PostgresStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        attempt = 0
+        while True:
+            try:
+                return method(self, *args, **kwargs)
+            except Exception as exc:
+                # 非连接错，或重试次数已用尽 → 原样抛（绝不吞真失败）。
+                if attempt >= self._RECONNECT_ATTEMPTS or not self._is_connection_error(exc):
+                    raise
+                attempt += 1
+                self._reconnect()
+    # functools.wraps 的静态返回类型是 `_Wrapped[...]`，与声明的 Callable 形式不完全等价；
+    # 它保留的正是原签名，所以这里显式 cast 一次即可（同 sqlite._locked）。
+    return cast("Callable[Concatenate[PostgresStore, P], R]", wrapper)
+
+
 class PostgresStore:
     """PostgreSQL 持久化实现，接口与 SqliteStore 一致（见 store/base.py）。"""
 
     backend = "postgres"
     # 目标 schema 版本（与 SqliteStore 对齐；每次加表/加列 +1）
     _SCHEMA_VERSION = 4
+    # 连接坏掉后的**有界**重连重试次数（不含首次尝试）。刻意很小：
+    # 重连本应几乎必成，连续失败说明 DB 真的不可用，尽早把错误抛给上层比死等更好。
+    _RECONNECT_ATTEMPTS = 2
+    # 期望的会话级 row_factory（默认 None = 用 psycopg 自带 tuple_row）。
+    # 重连时按它重新应用：否则将来若有人改成 dict_row，坏一次连接就会静默退回元组行。
+    _row_factory: Any = None
 
     def __init__(
         self,
@@ -74,7 +119,7 @@ class PostgresStore:
             "host": host, "port": port, "dbname": dbname,
             "user": user, "password": password, "connect_timeout": connect_timeout,
         }
-        self.conn = psycopg.connect(**self._connect_kwargs, autocommit=True)
+        self.conn = self._connect()
         # 一把 RLock 串行化**事务块**路径。为什么需要（SQLite 版也有同款 `_locked`）：
         # psycopg 的单条语句本身受连接内部锁保护，但 `with conn.transaction():` 这种
         # **事务块**在多线程下会在同一条连接上互相嵌套成 savepoint，交错时抛
@@ -86,6 +131,7 @@ class PostgresStore:
         self._rate_window_seconds = 0.0
         self._init_schema()
 
+    @_reconnecting
     def ping(self) -> None:
         """健康检查探针：执行一句无害查询确认连接可用。
 
@@ -103,7 +149,47 @@ class PostgresStore:
         用途：LISTEN/NOTIFY 需要一条**专门等待通知**的连接——等待期间它被占住，
         不能和 store 的读写共用（否则会互相阻塞）。
         """
-        return self._psycopg.connect(**self._connect_kwargs, autocommit=True)
+        psycopg = self._psycopg
+        return psycopg.connect(**self._connect_kwargs, autocommit=True)
+
+    def _connect(self) -> Any:
+        """建立一条连接并**一次性应用全部会话设置**。
+
+        单独抽出是给重连用的：连接坏掉后重建时必须把 autocommit、row_factory 这些
+        会话级设置重新应用一遍，否则重连出来的连接行为会和首连不一致（例如 autocommit
+        丢了就又回到"毒丸连接"那条老路）。
+        """
+        psycopg = self._psycopg
+        # autocommit=True 每次连接都显式传入 —— 重连后也必须保持，否则又回到
+        # 事务内报错就污染整条连接的老路。
+        conn = psycopg.connect(**self._connect_kwargs, autocommit=True)
+        # row_factory 是会话级设置，重连时要重新应用（默认 None 时不动，保持 psycopg 默认）。
+        if self._row_factory is not None:
+            conn.row_factory = self._row_factory
+        return conn
+
+    def _is_connection_error(self, exc: BaseException) -> bool:
+        """该异常是否属于"连接已坏、重连后应可恢复"这一类。
+
+        只认 `OperationalError`（psycopg 用它在连接关闭 / 网络断开 / 服务端回收时抛）与
+        `InterfaceError`。SQL 语法错、约束冲突、序列化错等**不是**连接错，不应触发重连重试。
+        """
+        psycopg = self._psycopg
+        operational = getattr(psycopg, "OperationalError", None)
+        if isinstance(operational, type) and isinstance(exc, operational):
+            return True
+        interface = getattr(psycopg, "InterfaceError", None)
+        return isinstance(interface, type) and isinstance(exc, interface)
+
+    def _reconnect(self) -> None:
+        """关掉坏连接、重建一条（并重新应用会话设置）。
+
+        旧连接 close 失败（很多情况下它已经坏了）不影响重连，故忽略其异常。
+        """
+        old = self.conn
+        with contextlib.suppress(Exception):
+            old.close()
+        self.conn = self._connect()
 
     def _init_schema(self) -> None:
         with self.conn.cursor() as cur:
@@ -254,6 +340,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def schema_version(self) -> int:
         """当前 schema 版本（真实记录，不再硬编码在别处）。"""
         with self.conn.cursor() as cur:
@@ -262,6 +349,7 @@ class PostgresStore:
         return int(row[0]) if row else 0
 
     # ---- Run 状态 ----
+    @_reconnecting
     def save_run(self, run: AgentRun) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -272,6 +360,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def load_run(self, run_id: str) -> AgentRun | None:
         with self.conn.cursor() as cur:
             cur.execute("SELECT status, user_id FROM runs WHERE run_id = %s", (run_id,))
@@ -282,6 +371,7 @@ class PostgresStore:
         run.status = RunStatus[row[0]]
         return run
 
+    @_reconnecting
     def delete_run(self, run_id: str) -> None:
         """删除整个会话：对话、待审批、checkpoint、事件、状态一并清掉（与 SqliteStore 一致）。
 
@@ -297,6 +387,7 @@ class PostgresStore:
             cur.execute("DELETE FROM run_events WHERE run_id = %s", (run_id,))
             cur.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
 
+    @_reconnecting
     def record_approval_decision(
         self,
         run_id: str,
@@ -316,6 +407,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def list_approval_history(
         self, limit: int = 20, owner: str | None = None
     ) -> list[dict[str, Any]]:
@@ -341,6 +433,7 @@ class PostgresStore:
             for r in rows
         ]
 
+    @_reconnecting
     def list_runs(self, limit: int = 50, owner: str | None = None) -> list[dict[str, Any]]:
         """列出会话概要（前端会话列表用）：按最近活跃排序，语义与 SqliteStore 一致。
 
@@ -384,6 +477,7 @@ class PostgresStore:
         return out
 
     # ---- 用户（中控台账号）----
+    @_reconnecting
     def create_user(self, user_id: str) -> None:
         """登记一个中控台用户（幂等：已存在则不动）。"""
         with self.conn.cursor() as cur:
@@ -394,6 +488,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def list_users(self) -> list[dict[str, Any]]:
         """已登记的用户列表（按创建时间）。"""
         with self.conn.cursor() as cur:
@@ -402,6 +497,7 @@ class PostgresStore:
         return [{"user_id": r[0], "created_at": r[1]} for r in rows]
 
     # ---- 对话消息 ----
+    @_reconnecting
     def append_message(self, run_id: str, message: Message) -> None:
         """追加一条消息。入库前按会话 + 角色 + 内容 + 工具调用查重，完全相同的不重复落库。"""
         # 与 SqliteStore 共用同一编码助手，保证跨后端落盘格式（含版本前缀）一致
@@ -427,6 +523,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def load_messages(self, run_id: str) -> list[Message]:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -449,6 +546,7 @@ class PostgresStore:
         return out
 
     # ---- 待审批 ----
+    @_reconnecting
     def save_pending_approval(
         self,
         run_id: str,
@@ -473,6 +571,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def pending_approval_created_at(self, run_id: str) -> str | None:
         """该 run 进入"等待审批"的时刻（ISO 字符串）；没有待审批或老数据没记则 None。"""
         with self.conn.cursor() as cur:
@@ -484,6 +583,7 @@ class PostgresStore:
             return None
         return str(row[0])
 
+    @_reconnecting
     def load_pending_approval(
         self, run_id: str
     ) -> tuple[str, str, dict[str, object], str] | None:
@@ -503,6 +603,7 @@ class PostgresStore:
             args = {}
         return row[0], row[1], args if isinstance(args, dict) else {}, row[3]
 
+    @_reconnecting
     def clear_pending_approval(self, run_id: str) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -511,6 +612,7 @@ class PostgresStore:
         self.conn.commit()
 
     # ---- 检查点（与 SqliteStore 对齐）----
+    @_reconnecting
     def save_checkpoint(self, checkpoint: object) -> None:
         from warden_agent.runtime.checkpoint import Checkpoint
 
@@ -523,12 +625,14 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def load_checkpoint(self, run_id: str) -> object | None:
         with self.conn.cursor() as cur:
             cur.execute("SELECT data FROM checkpoints WHERE run_id = %s", (run_id,))
             row = cur.fetchone()
         return None if row is None else self._decode_checkpoint(row[0])
 
+    @_reconnecting
     def list_checkpoints(self) -> list[object]:
         with self.conn.cursor() as cur:
             cur.execute("SELECT data FROM checkpoints ORDER BY run_id")
@@ -551,12 +655,14 @@ class PostgresStore:
         return Checkpoint.from_dict(obj) if isinstance(obj, dict) else None
 
     # ---- 跨副本共享状态（幂等 / 事件流 / 限流计数）----
+    @_reconnecting
     def get_idempotent(self, key: str) -> str | None:
         with self.conn.cursor() as cur:
             cur.execute("SELECT payload FROM idempotency WHERE key = %s", (key,))
             row = cur.fetchone()
         return None if row is None else str(row[0])
 
+    @_reconnecting
     def save_idempotent(self, key: str, payload: str) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -566,6 +672,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def reserve_idempotent(self, key: str, payload: str) -> bool:
         """原子占位：`ON CONFLICT DO NOTHING` + rowcount 判断是否占到（防并发 TOCTOU）。"""
         with self.conn.cursor() as cur:
@@ -574,10 +681,11 @@ class PostgresStore:
                 "ON CONFLICT (key) DO NOTHING",
                 (key, payload, _now_iso()),
             )
-            reserved = cur.rowcount == 1
+            reserved = bool(cur.rowcount == 1)
         self.conn.commit()
         return reserved
 
+    @_reconnecting
     def release_idempotent(self, key: str, payload: str) -> None:
         """仅当内容仍是那条占位时才删（否则会把已缓存的响应快照删掉）。"""
         with self.conn.cursor() as cur:
@@ -586,6 +694,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def append_event(self, run_id: str, payload: str, keep: int | None = None) -> int:
         # INSERT + 裁剪必须同生共死：autocommit 模式下拆成两条语句时，中间可见的
         # "插入未裁剪"状态会被其它副本读到。用显式事务块包住（与 SQLite 的加锁两步对齐）。
@@ -605,6 +714,7 @@ class PostgresStore:
                 )
         return seq
 
+    @_reconnecting
     def purge_expired_idempotency(self, before_iso: str) -> int:
         """删掉早于 `before_iso` 的幂等记录（成功快照原先永不删除）。
 
@@ -619,6 +729,7 @@ class PostgresStore:
         self.conn.commit()
         return int(count or 0)
 
+    @_reconnecting
     def purge_stale_rate_limits(self, before_epoch: float) -> int:
         """删掉窗口确实已结束的限流计数行（行永不自己消失）。
 
@@ -637,6 +748,7 @@ class PostgresStore:
         self.conn.commit()
         return int(count or 0)
 
+    @_reconnecting
     def list_events_after(
         self, run_id: str, after_seq: int, limit: int = 200
     ) -> list[tuple[int, str]]:
@@ -649,6 +761,7 @@ class PostgresStore:
             rows = cur.fetchall()
         return [(int(r[0]), str(r[1])) for r in rows]
 
+    @_reconnecting
     def hit_rate_limit(
         self, bucket_key: str, window_seconds: int, now: float
     ) -> tuple[int, float]:
@@ -683,6 +796,7 @@ class PostgresStore:
     # 所以并发抢同一把锁只有一方能拿到；随后读回来核对 (owner, expires_at) 确认归属。
     # 注：autocommit 模式下「UPSERT + 读回」是两条语句，但不存在竞态——我们写入的
     # expires_at 在未来，别人只有在其过期后（即 <= now）才可能接管。
+    @_reconnecting
     def acquire_run_lock(
         self, run_id: str, owner: str, expires_at: float, now: float
     ) -> bool:
@@ -705,6 +819,7 @@ class PostgresStore:
             return False
         return str(row[0]) == owner and float(row[1]) == expires_at
 
+    @_reconnecting
     def renew_run_lock(
         self, run_id: str, owner: str, expires_at: float, now: float
     ) -> bool:
@@ -718,6 +833,7 @@ class PostgresStore:
             changed = cur.rowcount
         return int(changed or 0) > 0
 
+    @_reconnecting
     def release_run_lock(self, run_id: str, owner: str) -> None:
         """释放：只删自己的锁（owner 不匹配时不动，防止误删他人的锁）。"""
         with self.conn.cursor() as cur:
@@ -725,6 +841,7 @@ class PostgresStore:
                 "DELETE FROM run_locks WHERE run_id = %s AND owner = %s", (run_id, owner)
             )
 
+    @_reconnecting
     def run_lock_owner(self, run_id: str, now: float) -> str | None:
         """当前持有者（已过期视为无人持有，并顺手清掉那行）。"""
         with self.conn.cursor() as cur:
@@ -740,6 +857,7 @@ class PostgresStore:
             return str(row[0])
 
     # ---- 凭证保管库（CredentialVault 协议，见 credential/vault.py）----
+    @_reconnecting
     def save_credential(self, credential: StoredCredential) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -756,6 +874,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def load_credential(self, scope: str, name: str) -> StoredCredential | None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -767,6 +886,7 @@ class PostgresStore:
             return None
         return StoredCredential(scope=scope, name=name, encrypted=decode_fields(row[0]))
 
+    @_reconnecting
     def delete_credential(self, scope: str, name: str) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -774,6 +894,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def list_credential_names(self, scope: str) -> list[str]:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -782,6 +903,7 @@ class PostgresStore:
             rows = cur.fetchall()
         return [str(r[0]) for r in rows]
 
+    @_reconnecting
     def save_credential_lease(self, lease: StoredLease) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -800,6 +922,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def load_credential_lease(self, scope: str, lease_id: str) -> StoredLease | None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -818,6 +941,7 @@ class PostgresStore:
             expires_at=datetime.fromisoformat(str(row[2])),
         )
 
+    @_reconnecting
     def delete_credential_lease(self, scope: str, lease_id: str) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -826,6 +950,7 @@ class PostgresStore:
             )
         self.conn.commit()
 
+    @_reconnecting
     def purge_expired_credential_leases(self, scope: str, now: datetime) -> int:
         """删掉某作用域下已过期的租约记录，返回删除条数（惰性清理）。"""
         with self.conn.cursor() as cur:

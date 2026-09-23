@@ -77,12 +77,14 @@ def _complexity(text: str) -> bool:
     return hits >= _COMPLEX_HIT_THRESHOLD
 
 
-def build_plan(user_text: str) -> TaskPlan:
+def build_plan(user_text: str, *, max_steps: int = 5) -> TaskPlan:
     """给定用户任务，判断是否复杂，复杂则拆成阶段。
 
     目前用固定的一套"通用研究流程"作为阶段模板：
       调研资料 → 梳理要点 → 组织成稿 → 收尾（可覆盖绝大多数"调研/报告/文档"类任务）。
     这是给"通用任务"用的；真实系统可换成领域专属模板或让模型自己规划。
+
+    `max_steps` 给阶段数封顶（防模型/模板拆出几十步占爆上下文）。
     """
     if not _complexity(user_text):
         return TaskPlan(is_complex=False)
@@ -104,7 +106,7 @@ def build_plan(user_text: str) -> TaskPlan:
             title="复核与收尾",
             goal="检查输出是否覆盖了任务要求、有没有遗漏，给出最终回答。",
         ),
-    ]
+ ][: max(0, max_steps)]
     summary = "识别为复杂任务，拆分为阶段：" + " → ".join(s.title for s in steps)
     return TaskPlan(is_complex=True, steps=steps, summary=summary)
 
@@ -129,7 +131,114 @@ def plan_as_context(plan: TaskPlan, current: int) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["PlanStep", "TaskPlan", "build_plan", "plan_as_context", "is_complex"]
+@dataclass
+class PlanState:
+    """一次运行中的规划**进度状态** —— 让"分步推进/每步观察"从静态提示变成可推进的状态机。
+
+    此前阶段规划只在 run 开始时注入一次（`current` 恒为 0），所谓"分步推进"名不副实。
+    本类承载"进行到第几步"：AgentLoop 在一步成功后 `advance()`、失败时 `mark_failed()`，
+    并把最新阶段上下文重新注入给模型（每步观察）。
+
+    边界与取向：
+      - **有界**：步数受 `max_steps` 约束，`advance()` 绝不超过总步数（到末步即停）。
+      - **失败不前进**：`mark_failed()` 只记录、不推进——后续阶段绝不会被误标为已完成。
+      - **可观察/可持久化**：`to_dict()` 给出当前步与每步完成状态，供审计或落盘。
+    """
+
+    plan: TaskPlan
+    max_steps: int = 5
+    current: int = 0          # 当前进行到的阶段下标（0-based）
+    failed: bool = False      # 当前阶段是否失败（失败则不推进）
+    failure: str = ""         # 失败原因（给观察/审计用）
+
+    def _steps(self) -> list[Any]:
+        return list(getattr(self.plan, "steps", None) or [])
+
+    @property
+    def total(self) -> int:
+        """总步数（受 max_steps 封顶）。"""
+        return min(len(self._steps()), max(int(self.max_steps), 0))
+
+    @property
+    def done(self) -> bool:
+        """是否所有阶段都已完成。"""
+        return self.current >= self.total
+
+    @property
+    def current_step(self) -> Any | None:
+        """当前阶段的 PlanStep（越界/空规划返回 None）。"""
+        steps = self._steps()
+        return steps[self.current] if 0 <= self.current < self.total else None
+
+    def advance(self) -> int:
+        """把当前阶段标记为完成并推进到下一阶段；已到末步则停在末步。
+
+        返回推进后的 `current`（便于测试与观察）。成功推进时清除上一次的失败标记
+        （模型重试后成功，不应还背着旧失败）。
+        """
+        if self.current < self.total:
+            self.current += 1
+        self.failed = False
+        self.failure = ""
+        return self.current
+
+    def mark_failed(self, reason: str = "") -> None:
+        """标记当前阶段失败：**不推进**，后续阶段不会被静默标为完成。"""
+        if not self.done:
+            self.failed = True
+            self.failure = reason
+
+    def context(self, planner: Any = None) -> str:
+        """渲染当前阶段上下文（优先走 planner.context，保持与注入口径一致）。"""
+        if planner is not None and hasattr(planner, "context"):
+            return str(planner.context(self.plan, self.current))
+        return plan_as_context(self.plan, self.current)
+
+    def to_dict(self) -> dict[str, Any]:
+        """可观察/可持久化的进度快照（每步标题 + 是否已完成）。"""
+        steps = [
+            {
+                "index": idx,
+                "title": str(getattr(step, "title", step)),
+                "done": idx < self.current,
+            }
+            for idx, step in enumerate(self._steps()[: self.total])
+        ]
+        return {
+            "total": self.total,
+            "current": self.current,
+            "done": self.done,
+            "failed": self.failed,
+            "failure": self.failure,
+            "steps": steps,
+        }
+
+
+def make_plan_state(
+    planner: Any, user_text: str, *, max_steps: int = 5,
+) -> PlanState | None:
+    """让 planner 为任务产出规划，并包成可推进的 `PlanState`。
+
+    简单任务（planner 判为非复杂）或无 planner 返回 None —— 保持基础 loop 不变。
+    planner 抛异常也返回 None（规划失败不该拖垮主循环）。
+    """
+    if planner is None:
+        return None
+    try:
+        plan = planner.build(user_text)
+    except Exception:  # noqa: BLE001 - 规划不可用绝不拖垮主循环
+        return None
+    if plan is None or not getattr(plan, "is_complex", False):
+        return None
+    if not getattr(plan, "steps", None):
+        return None
+    return PlanState(plan=plan, max_steps=max_steps)
+
+
+__all__ = [
+    "PlanStep", "TaskPlan", "PlanState", "build_plan", "plan_as_context",
+    "is_complex", "make_plan_state",
+]
 
 # 对外暴露复杂度判定（供测试 / 其他模块复核用）
 def is_complex(text: str) -> bool:
@@ -225,8 +334,8 @@ def _parse_plan_steps(resp: Any, max_steps: int) -> list[PlanStep]:
 
 
 __all__ = [
-    "PlanStep", "TaskPlan", "build_plan", "plan_as_context", "is_complex",
-    "plan_with_model", "ModelPlanner",
+    "PlanStep", "TaskPlan", "PlanState", "build_plan", "plan_as_context",
+    "is_complex", "make_plan_state", "plan_with_model", "ModelPlanner",
 ]
 
 

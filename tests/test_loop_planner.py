@@ -3,7 +3,14 @@ from tests.conftest import ScriptedModel, weather_tool
 
 from warden_agent.loop.intent import ToolIntentRouter
 from warden_agent.loop.loop import AgentLoop
-from warden_agent.loop.planner import build_plan, is_complex, plan_as_context
+from warden_agent.loop.planner import (
+    PlanStep,
+    TaskPlan,
+    build_plan,
+    is_complex,
+    make_plan_state,
+    plan_as_context,
+)
 from warden_agent.model.model import ChatResponse, ToolCall
 
 # ---- Planner 本身 ----
@@ -60,6 +67,107 @@ def test_planner_注入规划上下文_to_loop() -> None:
     # 系统消息里应包含规划上下文
     sys_msgs = [m.content for m in reply.messages if m.role == "system"]
     assert any("任务规划" in s or "调研与资料收集" in s for s in sys_msgs)
+
+
+# ---- 【L2】多步规划：PlanState 推进 + loop 集成 ----
+
+
+def _three_step_planner() -> object:
+    """一个固定 3 步、始终判定为复杂的测试规划器。"""
+
+    class _P:
+        def __init__(self) -> None:
+            self.plan = TaskPlan(is_complex=True, steps=[
+                PlanStep("一", "目标一"),
+                PlanStep("二", "目标二"),
+                PlanStep("三", "目标三"),
+            ])
+
+        def build(self, text: str) -> TaskPlan:
+            return self.plan
+
+        def context(self, plan: TaskPlan, current: int) -> str:
+            return plan_as_context(plan, current)
+
+    return _P()
+
+
+def test_plan_state_三步推进_0到3后即停() -> None:
+    """3 步计划从 0 推进到 3，且绝不超过总步数（有界）。"""
+    st = make_plan_state(_three_step_planner(), "调研三家公司并写报告")
+    assert st is not None
+    assert (st.current, st.total) == (0, 3)
+    assert st.advance() == 1
+    assert st.advance() == 2
+    assert st.advance() == 3
+    assert st.done is True
+    assert st.advance() == 3  # 到末步即停
+    assert st.advance() == 3
+
+
+def test_plan_state_失败不推进也不标后续完成() -> None:
+    st = make_plan_state(_three_step_planner(), "复杂任务")
+    assert st is not None
+    st.advance()                       # 第 1 步完成
+    st.mark_failed("第 2 步失败")       # 第 2 步失败
+    assert st.current == 1
+    assert st.failed is True
+    assert st.done is False
+    snap = st.to_dict()
+    assert [s["done"] for s in snap["steps"]] == [True, False, False]
+    assert snap["current"] == 1 and snap["failed"] is True
+
+
+def test_make_plan_state_简单任务或无规划器为空() -> None:
+    class _P:
+        def build(self, text: str) -> TaskPlan:
+            return build_plan(text)
+
+        def context(self, plan: TaskPlan, current: int) -> str:
+            return plan_as_context(plan, current)
+
+    assert make_plan_state(_P(), "上海天气怎么样") is None
+    assert make_plan_state(None, "调研三家公司并写报告") is None
+
+
+def test_loop_规划随每步成功推进并在上下文里可见() -> None:
+    """3 步计划：loop 每完成一步就推进，注入的阶段上下文随之更新到 3/3。"""
+    model = ScriptedModel([
+        ChatResponse(content=None, finish_reason="tool_calls",
+                     tool_calls=[_tc("c1", "weather.get", {"city": "A"})]),
+        ChatResponse(content=None, finish_reason="tool_calls",
+                     tool_calls=[_tc("c2", "weather.get", {"city": "B"})]),
+        ChatResponse(content=None, finish_reason="tool_calls",
+                     tool_calls=[_tc("c3", "weather.get", {"city": "C"})]),
+        ChatResponse(content="报告完成。", finish_reason="stop"),
+    ])
+    agent = AgentLoop(model=model, catalog=weather_tool(), planner=_three_step_planner())
+    reply = agent.run("调研三家公司并写报告")
+    assert reply.plan is not None
+    assert reply.plan.current == 3
+    assert reply.plan.done is True
+    assert agent.last_plan is reply.plan  # 可观察
+    plan_msgs = [
+        m.content for m in reply.messages
+        if m.role == "system" and "任务规划" in (m.content or "")
+    ]
+    assert plan_msgs
+    assert "3/3" in plan_msgs[-1], f"阶段上下文应推进到末步，实际：{plan_msgs[-1]}"
+
+
+def test_loop_失败步骤不推进且不标记后续完成() -> None:
+    """某步工具执行失败：进度冻结在当前步并标失败，后续阶段不被静默算作完成。"""
+    model = ScriptedModel([
+        ChatResponse(content=None, finish_reason="tool_calls",
+                     tool_calls=[_tc("c1", "weather.missing", {"city": "A"})]),
+        ChatResponse(content="改用其它方式完成。", finish_reason="stop"),
+    ])
+    agent = AgentLoop(model=model, catalog=weather_tool(), planner=_three_step_planner())
+    reply = agent.run("调研三家公司并写报告")
+    assert reply.plan is not None
+    assert reply.plan.current == 0
+    assert reply.plan.failed is True
+    assert reply.plan.done is False
 
 
 # ---- intent 路由器 ----

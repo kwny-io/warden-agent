@@ -81,6 +81,7 @@ from warden_agent.web.ratelimit import limiter_from_env
 from warden_agent.web.search import providers_from_env
 from warden_agent.web.server import (
     DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_SESSION_CACHE_MAX,
     DEFAULT_SSE_MAX_CONCURRENCY,
     build_app,
 )
@@ -330,6 +331,27 @@ def _event_keep_from_env(env: Mapping[str, str]) -> int:
     return env_positive_int("WARDEN_EVENT_KEEP", 500, env)
 
 
+def _audit_key_status(env: Mapping[str, str], *, audit_enabled: bool, has_key: bool) -> str:
+    """审计链密钥的启动口径：`off` / `keyed` / `unkeyed` / `required-missing`。
+
+    默认（不设 `WARDEN_AUDIT_REQUIRE_KEY`）时未配密钥只告警、非致命；设了它则
+    “审计开着却没密钥”直接拒绝启动——让“忘了配密钥”变成起不来，而不是静默降级。
+    """
+    if not audit_enabled:
+        return "off"
+    if has_key:
+        return "keyed"
+    return "required-missing" if env_bool("WARDEN_AUDIT_REQUIRE_KEY", False, env) else "unkeyed"
+
+
+def _session_cache_max_from_env(env: Mapping[str, str]) -> int:
+    """HTTP 会话内存缓存上限（`WARDEN_SESSION_CACHE_MAX`，默认 1000；<=0 = 不限）。
+
+    统一走 `env_int`：解析口径只有一处；SessionRegistry 侧把 <=0 当“不限”。
+    """
+    return env_int("WARDEN_SESSION_CACHE_MAX", DEFAULT_SESSION_CACHE_MAX, env)
+
+
 def _cognition_from_env(
     env: Mapping[str, str], catalog: ToolCatalog, model: AgentChatModel,
 ) -> tuple[Any, Any, int]:
@@ -415,6 +437,26 @@ def main() -> None:
         # 否则 SQLite。这样存储换 PG 时审计自动跟过去，不再需要"多副本记得关审计"这种部署约定。
         audit_store = audit_store_for_backend(store, sqlite_db_path=_db_path())
         logger.info("已开启审计（后端=%s）", type(audit_store).__name__)
+    # 审计密钥：`WARDEN_AUDIT_REQUIRE_KEY=1` 时“开着审计却没密钥”直接拒绝启动（fail-closed）；
+    # 默认仍非致命（只告警），但 /health/ready 会降级、/metrics 会暴露 warden_audit_unkeyed。
+    if audit_store is not None:
+        from warden_agent.web.audit import audit_chain_key
+
+        _audit_status = _audit_key_status(
+            os.environ, audit_enabled=True, has_key=audit_chain_key() is not None
+        )
+        if _audit_status == "required-missing":
+            logger.error(
+                "WARDEN_AUDIT_REQUIRE_KEY=1 但未配置 WARDEN_AUDIT_KEY：审计链会退化为"
+                "不带密钥的哈希链（挡不住会重算整条链的人），拒绝启动。"
+                "请配置 WARDEN_AUDIT_KEY，或取消该开关。"
+            )
+            raise SystemExit(2)
+        if _audit_status == "unkeyed":
+            logger.warning(
+                "审计链未配置 WARDEN_AUDIT_KEY：退化为不带密钥的哈希链并继续运行"
+                "（可设 WARDEN_AUDIT_REQUIRE_KEY=1 改为拒绝启动）。"
+            )
 
     catalog = _build_catalog()
     planner, intent, ctx_chars = _cognition_from_env(os.environ, catalog, model)
@@ -552,6 +594,7 @@ def main() -> None:
     sse_max_concurrency = env_int(
         "WARDEN_SSE_MAX_CONNECTIONS", DEFAULT_SSE_MAX_CONCURRENCY, os.environ
     )
+    session_cache_max = _session_cache_max_from_env(os.environ)
     logger.info(
         "入站保护：请求体上限 %s｜SSE 并发上限 %s（WARDEN_MAX_REQUEST_BYTES / "
         "WARDEN_SSE_MAX_CONNECTIONS，0 = 关闭）",
@@ -592,6 +635,7 @@ def main() -> None:
         maintenance=maintenance,
         max_request_bytes=max_request_bytes,
         sse_max_concurrency=sse_max_concurrency,
+        session_cache_max=session_cache_max,
     )
     port = env_int("PORT", 8000)
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import httpx
 import pytest
@@ -120,3 +121,59 @@ def test_tracing会把span交给导出器(monkeypatch: pytest.MonkeyPatch) -> No
     assert rec["span_id"] == inside_span
     assert rec["end_ns"] >= rec["start_ns"]
     assert dict(rec["attributes"]) == {"k": "v"}
+
+
+# ---- 【O9】导出器初始化失败可观测 ----
+
+
+def test_otel_导出器初始化失败写入失败指标(monkeypatch: pytest.MonkeyPatch) -> None:
+    """起不来不能只打日志：`warden_otlp_export_init_failures_total` 要能被看到。"""
+    from warden_agent.core.metrics import metrics
+
+    class _Boom:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("import boom")
+
+    otel.reset_for_tests()
+    monkeypatch.setattr(otel, "OtlpExporter", _Boom)
+    try:
+        assert otel._exporter_for({"OTEL_EXPORTER_OTLP_ENDPOINT": "http://x"}) is None
+        assert "warden_otlp_export_init_failures_total" in metrics().render()
+    finally:
+        otel.reset_for_tests()
+
+
+# ---- 【O12】内部计数器在多线程下不丢自增 ----
+
+
+def test_otel_内部计数自增在多线程下不丢() -> None:
+    """`_dropped` / `_failed` 的 `+=` 是读-改-写；并发下必须靠锁保证不丢计数。"""
+    exporter = otel.OtlpExporter(
+        otel.OtlpConfig(endpoint="http://x/v1/traces"),
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+    )
+    n = 200
+    threads = [threading.Thread(target=exporter._bump, args=("_dropped",)) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    exporter.close()
+    assert exporter.dropped == n, "并发自增不应丢失"
+
+
+def test_otel_导出失败计数在多线程下不丢() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    exporter = otel.OtlpExporter(otel.OtlpConfig(endpoint="http://x/v1/traces"), client=client)
+    span = otel._Span("a" * 32, "b" * 16, None, "s", 1, 2, ())
+    n = 100
+    threads = [threading.Thread(target=exporter._send, args=([span],)) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    exporter.close()
+    assert exporter.failed == n, "并发导出失败应精确计数"

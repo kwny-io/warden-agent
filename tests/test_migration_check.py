@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -25,3 +27,49 @@ def _load_check_module():
 def test_sqlite迁移检查通过_版本与结构指纹一致() -> None:
     module = _load_check_module()
     assert module.verify("sqlite") == []
+
+
+def test_快照覆盖记忆与审计表() -> None:
+    """memories / audit_log 此前不在指纹里——改了它们的结构 CI 拦不住，现在必须覆盖。"""
+    module = _load_check_module()
+    snapshot = module.load_snapshot()
+    tables = snapshot["tables"]
+    assert "memories" in tables, "记忆表不在 schema 指纹里，结构变更会绕过守门"
+    assert "audit_log" in tables, "审计表不在 schema 指纹里，结构变更会绕过守门"
+    # 关键列确实在指纹里（防止只登记了一个空表名糊弄过去）
+    assert {"uid", "owner", "scope", "audit"} <= set(tables["memories"])
+    assert {"id", "prev_hash", "hash"} <= set(tables["audit_log"])
+
+
+def test_快照版本等于两个后端的目标常量() -> None:
+    from warden_agent.store.postgres import PostgresStore
+    from warden_agent.store.sqlite import SqliteStore
+
+    module = _load_check_module()
+    snap_version = int(module.load_snapshot()["version"])
+    assert snap_version == SqliteStore._SCHEMA_VERSION
+    assert snap_version == PostgresStore._SCHEMA_VERSION
+
+
+def _verify_with_broken_table(
+    monkeypatch: pytest.MonkeyPatch, table: str, dropped: str
+) -> list[str]:
+    """用真实指纹，但故意从某表删一列，验证守门会失败。"""
+    module = _load_check_module()
+    version, tables = module.read_sqlite()
+    broken = {name: list(cols) for name, cols in tables.items()}
+    broken[table] = [col for col in broken[table] if col != dropped]
+    monkeypatch.setattr(module, "read_sqlite", lambda: (version, broken))
+    return module.verify("sqlite")
+
+
+def test_故意删掉记忆表一列会被判失败(monkeypatch: pytest.MonkeyPatch) -> None:
+    problems = _verify_with_broken_table(monkeypatch, "memories", "owner")
+    assert problems, "memories 少了列却没被判失败——记忆表仍在指纹盲区"
+    assert any("memories" in line for line in problems)
+
+
+def test_故意删掉审计表一列会被判失败(monkeypatch: pytest.MonkeyPatch) -> None:
+    problems = _verify_with_broken_table(monkeypatch, "audit_log", "prev_hash")
+    assert problems, "audit_log 少了列却没被判失败——审计表仍在指纹盲区"
+    assert any("audit_log" in line for line in problems)

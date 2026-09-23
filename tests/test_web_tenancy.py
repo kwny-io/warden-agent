@@ -273,3 +273,27 @@ async def test_未开启认证_不按归属拦截() -> None:
     async with _client(_app(api_keys=None)) as c:
         await c.post("/chat/run-y?user_id=carol", json={"text": "hi"})
         assert (await c.get("/status/run-y?user_id=dave")).status_code == 200
+
+
+# ---------- 防 run_id 抢注：创建者一锤定音 ----------
+
+
+@pytest.mark.asyncio
+async def test_抢先看到的run不能被他人接管() -> None:
+    """客户端自带 run_id 是先到先得：alice 先看到的无归属 Run，bob 再碰就会被拒，
+    而不是靠“首次 /chat 时端点盖章”把 alice 的会话悄悄记到 bob 名下。"""
+    async with _client(_app()) as c:
+        # alice 先“看到”这个尚无落库归属的 run（GET 不写库，但已记下创建者）
+        assert (await c.get("/status/run-squat", headers=A_ALICE)).status_code == 200
+        # bob 用同一 run_id 发起对话：必须 403，而不是被接受并接管
+        r = await c.post("/chat/run-squat", json={"text": "hi"}, headers=A_BOB)
+        assert r.status_code == 403
+        assert r.json()["errorCode"] == "AUTHORIZATION_DENIED"
+        # 归属仍是 alice：她自己能正常对话，且 bob 的对话列表里没有这个 run
+        assert (
+            await c.post("/chat/run-squat", json={"text": "hi"}, headers=A_ALICE)
+        ).status_code == 200
+        assert all(
+            x["run_id"] != "run-squat"
+            for x in (await c.get("/runs", headers=A_BOB)).json()
+        )

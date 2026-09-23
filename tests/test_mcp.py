@@ -12,6 +12,11 @@
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+from collections.abc import Iterator
+
 import pytest
 
 from warden_agent.mcp import (
@@ -67,29 +72,51 @@ def test_审查_关闭危险拦截全放行() -> None:
 
 # ---- 集成：连接真实 MCP stdio server（仅当 node + 服务器可用）----
 _SERVER = "npx -y @modelcontextprotocol/server-everything"
+# 预热用的宽松超时：冷启动（npx 解析/下载 + node 启动）在负载下可能很慢，
+# 预热只跑一次，跑通后 npx 缓存已热，后续操作就快。
+_WARMUP_TIMEOUT_S = 600
+
+
+@pytest.fixture(scope="session")
+def warm_client() -> Iterator[McpClient]:
+    """会话级预热：真实服务器的冷启动只做一次，之后再复用同一个已热客户端。
+
+    这样定时断言面对的是“已就绪”的服务器，而不是每次重新冷启 npx（原 flake 的根因）。
+    注意：环境已由 `client_ready()` 在收集期判定过；**预热失败即真失败**，不静默跳过
+    （与“连接失败就该失败”的约定一致）。环境不具备条件时由 `requires_mcp_server` 跳过，
+    此时本 fixture 根本不会被建立。
+    """
+    prev = os.environ.get("WARDEN_MCP_TIMEOUT_S")
+    os.environ["WARDEN_MCP_TIMEOUT_S"] = str(_WARMUP_TIMEOUT_S)
+    try:
+        client = McpClient(_SERVER)
+        tools = client.list_tools()  # 预热：把 npx/node 拉起来一次
+        assert tools, "预热未发现任何工具（服务器异常）"
+        yield client
+    finally:
+        if prev is None:
+            os.environ.pop("WARDEN_MCP_TIMEOUT_S", None)
+        else:
+            os.environ["WARDEN_MCP_TIMEOUT_S"] = prev
 
 
 @requires_mcp_server
-def test_mcp_真实连接_列出工具() -> None:
-    client = McpClient(_SERVER)
-    tools = client.list_tools()          # 环境已判定可跑 → 连不上就是真失败，不该跳过
+def test_mcp_真实连接_列出工具(warm_client: McpClient) -> None:
+    tools = warm_client.list_tools()    # 环境已判定可跑 → 连不上就是真失败，不该跳过
     assert len(tools) > 0
     assert any(t.name == "get-sum" for t in tools)
 
 
 @requires_mcp_server
-def test_mcp_真实连接_调用工具() -> None:
-    client = McpClient(_SERVER)
-    client.list_tools()                  # 先建立连接/发现
-    result = client.call("get-sum", {"a": 2, "b": 3})
+def test_mcp_真实连接_调用工具(warm_client: McpClient) -> None:
+    result = warm_client.call("get-sum", {"a": 2, "b": 3})
     assert "5" in str(result)
 
 
 @requires_mcp_server
-def test_mcp_导入审查并注册危险工具被拦() -> None:
+def test_mcp_导入审查并注册危险工具被拦(warm_client: McpClient) -> None:
     """关键：先审查再导入——危险的远端工具（如含 delete）会被拦截，不进工具管线。"""
-    client = McpClient(_SERVER)
-    report = client.import_reviewed(ToolCatalog())
+    report = warm_client.import_reviewed(ToolCatalog())
     assert isinstance(report, McpImportReport)
     assert report.discovered > 0
     # 应该没有任何危险名的工具被导入
@@ -97,6 +124,91 @@ def test_mcp_导入审查并注册危险工具被拦() -> None:
     assert not any("delete" in n or "shell" in n for n in imported_names)
     # 有被拒绝的（比如 gzip-file-as-resource 或危险参数）或全部通过
     assert report.imported == len(imported_names)
+
+
+# ---- 超时可配置 + 有界重试（不依赖 node）----
+
+
+def test_mcp超时可配置并传给subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    from warden_agent.mcp import client as client_mod
+
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        seen["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"tools": []}', stderr="")
+
+    monkeypatch.setattr(client_mod.subprocess, "run", fake_run)
+    monkeypatch.setenv("WARDEN_MCP_TIMEOUT_S", "321")
+    assert McpClient("fake-server").list_tools() == []
+    assert seen["timeout"] == 321
+
+
+def test_mcp超时用默认120(monkeypatch: pytest.MonkeyPatch) -> None:
+    from warden_agent.mcp import client as client_mod
+
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        seen["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"tools": []}', stderr="")
+
+    monkeypatch.setattr(client_mod.subprocess, "run", fake_run)
+    monkeypatch.delenv("WARDEN_MCP_TIMEOUT_S", raising=False)
+    assert McpClient("fake-server").list_tools() == []
+    assert seen["timeout"] == client_mod._DEFAULT_TIMEOUT_S == 120
+
+
+def test_mcp_list超时重试一次后成功(monkeypatch: pytest.MonkeyPatch) -> None:
+    """只读的 list：第一次超时允许重试一次，第二次成功。"""
+    from warden_agent.mcp import client as client_mod
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        tool = {"name": "get-sum", "description": "", "inputSchema": {}}
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"tools": [tool]}), stderr=""
+        )
+
+    monkeypatch.setattr(client_mod.subprocess, "run", fake_run)
+    tools = McpClient("fake-server").list_tools()
+    assert [t.name for t in tools] == ["get-sum"]
+    assert calls["n"] == 2
+
+
+def test_mcp_call超时不重试(monkeypatch: pytest.MonkeyPatch) -> None:
+    """call 可能有副作用：超时**绝不重试**，只能执行一次。"""
+    from warden_agent.mcp import client as client_mod
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(client_mod.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="超时"):
+        McpClient("fake-server").call("danger", {"x": 1})
+    assert calls["n"] == 1
+
+
+def test_mcp_list两次都超时报错不无限重试(monkeypatch: pytest.MonkeyPatch) -> None:
+    from warden_agent.mcp import client as client_mod
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(client_mod.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="超时"):
+        McpClient("fake-server").list_tools()
+    assert calls["n"] == 2  # 有界：最多两次
 
 
 # ---- 可用性判定本身（"跳过要确定"这条约定的守卫）----

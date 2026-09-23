@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from pathlib import Path
 
 from warden_agent.core.run.status import AgentRun
@@ -117,6 +118,41 @@ def test_幂等清扫把naive阈值归一化(tmp_path: Path) -> None:
         assert store.purge_expired_idempotency(future.isoformat()) == 1
     finally:
         store.close()
+
+
+def test_审计表老库补列不吞真失败(tmp_path: Path) -> None:
+    """审计表补列改用显式 _has_column 判定：老库能补上链字段，链依然完整可验。
+
+    旧实现用 `contextlib.suppress(sqlite3.OperationalError)` 包 ALTER，会把「列已存在」
+    与真失败（磁盘满/库被锁/权限不足）混为一谈。这里验证老库（无 prev_hash/hash）
+    仍能正确补列并写出可验证的链。
+    """
+    from warden_agent.web.audit import AuditRecord, SqliteAuditStore
+
+    conn = sqlite3.connect(str(tmp_path / "old.db"))
+    # 模拟加链之前的老表：没有 prev_hash / hash 两列
+    conn.execute(
+        "CREATE TABLE audit_log ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, correlation_id TEXT NOT NULL,"
+        " tenant_id TEXT NOT NULL, principal_type TEXT NOT NULL,"
+        " principal_id TEXT NOT NULL, product_id TEXT NOT NULL,"
+        " operation TEXT NOT NULL, run_id TEXT, method TEXT NOT NULL,"
+        " path TEXT NOT NULL, status INTEGER NOT NULL, at REAL NOT NULL)"
+    )
+    conn.commit()
+
+    store = SqliteAuditStore(conn=conn, chain_key=b"test-key")
+    cols = {
+        r[1] for r in conn.execute("SELECT * FROM pragma_table_info('audit_log')")
+    }
+    assert {"prev_hash", "hash"} <= cols, "老库没补上链字段"
+    store.append(AuditRecord(
+        correlation_id="c1", tenant_id="t1", principal_type="user",
+        principal_id="p1", product_id="w", operation="submit", run_id=None,
+        method="POST", path="/runs", status=200,
+    ))
+    ok, msg = store.verify_chain()
+    assert ok, msg
 
 
 def test_租约清扫把naive_now归一化(tmp_path: Path) -> None:

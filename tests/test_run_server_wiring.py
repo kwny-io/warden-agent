@@ -15,12 +15,14 @@ import pytest
 from warden_agent.tool.catalog import ToolCatalog
 from warden_agent.web.run_server import (
     AuthConfigError,
+    _audit_key_status,
     _build_catalog,
     _build_policy,
     _cognition_from_env,
     _db_path,
     _event_keep_from_env,
     _knowledge_from_env,
+    _session_cache_max_from_env,
     _shared_state_from_env,
     _stability_from_env,
     ensure_listen_is_safe,
@@ -71,6 +73,26 @@ def test_事件保留数_默认500_非正数回落默认() -> None:
     assert _event_keep_from_env({"WARDEN_EVENT_KEEP": "50"}) == 50
     assert _event_keep_from_env({"WARDEN_EVENT_KEEP": "0"}) == 500      # <=0 → 默认
     assert _event_keep_from_env({"WARDEN_EVENT_KEEP": "-3"}) == 500
+
+
+def test_审计密钥启动口径() -> None:
+    """审计关闭/带密钥/无密钥/开关要求密钥四种口径。"""
+    assert _audit_key_status({}, audit_enabled=False, has_key=False) == "off"
+    assert _audit_key_status({}, audit_enabled=True, has_key=True) == "keyed"
+    assert _audit_key_status({}, audit_enabled=True, has_key=False) == "unkeyed"
+    # 开了 REQUIRE_KEY 又没密钥 → 拒绝启动（required-missing）；有密钥时开关不影响
+    assert _audit_key_status(
+        {"WARDEN_AUDIT_REQUIRE_KEY": "1"}, audit_enabled=True, has_key=False
+    ) == "required-missing"
+    assert _audit_key_status(
+        {"WARDEN_AUDIT_REQUIRE_KEY": "1"}, audit_enabled=True, has_key=True
+    ) == "keyed"
+
+
+def test_会话缓存上限解析() -> None:
+    assert _session_cache_max_from_env({}) == 1000
+    assert _session_cache_max_from_env({"WARDEN_SESSION_CACHE_MAX": "5"}) == 5
+    assert _session_cache_max_from_env({"WARDEN_SESSION_CACHE_MAX": "0"}) == 0  # 0 = 不限
 
 
 def test_知识库开关_支持开关与目录() -> None:

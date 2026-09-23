@@ -15,19 +15,29 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from warden_agent.core.settings import env_positive_int
 from warden_agent.tool.catalog import ToolSpec, function_tool
+
+logger = logging.getLogger("warden.mcp")
 
 # 默认审查用的危险关键词：工具名/参数若含这些，默认拒绝导入
 _DANGEROUS_NAME = ("shell", "exec", "system", "delete", "rm", "drop", "write")
 _DANGEROUS_ARG = ("command", "script", "sql")
 
 _DEFAULT_CLI = str(Path(__file__).resolve().parents[3] / "ts" / "mcp-client" / "mcp-client.mjs")
+
+# 单次 MCP 操作超时（秒）。冷启动（npx resolve/download + node 启动）在机器负载高时可能
+# 超过 60s，所以默认放宽到 120s，并允许用 WARDEN_MCP_TIMEOUT_S 覆盖。
+_DEFAULT_TIMEOUT_S = 120
+# 只读的 list 允许尝试两次（就一次重试），应对冷启动抖动；call 只试一次（可能有副作用）。
+_LIST_ATTEMPTS = 2
 
 
 @dataclass
@@ -113,12 +123,28 @@ class McpClient:
             cmd += ["--tool", tool]
         if args is not None:
             cmd += ["--args", json.dumps(args)]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        except subprocess.TimeoutExpired:
+        timeout = env_positive_int("WARDEN_MCP_TIMEOUT_S", _DEFAULT_TIMEOUT_S)
+        # 有界重试：仅只读的 list 在超时后重试一次；call 绝不重试（工具调用可能有副作用，
+        # 重试可能导致重复执行）。
+        attempts = _LIST_ATTEMPTS if op == "list" else 1
+        proc: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                break
+            except subprocess.TimeoutExpired:
+                if attempt < attempts:
+                    logger.warning(
+                        "MCP %s 超时（%ss，第 %d 次），重试一次"
+                        "（仅只读的 list 允许重试；call 不重试以免重复执行）",
+                        op, timeout, attempt,
+                    )
+                    continue
+                return {"error": "MCP 调用超时"}
+            except OSError as e:
+                return {"error": f"无法启动 node CLI: {e}"}
+        if proc is None:  # 理论上不可达（attempts>=1）；防御性兜底，避免用 -O 去除 assert
             return {"error": "MCP 调用超时"}
-        except OSError as e:
-            return {"error": f"无法启动 node CLI: {e}"}
         last_line = (proc.stdout or "").strip().splitlines()
         if not last_line:
             return {"error": f"node CLI 无输出: {(proc.stderr or '')[:200]}"}

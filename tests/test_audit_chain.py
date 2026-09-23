@@ -26,11 +26,13 @@ import pytest
 from warden_agent import cli
 from warden_agent.web.audit import (
     GENESIS,
+    AuditLogger,
     AuditRecord,
     SqliteAuditStore,
     audit_chain_key,
     chain_hash,
 )
+from warden_agent.web.auth import RunOperation
 
 KEY = b"unit-test-audit-key-material"      # 测试用固定材料（非真实密钥）
 
@@ -267,3 +269,81 @@ def test_审计写入仍不影响业务_链不会让它变脆(tmp_path: Path) ->
     assert len(records) == 1 and records[0].principal_id == "alice"
     assert records[0].status == 200
     assert sqlite3 is not None
+
+
+# ---------------------------------------------------------------------------
+# 四、尾部截断：链只能发现“改中间/删中间”，锚点才能发现“从末尾删”
+# ---------------------------------------------------------------------------
+
+
+def test_记锚点后从末尾删行会被发现(tmp_path: Path) -> None:
+    """锚点前：删末尾的行，剩下的链依然自洽 → 必须靠锚点才能发现。"""
+    store = _store(tmp_path)
+    _append_n(store, 5)
+    store.record_anchor()
+    store._conn.execute("DELETE FROM audit_log WHERE id > 3")
+    store._conn.commit()
+    ok, detail = store.verify_chain()
+    assert ok is False
+    assert "尾部被截断" in detail
+
+
+def test_锚点之后正常追加不算尾断(tmp_path: Path) -> None:
+    """锚点只是“某个时刻的链头”：之后正常追加，锚定的链头仍在链上 → 不算尾断。"""
+    store = _store(tmp_path)
+    _append_n(store, 3)
+    store.record_anchor()
+    _append_n(store, 2)
+    ok, detail = store.verify_chain()
+    assert ok, detail
+
+
+def test_没记过锚点时不误报尾断(tmp_path: Path) -> None:
+    """诚实边界：从未锚过就无从对比，剩下的链自洽就如实报完整（不假装能发现尾断）。"""
+    store = _store(tmp_path)
+    _append_n(store, 3)
+    store._conn.execute("DELETE FROM audit_log WHERE id > 1")
+    store._conn.commit()
+    ok, detail = store.verify_chain()
+    assert ok, detail
+
+
+def test_锚点链头被替换也会被发现(tmp_path: Path) -> None:
+    """删掉末尾再追加同样条数的伪造行：条数对得上，但锚定的链头已不在链上。"""
+    store = _store(tmp_path)
+    _append_n(store, 3)
+    store.record_anchor()
+    store._conn.execute("DELETE FROM audit_log WHERE id = 3")
+    # 伪造一条接在 id=2 之后（不知道密钥，用假哈希；条数仍是 3）
+    head = store._conn.execute("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+    store._conn.execute(
+        "INSERT INTO audit_log (correlation_id, tenant_id, principal_type, principal_id,"
+        " product_id, operation, run_id, method, path, status, at, prev_hash, hash)"
+        " VALUES ('forged', 'acme', 'user', 'mallory', 'local', 'QUERY', 'run-x',"
+        " 'GET', '/status/run-x', 200, 1.0, ?, ?)",
+        (head, hashlib.sha256(b"forged").hexdigest()),
+    )
+    store._conn.commit()
+    ok, detail = store.verify_chain()
+    assert ok is False
+    assert "被改动过" in detail or "尾部被截断" in detail
+
+
+def test_未配密钥的存储keyed为假(tmp_path: Path) -> None:
+    assert SqliteAuditStore(db_path=_db(tmp_path), chain_key=None).keyed is False
+    assert _store(tmp_path).keyed is True
+
+
+def test_AuditLogger定期记锚点(tmp_path: Path) -> None:
+    """每 N 条审计自动锚一次链头（“定期锚”），不需要外部调度。"""
+    store = _store(tmp_path)
+    lg = AuditLogger(store, enabled=True)
+    lg._ANCHOR_EVERY = 2  # 实例上改小间隔，便于测试
+    for i in range(2):
+        lg.record(
+            correlation_id=f"c{i}", caller=None, operation=RunOperation.QUERY,
+            run_id="r", method="GET", path="/status/r", status=200,
+        )
+    count = store._conn.execute("SELECT COUNT(*) FROM audit_anchor").fetchone()[0]
+    assert count == 1
+    assert lg.keyed is True

@@ -137,6 +137,10 @@ class OtlpExporter:
         self._q: queue.Queue[_Span] = queue.Queue(maxsize=_QUEUE_MAX)
         self._dropped = 0
         self._failed = 0
+        # 【O12】内部计数器保护锁：`+=` 是非原子的“读-改-写”，
+        # 多线程（submit 的抓取线程 + 后台导出线程）并发下会丢自增。
+        # 对外暴露的 Prometheus 指标本身是锁保护的，但内部计数不能因此就不准。
+        self._counter_lock = threading.Lock()
         self._stop = threading.Event()
         if client is not None:
             self._client = client
@@ -151,24 +155,33 @@ class OtlpExporter:
 
     @property
     def dropped(self) -> int:
-        return self._dropped
+        with self._counter_lock:
+            return self._dropped
 
     @property
     def failed(self) -> int:
-        return self._failed
+        with self._counter_lock:
+            return self._failed
+
+    def _bump(self, attr: str) -> int:
+        """原子地把 `attr` 自增 1 并返回新值（见 _counter_lock 的说明）。"""
+        with self._counter_lock:
+            value = int(getattr(self, attr)) + 1
+            setattr(self, attr, value)
+            return value
 
     def submit(self, span: _Span) -> None:
         """入队一个 span（非阻塞）。队列满则丢弃并计数——绝不阻塞请求路径。"""
         try:
             self._q.put_nowait(span)
         except queue.Full:
-            self._dropped += 1
+            dropped = self._bump("_dropped")
             from warden_agent.core.metrics import note
 
             note("warden_otlp_dropped_total", "OTLP span 因队列满被丢弃的次数")
-            if self._dropped == 1 or self._dropped % 100 == 0:
+            if dropped == 1 or dropped % 100 == 0:
                 logger.warning(
-                    "OTLP 队列已满，丢弃 span（累计 %d 条）——收集器跟不上或不可达", self._dropped
+                    "OTLP 队列已满，丢弃 span（累计 %d 条）——收集器跟不上或不可达", dropped
                 )
 
     def _take_batch(self, timeout: float) -> list[_Span]:
@@ -199,20 +212,20 @@ class OtlpExporter:
                 headers=dict(self._cfg.headers),
             )
             if resp.status_code >= 300:
-                self._failed += 1
+                failed = self._bump("_failed")
                 from warden_agent.core.metrics import note
 
                 note("warden_otlp_export_failures_total", "OTLP 导出失败批次数")
                 logger.warning(
-                    "OTLP 导出返回 status=%s（累计失败 %d 批）", resp.status_code, self._failed
+                    "OTLP 导出返回 status=%s（累计失败 %d 批）", resp.status_code, failed
                 )
         except Exception:  # noqa: BLE001 - 收集器不可达不能拖垮业务
-            self._failed += 1
+            failed = self._bump("_failed")
             from warden_agent.core.metrics import note
 
             note("warden_otlp_export_failures_total", "OTLP 导出失败批次数")
             logger.warning(
-                "OTLP 导出异常（累计失败 %d 批）——只记日志，不影响业务", self._failed
+                "OTLP 导出异常（累计失败 %d 批）——只记日志，不影响业务", failed
             )
 
     def close(self, timeout: float = 2.0) -> None:
@@ -250,6 +263,12 @@ def _exporter_for(env: Mapping[str, str] | None) -> OtlpExporter | None:
                     _exporter = OtlpExporter(cfg)
                     logger.info("OTLP 链路导出已开启 endpoint=%s", cfg.endpoint)
                 except Exception:  # noqa: BLE001 - 起不来就退回"只打日志"
+                    from warden_agent.core.metrics import note
+
+                    note(
+                        "warden_otlp_export_init_failures_total",
+                        "OTLP 导出器初始化失败次数（失败则链路退回仅结构化日志）",
+                    )
                     logger.warning("OTLP 导出器初始化失败，退回仅结构化日志", exc_info=True)
         return _exporter
 

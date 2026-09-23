@@ -20,8 +20,8 @@ import pytest
 from tests.conftest import ScriptedModel, weather_tool
 
 from warden_agent.core.metrics import metrics
-from warden_agent.model.model import ChatResponse
-from warden_agent.policy.policy import PolicyEngine
+from warden_agent.model.model import ChatResponse, ToolCall
+from warden_agent.policy.policy import Decision, PolicyEngine, PolicyResult
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.web.audit import InMemoryAuditStore
 from warden_agent.web.auth import ROLE_ADMIN, ROLE_USER, ROLE_VIEWER, TrustedCaller
@@ -219,7 +219,9 @@ async def test_events受SSE并发闸门保护() -> None:
     async with _client(app) as client:
         r = await client.get("/events/run-ev")
         assert r.status_code == 503
-        assert "上限" in r.json()["detail"]
+        body = r.json()
+        assert body["errorCode"] == "SERVICE_UNAVAILABLE"
+        assert "上限" in body["detail"]
     gate.release()
     assert gate.active == 0
     async with _client(app) as client:
@@ -247,3 +249,50 @@ async def test_metrics仅管理员可读() -> None:
         ok = await client.get("/metrics", headers=A_ADMIN)
         assert ok.status_code == 200
         assert "warden_http_requests_total" in ok.text
+
+
+# ---- 7：approve/reject 再次遇到审批也要发事件（与 /chat 对齐）----
+
+
+def _ask_policy() -> PolicyEngine:
+    engine = PolicyEngine()
+    engine.add(lambda name, args: PolicyResult(Decision.ASK, "需要人工批准"))
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_approve再次遇到审批也会发事件() -> None:
+    """回归：approve/reject 拿到 NeedsApproval 时只回响应不发事件，/events 订阅方收不到。"""
+    script = [
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="c1", name="weather.get", arguments={"city": "上海"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="c2", name="weather.get", arguments={"city": "北京"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content="好了", finish_reason="stop"),
+    ]
+    bus = InProcessEventBus()
+    store = SqliteStore(Path(tempfile.mkdtemp()) / "t.db")
+    app = build_app(
+        model=ScriptedModel(script),
+        catalog=weather_tool(),
+        policy=_ask_policy(),
+        store=store,
+        event_bus=bus,
+    )
+    async with _client(app) as client:
+        first = await client.post("/chat/run-w8", json={"text": "hi"})
+        assert first.json()["kind"] == "needs_approval"
+        second = await client.post("/approve/run-w8")
+        assert second.json()["kind"] == "needs_approval"
+    # 收集总线上的事件：两次 NeedsApproval 都应各有一次 needs_approval 事件
+    seq, events = 0, []
+    while True:
+        items = bus.poll("run-w8", seq, timeout=0.01)
+        if not items:
+            break
+        for s, ev in items:
+            seq = s
+            events.append(ev)
+    assert sum(1 for e in events if e.get("event") == "needs_approval") == 2

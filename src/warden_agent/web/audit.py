@@ -35,7 +35,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import hmac
 import json
@@ -185,6 +184,11 @@ class SqliteAuditStore:
             )
         self._init()
 
+    @property
+    def keyed(self) -> bool:
+        """链是否带密钥（HMAC）。False = 退化为不带密钥哈希链，应在就绪探针/指标上暴露。"""
+        return self._chain_key is not None
+
     def _init(self) -> None:
         self._conn.execute(
             """
@@ -207,13 +211,36 @@ class SqliteAuditStore:
             )
             """
         )
-        # 老库补列（列加在末尾，不影响 _row_to_record 的位置索引）
+        # 老库补列（列加在末尾，不影响 _row_to_record 的位置索引）。
+        # 用显式 _has_column 判定，而不是 try/except sqlite3.OperationalError 吞掉：
+        # 后者会把「列已存在」和**真失败**（磁盘满 / 库被锁 / 权限不足）混为一谈——
+        # 真失败被静默吞掉，于是老库「以为升级了、其实没加列」。
         for column in ("prev_hash", "hash"):
-            with contextlib.suppress(sqlite3.OperationalError):
+            if not self._has_column("audit_log", column):
                 self._conn.execute(
                     f"ALTER TABLE audit_log ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
                 )
+        # 链头锚点：只追加。verify_chain 拿它对比“当前链头是否还在”，
+        # 从而发现“把末尾 N 行删掉后链依然自洽”的尾部截断。
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_anchor (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                last_id   INTEGER NOT NULL,
+                head_hash TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                at        REAL NOT NULL
+            )
+            """
+        )
         self._conn.commit()
+
+    def _has_column(self, table: str, column: str) -> bool:
+        """该表是否已有某列（用 pragma_table_info 表值函数 + 参数化查询，不拼 SQL）。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", (table, column)
+        ).fetchone()
+        return bool(row and row[0])
 
     def _last_hash(self) -> str:
         """链头：已落库的最后一条的 hash（空表 → GENESIS）。
@@ -258,6 +285,37 @@ class SqliteAuditStore:
             )
             self._conn.commit()
 
+    def _latest_anchor(self) -> tuple[int, str, int] | None:
+        """最近一次锚点（last_id, head_hash, row_count）；从未记过则 None。"""
+        row = self._conn.execute(
+            "SELECT last_id, head_hash, row_count FROM audit_anchor ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return (int(row[0]), str(row[1]), int(row[2])) if row else None
+
+    def record_anchor(self) -> dict[str, Any]:
+        """把当前链头（最后一条 id + hash + 总条数）**只追加**地记入锚点表。
+
+        为什么要它：链只能发现“改中间/删中间”——从**末尾**删掉 N 行后，剩下的链依然自洽。
+        锚点把“某个时刻的链头”固定下来，之后 verify_chain 发现该链头不在链上就报尾断。
+        调用时机：归档/巡检等“定期或按需”的时点（`AuditLogger` 也会每 N 条自动锚一次）。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, hash FROM audit_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            last_id = int(row[0]) if row else 0
+            head_hash = str(row[1]) if row and row[1] else GENESIS
+            count = int(
+                self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+            )
+            self._conn.execute(
+                "INSERT INTO audit_anchor (last_id, head_hash, row_count, at)"
+                " VALUES (?, ?, ?, ?)",
+                (last_id, head_hash, count, time.time()),
+            )
+            self._conn.commit()
+        return {"last_id": last_id, "head_hash": head_hash, "row_count": count}
+
     def verify_chain(self) -> tuple[bool, str]:
         """整条链走一遍，校验每条记录的哈希与前后衔接。返回 (是否完整, 说明)。
 
@@ -293,6 +351,22 @@ class SqliteAuditStore:
                     "（字段、时间或行号任一被改都会导致不匹配）"
                 )
             prev_hash = stored_hash
+        # 尾断检测：链本身自洽不代表完整——从末尾删掉 N 行后剩下的链仍自洽。
+        # 拿最近的锚点对比：它锚定的链头若已不在链上（或被删到更短），就是尾部被截断。
+        anchor = self._latest_anchor()
+        if anchor is not None:
+            anchored_id, anchored_hash, anchored_count = anchor
+            shorter = len(rows) < anchored_count
+            head_gone = anchored_id > 0 and not any(
+                int(r[0]) == anchored_id and str(r[13] or "") == anchored_hash
+                for r in rows
+            )
+            if shorter or head_gone:
+                return False, (
+                    f"链条尾部被截断：锚点记录的 id={anchored_id}（hash={anchored_hash[:12]}…，"
+                    f"共 {anchored_count} 条）已不在链上，当前仅 {len(rows)} 条——"
+                    "末端的审计记录被删除或替换（改中间/删中间的链能自洽，只有锚点能发现尾断）"
+                )
         return True, f"链完整：{len(rows)} 条记录，链头 {prev_hash[:12]}…"
 
     def export_records(
@@ -469,6 +543,11 @@ class PostgresAuditStore:
         self._lock = threading.RLock()
         self._init()
 
+    @property
+    def keyed(self) -> bool:
+        """链是否带密钥（HMAC）。False = 退化为不带密钥哈希链，应在就绪探针/指标上暴露。"""
+        return self._chain_key is not None
+
     def _init(self) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
@@ -497,6 +576,18 @@ class PostgresAuditStore:
             )
             cur.execute(
                 "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS hash TEXT NOT NULL DEFAULT ''"
+            )
+            # 链头锚点（只追加）：语义同 SQLite 版，verify_chain 据此发现尾部截断。
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_anchor (
+                    id        BIGSERIAL PRIMARY KEY,
+                    last_id   BIGINT NOT NULL,
+                    head_hash TEXT NOT NULL,
+                    row_count BIGINT NOT NULL,
+                    at        DOUBLE PRECISION NOT NULL
+                )
+                """
             )
         self._conn.commit()
 
@@ -535,6 +626,33 @@ class PostgresAuditStore:
                 "UPDATE audit_log SET hash = %s WHERE id = %s", (digest, row_id)
             )
 
+    def _latest_anchor(self) -> tuple[int, str, int] | None:
+        """最近一次锚点（last_id, head_hash, row_count）；从未记过则 None。"""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_id, head_hash, row_count FROM audit_anchor"
+                " ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        return (int(row[0]), str(row[1]), int(row[2])) if row else None
+
+    def record_anchor(self) -> dict[str, Any]:
+        """把当前链头（最后一条 id + hash + 总条数）**只追加**地记入锚点表（语义同 SQLite 版）。"""
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("SELECT id, hash FROM audit_log ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            last_id = int(row[0]) if row else 0
+            head_hash = str(row[1]) if row and row[1] else GENESIS
+            cur.execute("SELECT COUNT(*) FROM audit_log")
+            count = int(cur.fetchone()[0])
+            cur.execute(
+                "INSERT INTO audit_anchor (last_id, head_hash, row_count, at)"
+                " VALUES (%s, %s, %s, %s)",
+                (last_id, head_hash, count, time.time()),
+            )
+        self._conn.commit()
+        return {"last_id": last_id, "head_hash": head_hash, "row_count": count}
+
     def verify_chain(self) -> tuple[bool, str]:
         """整条链走一遍，校验每条记录的哈希与前后衔接。返回 (是否完整, 说明)。"""
         with self._conn.cursor() as cur:
@@ -567,6 +685,21 @@ class PostgresAuditStore:
                     "（字段、时间或行号任一被改都会导致不匹配）"
                 )
             prev_hash = stored_hash
+        # 尾断检测（语义同 SQLite 版）：锚点链头已不在链上/链更短 → 尾部被截断。
+        anchor = self._latest_anchor()
+        if anchor is not None:
+            anchored_id, anchored_hash, anchored_count = anchor
+            shorter = len(rows) < anchored_count
+            head_gone = anchored_id > 0 and not any(
+                int(r[0]) == anchored_id and str(r[13] or "") == anchored_hash
+                for r in rows
+            )
+            if shorter or head_gone:
+                return False, (
+                    f"链条尾部被截断：锚点记录的 id={anchored_id}（hash={anchored_hash[:12]}…，"
+                    f"共 {anchored_count} 条）已不在链上，当前仅 {len(rows)} 条——"
+                    "末端的审计记录被删除或替换（改中间/删中间的链能自洽，只有锚点能发现尾断）"
+                )
         return True, f"链完整：{len(rows)} 条记录，链头 {prev_hash[:12]}…"
 
     def export_records(
@@ -666,13 +799,23 @@ def audit_store_for_backend(
 class AuditLogger:
     """App 层的审计写入门面：决定"是否记录 + 记到哪个后端"。"""
 
+    # 每写这么多条就自动记一个链头锚点（“定期锚”）：低成本（一条 SQL），
+    # 却能把“从末尾删行”的尾部截断变成可发现。也可以用 `record_anchor()` 按需锚。
+    _ANCHOR_EVERY = 100
+
     def __init__(self, store: AuditStore, enabled: bool = True) -> None:
         self._store = store
         self._enabled = enabled
+        self._writes_since_anchor = 0
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def keyed(self) -> bool:
+        """审计后端是否带链密钥。无链能力的后端（如内存版）视为已带密钥（不误报）。"""
+        return getattr(self._store, "keyed", True) is not False
 
     def record(
         self,
@@ -708,3 +851,14 @@ class AuditLogger:
             from warden_agent.core.metrics import note
 
             note("warden_audit_write_failures_total", "审计写入失败次数（账本可能缺条）")
+            return
+        # 定期锚链头：锚点写入失败同样不能影响业务（尽力而为，与审计本身一致）。
+        self._writes_since_anchor += 1
+        if self._writes_since_anchor >= self._ANCHOR_EVERY:
+            self._writes_since_anchor = 0
+            anchor = getattr(self._store, "record_anchor", None)
+            if callable(anchor):
+                try:
+                    anchor()
+                except Exception:  # noqa: BLE001 - 锚点失败不影响业务
+                    logger.warning("审计链锚点写入失败 correlation=%s", correlation_id)

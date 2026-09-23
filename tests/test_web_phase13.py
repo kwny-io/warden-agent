@@ -17,7 +17,7 @@ from tests.conftest import ScriptedModel, weather_tool
 from warden_agent.model.model import ChatResponse
 from warden_agent.policy.policy import PolicyEngine
 from warden_agent.store.sqlite import SqliteStore
-from warden_agent.web.audit import InMemoryAuditStore
+from warden_agent.web.audit import InMemoryAuditStore, SqliteAuditStore
 from warden_agent.web.auth import TrustedCaller
 from warden_agent.web.server import build_app
 
@@ -232,3 +232,40 @@ def test_readiness_存储故障_返回degraded() -> None:
     r = readiness(BrokenStore())
     assert r.status == "degraded"
     assert r.checks["brokenstore"] == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_unkeyed审计链_就绪降级并暴露指标() -> None:
+    """审计开着却无链密钥 = 防篡改降级：就绪探针须降级、指标须可查，别静默。"""
+    unkeyed = SqliteAuditStore(db_path=Path(tempfile.mkdtemp()) / "a.db", chain_key=None)
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="hi", finish_reason="stop")]),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=_store(),
+        audit_store=unkeyed,
+    )
+    async with await _client(app) as client:
+        r = await client.get("/health/ready")
+        assert r.status_code == 503
+        assert r.json()["status"] == "degraded"
+        assert r.json()["checks"]["audit_chain"] == "unkeyed"
+        m = await client.get("/metrics")
+        assert "warden_audit_unkeyed 1" in m.text
+
+
+@pytest.mark.asyncio
+async def test_keyed审计链_就绪正常() -> None:
+    """配了链密钥：就绪不降级，也不再报 audit_chain 检查项。"""
+    keyed = SqliteAuditStore(db_path=Path(tempfile.mkdtemp()) / "a.db", chain_key=b"k")
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="hi", finish_reason="stop")]),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=_store(),
+        audit_store=keyed,
+    )
+    async with await _client(app) as client:
+        r = await client.get("/health/ready")
+        assert r.status_code == 200
+        assert "audit_chain" not in r.json()["checks"]

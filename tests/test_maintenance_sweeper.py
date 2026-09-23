@@ -17,6 +17,8 @@ from warden_agent.runtime.maintenance import (
     DEFAULT_IDEMPOTENCY_TTL_S,
     DEFAULT_RATE_LIMIT_MAX_AGE_S,
     MaintenanceSweeper,
+    refresh_stuck_gauge,
+    set_stuck_gauge,
     sweep,
 )
 from warden_agent.store.sqlite import SqliteStore
@@ -132,3 +134,51 @@ def test_间隔为零_不启动且stop安全() -> None:
     assert sweeper.interval == 0
     sweeper.stop()
     assert sweeper._thread is None  # noqa: SLF001
+
+
+# ---- 【O4】清扫失败可观测：失败不再只有日志 ----
+
+
+def test_清扫失败写入失败指标() -> None:
+    """清扫炸了要留下 `warden_maintenance_sweep_failures_total{task=...}`，
+    否则库在静默无界增长、告警也接不上。"""
+    from warden_agent.core.metrics import metrics
+
+    class _Bad:
+        def purge_expired_idempotency(self, before_iso: str) -> int:
+            raise RuntimeError("boom")
+
+    sweep(_Bad(), idempotency_ttl_s=0.0, rate_limit_max_age_s=0.0)
+    assert ('warden_maintenance_sweep_failures_total{task="idempotency"}'
+            in metrics().render())
+
+
+# ---- 【O10】stuck 指标序列始终存在 ----
+
+
+def test_stuck_gauge_无卡死也写零() -> None:
+    """即使没有卡死 Run，也要把序列写成 0（而不是缺失），否则告警规则无从评估。"""
+    from warden_agent.core.metrics import metrics
+
+    set_stuck_gauge(0)
+    assert 'warden_stuck_runs{older_than="60m"} 0' in metrics().render()
+
+
+def test_refresh_stuck_gauge_计算出卡死数并写入() -> None:
+    from warden_agent.core.metrics import metrics
+    from warden_agent.core.run.status import RunStatus
+    from warden_agent.runtime.checkpoint import Checkpoint
+
+    class _Cps:
+        def list(self) -> list[Checkpoint]:
+            return [Checkpoint(run_id="run-stuck", status=RunStatus.WAITING_APPROVAL,
+                               iteration=1, step="awaiting")]
+
+    class _Store:
+        def list_runs(self, limit: int = 200) -> list[dict[str, object]]:
+            return [{"run_id": "run-stuck",
+                     "updated_at": "2000-01-01T00:00:00+00:00"}]
+
+    count = refresh_stuck_gauge(_Store(), _Cps(), older_than_seconds=3600)
+    assert count == 1
+    assert 'warden_stuck_runs{older_than="60m"} 1' in metrics().render()

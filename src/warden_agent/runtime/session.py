@@ -26,14 +26,15 @@ from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.loop.cognition import (
     intent_hint,
     manage_context,
-    plan_context,
     recall_context,
 )
 from warden_agent.loop.loop import exec_tool
+from warden_agent.loop.planner import PlanState, make_plan_state
 from warden_agent.memory.owner import owner_scope
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
 from warden_agent.runtime.checkpoint import (
+    Checkpoint,
     CheckpointManager,
     CheckpointStore,
     CompletionGuard,
@@ -123,6 +124,21 @@ def _ensure_tool_results(messages: list[Message]) -> list[Message]:
     return out
 
 
+# 存档点里表示"该轮模型调用已完成、正处在后续步骤"的 step：恢复时该轮的模型调用
+# 不必重跑，从下一轮继续即可。其余 step（model_call / init / failed）表示该轮尚未完成，
+# 从该轮继续。
+_POST_MODEL_STEPS = frozenset({"tool_exec", "awaiting_approval"})
+
+
+def _resume_iteration(cp: Checkpoint | None) -> int:
+    """从存档点算出恢复后应从第几轮迭代继续，避免重跑已完成的迭代。"""
+    if cp is None:
+        return 0
+    if cp.step in _POST_MODEL_STEPS:
+        return cp.iteration + 1
+    return cp.iteration
+
+
 class AgentSession:
     """一次可恢复、可审批的 Agent 运行会话。"""
 
@@ -144,6 +160,7 @@ class AgentSession:
         checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.run_id = run_id
+        self._closed = False  # 从会话缓存淘汰时置位（见 SessionRegistry）：标记对象已下线
         self.model = model
         self.catalog = catalog
         self.policy = policy_engine
@@ -160,6 +177,14 @@ class AgentSession:
         #   memory/scope     记忆按需取用：按关键词重叠注入相关记忆
         #   max_context_chars 上下文裁剪阈值（0 = 不裁剪）
         self.planner = planner
+        # 【多步规划】有界、可推进的规划进度状态（PlanState）。
+        # 此前产品路径只在**每次请求**里用 plan_context(planner, text) 注入一次当前阶段
+        # （current 恒为 0），"分步推进"名不副实。这里改由 PlanState 承载进度，
+        # 主循环每完成一步 advance()、失败 mark_failed()，并每轮重注入当前阶段。
+        # _plan_built 区分"未规划"与"规划过但不是复杂任务"——避免简单任务每轮都
+        # 重新触发 planner.build（ModelPlanner 会多花一次模型调用）。
+        self._plan_state: PlanState | None = None
+        self._plan_built = False
         self.intent = intent
         self.memory = memory
         self._memory_scope = memory_scope
@@ -240,6 +265,8 @@ class AgentSession:
     # ---------- 对外主入口 ----------
     def start(self, user_text: str) -> SessionOutcome:
         """开始(或继续)处理一句用户指令，返回：最终回答 / 需要审批。"""
+        self._plan_state = None  # 新一轮用户指令 = 重新规划
+        self._plan_built = False
         # 多轮对话：上一轮已结束（COMPLETED 等），新消息就开启新一轮执行周期
         if self.run.is_terminal():
             self.run.restart()
@@ -269,11 +296,24 @@ class AgentSession:
           - `WAITING_APPROVAL` / `WAITING_INTERACTION` / `SUSPENDED` → 抛 `RunNotResumable`
             （**必须等人**，自动续跑等于绕过人工闸门）；
           - 其余（PENDING / QUEUED / RUNNING / …）→ 继续跑。
+
+        状态以**存档点**为准：恢复控制器按存档点状态分组，会话必须用同一份真相，
+        否则会出现"控制器判可续、会话却按旧状态抛 `RunNotResumable`"（或更危险的反向：
+        控制器判 await_human、会话却按旧 RUNNING 自动续跑，绕过审批闸门）。
+        迭代位置同样以存档点为准：从已完成的迭代之后继续，不把跑过的轮次再跑一遍。
         """
+        # 续跑按当前用户输入重新规划（进程重启后 PlanState 是内存态、随会话消失，
+        # 无法从存档点还原步号——见 _ensure_plan_state 的说明）。
+        self._plan_state = None
+        self._plan_built = False
+        # 用存档点校正 run 状态（分歧写回，避免下次重启再次分叉）。
+        before = self.run.status
+        cp = self._checkpoints.restore(self.run)
+        if self.run.status != before:
+            self._persist_run()
         if self.run.status == RunStatus.FAILED:
             # 确定性失败（如策略拒绝）标了 retryable=False：重试也是同样结果，拦住。
-            latest = self._checkpoints.latest
-            if latest is not None and not latest.retryable:
+            if cp is not None and cp.status == RunStatus.FAILED and not cp.retryable:
                 raise RunNotResumable(
                     f"Run {self.run_id!r} 是确定性失败（如策略拒绝），重试不会改变结果"
                 )
@@ -299,7 +339,7 @@ class AgentSession:
             self.run.mark_queued()
             self.run.start()
             self._persist_run()
-        return self._advance()
+        return self._advance(_resume_iteration(cp))
 
     def run_typed(self, reply_type: Any, user_text: str) -> Any:
         """类型化结果交付：让模型严格按给定 Pydantic 类的 schema 返回，还原成对象。
@@ -312,6 +352,8 @@ class AgentSession:
         """
         self._reply_type = reply_type
         self._reply_schema = reply_type.model_json_schema()
+        self._plan_state = None  # 新一轮用户指令 = 重新规划
+        self._plan_built = False
 
         # 多轮对话：上一轮已结束，新消息开启新一轮执行周期
         if self.run.is_terminal():
@@ -343,6 +385,10 @@ class AgentSession:
         self._persist_run()
         return self._execute_and_continue(call)
 
+    def _continue_iteration(self) -> int:
+        """审批/拒绝后继续：该轮模型调用已完成，从存档点的下一轮迭代接着跑。"""
+        return _resume_iteration(self._checkpoints.latest)
+
     def reject(self) -> SessionOutcome:
         """人工拒绝被拦截的工具：不执行它，把"已拒绝"作为工具结果告诉模型，继续。"""
         if not self._gated or not self._approval:
@@ -357,16 +403,19 @@ class AgentSession:
         denied = Message(role="tool", content=f"[用户拒绝执行 {call.name}]", tool_call=call)
         self.messages.append(denied)
         self.store.append_message(self.run_id, denied)
-        return self._advance()
+        return self._advance(self._continue_iteration())
 
     # ---------- 内部：主推进 ----------
-    def _advance(self) -> SessionOutcome:
-        """默认推进：循环跑完，最终内容作为 FinalReply 返回。"""
-        return cast(SessionOutcome, self._run_loop(self._finalize_plain))
+    def _advance(self, start_iteration: int = 0) -> SessionOutcome:
+        """默认推进：循环跑完，最终内容作为 FinalReply 返回。
 
-    def _advance_typed(self) -> Any:
+        `start_iteration` 用于恢复/审批续跑：跳过此前已完成的迭代，不把跑过的轮次再跑一遍。
+        """
+        return cast(SessionOutcome, self._run_loop(self._finalize_plain, start_iteration))
+
+    def _advance_typed(self, start_iteration: int = 0) -> Any:
         """类型化推进：循环跑完，最终内容校验还原成 reply_type 对象返回。"""
-        return self._run_loop(self._finalize_typed)
+        return self._run_loop(self._finalize_typed, start_iteration)
 
     def _mark_failed(self, *, retryable: bool = True) -> None:
         """把"驱动失败"落到 Run 状态上（非终态才置 FAILED）。
@@ -384,11 +433,12 @@ class AgentSession:
                                RunStatus.CANCELLED, RunStatus.TIMED_OUT):
             return  # 已终态（例如收尾 on_content 抛错时已 COMPLETED）——不改写
         self.run.fail()
-        self._persist_run()
-        # 落一个 FAILED 存档点：恢复计划据 status + retryable 决定"重试 or 终态"。
-        # 没有它，存档点会停在崩溃前的 RUNNING，把 FAILED 的 run 误归入"可续跑"。
+        # 先落 FAILED 存档点（恢复的真相源），再落 run 状态：反过来会在两次写之间
+        # 留下"库说 FAILED、存档点还停在 RUNNING"的分叉，而恢复计划按存档点分组，
+        # 会把它误当可续跑，attempts 永不递增（无限重试）。
         last_iter = self._checkpoints.latest.iteration if self._checkpoints.latest else 0
         self._checkpoint("failed", last_iter, retryable=retryable)
+        self._persist_run()
 
     @contextmanager
     def _fail_run_on_error(self) -> Iterator[None]:
@@ -469,9 +519,13 @@ class AgentSession:
                              owner=self.run.user_id)
         if mem:
             extra.append(Message(role="system", content=mem))
-        plan = plan_context(self.planner, user_text)
-        if plan:
-            extra.append(Message(role="system", content=plan))
+        # 【多步规划】注入**当前阶段**（而非恒定的第 0 阶段）：PlanState 在主循环里
+        # 随步成功推进，每轮请求据此重渲染阶段上下文。无规划器/非复杂任务时为 None。
+        # 规划是每次请求临时注入的，不写进 self.messages（否则恢复会话会重复叠加）。
+        if self._plan_state is not None:
+            plan = self._plan_state.context(self.planner)
+            if plan:
+                extra.append(Message(role="system", content=plan))
         # 注入在**首条 system 之后**，不要把 system 提示顶到最末尾
         combined = history[:1] + extra + history[1:] if extra and history else history
         return manage_context(combined, self.max_context_chars)
@@ -483,8 +537,26 @@ class AgentSession:
             self._last_user_text(), self.messages,
         )
 
-    def _run_loop(self, on_content: Callable[[str], Any]) -> Any:
-        """循环骨架：模型调用 → 工具/审批 → 到最终内容交给 on_content。"""
+    def _ensure_plan_state(self) -> PlanState | None:
+        """为本轮任务构建一次有界、可推进的规划状态（简单任务/无规划器返回 None）。
+
+        只构建一次（_plan_built 哨兵），避免简单任务每轮都重新触发 planner.build。
+        注意：PlanState 是**内存态**，进程重启后随会话消失。它不落存档点——因为
+        `Checkpoint` 没有承载"进行到第几步"的字段（且本任务不改 checkpoint.py）。
+        因此跨进程 resume 会从第 0 步重新规划，但**绝不会**把已完成的后续步骤静默标为
+        完成；步数仍受 max_steps 有界约束，行为安全。
+        """
+        if not self._plan_built:
+            self._plan_state = make_plan_state(self.planner, self._last_user_text())
+            self._plan_built = True
+        return self._plan_state
+
+    def _run_loop(self, on_content: Callable[[str], Any], start_iteration: int = 0) -> Any:
+        """循环骨架：模型调用 → 工具/审批 → 到最终内容交给 on_content。
+
+        `start_iteration`：从第几轮迭代开始。恢复/审批续跑时传入存档点的迭代号，
+        已完成的迭代（`< start_iteration`）不再执行。
+        """
         if self.run.status in (RunStatus.COMPLETED, RunStatus.FAILED,
                                RunStatus.CANCELLED, RunStatus.TIMED_OUT):
             raise RuntimeError(f"会话已结束，不能继续({self.run.status.name})")
@@ -492,7 +564,8 @@ class AgentSession:
         with owner_scope(self.run.user_id), self._fail_run_on_error():
             # 记录驱动起点：此后**新**产生的悬空工具调用才算"未执行"（见 _mark_completed）
             self._dangling_baseline = self._dangling_tool_ids()
-            for iteration in range(self.max_iterations):
+            self._ensure_plan_state()  # 【多步规划】本轮开始构建一次可推进的规划进度
+            for iteration in range(start_iteration, self.max_iterations):
                 self._checkpoint("model_call", iteration)
                 response = self.model.chat(ChatRequest(
                     messages=self._request_messages(),
@@ -501,6 +574,9 @@ class AgentSession:
                 ))
 
                 if response.tool_calls:
+                    # 【多步规划】本轮是否有"真正成功的执行"与"失败"，用于推进/冻结规划进度。
+                    round_ok = False
+                    round_failed = False
                     for call in response.tool_calls:
                         note = Message(role="assistant",
                                        content=f"[调用工具 {call.name}]", tool_call=call)
@@ -523,7 +599,14 @@ class AgentSession:
                             self.store.append_message(self.run_id, hint_msg)
                             continue
                         self._checkpoint("tool_exec", iteration)
-                        self._execute(call)
+                        # 记录成功/失败，供下方推进/冻结规划进度（与 AgentLoop 语义一致）
+                        if self._execute(call) is not None:
+                            round_failed = True
+                        else:
+                            round_ok = True
+                    # 【多步规划】本轮有成功执行才前进；只有失败则冻结并标记失败，
+                    # 后续阶段绝不被静默标为已完成；意图提示（未执行）既不算成功也不算失败。
+                    self._advance_plan(round_ok=round_ok, round_failed=round_failed)
                     continue  # 本批工具都执行完，回到循环让模型再想
 
                 if response.content is not None:
@@ -587,6 +670,8 @@ class AgentSession:
 
     def _stream_impl(self, user_text: str) -> Iterator[dict[str, Any]]:
         """以生成器方式处理一句用户指令，逐增量产出事件（配合 SSE 打字机）。"""
+        self._plan_state = None  # 新一轮用户指令 = 重新规划
+        self._plan_built = False
         # 多轮对话：上一轮已结束（COMPLETED 等），新消息就开启新一轮执行周期。
         # 注意：stream() 不走 _run_loop 的终态拦截，必须在这里先重开，
         # 否则会在 wait_for_approval()/resume() 处撞上非法状态转换（UI 第二条消息报 500）。
@@ -607,6 +692,7 @@ class AgentSession:
 
         # 驱动起点基线：此后新产生的悬空工具调用才算"未执行"（见 _mark_completed）
         self._dangling_baseline = self._dangling_tool_ids()
+        self._ensure_plan_state()  # 【多步规划】本轮开始构建一次可推进的规划进度
         for iteration in range(self.max_iterations):
             self._checkpoint("model_call", iteration)
             request = ChatRequest(
@@ -630,6 +716,8 @@ class AgentSession:
             assert response is not None
 
             if response.tool_calls:
+                round_ok = False
+                round_failed = False
                 for call in response.tool_calls:
                     # 先推工具事件，再落库
                     yield {"type": "tool", "name": call.name,
@@ -661,7 +749,12 @@ class AgentSession:
                         continue
                     # 流式下也把工具结果落库（复用 _execute，携带 tool_call_id；含稳定性+错误喂回）
                     self._checkpoint("tool_exec", iteration)
-                    self._execute(call)
+                    if self._execute(call) is not None:
+                        round_failed = True
+                    else:
+                        round_ok = True
+                # 【多步规划】与同步路径同口径：成功才推进，失败则冻结
+                self._advance_plan(round_ok=round_ok, round_failed=round_failed)
                 continue
 
             if response.content is not None:
@@ -713,6 +806,19 @@ class AgentSession:
         logger.info("工具 %s 需要人工批准，会话进入 WAITING_APPROVAL", call.name)
         return NeedsApproval(self._approval)
 
+    def _advance_plan(self, *, round_ok: bool, round_failed: bool) -> None:
+        """按本轮结果推进/冻结规划进度（无规划时不做事）。
+
+        与 AgentLoop 完全同口径：仅当本轮有工具有**成功执行**才 advance()；
+        只有失败则 mark_failed()（不推进），使后续阶段不被误标为完成。
+        """
+        if self._plan_state is None:
+            return
+        if round_ok:
+            self._plan_state.advance()
+        elif round_failed:
+            self._plan_state.mark_failed("工具执行失败")
+
     def _execute_and_continue(self, call: ToolCall) -> SessionOutcome:
         """审批通过后：执行被拦截的工具，**结果落库后**再清审批单，最后继续循环。
 
@@ -720,11 +826,15 @@ class AgentSession:
         这次"已批准的动作"就永久丢失了——重启后既没有审批单可重放，也没有工具结果
         证明它执行过。先执行并落库，最坏情况只是重启后审批单还在（可再批准一次）。
         """
-        self._execute(call)
+        error = self._execute(call)
         self._clear_approval()
-        return self._advance()
+        # 【多步规划】被审批拦下的这一步：执行成功才推进规划，失败则冻结。
+        # （ASK 在 _run_loop 里是"执行前 return"，所以该批次的推进落在这里，不会重复推进。）
+        self._advance_plan(round_ok=error is None, round_failed=error is not None)
+        return self._advance(self._continue_iteration())
 
-    def _execute(self, call: ToolCall) -> None:
+    def _execute(self, call: ToolCall) -> str | None:
+        """执行一次工具调用并落库；返回错误串（成功返回 None）供调用方推进规划。"""
         result, error = exec_tool(self.catalog, self.stability, call.name, call.arguments)
         # 关键：工具结果必须携带与 assistant.tool_calls[].id 一致的 call 引用，
         # 否则真实 API 要求"assistant 发起的 tool_call 必须一一被 tool 消息响应"，
@@ -737,6 +847,7 @@ class AgentSession:
         msg = Message(role="tool", content=content, tool_call=call)
         self.messages.append(msg)
         self.store.append_message(self.run_id, msg)
+        return error
 
     def _clear_approval(self) -> None:
         self._gated = None
@@ -764,3 +875,16 @@ class AgentSession:
     def is_terminal(self) -> bool:
         return self.run.status in (RunStatus.COMPLETED, RunStatus.FAILED,
                                    RunStatus.CANCELLED, RunStatus.TIMED_OUT)
+
+    def close(self) -> None:
+        """从 HTTP 会话内存缓存淘汰时调用（幂等）：标记对象已关闭。
+
+        会话持有的资源（模型/存储/记忆/稳定性层）都是**共享**的，不能在这里关；
+        这里只做标记，表明这个内存对象已不再被缓存当作活跃会话。持久化状态不受影响，
+        之后同一 run_id 再访问会从存储重新恢复一个新会话。
+        """
+        self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed

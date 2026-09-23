@@ -13,6 +13,29 @@
       "run_id",
       "tool_name"
     ],
+    "audit_anchor": [
+      "at",
+      "head_hash",
+      "id",
+      "last_id",
+      "row_count"
+    ],
+    "audit_log": [
+      "at",
+      "correlation_id",
+      "hash",
+      "id",
+      "method",
+      "operation",
+      "path",
+      "prev_hash",
+      "principal_id",
+      "principal_type",
+      "product_id",
+      "run_id",
+      "status",
+      "tenant_id"
+    ],
     "checkpoints": [
       "data",
       "run_id"
@@ -34,6 +57,25 @@
       "created_at",
       "key",
       "payload"
+    ],
+    "memories": [
+      "actor_id",
+      "actor_kind",
+      "audit",
+      "conflicts_with",
+      "content_data",
+      "content_kind",
+      "content_text",
+      "created_at",
+      "expires_at",
+      "key",
+      "owner",
+      "scope",
+      "status",
+      "supersedes",
+      "uid",
+      "updated_at",
+      "version"
     ],
     "messages": [
       "content",

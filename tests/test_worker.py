@@ -183,6 +183,116 @@ def test_failed可重试且attempts递增() -> None:
     assert reloaded is not None and reloaded.attempts == 2
 
 
+def test_resume从存档迭代继续_不重跑已完成迭代() -> None:
+    """存档点记着"跑到第几轮"（iteration），resume 必须从那里接着跑，
+    而不是无视它从 0 重来（修复前：iteration/step 存了但没人消费）。"""
+    store = _store()
+    cp_store = _cp(store)
+    run = AgentRun("r-iter")
+    run.mark_queued()
+    run.start()
+    store.save_run(run)
+    store.append_message("r-iter", Message(role="user", content="hi"))
+    # 进程在第 5 轮 model_call 前被硬杀
+    cp_store.save(Checkpoint(
+        run_id="r-iter", status=RunStatus.RUNNING, iteration=5, step="model_call"
+    ))
+
+    model = ScriptedModel(_ok("续跑完成"))
+    sess = _session(store, "r-iter", model)
+    seen: list[tuple[str, int]] = []
+    orig = sess._checkpoint  # noqa: SLF001
+
+    def spy(step: str, iteration: int, *, retryable: bool = True) -> None:
+        seen.append((step, iteration))
+        orig(step, iteration, retryable=retryable)
+
+    sess._checkpoint = spy  # type: ignore[method-assign]  # noqa: SLF001
+    outcome = sess.resume()
+
+    assert isinstance(outcome, FinalReply)
+    # 关键：第 5 轮之前的迭代（< 5）一次都没再执行
+    assert all(it >= 5 for _, it in seen), seen
+    assert seen[0] == ("model_call", 5)
+    assert model.calls == 1  # 只发生一次模型调用，没有从 0 重放
+
+
+def test_resume_tool_exec步从下一轮继续() -> None:
+    """step=tool_exec 表示该轮模型调用已完成、正处在工具执行中：从下一轮继续。"""
+    store = _store()
+    cp_store = _cp(store)
+    run = AgentRun("r-tool")
+    run.mark_queued()
+    run.start()
+    store.save_run(run)
+    store.append_message("r-tool", Message(role="user", content="hi"))
+    cp_store.save(Checkpoint(
+        run_id="r-tool", status=RunStatus.RUNNING, iteration=3, step="tool_exec"
+    ))
+
+    model = ScriptedModel(_ok("续跑完成"))
+    sess = _session(store, "r-tool", model)
+    seen: list[tuple[str, int]] = []
+    orig = sess._checkpoint  # noqa: SLF001
+
+    def spy(step: str, iteration: int, *, retryable: bool = True) -> None:
+        seen.append((step, iteration))
+        orig(step, iteration, retryable=retryable)
+
+    sess._checkpoint = spy  # type: ignore[method-assign]  # noqa: SLF001
+    sess.resume()
+    assert seen[0] == ("model_call", 4)  # 该轮模型调用不重跑
+
+
+def test_resume用存档点状态校正run_不绕过审批闸门() -> None:
+    """run 表里是旧 RUNNING、存档点却是 WAITING_APPROVAL 时，会话必须按存档点
+    判"等人"——否则会按旧状态自动续跑，绕过人工审批闸门。
+    （修复前：restore() 只在测试里被引用，session 完全忽略存档点状态。）"""
+    store = _store()
+    cp_store = _cp(store)
+    run = AgentRun("r-diverge")
+    run.mark_queued()
+    run.start()  # 库里的 run 停在 RUNNING（与存档点分叉）
+    store.save_run(run)
+    cp_store.save(Checkpoint(
+        run_id="r-diverge", status=RunStatus.WAITING_APPROVAL,
+        iteration=2, step="awaiting_approval",
+    ))
+
+    # 恢复控制器按存档点把它归入"等人"
+    assert RecoveryController(cp_store).plan().action_for("r-diverge") == "await_human"
+
+    sess = _session(store, "r-diverge", ScriptedModel(_ok()))
+    with pytest.raises(RunNotResumable, match="等人工"):
+        sess.resume()
+    # 分歧被解决：run 状态被校正为存档点的状态并写回
+    assert sess.status() == RunStatus.WAITING_APPROVAL
+    assert store.load_run("r-diverge").status == RunStatus.WAITING_APPROVAL
+
+
+def test_控制器判可续的run_会话不再抛RunNotResumable() -> None:
+    """反向分叉：run 表已是 COMPLETED、存档点仍是 RUNNING。控制器按存档点判"可续"，
+    会话就不能因为旧终态把它拒掉（修复前：resume 抛 RunNotResumable("已是终态")）。"""
+    store = _store()
+    cp_store = _cp(store)
+    run = AgentRun("r-resumable")
+    run.mark_queued()
+    run.start()
+    run.begin_completing()
+    run.complete()  # 库里的 run 已是 COMPLETED
+    store.save_run(run)
+    store.append_message("r-resumable", Message(role="user", content="hi"))
+    cp_store.save(Checkpoint(
+        run_id="r-resumable", status=RunStatus.RUNNING, iteration=1, step="model_call"
+    ))
+    assert RecoveryController(cp_store).plan().action_for("r-resumable") == "resume"
+
+    outcome = _session(store, "r-resumable", ScriptedModel(_ok("续跑完成"))).resume()
+    assert isinstance(outcome, FinalReply)
+    assert outcome.text == "续跑完成"
+    assert store.load_run("r-resumable").status == RunStatus.COMPLETED
+
+
 # ---------- worker ----------
 
 

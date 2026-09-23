@@ -167,6 +167,21 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "WARDEN_AUDIT", "开启审计账本（每请求一条，写 audit_log 表）",
         "web/run_server.py", ("web/run_server.py",), kind="bool",
     ),
+    EnvSpec(
+        "WARDEN_AUDIT_REQUIRE_KEY",
+        "审计开启但未配置 `WARDEN_AUDIT_KEY` 时**拒绝启动**（默认仅告警、非致命）",
+        "web/run_server.py", ("web/run_server.py",), kind="bool",
+        note="默认关：不配密钥时审计链退化为不带密钥的哈希链，仍能发现手改/删行，"
+             "但挡不住会重算整条链的人。生产环境应配密钥并打开本开关，"
+             "让\"忘了配密钥\"变成起不来，而不是静默降级",
+    ),
+    EnvSpec(
+        "WARDEN_SESSION_CACHE_MAX",
+        "HTTP 会话内存缓存上限（LRU 淘汰，防任意 run_id 把内存撑爆）；默认 1000，<=0 = 不限",
+        "web/run_server.py", ("web/run_server.py",), default="1000", kind="int",
+        note="任何 GET /status/<随机 id> 都会建一个 AgentSession；不透顶的话内存可无界增长。"
+             "到上限按 LRU 淘汰最久未访问的会话（淘汰时关闭会话对象）",
+    ),
     # ---- 限流与配额（入站 / 出站 两个方向）----
     EnvSpec(
         "WARDEN_RATE_LIMIT", "【入站】每调用者速率，`次数/窗口秒数`",
@@ -251,6 +266,14 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
             "web/run_server.py", ("web/run_server.py",), kind="path"),
     EnvSpec("MCP_SERVER", "MCP server 启动命令（需 node；工具先审查再导入）",
             "web/run_server.py", ("web/run_server.py",)),
+    EnvSpec(
+        "WARDEN_MCP_TIMEOUT_S",
+        "单次 MCP 操作超时（秒）；默认 120，<=0 用默认",
+        "mcp/client.py", ("mcp/client.py",),
+        default="120", kind="int",
+        note="冷启动（npx 解析/下载 + node 启动）在负载下可能超过 60s，所以默认放宽；"
+             "只读的 list 超时后允许重试一次，call 绝不重试（可能有副作用）",
+    ),
     # ---- 向量检索 ----
     EnvSpec("WARDEN_EMBED_BASE_URL", "真语义嵌入端点（不配则用词频哈希，非语义检索）",
             "rag/knowledge.py", ("rag/knowledge.py",)),

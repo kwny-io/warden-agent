@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 
@@ -94,7 +95,9 @@ async def test_sse并发超上限立刻返回503() -> None:
     async with _client(app) as client:
         resp = await client.post("/chat/stream/run-full", json={"text": "hi"})
         assert resp.status_code == 503
-        assert "上限" in resp.json()["detail"]
+        body = resp.json()
+        assert body["errorCode"] == "SERVICE_UNAVAILABLE"
+        assert "上限" in body["detail"]
     gate.release()
     gate.release()
     async with _client(app) as client, client.stream(
@@ -121,3 +124,35 @@ def test_sse闸门计数与释放() -> None:
     gate.release()
     gate.release()  # 多余的 release（幂等石旁）
     assert gate.active == 0
+
+
+# ---- 会话内存缓存有界：任意 run_id 不能把内存撑爆 ----
+
+
+@pytest.mark.asyncio
+async def test_会话缓存超过上限淘汰最久未访问_并关闭() -> None:
+    """cap=2：访问 r1/r2 后再取 r3，最久未访问的 r1 应被淘汰且被关闭。"""
+    app = _app(session_cache_max=2)
+    registry = app.state.session_registry
+    async with _client(app) as client:
+        await client.get("/status/r1")
+        sess1 = registry._sessions["r1"]
+        await client.get("/status/r2")
+        await client.get("/status/r3")
+    assert "r1" not in registry._sessions
+    assert list(registry._sessions.keys()) == ["r2", "r3"]
+    assert sess1.closed is True, "被淘汰的会话必须被关闭"
+
+
+@pytest.mark.asyncio
+async def test_会话缓存TTL过期也会淘汰() -> None:
+    """TTL 到期后再次访问会先清掉过期会话（不只是容量限制）。"""
+    app = _app(session_cache_max=10, session_ttl_s=0.01)
+    registry = app.state.session_registry
+    async with _client(app) as client:
+        await client.get("/status/t1")
+        sess1 = registry._sessions["t1"]
+        await asyncio.sleep(0.05)
+        await client.get("/status/t2")
+    assert "t1" not in registry._sessions
+    assert sess1.closed is True
