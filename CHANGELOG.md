@@ -5,6 +5,35 @@
 
 ---
 
+## 2026-09-24（第二十六批：独立审计后的三项安全/类型修复）
+
+> 来源：对 `dev` 工作树的一次独立审计（安全治理 / 交付运维 / 代码质量契约 三路并行，只读审查）。
+> 本轮先修掉三处「声称做了、实际没做」的地方——都是**小改动、高杀伤力**；其余发现按优先级
+> 另行安排（发布工程、沙箱隔离、备份与迁移 Job、NetworkPolicy 等）。
+
+- **子进程不再继承主进程环境（密钥泄漏面）**：`execution/broker.py` 起子进程时没有传 `env=`，
+  于是整个 `os.environ` 被继承——包括 `WARDEN_*` 主密钥、模型 API key，任何被执行的 `shell.run`
+  命令（注册于 `agent.py:275`）都能直接读到。新增 `execution/child_env.py`（白名单 + **剥离全部
+  `WARDEN_*`**），在 `execution/broker.py:165`、`git/revision.py:101` 接线，`mcp/client.py:132` 走
+  `env_without_warden()`；顺带把 `PATH` 拼接改成跨平台（原先写死 Unix 分隔符）。
+- **审批门禁补全覆盖**：`web/run_server.py:126` 的 ASK 集合原先只含 `fs.delete`，而 `fs.delete`
+  在 `run_server.py:112-121` 其实是个只 `return f"已删除 {path}"` 的演示空壳——真正会改仓库的
+  `git.apply_patch`（`git/tools.py:31`）、`shell.run`、`fs.write` 全都直通。现改为
+  `{shell.run, git.apply_patch, fs.write, mcp.call_tool, rag.delete_document}`，并新增守卫测试
+  「凡注册的写工具必须被门禁覆盖」，防止后续加工具时漂移。
+- **补 `py.typed`（PEP 561 标记）**：库缺这个空文件时，裸 `mypy` 会**直接拒绝检查该包**——实测摘掉后报
+  `Package 'warden_agent' cannot be type checked due to missing py.typed marker`，**EXIT=2 且检查 0 个文件**
+  （不是静默变绿）；CI 走的是显式路径 `mypy src/warden_agent`（`.github/workflows/ci.yml:79`），所以一直
+  是 99 文件零错。补上后裸 `mypy` 同样 `Success: no issues found in 99 source files`，并加守卫测试锁住该文件。
+- 验证：全量 `pytest` **1129 passed / 36 skipped**（较上批 1114 增加 15 条守卫）；`coverage` 85%
+  （新增 `execution/child_env.py` 100%）；`mypy --strict` **99 文件**零错；`ruff check src tests` 全绿。
+
+> 已知（未修，按优先级）：`dev` 仍领先 `master` 52 个提交且无 tag / release；语义档沙箱
+> （`execution/sandbox.py:44-52` 的 `_NETWORK_TOKENS` 正则）注释自认可绕过，生产应强制内核档；
+> 无备份 CronJob、无迁移 Job；`deploy/` 无 NetworkPolicy；审计账本记原始参数未脱敏；前端仍无测试。
+
+---
+
 ## 2026-09-23（第二十五批：前端类型门禁 + dev 代理修复）
 
 - **CI 补前端类型检查**：`.github/workflows/ci.yml` 的前端步骤在 `npm run build` 前加 `npm run typecheck`

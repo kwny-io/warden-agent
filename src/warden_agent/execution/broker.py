@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from warden_agent.execution.child_env import minimal_child_env
+
 if TYPE_CHECKING:
     from warden_agent.execution._platform import ProcessLimiter
 
@@ -162,6 +164,10 @@ class ExecutionBroker:
                 stderr=subprocess.PIPE,
                 cwd=cwd,
                 text=True,
+                # **不传 `env=` 就等于把宿主环境整包交给模型能影响的子进程**：
+                # 一句 `env` / `print(os.environ)` 就能读出 WARDEN_API_KEY 等
+                # 服务端密钥。这里给最小白名单，见 execution/child_env.py。
+                env=minimal_child_env(),
                 **popen_kwargs,
             )
             if limiter is not None:

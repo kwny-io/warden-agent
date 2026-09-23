@@ -19,6 +19,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Protocol
 
+from warden_agent.execution.child_env import minimal_child_env
+
 _GIT_READ_CAP = "git.read"
 
 
@@ -98,6 +100,9 @@ class DirectGitProbe:
                 p = subprocess.run(
                     [self.git, "-c", "credential.interactive=never", *args],
                     cwd=repo.root, capture_output=True, text=True, timeout=timeout,
+                    # 同上：只给最小环境（git 只需要 PATH/HOME），不给服务端密钥。
+                    # 更关键的是 git hook/别名也拿不到密钥。
+                    env=minimal_child_env(),
                 )
                 return p.returncode, p.stdout.strip()
             except (FileNotFoundError, subprocess.TimeoutExpired):

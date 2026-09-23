@@ -63,7 +63,7 @@ from warden_agent.loop.planner import ModelPlanner
 from warden_agent.model.deepseek import DeepSeekModel
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel
-from warden_agent.policy.policy import PolicyEngine, ask_when_tool_in
+from warden_agent.policy.policy import PolicyEngine, ask_when_tool_not_pure
 from warden_agent.runtime.locking import run_lock_for
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog, function_tool
@@ -121,10 +121,48 @@ def _build_catalog() -> ToolCatalog:
     return catalog
 
 
-def _build_policy() -> PolicyEngine:
-    """门禁：fs.* 高危动作需要人工批准；其余默认放行。"""
+# 无副作用豁免名单：只写**本项目自己**的数据（租户内、可回滚、不碰外部系统），
+# 把它们也堵在审批上只会把日常操作变成"点确认"的体力活。
+# 想更严的部署：把这个集合改成 frozenset()（连 memory.remember 也要人工批准）。
+_POLICY_BENIGN_TOOLS: frozenset[str] = frozenset({"memory.remember"})
+
+
+def _is_pure_tool(catalog: ToolCatalog, name: str) -> bool:
+    """查目录：该工具是否**显式声明** `pure=True`。
+
+    查不到（未注册/名字不对）→ False，即按"可能有副作用"处理（fail-closed）。
+    """
+    try:
+        return bool(catalog.get(name).pure)
+    except KeyError:
+        return False
+
+
+def _build_policy(catalog: ToolCatalog) -> PolicyEngine:
+    """门禁：**没声明 `pure=True` 的工具默认需要人工批准**，声明了才放行。
+
+    这里曾经是 `ask_when_tool_in(frozenset({"fs.delete"}))` —— 黑名单式，只有被
+    点名的工具才拦。实测后果是**双向错的**：
+
+      - `shell.run`（能在沙箱里跑任意命令）、`git.apply_patch`（写仓库）、
+        MCP 导入的工具全部**直接放行** —— 它们才是有真实副作用的那些；
+      - 唯一被拦住的 `fs.delete` 恰恰是演示用的空壳（函数体只 `return "已删除 xxx"`），
+        连真实删除都没做。
+
+    也就是"门是上了锁的，但锁在了没有门的那面墙上"。现在按 `pure` 声明默认拦：
+    新增工具忘标记 = 要审批，而不是 = 放行。
+
+    `catalog` 必须是**同一个会被 `build_app` 继续 augment 的目录对象**（见
+    web/server.py 里 `augment_catalog(catalog, ...)`）—— 这样后注册的
+    memory/web/skill/mcp/git 工具也在门禁覆盖范围内（闭包读的是实时目录）。
+    """
     engine = PolicyEngine()
-    engine.add(ask_when_tool_in(frozenset({"fs.delete"})))
+    engine.add(
+        ask_when_tool_not_pure(
+            lambda name: _is_pure_tool(catalog, name),
+            exempt=_POLICY_BENIGN_TOOLS,
+        )
+    )
     return engine
 
 
@@ -604,7 +642,7 @@ def main() -> None:
     app = build_app(
         model=model,
         catalog=catalog,
-        policy=_build_policy(),
+        policy=_build_policy(catalog),
         store=store,
         # 默认启用记忆与 Web 搜索（离线可跑）；技能/MCP/Git 按环境变量开启
         memory=True,

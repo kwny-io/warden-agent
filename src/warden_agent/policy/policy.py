@@ -146,3 +146,38 @@ def ask_when_tool_in(askable: frozenset[str]) -> Policy:
             return PolicyResult(Decision.ASK, f"动作 {tool_name!r} 需要人工批准")
         return PolicyResult(Decision.ALLOW)
     return policy
+
+
+def ask_when_tool_not_pure(
+    is_pure: Callable[[str], bool],
+    *,
+    exempt: frozenset[str] = frozenset(),
+) -> Policy:
+    """询问：**没有声明 `pure=True` 的工具**默认需要人工批准（可能有副作用）。
+
+    为什么方向是"默认要批"、而不是"列黑名单"：黑名单永远漏 —— 新加一个破坏性工具
+    （`shell.run` / `git.apply_patch` / MCP 导入的工具）不会自动被拦住，而**忘加规则
+    的后果是"直接放行"**。这里反过来：`pure=True` 是工具作者对"无副作用"的显式声明，
+    没声明就按"可能有副作用"处理 —— 忘标记的后果是"多问用户一句"，属 fail-closed。
+
+    `is_pure`：按工具名查"是否声明为 pure"的回调（通常查 ToolCatalog）；
+        查不到（未注册/名字不对）应当返回 False，本函数也会把异常当成"非 pure"。
+    `exempt`：显式豁免的工具名 —— 用于"只改本系统自己数据、不碰外部系统"的一类
+        （如 `memory.remember`），避免把日常操作全堵在人的确认上。
+        这是**收窄**白名单（默认仍然要批），加一项需要写清理由。
+    """
+    def policy(tool_name: str, arguments: dict[str, object]) -> PolicyResult:
+        if tool_name in exempt:
+            return PolicyResult(Decision.ALLOW, f"{tool_name!r} 在无副作用豁免名单里")
+        try:
+            pure = bool(is_pure(tool_name))
+        except Exception:  # noqa: BLE001 - 判定不出来按"可能有副作用"处理（fail-closed）
+            pure = False
+        if pure:
+            return PolicyResult(
+                Decision.ALLOW, f"{tool_name!r} 声明为 pure=True（无副作用）")
+        return PolicyResult(
+            Decision.ASK,
+            f"{tool_name!r} 未声明 pure=True，可能有副作用，需要人工批准",
+        )
+    return policy

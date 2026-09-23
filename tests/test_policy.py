@@ -10,6 +10,7 @@ from warden_agent.policy.policy import (
     PolicyDenied,
     PolicyEngine,
     PolicyResult,
+    ask_when_tool_not_pure,
     deny_when_path_in_protected,
 )
 
@@ -103,3 +104,56 @@ def test_受保护路径_反斜杠也按组件识别() -> None:
 def test_受保护路径_无path参数放行() -> None:
     policy = deny_when_path_in_protected(("/data",))
     assert policy("weather.get", {"city": "上海"}).decision == Decision.ALLOW
+
+
+# ---- "非 pure 默认要人工批准"规则：方向的修正（黑名单 → 默认拦）----
+
+_PURE = {"weather.get", "memory.recall"}
+
+
+def _is_pure(name: str) -> bool:
+    return name in _PURE
+
+
+def test_非pure工具默认要人工批准() -> None:
+    """`shell.run` / `git.apply_patch` 这类**没声明 pure** 的工具默认落 ASK。
+
+    这一条守的是那个真实缺陷：改前是黑名单（只拦 `fs.delete`），于是
+    `shell.run`（能在沙箱里跑任意命令）和 `git.apply_patch`（写仓库）**直接放行**。
+    """
+    policy = ask_when_tool_not_pure(_is_pure)
+    assert policy("shell.run", {"command": "rm -rf /"}).decision == Decision.ASK
+    assert policy("git.apply_patch", {}).decision == Decision.ASK
+    assert policy("mcp.some_remote_tool", {}).decision == Decision.ASK
+
+
+def test_pure工具放行() -> None:
+    policy = ask_when_tool_not_pure(_is_pure)
+    assert policy("weather.get", {"city": "上海"}).decision == Decision.ALLOW
+    assert policy("memory.recall", {"key": "k"}).decision == Decision.ALLOW
+
+
+def test_查不到工具也按非pure处理() -> None:
+    """未注册的名字（或查目录报错）也要 ASK —— fail-closed，不能因"查不到"而放行。"""
+    def boom(name: str) -> bool:
+        raise KeyError(name)
+
+    policy = ask_when_tool_not_pure(boom)
+    assert policy("未知工具", {}).decision == Decision.ASK
+
+
+def test_exempt_名单里的工具放行() -> None:
+    policy = ask_when_tool_not_pure(_is_pure, exempt=frozenset({"memory.remember"}))
+    assert policy("memory.remember", {"key": "k", "text": "t"}).decision == Decision.ALLOW
+    # 豁免是**收窄**白名单：名单外的非 pure 工具照旧要批
+    assert policy("shell.run", {"command": "x"}).decision == Decision.ASK
+
+
+def test_与其它规则合成时仍然取最严() -> None:
+    engine = PolicyEngine()
+    engine.add(ask_when_tool_not_pure(_is_pure))
+    engine.add(deny_when_path_in_protected(("C:/Windows",)))
+    # 非 pure + 落到受保护路径 → DENY（DENY 比 ASK 严）
+    assert engine.evaluate("fs.delete", {"path": "C:/Windows/x"}).decision == Decision.DENY
+    # 非 pure 但不碰受保护路径 → ASK
+    assert engine.evaluate("fs.delete", {"path": "D:/tmp/x"}).decision == Decision.ASK

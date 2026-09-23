@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from warden_agent.core.settings import env_positive_int
+from warden_agent.execution.child_env import env_without_warden
 from warden_agent.tool.catalog import ToolSpec, function_tool
 
 logger = logging.getLogger("warden.mcp")
@@ -130,7 +131,14 @@ class McpClient:
         proc: subprocess.CompletedProcess[str] | None = None
         for attempt in range(1, attempts + 1):
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout,
+                    # MCP server 是**操作者装配的外部组件**：它可能真需要自己的
+                    # 厂商密钥（如它自己的 OPENAI_API_KEY），所以不能一刀切白名单；
+                    # 但 `WARDEN_*` 是本服务端自己的密钥/配置，它没有任何正当理由
+                    # 需要 —— 一律摘掉（见 execution/child_env.py）。
+                    env=env_without_warden(),
+                )
                 break
             except subprocess.TimeoutExpired:
                 if attempt < attempts:

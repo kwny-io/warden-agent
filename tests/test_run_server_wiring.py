@@ -145,9 +145,50 @@ def test_演示策略把删除列为需要审批() -> None:
     """`fs.delete` 必须落在 ASK 上——它是演示"人工闸门真的会拦"的那个高危工具。"""
     from warden_agent.policy.policy import Decision
 
-    policy = _build_policy()
+    policy = _build_policy(_build_catalog())
     assert policy.evaluate("fs.delete", {"path": "x"}).decision == Decision.ASK
     assert policy.evaluate("weather.get", {"city": "上海"}).decision == Decision.ALLOW
+
+
+def test_演示策略默认拦所有非pure工具() -> None:
+    """产品路径的门禁口径：**没声明 pure=True 的一律 ASK**，不靠工具名黑名单。
+
+    改前是 `ask_when_tool_in({"fs.delete"})`，于是 `shell.run`（能在沙箱里跑任意
+    命令）、`git.apply_patch`（写仓库）、MCP 导入的工具全部直接放行；唯一被拦住的
+    `fs.delete` 反而是没有真实副作用的演示空壳。
+    """
+    from warden_agent.policy.policy import Decision
+
+    policy = _build_policy(_build_catalog())
+    for name in ("shell.run", "git.apply_patch", "fs.delete", "mcp.anything"):
+        assert policy.evaluate(name, {}).decision == Decision.ASK, name
+    # 未注册的名字也要 ASK（fail-closed），不能因为"目录里没有"就放行
+    assert policy.evaluate("完全不存在的工具", {}).decision == Decision.ASK
+
+
+def test_演示策略覆盖后注册进目录的工具() -> None:
+    """关键的一条：策略闭包读的是**实时目录**。
+
+    `build_app` 会继续往同一个 catalog 里 augment（memory/web/skill/mcp/git），
+    所以策略必须在**注册之后**也能拦得住 —— 否则"启动时没有的工具"就成了绕过口。
+    """
+    from warden_agent.policy.policy import Decision
+    from warden_agent.tool.catalog import function_tool
+
+    catalog = _build_catalog()
+    policy = _build_policy(catalog)          # 先建策略
+
+    @function_tool(
+        "late.registered",
+        "启动后才注册的破坏性工具",
+        {"type": "object", "properties": {}},
+        pure=False,
+    )
+    def late() -> str:
+        return "done"
+
+    catalog.register(late)                    # 后注册
+    assert policy.evaluate("late.registered", {}).decision == Decision.ASK
 
 # ---------- 存储选择（多副本的前提：能真的选到 PostgreSQL）----------
 
