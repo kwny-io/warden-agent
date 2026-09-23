@@ -9,17 +9,14 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      // 所有后端 API 和 SSE 都代理过去
-      "/chat": "http://127.0.0.1:8000",
-      "/events": "http://127.0.0.1:8000",
-      "/status": "http://127.0.0.1:8000",
-      "/approvals": "http://127.0.0.1:8000",
-      "/approve": "http://127.0.0.1:8000",
-      "/reject": "http://127.0.0.1:8000",
-      "/capabilities": "http://127.0.0.1:8000",
-      "/memory": "http://127.0.0.1:8000",
-      "/audit": "http://127.0.0.1:8000",
-      "/health": "http://127.0.0.1:8000",
+      // 所有后端 API 与 SSE 都代理到后端（开发时前后端分离热更新）。
+      // 用**一条正则**而不是逐个前缀枚举：漏一个前缀 = 该接口在 dev 下被 Vite 的
+      // SPA fallback 接走、返回 index.html，前端 `res.json()` 解析失败。
+      // 这个坑真实发生过：/runs /users /models /messages 当初就漏在了枚举之外，
+      // 导致 dev 模式下对话列表、历史恢复、用户列表、模型面板全部不可用
+      // （生产同源所以没暴露）。加前缀时请一并补进这条正则。
+      "^(/chat|/events|/status|/approvals|/approve|/reject|/capabilities|/memory|/audit|/health|/runs|/users|/models|/messages|/alerts)":
+        "http://127.0.0.1:8000",
     },
   },
 });

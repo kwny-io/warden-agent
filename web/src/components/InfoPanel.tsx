@@ -1,6 +1,6 @@
 // InfoPanel：侧边栏的信息面板——run 状态、能力(capabilities)、记忆(memory)、健康检查。
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { api } from "../lib/api";
 import type { Capabilities, HealthResult, MemoryItem } from "../lib/types";
 import { usePolling } from "../lib/usePolling";
@@ -141,7 +141,7 @@ export default function InfoPanel({ runId }: { runId: string }) {
   );
 }
 
-function Chip({ children }: { children: React.ReactNode }) {
+function Chip({ children }: { children: ReactNode }) {
   return (
     <span className="px-2 py-0.5 rounded-full bg-warden-accent/15 text-warden-accent text-[11px]">
       {children}
