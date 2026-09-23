@@ -193,3 +193,45 @@ def test_分派器_并行真并行() -> None:
     assert set(res.outputs) == {"a", "b", "c"}
     # 3 个 0.4s 的任务若串行约 1.2s,真并行应明显 < 1.0s
     assert elapsed < 1.0, f"应当真并行(实际 {elapsed:.2f}s)"
+
+
+def test_分派器_并行超时_按时返回并报未完成() -> None:
+    """超时必须真正生效：在 timeout 附近返回，未完成任务如实报告而不静默丢弃。"""
+    import time
+
+    from warden_agent.multiagent.dispatch import DispatchedTask, Dispatcher
+
+    class _Slow:
+        def __init__(self, delay: float):
+            self.delay = delay
+        def chat(self, request):
+            time.sleep(self.delay)
+            return ChatResponse(content="慢慢来", finish_reason="stop")
+
+    d = Dispatcher(timeout=0.3)
+    t0 = time.time()
+    res = d.run_parallel([
+        DispatchedTask("a", AgentLoop(model=_Slow(2.0), catalog=ToolCatalog()), "t"),
+        DispatchedTask("b", AgentLoop(model=_Slow(2.0), catalog=ToolCatalog()), "t"),
+    ])
+    elapsed = time.time() - t0
+    assert elapsed < 0.9, f"超时应按时返回，实际 {elapsed:.2f}s"
+    assert set(res.unfinished) == {"a", "b"}
+    assert "未完成" in res.outputs["a"]
+
+
+def test_分派器_单个失败不中止整批() -> None:
+    """一个子任务抛异常，其余仍正常产出；失败被单独记录在 errors。"""
+    from warden_agent.multiagent.dispatch import DispatchedTask, Dispatcher
+
+    d = Dispatcher()
+    res = d.run_parallel([
+        DispatchedTask("ok", _single_reply_agent("成功"), "t"),
+        DispatchedTask("bad", _boom_agent(), "t"),
+        DispatchedTask("ok2", _single_reply_agent("也成功"), "t"),
+    ])
+    assert res.outputs["ok"] == "成功"
+    assert res.outputs["ok2"] == "也成功"
+    assert "bad" in res.errors
+    assert "失败" in res.outputs["bad"]
+    assert res.unfinished == []

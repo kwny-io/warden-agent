@@ -58,9 +58,9 @@ class RunLockStore(Protocol):
 class RunLock(Protocol):
     """Run 级锁的统一接口。`owner` 标识"谁持有"，用来防误释放。"""
 
-    def acquire(self, run_id: str, owner: str, ttl_seconds: int | None = None) -> bool: ...
+    def acquire(self, run_id: str, owner: str, ttl_seconds: float | None = None) -> bool: ...
 
-    def renew(self, run_id: str, owner: str, ttl_seconds: int | None = None) -> bool: ...
+    def renew(self, run_id: str, owner: str, ttl_seconds: float | None = None) -> bool: ...
 
     def release(self, run_id: str, owner: str) -> None: ...
 
@@ -94,14 +94,14 @@ class InProcessRunLock:
     """
 
     def __init__(
-        self, ttl_seconds: int = DEFAULT_TTL_SECONDS, clock: Callable[[], float] | None = None
+        self, ttl_seconds: float = DEFAULT_TTL_SECONDS, clock: Callable[[], float] | None = None
     ) -> None:
         self.ttl_seconds = ttl_seconds
         self._clock = clock or time.time
         self._locks: dict[str, _Held] = {}
         self._mutex = threading.Lock()
 
-    def acquire(self, run_id: str, owner: str, ttl_seconds: int | None = None) -> bool:
+    def acquire(self, run_id: str, owner: str, ttl_seconds: float | None = None) -> bool:
         ttl = ttl_seconds or self.ttl_seconds
         now = self._clock()
         with self._mutex:
@@ -111,7 +111,7 @@ class InProcessRunLock:
             self._locks[run_id] = _Held(owner=owner, expires_at=now + ttl)
             return True
 
-    def renew(self, run_id: str, owner: str, ttl_seconds: int | None = None) -> bool:
+    def renew(self, run_id: str, owner: str, ttl_seconds: float | None = None) -> bool:
         ttl = ttl_seconds or self.ttl_seconds
         now = self._clock()
         with self._mutex:
@@ -145,19 +145,19 @@ class SqlRunLock:
     def __init__(
         self,
         store: RunLockStore,
-        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._store = store
         self.ttl_seconds = ttl_seconds
         self._clock = clock or time.time
 
-    def acquire(self, run_id: str, owner: str, ttl_seconds: int | None = None) -> bool:
+    def acquire(self, run_id: str, owner: str, ttl_seconds: float | None = None) -> bool:
         ttl = ttl_seconds or self.ttl_seconds
         now = self._clock()
         return self._store.acquire_run_lock(run_id, owner, now + ttl, now)
 
-    def renew(self, run_id: str, owner: str, ttl_seconds: int | None = None) -> bool:
+    def renew(self, run_id: str, owner: str, ttl_seconds: float | None = None) -> bool:
         ttl = ttl_seconds or self.ttl_seconds
         now = self._clock()
         return self._store.renew_run_lock(run_id, owner, now + ttl, now)
@@ -190,7 +190,7 @@ class RunLease:
         lock: RunLock,
         run_id: str,
         owner: str,
-        ttl_seconds: int | None = None,
+        ttl_seconds: float | None = None,
         *,
         interval_seconds: float | None = None,
         on_lost: Callable[[], None] | None = None,
@@ -198,9 +198,11 @@ class RunLease:
         self._lock = lock
         self.run_id = run_id
         self.owner = owner
-        # 显式取 int：getattr 的返回是 Any，直接参与算术会让类型检查失效
-        fallback_ttl = int(getattr(lock, "ttl_seconds", DEFAULT_TTL_SECONDS))
-        self._ttl: int = int(ttl_seconds) if ttl_seconds else fallback_ttl
+        # 显式取 float：getattr 的返回是 Any，直接参与算术会让类型检查失效。
+        # 用 float 而不是 int：亚秒级 TTL（测试里的 0.6s）被 int() 截断会变成 0，
+        # 于是静默退回 fallback——既不是调用方给的值，也让 TTL/3 的心跳间隔失真。
+        fallback_ttl = float(getattr(lock, "ttl_seconds", DEFAULT_TTL_SECONDS))
+        self._ttl: float = float(ttl_seconds) if ttl_seconds else fallback_ttl
         # 默认按 TTL 的 1/3 续租：留出两次重试余量，避免"刚好卡在过期边上"
         self._interval: float = interval_seconds or max(0.1, self._ttl / 3.0)
         self._on_lost = on_lost

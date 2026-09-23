@@ -18,8 +18,8 @@
 """
 from __future__ import annotations
 
+import logging
 import time
-from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from warden_agent.loop.loop import AgentLoop
@@ -27,6 +27,8 @@ from warden_agent.memory import MemoryScope
 from warden_agent.model.model import AgentChatModel
 from warden_agent.policy.policy import PolicyEngine
 from warden_agent.tool.catalog import ToolCatalog, ToolSpec, function_tool
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from warden_agent.memory import MemoryService
@@ -144,8 +146,13 @@ def share_memory(
         a._memory_scope = scope  # 直接借用 loop 内部的作用域字段，保持共享一致
         tools = make_memory_tools(service, scope)
         for t in tools:
-            with suppress(Exception):  # 已注册同名工具则跳过
+            try:
                 a.catalog.register(t)
+            except Exception as e:  # noqa: BLE001 - 工具注册失败不应拖垮共享记忆装配
+                # 不静默：注册失败要能从日志看出是哪个 Agent、哪张卡、为什么。
+                logger.warning(
+                    "共享记忆工具 %r 注册进 Agent 目录失败: %s", t.name, e,
+                )
 
 
 def build_supervisor(

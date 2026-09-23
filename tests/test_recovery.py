@@ -101,6 +101,17 @@ def test_failed_below_max_attempts_retries() -> None:
     assert [c.run_id for c in plan.to_retry] == ["g"]
 
 
+def test_non_retryable_failure_goes_terminal() -> None:
+    """确定性失败（retryable=False，如策略拒绝）直接判终态，不浪费重试额度。"""
+    inmem = InMemoryCheckpointStore()
+    cp = Checkpoint("deny", RunStatus.FAILED, 1, "failed", attempts=1, retryable=False)
+    _seed(inmem, [cp])
+    plan = RecoveryController(inmem, max_attempts_per_run=3).plan()
+    assert plan.action_for("deny") == "skip_failed"
+    assert [c.run_id for c in plan.to_retry] == []
+    assert [c.run_id for c in plan.terminal] == ["deny"]
+
+
 def test_can_resume_only_when_resume() -> None:
     inmem = InMemoryCheckpointStore()
     cps = [Checkpoint("ok", RunStatus.RUNNING, 1, "init"),

@@ -76,6 +76,11 @@ class RecoveryController:
                 continue
 
             if status == RunStatus.FAILED:
+                # 确定性失败（如策略拒绝）：重试也是同样结果，直接判终态，不消耗重试额度
+                if not cp.retryable:
+                    plan.decisions[cp.run_id] = "skip_failed"
+                    plan.terminal.append(cp)
+                    continue
                 # 失败了：按策略决定重试 or 判终态
                 if self.retry_failed and attempts < self.max_attempts_per_run:
                     plan.decisions[cp.run_id] = "retry"

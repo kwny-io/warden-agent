@@ -43,6 +43,10 @@ class DispatchResult:
     outputs: dict[str, str] = field(default_factory=dict)
     # 串行时记录执行顺序（便于断言/审计）
     order: list[str] = field(default_factory=list)
+    # 每个子任务失败的具体原因（键=任务名）。一个子任务失败不会中止整批。
+    errors: dict[str, str] = field(default_factory=dict)
+    # 并行时超时仍未完成的任务名（已取消 / 已反映为未完成产出）。
+    unfinished: list[str] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
@@ -62,22 +66,47 @@ class Dispatcher:
         """线程池并发执行一组独立子任务，全部完成后汇总每份产出。
 
         - 用 `ThreadPoolExecutor`（并发线程真并行，不是伪并行的 for 循环）。
-        - 每个子 Agent 跑完返回它的 `reply.text`；结构化与否由调用方决定
-          （分派器这里统一拿结论文本，是否包交接单由外面 wrap 层决定——此处直接取文本）。
-        - 等待全部完成（`wait(...)` + 设超时，防止某个子 Agent 卡死拖垮整体）。
+        - 用 `concurrent.futures.wait(..., timeout=...)` 做**真正生效**的超时；
+          超时后取消未开始的 future，并把"未完成"如实记入 `unfinished`/`errors`。
+        - 逐个 future 单独收集结果/异常：**一个子任务失败不中止整批**。
+        - 退出时 `shutdown(wait=False, cancel_futures=True)`，不等待被超时卡住的线程，
+          否则超时设置形同虚设（with 块会在退出时 wait 住）。
         """
         result = DispatchResult()
+        if not tasks:
+            return result
 
         def _run(t: DispatchedTask) -> tuple[str, str]:
             return t.name, t.agent.run(t.topic).text
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-            futures = {ex.submit(_run, t): t.name for t in tasks}
-            done, _not_done = wait(futures, timeout=self.timeout)
-            for fut in done:
-                name, text = fut.result()
-                result.outputs[name] = text
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        futures = {executor.submit(_run, t): t.name for t in tasks}
+        try:
+            done, not_done = wait(futures, timeout=self.timeout)
+            # 按提交顺序汇总，保证 order 确定性
+            for future, name in futures.items():
+                if future in not_done:
+                    continue
+                try:
+                    _name, text = future.result()
+                    result.outputs[name] = text
+                except Exception as e:  # noqa: BLE001 - 单个子任务异常不能中止整批
+                    detail = f"{type(e).__name__}: {e}"
+                    result.errors[name] = detail
+                    result.outputs[name] = f"[失败] {detail}"
                 result.order.append(name)
+            # 超时未完成的：取消 + 如实报告（不静默丢弃）
+            for future, name in futures.items():
+                if future not in not_done:
+                    continue
+                future.cancel()
+                detail = f"超过超时 {self.timeout}s 仍未完成"
+                result.unfinished.append(name)
+                result.errors[name] = detail
+                result.outputs[name] = f"[未完成] {detail}"
+                result.order.append(name)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         return result
 
     # ---- 串行：按依赖链，前一步产出喂给后一步 ----

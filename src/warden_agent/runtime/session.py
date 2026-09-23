@@ -227,20 +227,15 @@ class AgentSession:
     def _persist_run(self) -> None:
         self.store.save_run(self.run)
 
-    def _checkpoint(self, step: str, iteration: int) -> None:
+    def _checkpoint(self, step: str, iteration: int, *, retryable: bool = True) -> None:
         """记一个存档点（run_id + 此刻状态 + 迭代编号 + 进行到哪一步）。
 
         存档写失败不能拖垮会话——降级为告警，与审计的"尽力而为"策略一致。
         """
         try:
-            self._checkpoints.capture(self.run, iteration, step)
+            self._checkpoints.capture(self.run, iteration, step, retryable=retryable)
         except Exception:  # noqa: BLE001 - 存档是辅助能力，不能成为主路径单点
             logger.warning("存档点写入失败 run=%s step=%s", self.run_id, step)
-
-    def _persist_all_messages(self) -> None:
-        # 简化：会话持有的消息作为整体重写（教学版）；生产可用增量 append
-        for m in self.messages:
-            self.store.append_message(self.run_id, m)
 
     # ---------- 对外主入口 ----------
     def start(self, user_text: str) -> SessionOutcome:
@@ -276,6 +271,12 @@ class AgentSession:
           - 其余（PENDING / QUEUED / RUNNING / …）→ 继续跑。
         """
         if self.run.status == RunStatus.FAILED:
+            # 确定性失败（如策略拒绝）标了 retryable=False：重试也是同样结果，拦住。
+            latest = self._checkpoints.latest
+            if latest is not None and not latest.retryable:
+                raise RunNotResumable(
+                    f"Run {self.run_id!r} 是确定性失败（如策略拒绝），重试不会改变结果"
+                )
             # 重试：清掉上次残留的审批状态，回到 PENDING 重新驱动。
             # attempts +1 并随存档点写回——重试上限就是靠它判断的。
             self._checkpoints.attempts += 1
@@ -338,7 +339,6 @@ class AgentSession:
         if not self._gated or not self._approval:
             raise RuntimeError("当前没有等待审批的请求")
         call = self._gated
-        self._clear_approval()
         self.run.resume()  # WAITING_APPROVAL -> RUNNING
         self._persist_run()
         return self._execute_and_continue(call)
@@ -368,7 +368,7 @@ class AgentSession:
         """类型化推进：循环跑完，最终内容校验还原成 reply_type 对象返回。"""
         return self._run_loop(self._finalize_typed)
 
-    def _mark_failed(self) -> None:
+    def _mark_failed(self, *, retryable: bool = True) -> None:
         """把"驱动失败"落到 Run 状态上（非终态才置 FAILED）。
 
         为什么必须有这一步：驱动过程抛异常（模型报错 / 迭代超上限 / 策略拒绝）时，
@@ -376,18 +376,29 @@ class AgentSession:
         **可续跑**（`recovery.plan()` 只对 `FAILED` 走"重试 + attempts 上限"分支），
         于是 `attempts` 永不递增、重试上限形同虚设——一个坏 Run 会被**无限重试**，
         每一轮恢复都白跑一次。把状态置为 `FAILED` 后，"重试计数 + 上限"才真正生效。
+
+        `retryable=False` 用于确定性失败（如策略拒绝）：重试不会改变结果，
+        随 FAILED 存档点写回，恢复计划据此直接判终态。
         """
         if self.run.status in (RunStatus.COMPLETED, RunStatus.FAILED,
                                RunStatus.CANCELLED, RunStatus.TIMED_OUT):
             return  # 已终态（例如收尾 on_content 抛错时已 COMPLETED）——不改写
         self.run.fail()
         self._persist_run()
+        # 落一个 FAILED 存档点：恢复计划据 status + retryable 决定"重试 or 终态"。
+        # 没有它，存档点会停在崩溃前的 RUNNING，把 FAILED 的 run 误归入"可续跑"。
+        last_iter = self._checkpoints.latest.iteration if self._checkpoints.latest else 0
+        self._checkpoint("failed", last_iter, retryable=retryable)
 
     @contextmanager
     def _fail_run_on_error(self) -> Iterator[None]:
         """驱动期异常 → 先标记 FAILED 再原样抛出（见 `_mark_failed` 的说明）。"""
         try:
             yield
+        except PolicyDenied:
+            # 确定性策略拒绝：重试也是同样结果，标为不可重试
+            self._mark_failed(retryable=False)
+            raise
         except Exception:
             self._mark_failed()
             raise
@@ -518,9 +529,13 @@ class AgentSession:
                 if response.content is not None:
                     self.messages.append(Message(role="assistant", content=response.content))
                     self.store.append_message(self.run_id, self.messages[-1])
+                    # 先交付（类型化路径会做 schema 校验），成功后才置 COMPLETED：
+                    # 若先置 COMPLETED 再校验，校验失败时 run 已是终态、`_mark_failed` 会
+                    # no-op，留下"标记为完成、却没有交付结果"的坏状态。
+                    reply = on_content(response.content)
                     self._mark_completed(response.content)
                     self._checkpoint("done", iteration)
-                    return on_content(response.content)
+                    return reply
 
             raise RuntimeError("AgentLoop 迭代超过上限，任务未收敛（可能模型一直在调用工具）")
 
@@ -560,6 +575,10 @@ class AgentSession:
             # owner_scope：让 memory.remember 这类共享工具知道"当前是谁在用"
             with owner_scope(self.run.user_id):
                 yield from self._stream_impl(user_text)
+        except PolicyDenied:
+            # 流式路径的确定性策略拒绝同样不可重试
+            self._mark_failed(retryable=False)
+            raise
         except Exception:
             # 与 `_run_loop` 同理：流式路径抛错也必须把 Run 置为 FAILED，
             # 否则它会停在 RUNNING、被恢复计划当成"可续跑"而无限重试。
@@ -676,12 +695,9 @@ class AgentSession:
             arguments=call.arguments,
             reason=reason or "需要人工批准",
         )
-        self.run.wait_for_approval()  # RUNNING -> WAITING_APPROVAL
-        self._persist_run()
-        # 存档点状态 = WAITING_APPROVAL：跨 Run 恢复据此把它归入 awaiting_human
-        # （不能自动续跑，必须等人拍板）
-        self._checkpoint("awaiting_approval", iteration)
-        # 把待审批的一步也存下来，重启后能继续等批准
+        # 先落"待审批单"，再改状态：若反过来（先置 WAITING_APPROVAL 再存审批单），
+        # 两次写入之间崩溃会留下"在等待审批、却没有审批单"的 run——既批不了，
+        # resume() 也会因 WAITING_APPROVAL 直接抛 RunNotResumable，永久卡死。
         self.store.save_pending_approval(
             self.run_id,
             self._approval.approval_id,
@@ -689,12 +705,23 @@ class AgentSession:
             self._approval.arguments,
             self._approval.reason,
         )
+        self.run.wait_for_approval()  # RUNNING -> WAITING_APPROVAL
+        self._persist_run()
+        # 存档点状态 = WAITING_APPROVAL：跨 Run 恢复据此把它归入 awaiting_human
+        # （不能自动续跑，必须等人拍板）
+        self._checkpoint("awaiting_approval", iteration)
         logger.info("工具 %s 需要人工批准，会话进入 WAITING_APPROVAL", call.name)
         return NeedsApproval(self._approval)
 
     def _execute_and_continue(self, call: ToolCall) -> SessionOutcome:
-        """审批通过后：执行被拦截的工具，继续循环。"""
+        """审批通过后：执行被拦截的工具，**结果落库后**再清审批单，最后继续循环。
+
+        顺序不能反过来：若先清审批单再执行，一旦在执行与结果落库之间崩溃，
+        这次"已批准的动作"就永久丢失了——重启后既没有审批单可重放，也没有工具结果
+        证明它执行过。先执行并落库，最坏情况只是重启后审批单还在（可再批准一次）。
+        """
         self._execute(call)
+        self._clear_approval()
         return self._advance()
 
     def _execute(self, call: ToolCall) -> None:

@@ -72,7 +72,7 @@ class RecoveryWorker:
         max_attempts_per_run: int | None = None,
         lock: RunLock | None = None,
         owner: str | None = None,
-        lock_ttl_seconds: int | None = None,
+        lock_ttl_seconds: float | None = None,
     ) -> None:
         self.controller = controller
         self.session_factory = session_factory
@@ -143,7 +143,20 @@ class RecoveryWorker:
                 return WorkerAction(
                     cp.run_id, "held_by_other", f"已被 {holder} 驱动中，本轮跳过"
                 )
-            return self._drive_locked(cp, kind)
+            action = self._drive_locked(cp, kind)
+            if lease.lost:
+                # 驱动期间续租失败 = 我们已经不再独占这个 run（租约可能已被别的副本接管）。
+                # 此时绝不能把结果报成成功——否则两边都以为自己驱动了同一个 run，
+                # 而写入可能已经互相覆盖。如实记为 aborted，等下一轮重新规划。
+                logger.warning(
+                    "run=%s 驱动期间租约丢失，结果不作数（可能已被其他副本接管）",
+                    cp.run_id,
+                )
+                return WorkerAction(
+                    cp.run_id, "aborted",
+                    f"驱动期间丢失租约，结果不作数：{action.action}",
+                )
+            return action
 
     def _drive_locked(self, cp: Checkpoint, kind: str) -> WorkerAction:
         try:

@@ -1,5 +1,7 @@
 """Tool 管线测试。"""
-from warden_agent.tool.catalog import ToolCatalog, function_tool
+import pytest
+
+from warden_agent.tool.catalog import ToolArgumentError, ToolCatalog, function_tool
 
 
 def test_函数工具_被注册和调用() -> None:
@@ -45,3 +47,61 @@ def test_工具转openai格式() -> None:
     schema = add.to_openai_schema()
     assert schema["function"]["name"] == "math.add"
     assert schema["function"]["parameters"]["properties"]["a"]["type"] == "number"
+
+
+# ---- dispatch 前的 args schema 校验 ----
+
+@function_tool(
+    "math.add",
+    "加法",
+    {
+        "type": "object",
+        "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+        "required": ["a", "b"],
+    },
+)
+def _add(a: float, b: float) -> float:
+    return a + b
+
+
+def test_参数校验_缺必填拒绝() -> None:
+    catalog = ToolCatalog()
+    catalog.register(_add)
+    with pytest.raises(ToolArgumentError, match="缺少必填参数"):
+        catalog.execute("math.add", {"a": 1})
+
+
+def test_参数校验_类型不符拒绝() -> None:
+    catalog = ToolCatalog()
+    catalog.register(_add)
+    with pytest.raises(ToolArgumentError, match="类型应为"):
+        catalog.execute("math.add", {"a": "不是数字", "b": 2})
+
+
+def test_参数校验_bool不当数字() -> None:
+    catalog = ToolCatalog()
+    catalog.register(_add)
+    with pytest.raises(ToolArgumentError):
+        catalog.execute("math.add", {"a": True, "b": 2})
+
+
+def test_参数校验_合法通过() -> None:
+    catalog = ToolCatalog()
+    catalog.register(_add)
+    assert catalog.execute("math.add", {"a": 1, "b": 2}) == 3
+
+
+def test_参数校验_多余参数拒绝() -> None:
+    @function_tool(
+        "strict.tool",
+        "不许额外参数",
+        {"type": "object", "properties": {"x": {"type": "string"}},
+         "required": ["x"], "additionalProperties": False},
+    )
+    def strict(x: str) -> str:
+        return x
+
+    catalog = ToolCatalog()
+    catalog.register(strict)
+    with pytest.raises(ToolArgumentError, match="未声明的参数"):
+        catalog.execute("strict.tool", {"x": "a", "y": "b"})

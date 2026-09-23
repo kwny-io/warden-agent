@@ -162,7 +162,7 @@ def test_worker用租约驱动长任务时不会被抢() -> None:
     cp = Checkpoint(run_id="run-1", status=RunStatus.RUNNING, iteration=1, step="model_call")
     worker = RecoveryWorker(
         _Controller([cp]), _SlowSession, lock=replica_a, owner="replica-A",
-        lock_ttl_seconds=int(SHORT_TTL),       # 心跳间隔 = TTL/3 = 0.2s
+        lock_ttl_seconds=SHORT_TTL,            # 显式传 float；心跳间隔 = TTL/3 = 0.2s
     )
     # 在 worker 驱动期间（0.9s）去抢同一个 run：应当抢不到
 

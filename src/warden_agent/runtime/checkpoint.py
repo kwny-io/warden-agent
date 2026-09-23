@@ -45,6 +45,9 @@ class Checkpoint:
     step: str          # 进行到哪一步：init / model_call / tool_exec / awaiting_approval / done
     usage_tokens: int = 0
     attempts: int = 1  # 该 run 累计尝试圈数（失败重试会用；协调恢复靠它决定还重不重）
+    # 该次失败是否值得重试：确定性失败（如策略拒绝）置 False，恢复计划据此直接判终态，
+    # 不再消耗 attempts 上限。老数据无此字段时按 True 兜底（与历史行为一致）。
+    retryable: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +57,7 @@ class Checkpoint:
             "step": self.step,
             "usage_tokens": self.usage_tokens,
             "attempts": self.attempts,
+            "retryable": self.retryable,
         }
 
     @classmethod
@@ -65,6 +69,7 @@ class Checkpoint:
             step=str(data.get("step", "init")),
             usage_tokens=int(data.get("usage_tokens", 0)),
             attempts=int(data.get("attempts", 1)),
+            retryable=bool(data.get("retryable", True)),
         )
 
 
@@ -82,17 +87,23 @@ class CheckpointManager:
         self.attempts = 1  # 本次尝试算第 1 次；恢复时会从已有存档点接续
 
     def adopt_attempts_from(self, run_id: str) -> int:
-        """从持久化的存档点接续 attempts（重启后不让计数归零）。"""
+        """从持久化的存档点接续 attempts（重启后不让计数归零）。
+
+        顺带把读到的存档点记为 `latest`：`resume()` 需要据它的 `retryable` 判断
+        "这次失败该不该重试"，光看 run 状态分不出确定性失败。
+        """
         if self._persistence is not None:
             cp = self._persistence.load(run_id)
             if cp is not None:
                 self.attempts = max(1, cp.attempts)
+                self._latest = cp
         return self.attempts
 
     def capture(self, run: AgentRun, iteration: int, step: str,
-                usage_tokens: int = 0) -> Checkpoint:
+                usage_tokens: int = 0, retryable: bool = True) -> Checkpoint:
         cp = Checkpoint(run_id=run.run_id, status=run.status, iteration=iteration,
-                        step=step, usage_tokens=usage_tokens, attempts=self.attempts)
+                        step=step, usage_tokens=usage_tokens, attempts=self.attempts,
+                        retryable=retryable)
         self._latest = cp
         if self._persistence is not None:
             self._persistence.save(cp)

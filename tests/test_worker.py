@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, Message, ToolCall
 from warden_agent.policy.policy import Decision, PolicyEngine, PolicyResult
 from warden_agent.runtime.checkpoint import Checkpoint, checkpoint_store_for
+from warden_agent.runtime.locking import InProcessRunLock
 from warden_agent.runtime.recovery import RecoveryController
 from warden_agent.runtime.session import (
     AgentSession,
@@ -268,6 +270,36 @@ def test_worker重试未超上限则执行() -> None:
     assert store.load_run("r-retry").status == RunStatus.COMPLETED
     reloaded = cp_store.load("r-retry")
     assert reloaded is not None and reloaded.attempts == 2
+
+
+def test_worker租约丢失时_不报成功而是aborted() -> None:
+    """
+    驱动期间续租失败 = 我们不再独占该 run（可能已被别的副本接管）。
+    此时绝不能把结果报成 resumed——否则两边都以为是自己驱动的。
+    """
+    class _RenewFailsLock(InProcessRunLock):
+        def renew(self, run_id: str, owner: str, ttl_seconds: int | None = None) -> bool:
+            return False
+
+    class _SlowSession:
+        def __init__(self, run_id: str) -> None:
+            self.run_id = run_id
+
+        def resume(self):  # noqa: ANN201
+            time.sleep(0.8)  # 比心跳间隔（ttl/3 ≈ 0.33s）长，触发一次续租失败
+            return FinalReply(text="done", messages=[])
+
+    store = _store()
+    _crash_a_run(store)
+    controller = RecoveryController(_cp(store))
+    worker = RecoveryWorker(
+        controller, _SlowSession,
+        lock=_RenewFailsLock(ttl_seconds=1),
+        lock_ttl_seconds=1,
+    )
+    actions = worker.run_once()
+    assert [a.action for a in actions] == ["aborted"]
+    assert "租约" in actions[0].detail
 
 
 def test_worker单个run失败不影响整轮() -> None:

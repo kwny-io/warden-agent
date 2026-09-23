@@ -5,7 +5,7 @@
 import pytest
 from tests.conftest import ScriptedModel, weather_tool
 
-from warden_agent.loop.loop import AgentLoop
+from warden_agent.loop.loop import AgentLoop, LoopTimeout
 from warden_agent.model.model import ChatResponse, ToolCall
 
 
@@ -238,3 +238,101 @@ def test_同一工具重复调用_被意图判断拦下() -> None:
     tool_msgs = [m for m in reply.messages
                  if m.role == "tool" and m.content == "上海: 晴, 25度"]
     assert len(tool_msgs) == 1
+
+
+# ---- 重试计数用稳定身份（工具名+归一化参数），而不是会变的 call.id ----
+
+def test_重试上限_按稳定身份计数_不同id也累计() -> None:
+    """真实 API 每次会重新生成 call.id：同一工具+同一参数反复失败，
+    即使 id 不同也必须累计到 max_tool_retries，不能永远不触发。"""
+    model = ScriptedModel([
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="id-1", name="never.works", arguments={"q": "x"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="id-2", name="never.works", arguments={"q": "x"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="id-3", name="never.works", arguments={"q": "x"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content="换招了。", finish_reason="stop"),
+    ])
+    reply = AgentLoop(
+        model=model, catalog=weather_tool(), max_tool_retries=2,
+    ).run("hi")
+    give_up = [m for m in reply.messages if m.role == "tool" and "放弃该工具" in m.content]
+    assert len(give_up) == 1  # 若按 id 计数则永远不会出现
+    assert "换招" in reply.text
+
+
+def test_不同参数_重试计数分开() -> None:
+    """同一工具但参数不同，算作不同尝试，各自独立计数（不会被误合并）。"""
+    model = ScriptedModel([
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="a", name="never.works", arguments={"q": "1"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="b", name="never.works", arguments={"q": "2"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content="ok", finish_reason="stop"),
+    ])
+    reply = AgentLoop(
+        model=model, catalog=weather_tool(), max_tool_retries=1,
+    ).run("hi")
+    # 两次都是第一次失败（各 count=1，未超上限），不应出现"放弃该工具"
+    give_up = [m for m in reply.messages if m.role == "tool" and "放弃该工具" in m.content]
+    assert give_up == []
+
+
+# ---- 墙钟超时：挂死的模型/工具不能无限期阻塞 ----
+
+def test_慢模型_墙钟超时_尽快抛出() -> None:
+    import time
+
+    class _HangModel:
+        def chat(self, request):  # noqa: ANN001, ANN201 - 测试替身
+            time.sleep(2.0)
+            return ChatResponse(content="到不了这里", finish_reason="stop")
+
+    loop = AgentLoop(model=_HangModel(), catalog=weather_tool(), timeout=0.1)
+    t0 = time.time()
+    with pytest.raises(LoopTimeout):
+        loop.run("hi")
+    elapsed = time.time() - t0
+    assert elapsed < 0.8, f"超时应尽快返回，实际 {elapsed:.2f}s"
+
+
+def test_慢工具_墙钟超时_尽快抛出() -> None:
+    import time
+
+    from warden_agent.tool.catalog import ToolCatalog, function_tool
+
+    @function_tool("slow.tool", "很慢的工具", {"type": "object", "properties": {}})
+    def slow() -> str:
+        time.sleep(2.0)
+        return "done"
+
+    catalog = ToolCatalog()
+    catalog.register(slow)
+    model = ScriptedModel([
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="c1", name="slow.tool", arguments={})],
+            finish_reason="tool_calls"),
+        ChatResponse(content="结束", finish_reason="stop"),
+    ])
+    loop = AgentLoop(model=model, catalog=catalog, timeout=0.1)
+    t0 = time.time()
+    with pytest.raises(LoopTimeout):
+        loop.run("hi")
+    assert time.time() - t0 < 0.8
+
+
+def test_外部取消钩子_尽快中止() -> None:
+    """注入的 should_cancel() 返回 True 时，run 立刻抛 LoopTimeout（取消信号向外传播）。"""
+    model = ScriptedModel([ChatResponse(content="不应到达", finish_reason="stop")])
+    loop = AgentLoop(
+        model=model, catalog=weather_tool(), should_cancel=lambda: True,
+    )
+    with pytest.raises(LoopTimeout, match="取消"):
+        loop.run("hi")
+    assert model.calls == 0

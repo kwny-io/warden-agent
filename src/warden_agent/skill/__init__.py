@@ -14,8 +14,12 @@ from warden_agent.skill.skill import (
     SkillContent,
     SkillMetadata,
     SkillPackageParser,
+    SkillRequirementError,
+    SkillTrustError,
     SkillTrustSnapshot,
+    is_trusted,
     load_skills_from_dir,
+    missing_requires,
 )
 from warden_agent.skill.tools import skill_activation_tool, skill_to_tool
 
@@ -25,8 +29,12 @@ __all__ = [
     "SkillContent",
     "SkillMetadata",
     "SkillPackageParser",
+    "SkillRequirementError",
+    "SkillTrustError",
     "SkillTrustSnapshot",
+    "is_trusted",
     "load_skills_from_dir",
+    "missing_requires",
     "skill_activation_tool",
     "skill_to_tool",
 ]

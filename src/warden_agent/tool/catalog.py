@@ -102,6 +102,66 @@ class ToolArgumentError(Exception):
     """工具参数校验失败（用 Pydantic 校验时抛出）。"""
 
 
+# JSON Schema 基础类型 → Python 类型（仅覆盖工具参数常用的几种）
+_JSON_TYPE_MAP: dict[str, type | tuple[type, ...]] = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _type_matches(expected: object, value: object) -> bool:
+    """校验一个值是否命中 JSON Schema 的 type（支持单类型或类型列表）。"""
+    if isinstance(expected, list):
+        return any(_type_matches(item, value) for item in expected)
+    py = _JSON_TYPE_MAP.get(str(expected))
+    if py is None:
+        return True  # 未知/未声明类型不做强校验（不阻塞）
+    # bool 是 int 的子类：integer/number 不应把 True/False 当数字放行。
+    if isinstance(value, bool) and str(expected) in ("integer", "number"):
+        return False
+    return isinstance(value, py)
+
+
+def _validate_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> None:
+    """按工具的 `parameters_schema` 校验参数，不合法抛 `ToolArgumentError`。
+
+    在 dispatch 前拦下"必填缺失 / 类型不符 / 多余参数(additionalProperties=false)"，
+    而不是让脏参数进到工具函数里才炸（错误信息也更清楚，便于喂回模型纠正）。
+    """
+    schema = spec.parameters_schema or {}
+    if not isinstance(schema, dict) or not schema:
+        return
+    properties = schema.get("properties") or {}
+    required = schema.get("required") or []
+    missing = [name for name in required if name not in arguments]
+    if missing:
+        raise ToolArgumentError(
+            f"工具 {spec.name!r} 缺少必填参数: {', '.join(missing)}"
+        )
+    if schema.get("additionalProperties") is False and isinstance(properties, dict):
+        extra = [name for name in arguments if name not in properties]
+        if extra:
+            raise ToolArgumentError(
+                f"工具 {spec.name!r} 收到未声明的参数: {', '.join(extra)}"
+            )
+    if not isinstance(properties, dict):
+        return
+    for key, value in arguments.items():
+        rule = properties.get(key)
+        if not isinstance(rule, dict):
+            continue
+        expected = rule.get("type")
+        if expected is not None and not _type_matches(expected, value):
+            raise ToolArgumentError(
+                f"工具 {spec.name!r} 参数 {key!r} 类型应为 {expected}，实际为 "
+                f"{type(value).__name__}"
+            )
+
+
 def pydantic_tool[M: BaseModel](
     name: str,
     description: str,
@@ -177,8 +237,13 @@ class ToolCatalog:
         return list(self._by_name.values())
 
     def execute(self, name: str, arguments: dict[str, Any]) -> Any:
-        """根据名字找到工具并执行。AI 不能拿着没注册的名字来调用。"""
+        """根据名字找到工具并执行。AI 不能拿着没注册的名字来调用。
+
+        执行前先按工具的 `parameters_schema` 校验参数（必填/类型），
+        不合法直接抛 `ToolArgumentError`，不把脏参数交给工具函数。
+        """
         spec = self.get(name)
+        _validate_arguments(spec, arguments)
         if isinstance(spec, FunctionToolSpec) and spec.function is not None:
             return spec.function(**arguments)
         raise TypeError(f"{spec.name!r} 不是可执行的函数工具")

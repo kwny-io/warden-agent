@@ -7,14 +7,27 @@
 
 from __future__ import annotations
 
-from warden_agent.skill.skill import FrozenSkillBinding, SkillCatalog
+from warden_agent.skill.skill import (
+    FrozenSkillBinding,
+    SkillCatalog,
+    SkillRequirementError,
+    missing_requires,
+)
 from warden_agent.tool.catalog import ToolSpec, function_tool
 
 
-def skill_to_tool(binding: FrozenSkillBinding) -> ToolSpec:
+def skill_to_tool(
+    binding: FrozenSkillBinding,
+    *,
+    available: set[str] | None = None,
+) -> ToolSpec:
     """把一份技能转成一张"skill.<alias>.run"的技能卡：调用 = 激活（返回注入指令）。
 
     入参：目标技能别名。返回：该技能的激活正文（可直接作为系统指令注入）。
+
+    `available`：可选的"当前可用工具/依赖名集合"。给了就在激活前校验技能的
+    `requires`，缺依赖则抛 `SkillRequirementError`（不满足前置条件不允许激活）。
+    不可信技能（非 trusted）会在 `binding.activate()` 处被拒绝。
     """
     md = binding.metadata()
 
@@ -27,6 +40,12 @@ def skill_to_tool(binding: FrozenSkillBinding) -> ToolSpec:
         pure=True,
     )
     def run(goal: str) -> str:
+        if available is not None:
+            missing = missing_requires(binding, available)
+            if missing:
+                raise SkillRequirementError(
+                    f"技能 {md.name!r} 缺少依赖: {', '.join(missing)}"
+                )
         return f"{binding.activate()}\n目标：{goal}"
 
     return run

@@ -18,11 +18,28 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
+logger = logging.getLogger(__name__)
+
 _SKILL_FRONT = re.compile(r"^---\s*$(.*?)^---\s*$", re.MULTILINE | re.DOTALL)
+
+
+class SkillTrustError(Exception):
+    """技能信任级别不足：非 trusted 的技能拒绝激活/注入其指令正文。"""
+
+
+class SkillRequirementError(Exception):
+    """技能声明的 `requires` 依赖未满足。"""
+
+
+def is_trusted(level: str) -> bool:
+    """只有显式 `trust: trusted` 才算可信；untrusted/unknown/空值一律不可信。"""
+    return level.strip().lower() == "trusted"
 
 
 @dataclass(frozen=True)
@@ -55,7 +72,19 @@ class SkillMetadata:
             version=str(fields.get("version", "")),
             author=str(fields.get("author", "")),
             trust=str(fields.get("trust", "untrusted")),
+            requires=_parse_requires(str(fields.get("requires", ""))),
         )
+
+
+def _parse_requires(value: str) -> tuple[str, ...]:
+    """解析 `requires`：支持 `[a, b]`（YAML 列表）与 `a, b`（逗号分隔）两种写法。"""
+    raw = value.strip()
+    if not raw:
+        return ()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    items = [part.strip().strip('"').strip("'") for part in raw.split(",")]
+    return tuple(item for item in items if item)
 
 
 @dataclass(frozen=True)
@@ -123,6 +152,14 @@ class FrozenSkillBinding(Protocol):
     def trust_snapshot(self) -> SkillTrustSnapshot: ...
 
 
+def missing_requires(
+    binding: FrozenSkillBinding, available: Iterable[str],
+) -> tuple[str, ...]:
+    """返回该技能 `requires` 里、在 `available`（如已注册工具名）中缺失的依赖。"""
+    have = set(available)
+    return tuple(r for r in binding.metadata().requires if r not in have)
+
+
 class _BoundSkill:
     """默认技能绑定实现。"""
 
@@ -138,8 +175,16 @@ class _BoundSkill:
         return self._content
 
     def activate(self) -> str:
-        """激活：把技能正文作为可注入的系统指令返回（渐进披露的核心）。"""
+        """激活：把技能正文作为可注入的系统指令返回（渐进披露的核心）。
+
+        【信任闸门】只有 `trust: trusted` 的技能才能被激活——激活 = 把外部来源的
+        正文当成指令注入上下文，这是提示注入的主要入口，因此不可信技能直接拒绝。
+        """
         md = self._content.metadata
+        if not is_trusted(md.trust):
+            raise SkillTrustError(
+                f"技能 {md.name!r} 的信任级别为 {md.trust!r}，非 trusted，拒绝激活其指令正文"
+            )
         head = f"[技能 {md.name}] {md.description}"
         return f"{head}\n\n{self._content.body}".strip()
 
@@ -167,8 +212,14 @@ class SkillCatalog:
 
         - 不传/空 version 的技能登记到该别名的"无版本"分支。
         - 同一 (别名, 版本) 再次登记会覆盖（幂等更新该版本）。
+        - 未声明信任级别（默认 untrusted）的技能**仍可登记**（供审计），但不能被激活。
         """
         version = content.metadata.version or ""
+        if not is_trusted(content.metadata.trust):
+            logger.info(
+                "登记不可信技能 %r (version=%r, trust=%r)：可审计但不可激活",
+                alias, version, content.metadata.trust,
+            )
         self._versions.setdefault(alias, {})[version] = _BoundSkill(alias, content, source)
 
     def find(self, alias: str, version: str | None = None) -> FrozenSkillBinding | None:
@@ -252,7 +303,9 @@ def load_skills_from_dir(catalog: SkillCatalog, directory: str) -> int:
             try:
                 with open(path, encoding="utf-8") as f:
                     content = parser.parse(f.read())
-            except OSError:
+            except OSError as e:
+                # 不静默：加载失败要能从日志看出来是哪个文件、为什么失败（不再只是 continue）。
+                logger.warning("技能加载失败，跳过 %s: %s", path, e)
                 continue
             # 版本目录约定且 frontmatter 没写版本时,用目录名补上
             if version_dir and not content.metadata.version:

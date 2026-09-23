@@ -18,6 +18,12 @@
 """
 from __future__ import annotations
 
+import functools
+import json
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,8 +35,26 @@ from warden_agent.loop.cognition import (
 )
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel, ChatRequest, Message
-from warden_agent.policy.policy import Decision, PolicyDenied, PolicyEngine
+from warden_agent.policy.policy import ApprovalRequired, Decision, PolicyDenied, PolicyEngine
 from warden_agent.tool.catalog import ToolCatalog
+
+
+def _tool_signature(name: str, arguments: dict[str, Any]) -> str:
+    """工具调用的**稳定身份**：工具名 + 归一化后的参数。
+
+    不能用 `ToolCall.id` 当身份：真实 API 每次都会重新生成 id，即使模型反复用
+    同一工具、同一参数重试，id 也各不相同——于是按 id 计数的 `max_tool_retries`
+    永远触发不了。按"工具名 + 排序后的参数"归一，才能稳定识别"同一次尝试"。
+    """
+    try:
+        norm = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        norm = str(sorted((str(k), str(v)) for k, v in arguments.items()))
+    return f"{name}:{norm}"
+
+
+class LoopTimeout(TimeoutError):
+    """AgentLoop 触发墙钟超时或被取消：挂起的模型/工具不再无限期阻塞。"""
 
 
 def exec_tool(catalog: ToolCatalog, stability: Any, name: str,
@@ -95,6 +119,8 @@ class AgentLoop:
         planner: Any = None,
         intent: Any = None,
         stability: Any = None,
+        timeout: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         self.model = model
         self.catalog = catalog
@@ -102,6 +128,10 @@ class AgentLoop:
         self.max_iterations = max_iterations  # 最多循环多少轮，防止死循环
         self.max_tool_retries = max_tool_retries  # 单个工具调用失败最多纠正几次
         self.max_context_chars = max_context_chars  # 上下文裁剪阈值(0=不裁剪,见 loop 深度④)
+        # 【墙钟预算】>0 时整个 run 受总时长约束：模型/工具调用超时即抛 LoopTimeout
+        self.timeout = timeout
+        # 【取消钩子】外部可注入 should_cancel() -> bool；返回 True 时尽快中止 run
+        self.should_cancel = should_cancel
         # 没给就建一个空的安全判定器（默认全部放行）
         self.policy = policy_engine or PolicyEngine()
         self.memory = memory  # 可选：记忆中枢(见 loop 深度②)
@@ -134,15 +164,23 @@ class AgentLoop:
 
         # 追踪"同一次多工具调用里，哪个工具已经失败重试了几次"，
         # 防止模型用同样错误的参数反复打转。
+        # 键用**稳定身份**（工具名+归一化参数），不能用会变的 call.id（见 _tool_signature）。
         tool_retries: dict[str, int] = {}
         # 【loop 深度⑤】记录"已执行过"的工具调用签名,检测模型原地打转(同一调用反复发)
         seen_calls: list[str] = []
+        # 【墙钟预算】整个 run 的截止时间（None=不限时）。
+        deadline = None if self.timeout is None else time.monotonic() + self.timeout
 
         # 2. 进入循环
         for _ in range(self.max_iterations):
+            self._check_cancel(deadline)
             # 【loop 深度④】上下文管理：超长时把早期历史压缩成摘要,只保留最近窗口
             managed = self._manage_context(messages)
-            response = self.model.chat(ChatRequest(messages=managed, tools=tools))
+            response = self._call_with_deadline(
+                functools.partial(
+                    self.model.chat, ChatRequest(messages=managed, tools=tools)),
+                deadline, what="模型调用",
+            )
 
             # 情况A：模型想调用工具
             if response.tool_calls:
@@ -154,13 +192,18 @@ class AgentLoop:
                         tool_call=call,
                     )
                     messages.append(assistant_note)
-                    # 【门禁】执行前先过审批策略；被 DENY 直接拒绝，绝不执行
+                    # 【门禁】执行前先过审批策略；DENY 直接拒绝，ASK 必须挂起等批准（绝不执行）
                     verdict = self.policy.evaluate(call.name, call.arguments)
                     if verdict.decision == Decision.DENY:
                         raise PolicyDenied(
                             f"策略拒绝执行 {call.name!r}: {verdict.reason}"
                         )
-                    # 教学版：ASK 直接执行（真实系统会挂起等用户点批准，这里简化）
+                    if verdict.decision == Decision.ASK:
+                        # 与会话侧（runtime/session.py 的 _hold_for_approval）语义一致：
+                        # ASK = 挂起等人工拍板，本同步 API 用异常把"挂起"冒泡给调用方。
+                        raise ApprovalRequired(
+                            call.name, call.arguments, verdict.reason,
+                        )
 
                     # 【loop 深度⑤】工具意图判断（调用前预防误调）：
                     # intent 路由器校验"这个请求真的需要调这个工具吗"。
@@ -175,10 +218,16 @@ class AgentLoop:
 
                     # 【loop 深度①】工具调用失败自恢复：
                     # 尝试执行；失败不崩溃，把错误喂回模型让它自己纠正。
-                    result, error = self._safe_execute(call.name, call.arguments)
+                    self._check_cancel(deadline)
+                    result, error = self._call_with_deadline(
+                        functools.partial(
+                            self._safe_execute, call.name, call.arguments),
+                        deadline, what=f"工具 {call.name}",
+                    )
                     if error is not None:
-                        count = tool_retries.get(call.id, 0) + 1
-                        tool_retries[call.id] = count
+                        retry_key = _tool_signature(call.name, call.arguments)
+                        count = tool_retries.get(retry_key, 0) + 1
+                        tool_retries[retry_key] = count
                         if count <= self.max_tool_retries:
                             # 没超上限：把错误喂回模型，让它看着错误自己改
                             messages.append(Message(
@@ -203,7 +252,7 @@ class AgentLoop:
                     # 失败的调用不记（那样会短路深度①的重试机制，见下）。
                     # 若同一"工具名+参数"已成功执行过、却在后续又原样重发，
                     # 说明模型在打转：喂回提示让它改变策略，而不是无限重发。
-                    call_sig = f"{call.name}({sorted(call.arguments.items())})"
+                    call_sig = _tool_signature(call.name, call.arguments)
                     if call_sig in seen_calls:
                         messages.append(Message(
                             role="tool",
@@ -227,6 +276,42 @@ class AgentLoop:
 
         # 3. 循环次数用尽还没结束 = 视为异常，防止死循环
         raise RuntimeError("AgentLoop 迭代超过上限，任务未收敛（可能模型一直在调用工具）")
+
+    def _check_cancel(self, deadline: float | None) -> None:
+        """检查外部取消钩子与墙钟截止时间，到点就抛 LoopTimeout。"""
+        if self.should_cancel is not None and self.should_cancel():
+            raise LoopTimeout("任务被外部取消")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise LoopTimeout(f"任务超过墙钟预算 {self.timeout}s")
+
+    def _call_with_deadline(
+        self, fn: Callable[[], Any], deadline: float | None, *, what: str,
+    ) -> Any:
+        """在墙钟预算内执行一次阻塞调用（模型/工具）。
+
+        不设 timeout 时直接同步执行（零开销，向后兼容）；设了则把调用放到工作线程，
+        用剩余时间做 `future.result(timeout=...)`：超时就取消并抛 LoopTimeout，
+        让一个挂死的模型/工具无法无限期拖住整个 run（取消信号即从这个异常向外传播）。
+        """
+        self._check_cancel(deadline)
+        if deadline is None:
+            return fn()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LoopTimeout(f"{what} 前已超过墙钟预算 {self.timeout}s")
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(fn)
+            try:
+                return future.result(timeout=remaining)
+            except FuturesTimeout:
+                future.cancel()
+                raise LoopTimeout(
+                    f"{what} 执行超过墙钟预算 {self.timeout}s"
+                ) from None
+        finally:
+            # 不等待：超时的被调线程可能仍挂着，wait=True 会把主循环再次阻塞住。
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _schema_of(self, name: str) -> dict[str, Any]:
         """取某工具说明书（供意图路由器识别触发信号）；未注册返回空 dict。"""
