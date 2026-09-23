@@ -5,6 +5,23 @@
 
 ---
 
+## 2026-09-23（第二十五批：前端类型门禁 + dev 代理修复）
+
+- **CI 补前端类型检查**：`.github/workflows/ci.yml` 的前端步骤在 `npm run build` 前加 `npm run typecheck`
+  （`tsc --noEmit`）。此前 `vite build` 只用 esbuild 转译、**不做类型检查**，TS 类型错误能让 CI 全绿——
+  类型门禁形同虚设。
+- **修 `web/src/components/InfoPanel.tsx` 的类型错误**：`Chip` 用了 `React.ReactNode` 却没导入 `React`
+  命名空间（`"jsx": "react-jsx"` 下引用 UMD 全局会报 TS2686），改为 `import { type ReactNode } from "react"`。
+  这正是上一条门禁此前掩盖的错误。
+- **修 dev 代理漏端点**：`web/vite.config.ts` 的 proxy 由逐个前缀枚举改成**一条正则**，并补上原先漏掉的
+  `/runs`、`/users`、`/models`、`/messages`、`/alerts`。此前这些请求在 dev 下落到 Vite 的 SPA fallback、
+  返回 `index.html`，导致对话列表、历史恢复、用户列表、模型面板**在 dev 模式全坏**（生产同源所以未暴露）。
+- 验证：`web` 下 `npm run typecheck` 与 `npm run build` 均通过。
+
+> 已知（未修）：前端仍无测试、无 ErrorBoundary、无 lint——已单独拆成任务卡另行安排。
+
+---
+
 ## 2026-09-23（第二十四批：全仓独立审计与企业级补强——7 类问题逐条修复 + 真环境验证）
 
 > 承接第二十批「独立审计」留下的问题清单，对全仓做了一次**系统性审计**（安全 / 存储 / Web /
