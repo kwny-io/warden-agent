@@ -205,6 +205,24 @@ def test_第三方变量不误报() -> None:
     assert unknown_warden_variables({"DEEPSEEK_API_KEY": "placeholder", "PATH": "/usr/bin"}) == []
 
 
+def test_k8s注入的服务变量不误报() -> None:
+    """k8s 为 Service 注入 `<SVC>_SERVICE_HOST` / `<SVC>_PORT_80_TCP*` 等——
+    带 WARDEN_ 前缀但不是用户拼错，不该在每个 pod 启动时刷告警。"""
+    injected = {
+        "WARDEN_AGENT_SERVICE_HOST": "10.96.0.1",
+        "WARDEN_AGENT_SERVICE_PORT": "80",
+        "WARDEN_AGENT_SERVICE_PORT_HTTP": "80",
+        "WARDEN_AGENT_PORT": "tcp://10.96.0.1:80",
+        "WARDEN_AGENT_PORT_80_TCP": "tcp://10.96.0.1:80",
+        "WARDEN_AGENT_PORT_80_TCP_ADDR": "10.96.0.1",
+        "WARDEN_AGENT_PORT_80_TCP_PORT": "80",
+        "WARDEN_AGENT_PORT_80_TCP_PROTO": "tcp",
+    }
+    assert unknown_warden_variables(injected) == []
+    # 真正的拼写错误照抓
+    assert unknown_warden_variables({"WARDEN_RATELIMIT": "10/60"}) == ["WARDEN_RATELIMIT"]
+
+
 # ---------- 类型化访问器（各模块读配置的统一入口）----------
 
 

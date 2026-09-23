@@ -531,6 +531,16 @@ def _is_int(value: str) -> bool:
     return value.isdigit()
 
 
+# k8s 会为同命名空间内的 Service 自动注入一组环境变量（`<SVC>_SERVICE_HOST`、
+# `<SVC>_SERVICE_PORT[_<name>]`、`<SVC>_PORT_<port>_TCP[_ADDR|_PORT|_PROTO]`、`<SVC>_PORT`）。
+# 它们跟着 `WARDEN_` 前缀混进来，但**不代表用户拼错**——不忽略的话，每个 pod 启动都会
+# 刷一串假告警，真正的拼写错误反而被淹没。
+_K8S_SERVICE_ENV_RE = re.compile(
+    r"_(SERVICE_HOST|SERVICE_PORT|SERVICE_PORT_[A-Z0-9_]+"
+    r"|PORT|PORT_[0-9]+_TCP(?:_ADDR|_PORT|_PROTO)?)$"
+)
+
+
 def unknown_warden_variables(env: Mapping[str, str]) -> list[str]:
     """找出"看起来是我们家的、但没登记"的变量名——**拼写错误检测**。
 
@@ -541,6 +551,9 @@ def unknown_warden_variables(env: Mapping[str, str]) -> list[str]:
     suspects: list[str] = []
     for name in env:
         if name in known or not name.startswith("WARDEN_"):
+            continue
+        # k8s 注入的服务发现变量不是拼写错误（见 _K8S_SERVICE_ENV_RE）
+        if _K8S_SERVICE_ENV_RE.search(name):
             continue
         # 未登记的 WARDEN_* 一律可疑（本项目的 WARDEN_ 前缀都被登记完了）
         suspects.append(name)
