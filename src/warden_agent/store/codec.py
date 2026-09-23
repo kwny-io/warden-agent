@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
 T = TypeVar("T")
@@ -88,3 +89,60 @@ class VersionedCodecRegistry:
 
 
 DEFAULT_CODEC_REGISTRY = VersionedCodecRegistry([JsonCodec()])
+
+# ---------------------------------------------------------------------------
+# 跨后端统一的版本化落盘格式
+# ---------------------------------------------------------------------------
+#
+# 为什么要有这几个自由函数（而不是各存储各写一遍）：
+#   同一个 payload（tool_call / 待审批 arguments / checkpoint）可能先写进 SQLite、
+#   后来系统切到 PostgreSQL（或反之）。只要两边的落盘格式必须逐字节一致，
+#   就必须共用同一段编码逻辑——否则一边带 `v{n}:` 版本前缀、一边裸 JSON，
+#   跨库读回时版本契约就丢了。
+#
+# 格式：`v{版本号}:{codec 编码后的内容}`。无前缀的历史数据按 v1 兜底。
+
+
+def encode_versioned(
+    payload: object, registry: VersionedCodecRegistry | None = None
+) -> str:
+    """按注册表最新版本编码成 `v{n}:{内容}`。两个后端共用同一格式。"""
+    reg = registry if registry is not None else DEFAULT_CODEC_REGISTRY
+    ver, encoded = reg.encode(None, payload)
+    return f"v{ver}:{encoded}"
+
+
+def split_versioned(raw: str) -> tuple[int, str]:
+    """拆分 `v{n}:` 版本前缀；没有前缀（老数据）按 v1 兜底。"""
+    if raw.startswith("v") and ":" in raw:
+        head, _, body = raw.partition(":")
+        if head[1:].isdigit():
+            return int(head[1:]), body
+    return 1, raw
+
+
+def decode_versioned(
+    raw: str, registry: VersionedCodecRegistry | None = None
+) -> object:
+    """按版本前缀解码。未知版本抛 `KeyError`，由调用方决定兜底策略。"""
+    reg = registry if registry is not None else DEFAULT_CODEC_REGISTRY
+    ver, data = split_versioned(raw)
+    return reg.decode(ver, data)
+
+
+# ---------------------------------------------------------------------------
+# 时间归一化
+# ---------------------------------------------------------------------------
+#
+# 不变量：所有保留/过期时间比较，都必须在"UTC 感知"的同一基准上进行。
+# 只要生产方可能写进 naive datetime（无 tzinfo），字符串比较就会因缺少偏移量而
+# 误判（例如 `2026-01-01T00:00:00` 与 `2026-01-01T00:00:00+00:00`）。
+# 因此比较前一律先用本函数归一化，两个后端共用。
+
+
+def normalize_utc_iso(value: str | datetime) -> str:
+    """把 ISO 字符串 / datetime 统一成 UTC-aware 的 ISO 字符串。"""
+    moment = datetime.fromisoformat(value) if isinstance(value, str) else value
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC).isoformat()

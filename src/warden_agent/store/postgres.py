@@ -26,6 +26,11 @@ from warden_agent.credential.vault import (
     encode_fields,
 )
 from warden_agent.model.model import Message, ToolCall
+from warden_agent.store.codec import (
+    decode_versioned,
+    encode_versioned,
+    normalize_utc_iso,
+)
 
 
 def _now_iso() -> str:
@@ -76,6 +81,9 @@ class PostgresStore:
         # `OutOfOrderTransactionNesting`，甚至可能让一个线程的 COMMIT 提交另一个线程的半成品。
         # FastAPI 的同步端点跑在线程池里，所以"同一条连接被两个请求并发用"是常态。
         self._lock = threading.RLock()
+        # 本进程见过的最大限流窗口（hit_rate_limit 记录）。
+        # 用于让 purge_stale_rate_limits 判断"窗口是否还可能活着"（见该方法不变量）。
+        self._rate_window_seconds = 0.0
         self._init_schema()
 
     def ping(self) -> None:
@@ -167,6 +175,11 @@ class PostgresStore:
                     created_at TEXT NOT NULL
                 )
             """)
+            # 保留清扫按 created_at 扫描：没索引会随幂等记录量线性变慢
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_idempotency_created "
+                "ON idempotency (created_at)"
+            )
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS run_events (
                     id         BIGSERIAL PRIMARY KEY,
@@ -185,6 +198,11 @@ class PostgresStore:
                     count        BIGINT NOT NULL
                 )
             """)
+            # 保留清扫按 window_start 扫描：没索引会随限流桶数量线性变慢
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rate_limits_window "
+                "ON rate_limits (window_start)"
+            )
             # 凭证密文与租约（与 SqliteStore 对齐，见 credential/vault.py）。
             # 存的是 AES-GCM 密文，明文不落这张表。
             cur.execute("""
@@ -326,26 +344,31 @@ class PostgresStore:
     def list_runs(self, limit: int = 50, owner: str | None = None) -> list[dict[str, Any]]:
         """列出会话概要（前端会话列表用）：按最近活跃排序，语义与 SqliteStore 一致。
 
-        owner 给定时在应用层按归属过滤（与 SqliteStore 一致，避免动态拼 SQL）。
+        owner 给定时的过滤**下推到 SQL 的 WHERE**（与 SqliteStore 一致）——取完 LIMIT n
+        再在应用层过滤会"先截断再筛"，返回条数少于 n，即使该 owner 还有更多匹配。
         """
+        sql = (
+            """
+            SELECT r.run_id,
+                   r.status,
+                   (SELECT COUNT(*) FROM messages m WHERE m.run_id = r.run_id) AS msg_count,
+                   (SELECT m.content FROM messages m
+                     WHERE m.run_id = r.run_id AND m.role = 'user'
+                     ORDER BY m.id LIMIT 1) AS title,
+                   (SELECT MAX(m.id) FROM messages m WHERE m.run_id = r.run_id) AS last_id,
+                   r.updated_at,
+                   r.user_id
+            FROM runs r
+            """
+        )
+        params: list[object] = []
+        if owner:
+            sql += " WHERE r.user_id = %s"
+            params.append(owner)
+        sql += " ORDER BY last_id DESC NULLS LAST LIMIT %s"
+        params.append(limit)
         with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT r.run_id,
-                       r.status,
-                       (SELECT COUNT(*) FROM messages m WHERE m.run_id = r.run_id) AS msg_count,
-                       (SELECT m.content FROM messages m
-                         WHERE m.run_id = r.run_id AND m.role = 'user'
-                         ORDER BY m.id LIMIT 1) AS title,
-                       (SELECT MAX(m.id) FROM messages m WHERE m.run_id = r.run_id) AS last_id,
-                       r.updated_at,
-                       r.user_id
-                FROM runs r
-                ORDER BY last_id DESC NULLS LAST
-                LIMIT %s
-                """,
-                (limit,),
-            )
+            cur.execute(sql, params)
             rows = cur.fetchall()
         out = [
             {
@@ -358,8 +381,6 @@ class PostgresStore:
             }
             for r in rows
         ]
-        if owner:
-            out = [r for r in out if r["user_id"] == owner]
         return out
 
     # ---- 用户（中控台账号）----
@@ -383,8 +404,9 @@ class PostgresStore:
     # ---- 对话消息 ----
     def append_message(self, run_id: str, message: Message) -> None:
         """追加一条消息。入库前按会话 + 角色 + 内容 + 工具调用查重，完全相同的不重复落库。"""
+        # 与 SqliteStore 共用同一编码助手，保证跨后端落盘格式（含版本前缀）一致
         tool_json = (
-            json.dumps(message.tool_call.to_dict())
+            encode_versioned(message.tool_call.to_dict())
             if message.tool_call else None
         )
         # "查重 + 插入"是一对读改写，放进同一个事务块里（autocommit 模式下显式 BEGIN/COMMIT），
@@ -418,8 +440,10 @@ class PostgresStore:
             tool_call = None
             if tool_json:
                 try:
-                    tool_call = ToolCall.from_dict(json.loads(tool_json))
-                except json.JSONDecodeError:
+                    obj = decode_versioned(str(tool_json))
+                    tool_call = ToolCall.from_dict(obj) if isinstance(obj, dict) else None
+                except (json.JSONDecodeError, KeyError):
+                    # KeyError：未知版本；单行坏数据不能拖垮整次加载。
                     tool_call = None
             out.append(Message(role=role, content=content, tool_call=tool_call))
         return out
@@ -444,7 +468,7 @@ class PostgresStore:
                 "created_at = EXCLUDED.created_at",
                 (
                     run_id, approval_id, tool_name,
-                    json.dumps(arguments), reason, _now_iso(),
+                    encode_versioned(arguments), reason, _now_iso(),
                 ),
             )
         self.conn.commit()
@@ -472,9 +496,10 @@ class PostgresStore:
             row = cur.fetchone()
         if row is None:
             return None
+        args: object = {}
         try:
-            args = json.loads(row[2])
-        except json.JSONDecodeError:
+            args = decode_versioned(str(row[2]))
+        except (json.JSONDecodeError, IndexError, KeyError):
             args = {}
         return row[0], row[1], args if isinstance(args, dict) else {}, row[3]
 
@@ -494,7 +519,7 @@ class PostgresStore:
             cur.execute(
                 "INSERT INTO checkpoints (run_id, data) VALUES (%s, %s) "
                 "ON CONFLICT (run_id) DO UPDATE SET data = EXCLUDED.data",
-                (checkpoint.run_id, json.dumps(checkpoint.to_dict(), ensure_ascii=False)),
+                (checkpoint.run_id, encode_versioned(checkpoint.to_dict())),
             )
         self.conn.commit()
 
@@ -520,8 +545,8 @@ class PostgresStore:
         from warden_agent.runtime.checkpoint import Checkpoint
 
         try:
-            obj = json.loads(str(raw))
-        except json.JSONDecodeError:
+            obj = decode_versioned(str(raw))
+        except (json.JSONDecodeError, KeyError):
             return None
         return Checkpoint.from_dict(obj) if isinstance(obj, dict) else None
 
@@ -562,7 +587,9 @@ class PostgresStore:
         self.conn.commit()
 
     def append_event(self, run_id: str, payload: str, keep: int | None = None) -> int:
-        with self.conn.cursor() as cur:
+        # INSERT + 裁剪必须同生共死：autocommit 模式下拆成两条语句时，中间可见的
+        # "插入未裁剪"状态会被其它副本读到。用显式事务块包住（与 SQLite 的加锁两步对齐）。
+        with self._lock, self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO run_events (run_id, data, created_at) VALUES (%s, %s, %s) "
                 "RETURNING id",
@@ -576,21 +603,36 @@ class PostgresStore:
                     "DELETE FROM run_events WHERE run_id = %s AND id <= %s",
                     (run_id, seq - keep),
                 )
-        self.conn.commit()
         return seq
 
     def purge_expired_idempotency(self, before_iso: str) -> int:
-        """删掉早于 `before_iso` 的幂等记录（成功快照原先永不删除）。"""
+        """删掉早于 `before_iso` 的幂等记录（成功快照原先永不删除）。
+
+        比较前把阈值归一化成 UTC-aware ISO：生产方若传 naive datetime，字符串比较会误判。
+        """
         with self.conn.cursor() as cur:
-            cur.execute("DELETE FROM idempotency WHERE created_at < %s", (before_iso,))
+            cur.execute(
+                "DELETE FROM idempotency WHERE created_at < %s",
+                (normalize_utc_iso(before_iso),),
+            )
             count = cur.rowcount
         self.conn.commit()
         return int(count or 0)
 
     def purge_stale_rate_limits(self, before_epoch: float) -> int:
-        """删掉窗口起始早于 `before_epoch` 的限流计数行（行永不自己消失）。"""
+        """删掉窗口确实已结束的限流计数行（行永不自己消失）。
+
+        不变量：只有当 `window_start + window_seconds <= before_epoch` 时才删。
+        `before_epoch` 由维护清扫算成 `now - max_age`（≤ now），所以满足该条件的桶，
+        其窗口在 `before_epoch`（因而也在 now）之前就已结束，不可能仍在生效。
+        窗口上界取本进程见过的最大窗口（`hit_rate_limit` 记录），故是"按配置窗口"比较，
+        而非只比固定的 max_age（后者可能小于实际窗口、误删仍活着的桶）。
+        """
         with self.conn.cursor() as cur:
-            cur.execute("DELETE FROM rate_limits WHERE window_start < %s", (before_epoch,))
+            cur.execute(
+                "DELETE FROM rate_limits WHERE window_start + %s <= %s",
+                (self._rate_window_seconds, before_epoch),
+            )
             count = cur.rowcount
         self.conn.commit()
         return int(count or 0)
@@ -611,6 +653,10 @@ class PostgresStore:
         self, bucket_key: str, window_seconds: int, now: float
     ) -> tuple[int, float]:
         """固定窗口计数 +1。用单条 UPSERT 完成"过期则重置、否则累加"，避免读改写竞态。"""
+        # 记下见过的最大窗口，供 purge_stale_rate_limits 判断窗口是否可能仍活着。
+        self._rate_window_seconds = max(
+            self._rate_window_seconds, float(window_seconds)
+        )
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO rate_limits (bucket_key, window_start, count) "
@@ -785,7 +831,7 @@ class PostgresStore:
         with self.conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM credential_leases WHERE scope = %s AND expires_at <= %s",
-                (scope, now.isoformat()),
+                (scope, normalize_utc_iso(now)),
             )
             count = cur.rowcount
         self.conn.commit()

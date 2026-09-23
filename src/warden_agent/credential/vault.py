@@ -123,14 +123,25 @@ def encode_fields(encrypted: Mapping[str, str]) -> str:
     return json.dumps(dict(encrypted), ensure_ascii=False)
 
 
+class CorruptCredentialError(ValueError):
+    """凭证存在，但落库的密文 JSON 已损坏。
+
+    必须与"凭证不存在"区分开：前者是真数据损坏（要人介入），后者只是没登记。
+    """
+
+
 def decode_fields(raw: object) -> dict[str, str]:
-    """把落库的 JSON 文本还原成密文字典；坏数据返回空字典（不抛，避免一条脏行拖垮读取）。"""
+    """把落库的 JSON 文本还原成密文字典。
+
+    坏数据**显式抛 `CorruptCredentialError`**，不再返回空字典。返回空字典曾把"数据损坏"
+    伪装成正常：`has()` 说"有"、`issue()` 发出一张**空凭证**（字段全无）却被当成可用凭证，
+    比直接报错危险得多。"""
     try:
         obj = json.loads(str(raw))
-    except json.JSONDecodeError:
-        return {}
+    except (json.JSONDecodeError, TypeError) as e:
+        raise CorruptCredentialError(f"凭证密文不是合法 JSON: {e}") from e
     if not isinstance(obj, dict):
-        return {}
+        raise CorruptCredentialError("凭证密文 JSON 不是对象")
     return {str(k): str(v) for k, v in obj.items()}
 
 
@@ -210,11 +221,11 @@ def rotate_credentials(
     for scope in all_scopes:
         for name in vault.list_credential_names(scope):  # type: ignore[attr-defined]
             scanned += 1
-            record = vault.load_credential(scope, name)  # type: ignore[attr-defined]
-            if record is None:       # 刚好被删了
-                continue
-            encrypted = dict(record.encrypted)
             try:
+                record = vault.load_credential(scope, name)  # type: ignore[attr-defined]
+                if record is None:       # 刚好被删了
+                    continue
+                encrypted = dict(record.encrypted)
                 # 判断是否需要轮换；"谁也解不开"会在这里抛错（数据问题，不能当"无需轮换"）
                 if not any(
                     cipher.needs_rotation(token) for token in encrypted.values()  # type: ignore[attr-defined]
@@ -226,7 +237,7 @@ def rotate_credentials(
                     field: cipher.encrypt(cipher.decrypt(token))  # type: ignore[attr-defined]
                     for field, token in encrypted.items()
                 }
-            except Exception:  # noqa: BLE001 - 解不开就如实记账，绝不覆盖
+            except Exception:  # noqa: BLE001 - 解不开/密文损坏就如实记账，绝不覆盖
                 failed.append(f"{scope or '<部署级>'}/{name}")
                 continue
             vault.save_credential(  # type: ignore[attr-defined]

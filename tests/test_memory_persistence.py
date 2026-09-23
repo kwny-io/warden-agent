@@ -120,6 +120,48 @@ def test_search按文本与状态过滤() -> None:
     assert len(store.search(MemoryScope.USER)) == 2  # 不带过滤只看 ACTIVE
 
 
+def test_list_by_status_不套用ACTIVE过滤() -> None:
+    """按状态枚举：PENDING/TOMBSTONED 不能被 `search()` 的 ACTIVE 过滤漏掉。"""
+    store = SqliteMemoryStore(_db())
+    store.save(_item(key="p", status=MemoryStatus.PENDING))
+    store.save(_item(key="g", status=MemoryStatus.TOMBSTONED))
+
+    assert store.search(MemoryScope.USER) == []  # search 只看 ACTIVE
+    assert {i.key for i in store.list_by_status(MemoryStatus.PENDING)} == {"p"}
+    assert {i.key for i in store.list_by_status()} == {"p", "g"}
+
+
+def test_sqlite_purge经list_by_status真删行() -> None:
+    store = SqliteMemoryStore(_db())
+    svc = MemoryService(store)
+    past = _dt.datetime(2020, 1, 1, tzinfo=_dt.UTC)
+    p = svc.propose(MemoryScope.USER, "k", MemoryContent(text="过期"), expires_at=past)
+    svc.approve(p, replacing=False)
+
+    assert store.find_ref(MemoryScope.USER, "k")  # 软删前还在
+    assert svc.request_purge() == 1
+    assert svc.execute_purge() == 1
+    assert store.find_ref(MemoryScope.USER, "k") == []  # 真删了（不再是空操作）
+
+
+def test_带偏移的过期时间按UTC比较() -> None:
+    """回归：expires_at 以 ISO 字符串落库，字符串比较在非 UTC 偏移下会得出错误结论。"""
+    store = SqliteMemoryStore(_db())
+    svc = MemoryService(store)
+    # +08:00 的“过去”时间；归一为 UTC 后应与 now 正确比较
+    past_cn = _dt.datetime(
+        2020, 1, 1, tzinfo=_dt.timezone(_dt.timedelta(hours=8))
+    )
+    p = svc.propose(MemoryScope.USER, "k", MemoryContent(text="x"), expires_at=past_cn)
+    svc.approve(p, replacing=False)
+
+    assert svc.recall(MemoryScope.USER, key="k") == []
+    assert svc.request_purge() == 1
+    # store 的 purge_expired 也按 UTC-aware 比较后物理删除
+    assert store.purge_expired(_dt.datetime.now(_dt.UTC)) == 1
+    assert store.find_ref(MemoryScope.USER, "k") == []
+
+
 def test_审计轨迹落盘() -> None:
     store = SqliteMemoryStore(_db())
     item = _item()

@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import functools
 import json
 import sqlite3
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Concatenate, Protocol, cast
 
 from warden_agent.memory.models import (
     MemoryActor,
@@ -54,6 +55,42 @@ class MemoryRepository(Protocol):
         self, scope: MemoryScope, text_like: str | None = None, limit: int = 20,
         owner: str | None = None,
     ) -> list[MemoryItem]: ...
+    def list_by_status(
+        self, status: MemoryStatus | None = None, limit: int = 1000
+    ) -> list[MemoryItem]: ...
+    def delete(self, uid: str) -> None: ...
+
+
+def _to_utc(value: _dt.datetime) -> _dt.datetime:
+    """把任意 datetime 归一为 UTC-aware：naive 视为 UTC，带偏移的换算到 UTC。
+
+    为什么需要：`expires_at` 以 ISO 字符串落库，**字符串比较**只有在同一时区偏移下才等价于
+    时间比较；带 ``+08:00`` 的过期时间拿去和 UTC 的 now 比字符串会得出错误结论。统一成
+    UTC 后，存与比都一致（与 store agent 的其它时间处理口径一致）。
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=_dt.UTC)
+    return value.astimezone(_dt.UTC)
+
+
+def _locked[**P, R](
+    method: Callable[Concatenate[SqliteMemoryStore, P], R],
+) -> Callable[Concatenate[SqliteMemoryStore, P], R]:
+    """把方法体放进**存储自己的锁**里执行（与 `store.sqlite._locked` 同款）。
+
+    为什么读也要加锁：连接是 `check_same_thread=False` **跨线程共享**的，而 SQLite 一条连接
+    **不允许并发使用**——两个线程同时用它（哪怕一个读一个写）会抛
+    `sqlite3.InterfaceError`，在 HTTP 层表现为偶发 500。此前只有写方法加锁、读方法没加，
+    "读 + 写"这条最常见的并发组合会翻车。
+
+    锁用 **RLock**：读方法可能调用另一个已加锁的方法（如 `latest` → `find_ref`），
+    不会自锁死。泛型参数必须保留签名，否则 mypy 会把返回值退化成 Any、连累所有调用点。
+    """
+    @functools.wraps(method)
+    def wrapper(self: SqliteMemoryStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return cast("Callable[Concatenate[SqliteMemoryStore, P], R]", wrapper)
 
 
 def _owned(item: MemoryItem, owner: str | None) -> bool:
@@ -111,6 +148,27 @@ class InMemoryMemoryStore:
         items.sort(key=lambda i: i.updated_at, reverse=True)
         return items[:limit]
 
+    def list_by_status(
+        self, status: MemoryStatus | None = None, limit: int = 1000
+    ) -> list[MemoryItem]:
+        """按状态枚举记忆（status=None 表示不过滤）。
+
+        与 `search` 分开：`search` 写死了只返回 ACTIVE，用它枚举 PENDING/TOMBSTONED
+        永远是空——候选审批与清理路径需要的是**按状态**枚举。
+        """
+        with self._lock:
+            items = [
+                i for i in self._items.values()
+                if status is None or i.status == status
+            ]
+        items.sort(key=lambda i: i.updated_at, reverse=True)
+        return items[:limit]
+
+    def delete(self, uid: str) -> None:
+        """物理删除一条记忆（purge 用）。"""
+        with self._lock:
+            self._items.pop(uid, None)
+
 
 class SqliteMemoryStore:
     """落盘的记忆库：用 SQLite 实现 `MemoryRepository`，**重启不丢、可跨会话**。
@@ -133,7 +191,7 @@ class SqliteMemoryStore:
             self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         else:
             raise ValueError("SqliteMemoryStore 需要 db_path 或 conn")
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._init()
 
     def _init(self) -> None:
@@ -179,14 +237,14 @@ class SqliteMemoryStore:
     # ---- 序列化 ----
     @staticmethod
     def _iso(value: _dt.datetime | None) -> str | None:
-        return None if value is None else value.isoformat()
+        return None if value is None else _to_utc(value).isoformat()
 
     @staticmethod
     def _parse_iso(value: Any) -> _dt.datetime | None:
         if value is None:
             return None
         try:
-            return _dt.datetime.fromisoformat(str(value))
+            return _to_utc(_dt.datetime.fromisoformat(str(value)))
         except ValueError:
             return None
 
@@ -253,12 +311,14 @@ class SqliteMemoryStore:
             )
             self._conn.commit()
 
+    @_locked
     def find(self, uid: str) -> MemoryItem | None:
         row = self._conn.execute(
             "SELECT * FROM memories WHERE uid = ?", (uid,)
         ).fetchone()
         return None if row is None else self._row_to_item(row)
 
+    @_locked
     def find_ref(
         self, scope: MemoryScope, key: str, owner: str | None = None
     ) -> list[MemoryItem]:
@@ -270,6 +330,7 @@ class SqliteMemoryStore:
         rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [self._row_to_item(r) for r in rows]
 
+    @_locked
     def latest(
         self, scope: MemoryScope, key: str, owner: str | None = None
     ) -> MemoryItem | None:
@@ -284,6 +345,7 @@ class SqliteMemoryStore:
         candidates = active or items
         return max(candidates, key=lambda i: i.updated_at)
 
+    @_locked
     def search(
         self,
         scope: MemoryScope,
@@ -304,6 +366,33 @@ class SqliteMemoryStore:
             items = [i for i in items if needle in i.content.text.lower()]
         return items[:limit]
 
+    @_locked
+    def list_by_status(
+        self, status: MemoryStatus | None = None, limit: int = 1000
+    ) -> list[MemoryItem]:
+        """按状态枚举记忆（status=None 表示不过滤）。
+
+        不复用 `search`：后者写死了 `status = ACTIVE`，拿它枚举 PENDING/TOMBSTONED
+        永远是空（候选审批与清理路径曾因此变成 NO-OP）。
+        """
+        if status is None:
+            rows = self._conn.execute(
+                "SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM memories WHERE status = ?"
+                " ORDER BY updated_at DESC LIMIT ?",
+                (status.name, limit),
+            ).fetchall()
+        return [self._row_to_item(r) for r in rows]
+
+    @_locked
+    def delete(self, uid: str) -> None:
+        """物理删除一条记忆（purge 用）。"""
+        self._conn.execute("DELETE FROM memories WHERE uid = ?", (uid,))
+        self._conn.commit()
+
     def close(self) -> None:
         self._conn.close()
 
@@ -312,12 +401,15 @@ class SqliteMemoryStore:
 
         为什么需要：`MemoryService.execute_purge` 只把状态标成 TOMBSTONED、**不物理删**；
         若没有清扫，过期记忆会一直留在表里（内存与磁盘都只增不减）。
+
+        `now` 先归一为 UTC-aware：`expires_at` 落库前也已归一，字符串比较才等价于时间比较。
         """
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM memories WHERE status IN (?, ?)"
                 " OR (expires_at IS NOT NULL AND expires_at <= ?)",
-                (MemoryStatus.EXPIRED.name, MemoryStatus.TOMBSTONED.name, now.isoformat()),
+                (MemoryStatus.EXPIRED.name, MemoryStatus.TOMBSTONED.name,
+                 _to_utc(now).isoformat()),
             )
             self._conn.commit()
             return int(cur.rowcount or 0)
@@ -484,16 +576,45 @@ class PostgresMemoryStore:
             items = [i for i in items if needle in i.content.text.lower()]
         return items[:limit]
 
+    def list_by_status(
+        self, status: MemoryStatus | None = None, limit: int = 1000
+    ) -> list[MemoryItem]:
+        """按状态枚举记忆（status=None 表示不过滤；与 SQLite 版对齐）。"""
+        with self._conn.cursor() as cur:
+            if status is None:
+                cur.execute(
+                    "SELECT * FROM memories ORDER BY updated_at DESC LIMIT %s",
+                    (limit,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM memories WHERE status = %s"
+                    " ORDER BY updated_at DESC LIMIT %s",
+                    (status.name, limit),
+                )
+            rows = cur.fetchall()
+        return [SqliteMemoryStore._row_to_item(r) for r in rows]
+
+    def delete(self, uid: str) -> None:
+        """物理删除一条记忆（purge 用）。"""
+        with self._conn.cursor() as cur:
+            cur.execute("DELETE FROM memories WHERE uid = %s", (uid,))
+        self._conn.commit()
+
     def close(self) -> None:
         self._conn.close()
 
     def purge_expired(self, now: _dt.datetime) -> int:
-        """物理删除已过期 / 已墓碑化的记忆，返回删除条数（保留策略，同 SQLite 版）。"""
+        """物理删除已过期 / 已墓碑化的记忆，返回删除条数（保留策略，同 SQLite 版）。
+
+        `now` 先归一为 UTC-aware，与落库时统一的 `expires_at` 口径一致。
+        """
         with self._conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM memories WHERE status IN (%s, %s)"
                 " OR (expires_at IS NOT NULL AND expires_at <= %s)",
-                (MemoryStatus.EXPIRED.name, MemoryStatus.TOMBSTONED.name, now.isoformat()),
+                (MemoryStatus.EXPIRED.name, MemoryStatus.TOMBSTONED.name,
+                 _to_utc(now).isoformat()),
             )
             count = cur.rowcount
         self._conn.commit()

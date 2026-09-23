@@ -48,6 +48,14 @@ def test_default_base_url() -> None:
     assert cli.DEFAULT_BASE.startswith("http://127.0.0.1")
 
 
+def test_rotate_credentials解析pg与db参数() -> None:
+    """`rotate-credentials` 要能连 PG（之前硬编码 SqliteStore，PG 凭证永远轮换不了）。"""
+    args = cli._build_parser().parse_args(  # noqa: SLF001
+        ["rotate-credentials", "--pg", "--db", "x.db"]
+    )
+    assert args.pg is True and args.db == "x.db"
+
+
 def test_服务地址用WARDEN_SERVER_URL覆盖() -> None:
     assert cli.default_base_url({"WARDEN_SERVER_URL": "http://10.0.0.5:9000"}) == (
         "http://10.0.0.5:9000"

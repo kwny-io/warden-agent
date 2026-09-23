@@ -26,6 +26,13 @@ from warden_agent.memory.models import (
 from warden_agent.memory.store import MemoryRepository
 
 
+def _utc(value: _dt.datetime) -> _dt.datetime:
+    """把 datetime 归一为 UTC-aware（naive 视为 UTC），供过期比较用。"""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=_dt.UTC)
+    return value.astimezone(_dt.UTC)
+
+
 @dataclass
 class MemoryProposal:
     """一条待确认的记忆提议。approve/reject 它。"""
@@ -135,16 +142,16 @@ class MemoryService:
         )
 
     def pending(self, scope: MemoryScope | None = None) -> list[MemoryProposal]:
-        """列出待确认的候选提案（供人工/策略 review）。scope 给定时只看该作用域。"""
-        scopes = ([scope] if scope is not None
-                  else [MemoryScope.USER, MemoryScope.SESSION, MemoryScope.RUN,
-                        MemoryScope.WORKSPACE])
-        out = []
-        for scope_enum in scopes:
-            for item in self._repo.search(scope_enum, None, 100):
-                if item.status == MemoryStatus.PENDING:
-                    out.append(MemoryProposal(item))
-        return out
+        """列出待确认的候选提案（供人工/策略 review）。scope 给定时只看该作用域。
+
+        走 `list_by_status(PENDING)`：`search()` 写死了只返回 ACTIVE，拿它枚举候选永远
+        是空（这是修过的一个真 bug——pending() 一直返回 []）。
+        """
+        return [
+            MemoryProposal(item)
+            for item in self._repo.list_by_status(MemoryStatus.PENDING, 100)
+            if scope is None or item.scope == scope
+        ]
 
     # ---- 冲突消解 ----
     def resolve_conflict(self, proposal: MemoryProposal, keep_new: bool) -> None:
@@ -156,33 +163,38 @@ class MemoryService:
 
     # ---- 过期与清理 ----
     def request_purge(self, scope: MemoryScope | None = None) -> int:
-        """标记过期的记忆中已过期项的数量（统计，不物理删）。"""
+        """标记过期的记忆中已过期项的数量（统计，不物理删）。
+
+        走 `list_by_status(None)` 枚举全部状态——`search()` 只返回 ACTIVE，拿它找过期项
+        会漏掉已 PENDING/CONFLICTED 的（曾经也是 NO-OP）。比较前把 `expires_at` 归一为
+        UTC-aware，避免 naive/带偏移时区直接比较报错或得出错误结论。
+        """
         now = _dt.datetime.now(_dt.UTC)
         count = 0
-        scopes = ([scope] if scope is not None
-                  else [MemoryScope.USER, MemoryScope.SESSION, MemoryScope.RUN,
-                        MemoryScope.WORKSPACE])
-        for s in scopes:
-            for item in self._repo.search(s, None, 1000):
-                if item.expires_at is not None and now >= item.expires_at:
-                    if item.status != MemoryStatus.EXPIRED:
-                        item.status = MemoryStatus.EXPIRED
-                        item.record("expire", self._actor)
-                        self._repo.save(item)
-                    count += 1
+        for item in self._repo.list_by_status(None, 10000):
+            if scope is not None and item.scope != scope:
+                continue
+            expires = item.expires_at
+            if expires is not None and now >= _utc(expires):
+                if item.status != MemoryStatus.EXPIRED:
+                    item.status = MemoryStatus.EXPIRED
+                    item.record("expire", self._actor)
+                    self._repo.save(item)
+                count += 1
         return count
 
     def execute_purge(self) -> int:
-        """物理清除所有过期 / tombstone 的记忆，返回清除条数。"""
+        """物理清除所有过期 / tombstone 的记忆，返回清除条数。
+
+        走 `list_by_status` 枚举 EXPIRED / TOMBSTONED——`search()` 只返回 ACTIVE，用它找
+        墓碑永远是空（execute_purge 曾因此恒返回 0）。这里真地从存储里删除（不再只把状态
+        改写一遍），否则 `find_ref` 仍能读到，等于没清。
+        """
         removed = 0
-        for s in [MemoryScope.USER, MemoryScope.SESSION, MemoryScope.RUN,
-                  MemoryScope.WORKSPACE]:
-            for item in self._repo.search(s, None, 10000):
-                if item.status in (MemoryStatus.EXPIRED, MemoryStatus.TOMBSTONED):
-                    item.record("purge", self._actor)
-                    item.status = MemoryStatus.TOMBSTONED
-                    self._repo.save(item)
-                    removed += 1
+        for status in (MemoryStatus.EXPIRED, MemoryStatus.TOMBSTONED):
+            for item in self._repo.list_by_status(status, 10000):
+                self._repo.delete(item.uid)
+                removed += 1
         return removed
 
     # ---- 内部 ----
@@ -190,4 +202,6 @@ class MemoryService:
         """一条记忆此刻能否被检索到：必须 ACTIVE 且未过期。"""
         if item.status != MemoryStatus.ACTIVE:
             return False
-        return item.expires_at is None or _dt.datetime.now(_dt.UTC) < item.expires_at
+        if item.expires_at is None:
+            return True
+        return _dt.datetime.now(_dt.UTC) < _utc(item.expires_at)

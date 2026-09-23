@@ -34,7 +34,13 @@ from warden_agent.credential.vault import (
     encode_fields,
 )
 from warden_agent.model.model import Message, ToolCall
-from warden_agent.store.codec import DEFAULT_CODEC_REGISTRY, VersionedCodecRegistry
+from warden_agent.store.codec import (
+    DEFAULT_CODEC_REGISTRY,
+    VersionedCodecRegistry,
+    decode_versioned,
+    encode_versioned,
+    normalize_utc_iso,
+)
 
 
 def _locked[**P, R](
@@ -84,6 +90,10 @@ class SqliteStore:
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._lock = threading.RLock()
         self._codec: VersionedCodecRegistry = DEFAULT_CODEC_REGISTRY
+        # 本进程见过的最大限流窗口（hit_rate_limit 记录）。
+        # 用于让 purge_stale_rate_limits 判断"窗口是否还可能活着"——光靠固定的
+        # max_age 不够，因为 max_age 可能小于实际窗口。见该方法的不变量说明。
+        self._rate_window_seconds = 0.0
         self._init_schema()
         self._init_migrations()
 
@@ -140,6 +150,8 @@ class SqliteStore:
                 payload    TEXT NOT NULL,   -- JSON（body 以 base64 存放）
                 created_at TEXT NOT NULL
             );
+            -- 保留清扫按 created_at 扫描：没索引会随幂等记录量线性变慢
+            CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency (created_at);
             -- 事件流：SSE 事件落库，多副本订阅同一张表（轮询增量）
             CREATE TABLE IF NOT EXISTS run_events (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,6 +166,8 @@ class SqliteStore:
                 window_start REAL NOT NULL,
                 count        INTEGER NOT NULL
             );
+            -- 保留清扫按 window_start 扫描：没索引会随限流桶数量线性变慢
+            CREATE INDEX IF NOT EXISTS idx_rate_limits_window ON rate_limits (window_start);
             -- 凭证密文：AES-GCM 密文（外加随机 nonce），明文绝不落这张表。
             -- 没有它，"加密"只发生在内存里，进程一退凭证就没了。
             CREATE TABLE IF NOT EXISTS credentials (
@@ -270,8 +284,8 @@ class SqliteStore:
         """
         tool_json = None
         if message.tool_call is not None:
-            ver, encoded = self._codec.encode(None, message.tool_call.to_dict())
-            tool_json = f"v{ver}:{encoded}"
+            # 与 PostgreSQL 共用同一编码助手，保证跨后端落盘格式一致
+            tool_json = encode_versioned(message.tool_call.to_dict(), self._codec)
         with self._lock:
             dup = self.conn.execute(
                 "SELECT 1 FROM messages "
@@ -313,7 +327,8 @@ class SqliteStore:
             if tool_json:
                 try:
                     tool_call = self._decode_tool_call(tool_json)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, KeyError):
+                    # KeyError：未知版本（如未来写下的 v2）。单行坏数据不能拖垮整次加载。
                     tool_call = None
             out.append(Message(role=role, content=content, tool_call=tool_call))
         return out
@@ -380,9 +395,10 @@ class SqliteStore:
         """列出会话概要（前端会话列表用）：按最近活跃排序。
 
         title 取首条用户消息（没有消息的 run 回退用 run_id），msg_count 是对话条数。
-        owner 给定时在应用层按归属过滤（数据量小，避免动态拼 SQL）。
+        owner 给定时的过滤**下推到 SQL 的 WHERE**（而不是取完 LIMIT n 条再在应用层过滤）——
+        后者在混合归属下会"先截断再筛"，返回条数少于 n，即使该 owner 名下还有更多匹配。
         """
-        rows = self.conn.execute(
+        sql = (
             """
             SELECT r.run_id,
                    r.status,
@@ -394,11 +410,15 @@ class SqliteStore:
                    r.updated_at,
                    r.user_id
             FROM runs r
-            ORDER BY last_id IS NULL, last_id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+            """
+        )
+        params: list[object] = []
+        if owner:
+            sql += " WHERE r.user_id = ?"
+            params.append(owner)
+        sql += " ORDER BY last_id IS NULL, last_id DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
         out = [
             {
                 "run_id": r[0],
@@ -410,8 +430,6 @@ class SqliteStore:
             }
             for r in rows
         ]
-        if owner:
-            out = [r for r in out if r["user_id"] == owner]
         return out
 
     # ---- 用户（中控台账号）----
@@ -435,14 +453,7 @@ class SqliteStore:
 
     def _decode_tool_call(self, raw: str) -> ToolCall | None:
         """按版本前缀解码 tool_call；无前缀的老数据按 v1 JSON 兜底。"""
-        ver: int = 1
-        data: str = raw
-        if raw.startswith("v") and ":" in raw:
-            head, _, body = raw.partition(":")
-            if head[1:].isdigit():
-                ver = int(head[1:])
-                data = body
-        obj = self._codec.decode(ver, data)
+        obj = decode_versioned(raw, self._codec)
         if isinstance(obj, dict):
             return ToolCall.from_dict(obj)
         return None
@@ -457,7 +468,7 @@ class SqliteStore:
         reason: str,
     ) -> None:
         """把"卡在等待审批的那一步"存下来。arguments 走版本化 codec。"""
-        ver, encoded_args = self._codec.encode(None, arguments)
+        encoded_args = encode_versioned(arguments, self._codec)
         with self._lock:
             self.conn.execute(
                 "INSERT INTO pending_approvals "
@@ -467,10 +478,7 @@ class SqliteStore:
                 "approval_id=excluded.approval_id, tool_name=excluded.tool_name, "
                 "arguments=excluded.arguments, reason=excluded.reason, "
                 "created_at=excluded.created_at",
-                (
-                    run_id, approval_id, tool_name,
-                    f"v{ver}:{encoded_args}", reason, _now_iso(),
-                ),
+                (run_id, approval_id, tool_name, encoded_args, reason, _now_iso()),
             )
             self.conn.commit()
 
@@ -501,14 +509,7 @@ class SqliteStore:
         raw_args = row[2]
         args: object = {}
         try:
-            ver = 1
-            data = raw_args
-            if raw_args.startswith("v") and ":" in raw_args:
-                head, _, body = raw_args.partition(":")
-                if head[1:].isdigit():
-                    ver = int(head[1:])
-                    data = body
-            args = self._codec.decode(ver, data)
+            args = decode_versioned(raw_args, self._codec)
         except (json.JSONDecodeError, IndexError, KeyError):
             args = {}
         if not isinstance(args, dict):
@@ -527,12 +528,12 @@ class SqliteStore:
         from warden_agent.runtime.checkpoint import Checkpoint
 
         assert isinstance(checkpoint, Checkpoint)
-        ver, encoded = self._codec.encode(None, checkpoint.to_dict())
+        encoded = encode_versioned(checkpoint.to_dict(), self._codec)
         with self._lock:
             self.conn.execute(
                 "INSERT INTO checkpoints (run_id, data) VALUES (?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET data = excluded.data",
-                (checkpoint.run_id, f"v{ver}:{encoded}"),
+                (checkpoint.run_id, encoded),
             )
             self.conn.commit()
 
@@ -568,15 +569,8 @@ class SqliteStore:
         """按版本前缀解码一条 checkpoint；损坏/旧版本兜底返回 None。"""
         from warden_agent.runtime.checkpoint import Checkpoint
 
-        ver = 1
-        data = raw
-        if raw.startswith("v") and ":" in raw:
-            head, _, body = raw.partition(":")
-            if head[1:].isdigit():
-                ver = int(head[1:])
-                data = body
         try:
-            obj = self._codec.decode(ver, data)
+            obj = decode_versioned(raw, self._codec)
         except (json.JSONDecodeError, KeyError):
             return None
         if isinstance(obj, dict):
@@ -637,19 +631,33 @@ class SqliteStore:
             return seq
 
     def purge_expired_idempotency(self, before_iso: str) -> int:
-        """删掉早于 `before_iso` 的幂等记录（成功快照原先永不删除）。"""
+        """删掉早于 `before_iso` 的幂等记录（成功快照原先永不删除）。
+
+        比较前把阈值归一化成 UTC-aware ISO：生产方若传 naive datetime，字符串比较会误判。
+        """
         with self._lock:
             cur = self.conn.execute(
-                "DELETE FROM idempotency WHERE created_at < ?", (before_iso,)
+                "DELETE FROM idempotency WHERE created_at < ?",
+                (normalize_utc_iso(before_iso),),
             )
             self.conn.commit()
             return int(cur.rowcount or 0)
 
     def purge_stale_rate_limits(self, before_epoch: float) -> int:
-        """删掉窗口起始早于 `before_epoch` 的限流计数行（行永不自己消失）。"""
+        """删掉窗口确实已结束的限流计数行（行永不自己消失）。
+
+        不变量：只有当 `window_start + window_seconds <= before_epoch` 时才删。
+        `before_epoch` 由维护清扫算成 `now - max_age`（≤ now），所以满足该条件的桶，
+        其窗口在 `before_epoch`（因而也在 now）之前就已结束，不可能仍在生效。
+
+        为什么不能只比 `window_start < before_epoch`：max_age 是固定值，可能小于实际窗口，
+        那样一个"刚开始不久、窗口还活着"的桶会被误删。这里用本进程见过的最大窗口
+        （`hit_rate_limit` 记录，见 `_rate_window_seconds`）作为窗口上界，故是"按配置窗口"比较。
+        """
         with self._lock:
             cur = self.conn.execute(
-                "DELETE FROM rate_limits WHERE window_start < ?", (before_epoch,)
+                "DELETE FROM rate_limits WHERE window_start + ? <= ?",
+                (self._rate_window_seconds, before_epoch),
             )
             self.conn.commit()
             return int(cur.rowcount or 0)
@@ -672,6 +680,10 @@ class SqliteStore:
 
         读-改-写在同一把锁内完成，保证多线程下计数不丢。
         """
+        # 记下见过的最大窗口，供 purge_stale_rate_limits 判断窗口是否可能仍活着。
+        self._rate_window_seconds = max(
+            self._rate_window_seconds, float(window_seconds)
+        )
         with self._lock:
             row = self.conn.execute(
                 "SELECT window_start, count FROM rate_limits WHERE bucket_key = ?",
@@ -780,7 +792,7 @@ class SqliteStore:
         with self._lock:
             cur = self.conn.execute(
                 "DELETE FROM credential_leases WHERE scope = ? AND expires_at <= ?",
-                (scope, now.isoformat()),
+                (scope, normalize_utc_iso(now)),
             )
             self.conn.commit()
             return int(cur.rowcount or 0)

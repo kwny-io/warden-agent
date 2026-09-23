@@ -117,6 +117,47 @@ def test_未配置密钥材料时不落明文(db_path: Path, key_material: bytes
     assert secret.encode() not in db_path.read_bytes()
 
 
+def test_临时密钥加持久化保管库时不落盘(db_path: Path, secret: str) -> None:
+    """回归：未配置密钥材料时用进程内临时密钥，绝不能把重启后解不开的密文写进持久库。
+
+    以前会照常落盘 → 重启后密文永久解不开（“不落盘”的告警与实际行为不符）。
+    """
+    store = SqliteStore(db_path)
+    broker = default_broker({}, vault=store)
+    broker.register("openai", {"api_key": secret})
+
+    assert broker.has("openai")  # 进程内可见（临时密钥仍能加解密）
+    assert store.list_credential_names(DEPLOYMENT_SCOPE) == []  # 但没有落盘
+
+    store.close()
+    # 新进程（重新打开同一个库）读不到——因为压根没写进去
+    reopened = SqliteStore(db_path)
+    assert reopened.list_credential_names(DEPLOYMENT_SCOPE) == []
+
+
+def test_密文损坏时has与issue显式报错(
+    db_path: Path, key_material: bytes, secret: str
+) -> None:
+    """回归：坏 JSON 不能再退化成空字典——`has()` 说"有"、`issue()` 发出空凭证。"""
+    from warden_agent.credential.vault import CorruptCredentialError
+
+    store = SqliteStore(db_path)
+    broker = _broker(store, key_material)
+    broker.register("openai", {"api_key": secret})
+    # 直接破坏库里的密文 JSON（模拟磁盘/人为损坏）
+    store.conn.execute(
+        "UPDATE credentials SET data = ? WHERE name = ?", ("{not-json", "openai")
+    )
+    store.conn.commit()
+
+    # "不存在"仍是 False，与"存在但损坏"区分开
+    assert broker.has("no-such") is False
+    with pytest.raises(CorruptCredentialError):
+        broker.has("openai")
+    with pytest.raises(CorruptCredentialError):
+        broker.issue("openai")
+
+
 # ---------- 过期与清理 ----------
 
 

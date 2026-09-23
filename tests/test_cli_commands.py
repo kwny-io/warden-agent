@@ -239,6 +239,37 @@ def test_rotate_credentials空库_扫描0条(tmp_path: Path, capsys) -> None:
     assert "扫描 0 条" in capsys.readouterr().out
 
 
+def test_rotate_credentials_pg未配置主机_明确报错(monkeypatch) -> None:
+    """`--pg` 要能路由到 PG 后端（复用 `_open_run_store`）；未配主机时明确报错。"""
+    monkeypatch.delenv("WARDEN_PG_HOST", raising=False)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["rotate-credentials", "--pg"])
+    assert e.value.code == 1
+
+
+def test_rotate_credentials_sqlite路径真轮换(tmp_path: Path, monkeypatch, capsys) -> None:
+    """SQLite 路径：CLI 真的把旧密钥密文重加密到新密钥（不是空跑）。"""
+    from warden_agent.credential.crypto import CredentialCipher
+    from warden_agent.credential.vault import StoredCredential
+
+    old = b"old-key-material-for-cli-rotate"
+    new = b"new-key-material-for-cli-rotate"
+    db = tmp_path / "cred.db"
+    store = SqliteStore(db)
+    store.save_credential(StoredCredential(
+        scope="", name="model:x",
+        encrypted={"api_key": CredentialCipher(old).encrypt("secret-value")},
+    ))
+    store.close()
+
+    monkeypatch.setenv("WARDEN_CREDENTIAL_KEY", new.decode())
+    monkeypatch.setenv("WARDEN_CREDENTIAL_OLD_KEYS", old.decode())
+    cli.main(["rotate-credentials", "--db", str(db), "--json"])
+    report = json.loads(capsys.readouterr().out)
+    assert report["scanned"] == 1
+    assert report["rotated"] == 1 and report["failed"] == []
+
+
 def _audit_store(tmp_path: Path) -> Path:
     db = tmp_path / "audit.db"
     store = SqliteAuditStore(db_path=db)

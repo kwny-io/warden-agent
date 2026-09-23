@@ -80,7 +80,8 @@ def test_作用域隔离() -> None:
 
 # ---- 过期清理 ----
 def test_过期后不可检索_purge物理清除() -> None:
-    svc = _service()
+    repo = InMemoryMemoryStore()
+    svc = MemoryService(repo)
     past = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
     p = svc.propose(
         MemoryScope.USER, "k", MemoryContent(text="会过期的记忆"),
@@ -91,7 +92,30 @@ def test_过期后不可检索_purge物理清除() -> None:
     assert svc.recall(MemoryScope.USER, key="k") == []
     # request_purge 标记过期，execute_purge 清除
     assert svc.request_purge() >= 1
-    svc.execute_purge()
+    assert svc.execute_purge() >= 1
+    # 真的清掉了：find_ref 不再返回该行（回归：以前 search 只找 ACTIVE，purge 是空操作）
+    assert repo.find_ref(MemoryScope.USER, "k") == []
+
+
+def test_pending真的列出候选() -> None:
+    """回归：pending() 曾用 search()（只返回 ACTIVE）枚举 → 永远为空。"""
+    repo = InMemoryMemoryStore()
+    svc = MemoryService(repo)
+    svc.propose(MemoryScope.USER, "k1", MemoryContent(text="候选一"))
+    svc.propose(MemoryScope.SESSION, "k2", MemoryContent(text="候选二"))
+
+    assert {p.item.key for p in svc.pending()} == {"k1", "k2"}
+    assert {p.item.key for p in svc.pending(MemoryScope.USER)} == {"k1"}
+
+
+def test_墓碑也被execute_purge真删() -> None:
+    repo = InMemoryMemoryStore()
+    svc = MemoryService(repo)
+    p = svc.propose(MemoryScope.USER, "k", MemoryContent(text="x"))
+    svc.reject(p)  # TOMBSTONED
+    assert repo.find_ref(MemoryScope.USER, "k")  # 软删后仍在库里
+    assert svc.execute_purge() == 1
+    assert repo.find_ref(MemoryScope.USER, "k") == []  # 物理清除
 
 
 # ---- 审计轨迹 ----

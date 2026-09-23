@@ -126,7 +126,9 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     ),
     EnvSpec(
         "WARDEN_DB_PATH", "SQLite 文件路径（容器 rootfs 只读时必须指向可写卷）",
-        "web/run_server.py", ("web/run_server.py", "cli.py"), kind="path",
+        "web/run_server.py", ("web/run_server.py", "cli.py", "rag/loader.py"), kind="path",
+        note="rag/loader.py 也读它：默认把 RAG 索引持久化到主库同目录"
+             "（<db>-rag.db），避免重启重建向量。",
     ),
     EnvSpec(
         "WARDEN_PG_HOST", "PostgreSQL 主机；**设了它就用 PostgreSQL**（否则用 SQLite）",

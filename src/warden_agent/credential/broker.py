@@ -260,10 +260,21 @@ def default_broker(
     if material:
         cipher = CredentialCipher(material.encode("utf-8"), old_materials)
     else:
-        logger.warning(
-            "未配置 WARDEN_CREDENTIAL_KEY：凭证以**进程内临时密钥**加密"
-            "（进程退出即失效，不落盘）。生产环境请为每个部署配置独立密钥。"
-        )
+        # 临时密钥 + **持久化保管库** = 密文落盘却永远解不开（重启即废）。这不是
+        # "加密落库"，而是往库里塞垃圾；所以这种情况直接改用进程内保管库，**不落盘**，
+        # 让实情与告警文案一致。
+        if vault is not None and not isinstance(vault, InMemoryCredentialVault):
+            logger.warning(
+                "未配置 WARDEN_CREDENTIAL_KEY：凭证以**进程内临时密钥**加密，但检测到"
+                "持久化保管库。为避免把重启后无法解密的密文写进库里，本次凭证**只保存在"
+                "进程内（不落盘）**。生产环境请为每个部署配置独立密钥。"
+            )
+            vault = InMemoryCredentialVault()
+        else:
+            logger.warning(
+                "未配置 WARDEN_CREDENTIAL_KEY：凭证以**进程内临时密钥**加密，"
+                "保管库也是进程内的——进程退出即失效，不落盘。"
+            )
         # 临时密钥下不给历史密钥兜底：两者混在一起只会让"为什么解不开"更难查
         cipher = CredentialCipher(secrets.token_bytes(32))
     if old_materials:

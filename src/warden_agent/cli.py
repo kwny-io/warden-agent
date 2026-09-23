@@ -658,24 +658,30 @@ def _cmd_rotate_credentials(args: argparse.Namespace) -> None:
     用法：先把新密钥配成 `WARDEN_CREDENTIAL_KEY`、旧密钥放进
     `WARDEN_CREDENTIAL_OLD_KEYS`，跑本命令完成重加密，确认无误后再摘掉旧密钥。
     不做这一步直接换密钥 = 存量凭证全部解不开。
+
+    存储后端与其它命令一致：默认 SQLite（`--db`），`--pg` 则连 PostgreSQL——
+    多副本部署的凭证落在 PG 上，不接 `--pg` 就永远轮换不了它们。
     """
+    import contextlib
     import json
+    from typing import cast
 
     from warden_agent.credential.broker import default_broker
-    from warden_agent.credential.vault import rotate_credentials
-    from warden_agent.store.sqlite import SqliteStore
+    from warden_agent.credential.vault import CredentialVault, rotate_credentials
 
-    db = _db_from_args(args)
+    store, memory = _open_run_store(args)  # 复用同一套后端解析（含 --pg）
     try:
-        store = SqliteStore(db)
-    except Exception as e:  # 打不开库
-        _die(f"无法打开凭证库 {db}: {e}")
-
-    broker = default_broker(os.environ, vault=store)
-    # 作用域：默认只处理部署级；多用户各自导入的 key 用 --scope 逐个指定（或 --all-scopes）
-    scopes = [s for s in (args.scope or "").split(",") if s]
-    extra = _scopes_in_store(store) if args.all_scopes else ()
-    report = rotate_credentials(store, broker._cipher, scopes or ("",), extra_scopes=extra)  # noqa: SLF001
+        broker = default_broker(os.environ, vault=cast(CredentialVault, store))
+        # 作用域：默认只处理部署级；多用户各自导入的 key 用 --scope 逐个指定（或 --all-scopes）
+        scopes = [s for s in (args.scope or "").split(",") if s]
+        extra = _scopes_in_store(store) if args.all_scopes else ()
+        report = rotate_credentials(
+            store, broker._cipher, scopes or ("",), extra_scopes=extra  # noqa: SLF001
+        )
+    finally:
+        for obj in (memory, store):
+            with contextlib.suppress(Exception):
+                obj.close()  # type: ignore[attr-defined]
 
     if args.json:
         print(json.dumps(
@@ -879,6 +885,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "rotate-credentials", help="把存量凭证密文重加密到当前密钥（密钥轮换的第二半）"
     )
     p_rotate.add_argument("--db", default="", help="凭证库路径（默认取 WARDEN_DB_PATH）")
+    p_rotate.add_argument("--pg", action="store_true",
+                          help="连 PostgreSQL 凭证库（读 WARDEN_PG_*；多副本部署用）")
     p_rotate.add_argument("--scope", default="", help="只处理这些作用域（逗号分隔，默认部署级）")
     p_rotate.add_argument("--all-scopes", action="store_true", help="处理库里出现过的全部作用域")
     p_rotate.add_argument("--json", action="store_true", help="以 JSON 输出")
