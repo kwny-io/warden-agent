@@ -60,7 +60,7 @@ def test_未配置密钥材料时退化为进程内临时密钥且不报错() ->
 
 
 def test_相同明文两次注册密文不同() -> None:
-    broker = CredentialBroker(CredentialCipher(b"m" * 16))
+    broker = CredentialBroker(CredentialCipher(b"wiring-key-000016"))
     broker.register("a", {"api_key": SECRET})
     broker.register("b", {"api_key": SECRET})
     a = broker.encrypted_fields("a")

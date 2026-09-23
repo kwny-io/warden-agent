@@ -15,6 +15,7 @@ from warden_agent.execution.sandbox import (
     NetworkPolicy,
     SandboxedExecutionBroker,
     SandboxSpec,
+    _copy_tree_readonly,
 )
 
 
@@ -81,6 +82,25 @@ def test_workspace_input越出根目录被拒(tmp_path: Path) -> None:
     cmd = [sys.executable, "-c", "print(1)"]
     with pytest.raises(ValueError, match="不在允许的根目录内"):
         run(cmd, workspace_input=str(outside))
+
+
+def test_只读工作区_不拷贝指向外部的符号链接(tmp_path: Path) -> None:
+    """工作区内的软链不能把宿主外部文件带进沙箱（_copy_tree_readonly 须跳过软链）。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "ok.txt").write_text("OK", encoding="utf-8")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("SECRET", encoding="utf-8")
+    link = src / "leak.txt"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("当前环境不支持创建符号链接")
+
+    dst = tmp_path / "dst"
+    _copy_tree_readonly(src, dst)
+    assert (dst / "ok.txt").read_text(encoding="utf-8") == "OK"
+    assert not (dst / "leak.txt").exists(), "指向外部的软链绝不应被拷入沙箱"
 
 
 def test_超时强杀() -> None:

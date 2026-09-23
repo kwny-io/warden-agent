@@ -25,6 +25,30 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from warden_agent.core.settings import env_opt
 
+# 密钥材料最低门槛：SHA-256 只做拉伸（stretch），**不增加熵**——
+# 4 字节的 "main" 经 SHA-256 后看着像 32 字节，实际照样可暴力枚举。
+# 16 字节是允许直接用的下限（生产中推荐 32 字节随机密钥）。
+_MIN_KEY_BYTES = 16
+
+
+def _validate_key_material(key_material: bytes) -> None:
+    """校验外部密钥材料的基本强度，太短或明显的弱密钥直接报错。
+
+    只看两条最低底线，保持对既有部署宽容（不强制高熵口令）：
+      - 长度 >= `_MIN_KEY_BYTES`；
+      - 不能是所有字节相同的“弱密钥”（如 `b"m" * 16`）。
+    """
+    if len(key_material) < _MIN_KEY_BYTES:
+        raise ValueError(
+            f"凭证密钥材料过短：至少需要 {_MIN_KEY_BYTES} 字节（当前 {len(key_material)} 字节）。"
+            "SHA-256 只拉伸、不增加熵，短密钥可被暴力枚举；请生成随机密钥。"
+        )
+    if len(set(key_material)) == 1:
+        raise ValueError(
+            "凭证密钥材料过弱：所有字节相同（如 b'm' * 16）。"
+            "请使用随机密钥（推荐 32 字节）。"
+        )
+
 
 class CredentialCipher:
     """用一把外部提供的密钥做 AES-GCM 加解密。
@@ -44,6 +68,7 @@ class CredentialCipher:
     ) -> None:
         if not key_material:
             raise ValueError("密钥不能为空")
+        _validate_key_material(key_material)
         self._aes_key = hashlib.sha256(key_material).digest()  # 32 字节 AES-256
         # 历史密钥同理派生；解密时逐个尝试（GCM 是认证加密，密钥不对会直接校验失败，
         # 所以"试"是安全的——不会解出一段看似成功的坏数据）
@@ -137,7 +162,9 @@ def derive_key_from_env() -> bytes:
             "未配置 WARDEN_CREDENTIAL_KEY：凭证加密需要外部密钥。"
             "请为每个部署环境生成并配置一把独立密钥。"
         )
-    return key.encode("utf-8")
+    material = key.encode("utf-8")
+    _validate_key_material(material)
+    return material
 
 
 class InvalidToken(Exception):

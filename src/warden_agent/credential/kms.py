@@ -176,8 +176,9 @@ class VaultTransitKeyProvider:
         except Exception as e:  # noqa: BLE001 - 统一转成托管错误
             raise KeyProviderError(f"Vault transit 请求失败：{e}") from e
         if resp.status_code != 200:
+            # 只回状态码：Vault 响应体可能包含策略/路径等信息，不应落进错误消息。
             raise KeyProviderError(
-                f"Vault transit 解密被拒（HTTP {resp.status_code}）：{resp.text[:200]}"
+                f"Vault transit 解密被拒（HTTP {resp.status_code}）"
             )
         body = resp.json()
         plaintext_b64 = (body.get("data") or {}).get("plaintext")

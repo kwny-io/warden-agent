@@ -330,8 +330,15 @@ class SandboxedExecutionBroker:
 
 
 def _copy_tree_readonly(src: Path, dst: Path) -> None:
-    """把 src 目录拷进 dst，并把所有文件设为只读（ReadOnly）。"""
+    """把 src 目录拷进 dst，并把所有文件设为只读（ReadOnly）。
+
+    **跳过符号链接**：`shutil.copy2` 默认跟随软链，`_ensure_within_root` 只校验顶层
+    目录——工作区里一个指向外部的软链会被原样跟踪拷进来，等于把宿主任意可读文件
+    泄进沙箱。rglob 也只对常规文件操作，符号链接一概不复制。
+    """
     for item in src.rglob("*"):
+        if item.is_symlink():
+            continue
         if item.is_file():
             rel = item.relative_to(src)
             target = dst / rel

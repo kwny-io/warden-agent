@@ -20,6 +20,11 @@ from warden_agent.web.search import (
 _KEY = "test-" + secrets.token_hex(12)
 
 
+def _resolve_public(host: str) -> list[str]:
+    """离线解析器：测试端点一律视作解析到公网，避免真实 DNS 依赖。"""
+    return ["93.184.216.34"]
+
+
 # ---------- provider 选择（providers_from_env）----------
 
 
@@ -81,7 +86,8 @@ def test_tavily形态_POST带key并解析results() -> None:
             ]
         })
 
-    p = HttpSearchProvider("tavily", api_key=_KEY, transport=httpx.MockTransport(handler))
+    p = HttpSearchProvider("tavily", api_key=_KEY, transport=httpx.MockTransport(handler),
+                           resolver=_resolve_public)
     out = p.search("agent 运行时", top_k=5)
     assert captured["method"] == "POST"
     body = captured["body"]
@@ -104,7 +110,8 @@ def test_brave形态_GET带头并解析webresults() -> None:
             "web": {"results": [{"title": "R", "url": "https://r.example", "description": "描述"}]}
         })
 
-    p = HttpSearchProvider("brave", api_key=_KEY, transport=httpx.MockTransport(handler))
+    p = HttpSearchProvider("brave", api_key=_KEY, transport=httpx.MockTransport(handler),
+                           resolver=_resolve_public)
     out = p.search("hello", top_k=3)
     assert captured["method"] == "GET"
     assert captured["params"] == {"q": "hello", "count": "3"}
@@ -117,7 +124,7 @@ def test_网络错误返回空且不抛() -> None:
         raise httpx.ConnectError("boom")
 
     p = HttpSearchProvider("custom", endpoint="https://s.example/api",
-                           transport=httpx.MockTransport(handler))
+                           transport=httpx.MockTransport(handler), resolver=_resolve_public)
     assert p.search("x") == []
 
 
@@ -126,7 +133,7 @@ def test_非200返回空() -> None:
         return httpx.Response(500, text="err")
 
     p = HttpSearchProvider("custom", endpoint="https://s.example/api",
-                           transport=httpx.MockTransport(handler))
+                           transport=httpx.MockTransport(handler), resolver=_resolve_public)
     assert p.search("x") == []
 
 
@@ -142,3 +149,20 @@ def test_端点被URL策略拒绝时不发请求() -> None:
                            transport=httpx.MockTransport(handler))
     assert p.search("x") == []
     assert called["n"] == 0, "被策略拒绝的端点不应发出任何请求"
+
+
+def test_端点域名解析到内网时被拒绝且不发请求() -> None:
+    called = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called["n"] += 1
+        return httpx.Response(200, json={"results": []})
+
+    # 域名静态检查正常，但解析到内网 → 与抓取工具走同一条路径，必须拒绝
+    p = HttpSearchProvider(
+        "custom", api_key=_KEY, endpoint="https://search.evil.example/api",
+        transport=httpx.MockTransport(handler),
+        resolver=lambda h: ["10.0.0.9"],
+    )
+    assert p.search("x") == []
+    assert called["n"] == 0, "解析到内网的端点不应发出任何请求"

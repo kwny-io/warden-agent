@@ -107,6 +107,18 @@ def test_urlPolicy_拒绝传统IP简写() -> None:
         assert reason
 
 
+def test_urlPolicy_拒绝CGNAT与云元数据地址() -> None:
+    """100.64.0.0/10（含阿里云元数据 100.100.100.200）不得被当成公网段放行。"""
+    for url in (
+        "http://100.64.0.1/x",
+        "http://100.100.100.200/latest/meta-data",
+        "http://[fd00:ec2::254]/x",
+    ):
+        ok, reason = WebUrlPolicy.check(url)
+        assert not ok, f"应拒绝: {url}"
+        assert reason
+
+
 # ---- SSRF 防护：DNS 解析校验（防域名指向内网）----
 
 def test_check_for_network_放行解析到公网的域名() -> None:
@@ -139,6 +151,20 @@ def test_check_for_network_解析失败即拒绝() -> None:
     ok, reason = WebUrlPolicy.check_for_network("https://x.example/y", resolver=boom)
     assert not ok
     assert "解析失败" in reason
+
+
+def test_check_for_network_拦截解析到元数据与CGNAT() -> None:
+    """与静态检查同一判定：解析到 CGNAT / 云元数据地址也必须拒。"""
+    for ip in ("100.64.0.1", "100.100.100.200", "169.254.169.254"):
+        ok, _ = WebUrlPolicy.check_for_network(
+            "https://evil.example/x", resolver=lambda h, ip=ip: [ip])
+        assert not ok, f"应拒绝解析到 {ip}"
+
+
+def test_check_for_network_公网地址放行() -> None:
+    ok, reason = WebUrlPolicy.check_for_network(
+        "https://ok.example/x", resolver=lambda h: ["8.8.8.8"])
+    assert ok, reason
 
 
 # ---- 工具层：真实联网 provider 自动获得 DNS 校验 ----

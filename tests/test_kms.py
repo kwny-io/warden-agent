@@ -133,8 +133,11 @@ def test_vault_被拒时转成托管错误() -> None:
         key_name="warden",
         wrapped_key="vault:v1:abc",
     )
-    with pytest.raises(KeyProviderError):
+    with pytest.raises(KeyProviderError) as e:
         p.current_key()
+    # 错误消息只带状态码，不得回显 Vault 响应体（响应体可能含敏感信息）
+    assert "403" in str(e.value)
+    assert "permission denied" not in str(e.value)
 
 
 def test_vault_缺配置时列出缺了哪些() -> None:
@@ -153,7 +156,7 @@ def _issue_and_get(broker, name: str) -> str:  # type: ignore[no-untyped-def]
 
 
 def test_broker_用托管provider加解密闭环() -> None:
-    broker = default_broker(env={}, key_provider=StaticKeyProvider(b"dek-1"))
+    broker = default_broker(env={}, key_provider=StaticKeyProvider(b"dek-1-material-0001"))
     assert _issue_and_get(broker, "openai") == "s3cret"
 
 
@@ -162,14 +165,16 @@ def test_broker_历史密钥能解开旧密文_实现轮换兜底() -> None:
     from warden_agent.credential.vault import InMemoryCredentialVault
 
     vault = InMemoryCredentialVault()  # 两个 broker 共用同一份密文存储
-    old = default_broker(env={}, key_provider=StaticKeyProvider(b"dek-old"), vault=vault)
+    old = default_broker(
+        env={}, key_provider=StaticKeyProvider(b"dek-old-material-000"), vault=vault)
     old.register("openai", {"api_key": "legacy"})
     stored = old.encrypted_fields("openai")
     assert stored is not None
 
     rotated = default_broker(
         env={},
-        key_provider=StaticKeyProvider(b"dek-new", old_materials=[b"dek-old"]),
+        key_provider=StaticKeyProvider(
+            b"dek-new-material-000", old_materials=[b"dek-old-material-000"]),
         vault=vault,
     )
     # 新 broker 用新 DEK，但靠历史密钥仍能读旧密文
@@ -180,8 +185,10 @@ def test_broker_没有历史密钥时旧密文解不开() -> None:
     from warden_agent.credential.vault import InMemoryCredentialVault
 
     vault = InMemoryCredentialVault()
-    old = default_broker(env={}, key_provider=StaticKeyProvider(b"dek-old"), vault=vault)
+    old = default_broker(
+        env={}, key_provider=StaticKeyProvider(b"dek-old-material-000"), vault=vault)
     old.register("openai", {"api_key": "legacy"})
-    fresh = default_broker(env={}, key_provider=StaticKeyProvider(b"dek-only-new"), vault=vault)
+    fresh = default_broker(
+        env={}, key_provider=StaticKeyProvider(b"dek-only-new-000000"), vault=vault)
     with pytest.raises(InvalidToken):
         fresh.issue("openai")

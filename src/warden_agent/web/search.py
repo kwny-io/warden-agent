@@ -317,6 +317,7 @@ class HttpSearchProvider:
         endpoint: str = "",
         timeout_s: float = 10.0,
         transport: Any = None,
+        resolver: Callable[[str], Iterable[str]] | None = None,
     ) -> None:
         preset = _SEARCH_PRESETS.get(provider, {})
         self.provider = provider
@@ -325,11 +326,16 @@ class HttpSearchProvider:
         self.api_key = api_key
         self.timeout_s = timeout_s
         self._transport = transport
+        # DNS 解析器可注入（host -> list[ip]），便于离线测试端点解析到内网/元数据的场景。
+        self._resolver = resolver
 
     def search(self, query: str, top_k: int = 5) -> list[WebSearchResult]:
         if not self.endpoint:
             return []
-        ok, reason = WebUrlPolicy().check(self.endpoint)
+        # 与抓取工具同一条路径：静态检查 + 解析 DNS 并校验每个结果，
+        # 否则端点域名解析到内网（DNS rebinding）时静态检查看不出问题，
+        # 会把 API key 发向内网地址。
+        ok, reason = WebUrlPolicy.check_for_network(self.endpoint, self._resolver)
         if not ok:
             logger.warning("搜索端点被 URL 策略拒绝（%s）：%s", self.endpoint, reason)
             return []
@@ -435,6 +441,19 @@ _BLOCKED_HOSTNAMES = {
     "metadata", "metadata.google.internal", "metadata.goog",
 }
 
+# 无论 `is_global` 怎么判都要拒的地址段：云元数据端点 + CGNAT（100.64.0.0/10）。
+# 单靠 `is_global` 有版本/实现差异（低版本 Python 把 CGNAT 当公网），
+# 所以对已知的元数据地址再压一层显式黑名单。
+_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "169.254.169.254/32",   # AWS / GCP / Azure 链接本地元数据
+        "100.100.100.200/32",   # 阿里云元数据（落在 CGNAT 内）
+        "fd00:ec2::254/128",    # AWS IMDS IPv6
+        "100.64.0.0/10",        # RFC 6598 CGNAT 共享地址段，整体非公网
+    )
+)
+
 
 def _parse_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """host 是标准 IP 字面量则返回地址对象，否则 None。
@@ -461,14 +480,16 @@ def _looks_like_legacy_ip(host: str) -> bool:
 
 
 def _is_public_ip(ip: str) -> bool:
-    """公网地址判定：私有/环回/链路本地/保留/多播/未指定 都不算公网。"""
+    """公网地址判定：非 `is_global` 或命中元数据/CGNAT 黑名单的一律不算公网。
+
+    统一走 `addr.is_global`（Python 3.12 已把 CGNAT 100.64.0.0/10 判为非公网），
+    再叠加 `_BLOCKED_NETWORKS` 显式黑名单兜底。`check()` 与 `check_for_network()`
+    都调用本函数，保证静态检查与 DNS 解析检查用的是**同一个判定**。
+    """
     addr = _parse_ip(ip)
-    if addr is None:
+    if addr is None or not addr.is_global:
         return False
-    return not (
-        addr.is_private or addr.is_loopback or addr.is_link_local
-        or addr.is_reserved or addr.is_multicast or addr.is_unspecified
-    )
+    return not any(addr in net for net in _BLOCKED_NETWORKS)
 
 
 def _resolve_all(

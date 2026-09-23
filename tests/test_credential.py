@@ -90,3 +90,30 @@ def test_篡改密文解密失败(cipher: CredentialCipher) -> None:
     assert tampered != stored
     with pytest.raises(Exception):
         cipher.decrypt(tampered)
+
+
+def test_密钥材料过短被拒() -> None:
+    """SHA-256 只拉伸不增熵：短密钥（如 "main"）必须当场拒绝。"""
+    with pytest.raises(ValueError, match="过短"):
+        CredentialCipher(b"short-key")
+
+
+def test_密钥材料单字节重复被拒() -> None:
+    with pytest.raises(ValueError, match="过弱"):
+        CredentialCipher(b"m" * 16)
+
+
+def test_环境变量密钥过短被拒(monkeypatch: pytest.MonkeyPatch) -> None:
+    from warden_agent.credential.crypto import derive_key_from_env
+
+    monkeypatch.setenv("WARDEN_CREDENTIAL_KEY", "short")
+    with pytest.raises(ValueError, match="过短"):
+        derive_key_from_env()
+
+
+def test_环境变量密钥合格时返回材料(monkeypatch: pytest.MonkeyPatch) -> None:
+    from warden_agent.credential.crypto import derive_key_from_env
+
+    material = "random-enough-key-material-1234"
+    monkeypatch.setenv("WARDEN_CREDENTIAL_KEY", material)
+    assert derive_key_from_env() == material.encode("utf-8")
