@@ -45,7 +45,7 @@ jobs:
       - name: Install (按 uv.lock 固定版本)
         run: uv sync --frozen --extra dev
       - name: Ruff (lint)
-        run: uv run --frozen ruff check src tests
+        run: uv run --frozen ruff check src tests scripts
       - name: Mypy (strict)
         run: uv run --frozen mypy src/warden_agent
       - name: Pytest（含覆盖率门槛）

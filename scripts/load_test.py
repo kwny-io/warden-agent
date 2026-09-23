@@ -73,7 +73,9 @@ def _normalize_base(base: str) -> str:
     return base.rstrip("/")
 
 
-def _one_request(base: str, key: str, run_id: str, text: str, timeout: float) -> tuple[float, int, str]:
+def _one_request(
+    base: str, key: str, run_id: str, text: str, timeout: float
+) -> tuple[float, int, str]:
     """发一次 /chat，返回 (耗时秒, 状态码, 错误信息)。"""
     body = json.dumps({"text": text}).encode("utf-8")
     req = urllib.request.Request(
@@ -172,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         print("失败样本（最多 5 条）：")
         for e in errors[:5]:
             print(f"  - {e}")
-    print("⚠️ 这是链路级数字，包含**模型耗时**——报的时候要说清用的是哪个模型"
+    print("[警告] 这是链路级数字，包含**模型耗时**——报的时候要说清用的是哪个模型"
           "（离线假模型 ≈ 框架+状态机+存储开销；真模型会被模型延迟主导）")
 
     if error_rate > args.max_error_rate:

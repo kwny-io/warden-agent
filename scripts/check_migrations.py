@@ -17,8 +17,9 @@
 
 用法：
     uv run --frozen python scripts/check_migrations.py --backend sqlite
-    WARDEN_TEST_PG_HOST=localhost uv run --frozen python scripts/check_migrations.py --backend postgres
-    uv run --frozen python scripts/check_migrations.py --write   # 维护者：有意的 schema 变更后重写快照
+    WARDEN_TEST_PG_HOST=localhost uv run --frozen \
+        python scripts/check_migrations.py --backend postgres
+    uv run --frozen python scripts/check_migrations.py --write  # 有意的 schema 变更后重写快照
 
 退出码：0 一致；1 有分叉（并打印可执行的修复提示）。
 """
