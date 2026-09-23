@@ -17,7 +17,10 @@ services:
     image: prom/prometheus:v2.55.0
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.retention.time=7d"
+      # 保留期必须 ≥ SLO 最长窗口（warden.slo.yml 的 rate[30d]）：样本一旦被回收，
+      # 30d 记录规则只能看到部分数据（比率失真）甚至为空 → 慢烧告警静静地失效。
+      # 取 35d 留 5d 余量，避免窗口最老的样本刚好在评估时被回收。改 SLO 窗口时同步改它。
+      - "--storage.tsdb.retention.time=35d"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./alerts:/etc/prometheus/alerts:ro
@@ -31,6 +34,10 @@ services:
     image: prom/alertmanager:v0.27.0
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
+      # 必须显式开启环境变量展开：Alertmanager 默认**不**解析配置里的 ${VAR}，
+      # 会把 alertmanager.yml 的 ${ALERT_WEBHOOK_URL} 当作字面 URL → webhook 永远发不出去
+      # （且不报错，告警静默丢弃）。v0.27 支持 --config.expand-env。
+      - "--config.expand-env"
     environment:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-https://example.invalid/hook}
     volumes:

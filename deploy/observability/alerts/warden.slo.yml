@@ -6,7 +6,7 @@
 #
 # 两条 SLO（数值是**起点**，按业务定）：
 #   1) 可用性：成功请求占比 ≥ 99.5% / 30 天（即 30 天允许约 3.6 小时"不成功"）
-#   2) 延迟  ：p95 < 1s（用 le="1" 桶近似"1 秒内完成的比例"）
+#   2) 延迟  ：p95 < 1s（用 le="1.0" 桶近似"1 秒内完成的比例"）
 #
 # 校验：promtool check rules deploy/observability/alerts/warden.slo.yml
 groups:
@@ -28,6 +28,9 @@ groups:
               /
             clamp_min(sum(rate(warden_http_requests_total[1h])), 0.001)
           )
+      # ⚠️ rate[30d] 需要 Prometheus 保留 ≥ 30d 原始样本，否则这条记录规则只能看到
+      # 保留期内的部分数据（比率失真）甚至为空 → 慢烧告警静静地不生效。
+      # docker-compose.yml 已把 --storage.tsdb.retention.time 提到 35d（留 5d 余量），改这里时同步改它。
       - record: warden:slo_availability:ratio_rate30d
         expr: |
           1 - (
@@ -37,15 +40,19 @@ groups:
           )
 
       # ---- 延迟 SLI：1 秒内完成的比例 ----
-      # 直方图桶是累计的，le="1" 的累计计数 / 总计数 = "≤1s 的比例"。
+      # 直方图桶是累计的，le="1.0" 的累计计数 / 总计数 = "≤1s 的比例"。
+      # ⚠️ le 必须写 "1.0" 而不是 "1"：metrics.py 的 _merge_le 用 str(float) 渲染桶边界，
+      # 声明桶 (…, 1.0) 输出的标签是 le="1.0"；写 le="1" 匹配不到任何桶 → 分子恒为 0，
+      # 比率恒为 0、（1-比率）恒为 1 → 延迟燃烧率告警会**无条件误报**。
+      # 守卫测试 test_observability_config.py 锁死这点。
       - record: warden:slo_latency_fast:ratio_rate5m
         expr: |
-          sum(rate(warden_http_request_duration_seconds_bucket{le="1"}[5m]))
+          sum(rate(warden_http_request_duration_seconds_bucket{le="1.0"}[5m]))
             /
           clamp_min(sum(rate(warden_http_request_duration_seconds_count[5m])), 0.001)
       - record: warden:slo_latency_fast:ratio_rate1h
         expr: |
-          sum(rate(warden_http_request_duration_seconds_bucket{le="1"}[1h]))
+          sum(rate(warden_http_request_duration_seconds_bucket{le="1.0"}[1h]))
             /
           clamp_min(sum(rate(warden_http_request_duration_seconds_count[1h])), 0.001)
 

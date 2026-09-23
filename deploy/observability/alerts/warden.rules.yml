@@ -54,21 +54,11 @@ groups:
           description: "近 10 分钟 5xx 占比持续高于 5%。查 /audit 最近失败请求的 correlation_id，再按它捞日志。"
           runbook: "docs/operations.md"
 
-      - alert: WardenErrorBudgetBurnFast
-        # 快烧：短窗口错误率超过预算允许速率的 14.4 倍（多窗口燃烧率法的快窗口）。
-        expr: |
-          (
-            sum(rate(warden_http_errors_total[5m]))
-              /
-            clamp_min(sum(rate(warden_http_requests_total[5m])), 0.001)
-          ) > (14.4 * 0.005)
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "错误预算正在快速消耗（availability SLO 30d 目标 99.5%）"
-          description: "按当前速率，30 天预算可能在数小时内烧穿。优先止血（回滚/限流），再定位。"
-          runbook: "docs/operations.md"
+      # 【已移除】原先这里有一条 WardenErrorBudgetBurnFast：注释自称"多窗口燃烧率法的快窗口"，
+      # 但表达式只有 5m 单窗口，既不满足多窗口语义，又与 warden.slo.yml 的
+      # WardenAvailabilityBudgetBurnFast（5m+1h 双窗口，连门槛 14.4*0.005 都相同）完全重复。
+      # 保留它 = 同一事件双报警。真正的多窗口快速燃烧由 SLO 文件那条承担，故删除此处重复，
+      # 不再重造；若将来要独立于 SLO 的慢窗口，应实现真实的双窗口再恢复。
 
   # ---- 性能：延迟 ----
   - name: warden-latency
@@ -92,6 +82,12 @@ groups:
     rules:
       - alert: WardenStuckRuns
         # 等待人工审批/交互超过 60 分钟的 Run。这些 Run 不会自愈——没人处理就永久挂着。
+        #
+        # ⚠️ 已知局限：warden_stuck_runs 只在 /metrics 被抓取时由 _refresh_stuck_gauge 现算并写入
+        # （见 web/server.py）。若 _checkpoint_store_for(store) 返回 None，或刷新在首次成功写入前
+        # 持续抛异常，该 gauge **从未被 set** → 序列根本不存在 → 本告警不会触发（而非误报）。
+        # 不写 `== 0` 无法区分"真的没有挂起 Run"与"指标缺失"；这是设计上可接受的静默失败。
+        # 如需兜底，应改 server.py（另一处职责）在抓取失败时也 set，而不是在这里放松阈值。
         expr: warden_stuck_runs{older_than="60m"} > 0
         for: 15m
         labels:

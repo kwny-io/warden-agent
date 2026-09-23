@@ -17,6 +17,9 @@ route:
 receivers:
   - name: default
     # 这里用 webhook 占位：把 <ALERT_WEBHOOK_URL> 换成你的企业微信/钉钉/Slack 网关。
+    # ⚠️ 下面的 ${ALERT_WEBHOOK_URL} 只有在 Alertmanager 以 --config.expand-env 启动时才展开
+    # （docker-compose.yml 的 alertmanager 命令已加该 flag）。不加则 ${...} 被当字面 URL，
+    # 告警静默发不出去。
     # 起栈做演练时可以注释掉下面这段，日志里仍能看到告警（alertmanager 会记录触发）。
     webhook_configs:
       - url: "${ALERT_WEBHOOK_URL}"
@@ -24,6 +27,8 @@ receivers:
 
 inhibit_rules:
   # 服务整个下线时，别再刷它的错误率/延迟告警——先修下线。
+  # ⚠️ 不写 equal:["instance"]：被抑制的错误率/延迟/SLO 燃烧告警都是 sum(...) 聚合出来的，
+  # **没有 instance 标签**，而源告警 WardenServiceDown 带 instance → 两者永不相等 →
+  # 抑制从未生效。源只可能是 warden 自身的 WardenServiceDown，按 alertname+severity 限定即可。
   - source_matchers: ['alertname="WardenServiceDown"']
     target_matchers: ['severity=~"warning|critical"']
-    equal: ["instance"]
