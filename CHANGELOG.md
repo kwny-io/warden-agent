@@ -5,6 +5,65 @@
 
 ---
 
+## 2026-09-23（第二十四批：全仓独立审计与企业级补强——7 类问题逐条修复 + 真环境验证）
+
+> 承接第二十批「独立审计」留下的问题清单，对全仓做了一次**系统性审计**（安全 / 存储 / Web /
+> 运行时与策略 / 可观测性 / CI 与测试 / 文档与死代码 七块，共约 58 条发现），把「声称做了
+> 但实际没做/做错」的地方逐条修掉，并在**真实 Jaeger + 真实 kind K8s** 上做了端到端验证。
+
+### 1. 安全（security）
+
+- SSRF：改判 `is_global` + 云元数据地址**显式拒绝**（此前会被放行）；沙箱软链越界读；搜索端点 DNS 校验；
+  密钥熵下限；Vault 回显脱敏。
+
+### 2. 存储（storage）
+
+- PG 版本化 codec 与 SQLite 对齐；记忆 `pending/purge` 空操作修复（补 `list_by_status`）；`SqliteMemoryStore` 读锁；
+  owner 过滤下沉到 SQL；PG 事件写入原子化；保留策略建索引；凭证（瞬态密钥不落库、损坏抛错、`rotate-credentials --pg`）。
+
+### 3. Web
+
+- 幂等缓存**只缓存 2xx**；`event_bus`/`event_keep` 接线；5xx 计数；路由模板化 path 标签；`/events` SSE 并发闸门；
+  `/metrics` 管理员限定；统一 problem+json 错误体。
+
+### 4. 运行时与策略（runtime / loop）
+
+- 审批崩溃窗口；lease 丢失检测；`_mark_completed` 顺序；`PolicyDenied` 不再重试；`ASK` 不执行；工具重试稳定签名；
+  墙钟超时；`run_parallel` 超时与隔离；策略逐条隔离；技能 trust/requires；`applied_files`。
+
+### 5. 可观测性
+
+- SLO `le="1"` → `"1.0"`（含守卫测试）；alertmanager `--config.expand-env`；保留期 35d；inhibit 修正；告警去重。
+
+### 6. CI
+
+- `scripts/check_pg_tests_ran.py`（自动发现全部 PG 测试文件，任一 PG 跳过即失败）；action 固定 SHA；权限/超时；
+  装 pg 客户端 + 构建前端；RunLease float TTL。
+
+### 7. 加固（harden）
+
+- 审计锚点 `audit_anchor`（尾截断可检测）、`WARDEN_AUDIT_REQUIRE_KEY`、PG 有界重连、有界 LRU 会话、
+  从迭代续跑、多步 planner 进产品路径、维护/OTLP 失败指标、`warden_stuck_runs`、MCP 冷启动韧性。
+
+### 全量验证（本机，无 PostgreSQL）
+
+- `uv run --frozen pytest -p no:cacheprovider`：**1114 passed / 36 skipped / 0 failed**（共 1150 项，exit 0）。
+  跳过 = PG/pg_dump 依赖项（本机无 PG）+ win32 无内核隔离档 + 未构建前端 + 无 node 的 MCP；CI 起真 PG 后不跳过。
+- `uv run --frozen pytest --cov=warden_agent`：**TOTAL 85.26%**，门槛 `[tool.coverage.report] fail_under = 84` 达成（exit 0）。
+- `uv run --frozen mypy src/warden_agent`：**Success: no issues found in 98 source files**。
+- `uv run --frozen ruff check src tests scripts`：**All checks passed**。
+
+### 真环境验证（已归档，报告在 `.mimosa/reports/`，gitignore）
+
+- **真 Jaeger**（v2.21.0）+ OTLP：端到端 trace 成功导出。
+- **真 kind K8s**（v1.31.0）：2 副本、PG 存储/审计/记忆/通知、uid=10001、只读 rootfs、探针、鉴权 401/200、PDB、HPA。
+- **容量**：离线假模型并发 8 → p95 0.86s；真 DeepSeek → p95 1.21s。**更正**旧文档「并发 8 → p95 12.3s」，当前构建不复现。
+
+> 仍未覆盖（需目标环境）：真云 KMS/Vault 联调、托管 Jaeger/Tempo 展示验收、生产 K8s 集群实部署、
+> 沙箱真正内核级文件系统/网络隔离（需容器 / 内核命名空间）。
+
+---
+
 ## 2026-09-23（第二十三批：交付面缺口收尾——表保留策略 + 静默失败指标/告警 + schema 版本收口）
 
 > 承接第二十批「仍未处理（审计发现）」前两条与第四条。这三条是**代码侧**能闭环的，
