@@ -9,9 +9,15 @@ on:
   schedule:
     - cron: "0 3 * * 1"   # 每周一 03:00 UTC
 
+# 最小权限：workflow 默认只需读代码。需要写权限的 job（镜像签名推 GHCR + OIDC）
+# 在 job 级单独声明、覆盖这里——不给全 workflow 开大权限。
+permissions:
+  contents: read
+
 jobs:
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     # 起一个真实 PostgreSQL：让"存储可换 PostgreSQL"从**声称支持**变成**在 CI 里被验证**。
     # 此前 PG 集成测试是 skipif 跳过的、CI 里也没有库 —— 等于那段代码从未在自动化环境跑过。
     # 用 trust 认证免密，与本仓库测试的连接约定（用户 postgres、空密码、库 warden）一致。
@@ -34,16 +40,37 @@ jobs:
       WARDEN_TEST_PG_USER: postgres
       WARDEN_TEST_PG_PASSWORD: ""
     steps:
-      - uses: actions/checkout@v4
+      # 第三方 action 一律钉到**不可变的 commit SHA**（tag 可被移动，SHA 不会），
+      # 行尾注释给出对应版本，便于人工升级时知道钉的是哪一版。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       # 用 uv 按 uv.lock 安装：**依赖版本可复现**。
       # `--frozen` 禁止重新解析 —— lock 与 pyproject 不一致时 CI 直接失败，
       # 而不是"悄悄装到别的版本上，本地过、CI 挂"。
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
         with:
           python-version: "3.12"
           enable-cache: true
       - name: Install (按 uv.lock 固定版本)
         run: uv sync --frozen --extra dev
+      # pg_dump / pg_restore 不在 ubuntu-latest 的默认镜像里。
+      # 不装的话 tests/test_backup_retention.py 的 pg_dump 端到端会**静默跳过**，
+      # 备份链路就永远没在 CI 里真跑过。装上后由下面的防静默跳过守卫一并守住。
+      - name: 安装 postgresql-client（让 pg_dump 端到端测试真的跑）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+      # SPA 测试（tests/test_web.py::test_t10）在 web/dist 缺失时跳过。
+      # 之前 CI 从不构建前端 → 它**每次都在跳过**。这里显式构建，让它真的执行。
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 构建前端 SPA（让 SPA 服务测试不再静默跳过）
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
       - name: Ruff (lint)
         run: uv run --frozen ruff check src tests scripts
       - name: Mypy (strict)
@@ -53,7 +80,10 @@ jobs:
         # 不写原因就没法判断是不是该跑的被静默跳过了。
         # `--cov` 同时**执行覆盖率门禁**：`fail_under` 配在 pyproject.toml（单一事实源，
         # 基线 85.7% / 门槛 84%），这里不再重复写数字——避免"两个地方各写一个阈值"漂移。
-        run: uv run --frozen pytest --tb=short -rs -p no:cacheprovider --cov=warden_agent
+        # `--junitxml` 产出机器可读报告，供下一条"防静默跳过"守卫解析（不必再重跑一遍子集）。
+        run: |
+          uv run --frozen pytest --tb=short -rs -p no:cacheprovider --cov=warden_agent \
+            --junitxml=/tmp/pytest-junit.xml
       - name: K8s manifests 校验（kubeconform，官方 schema 严格模式）
         # 只查**字段合法性**（官方 schema）；"我们的要求"（探针齐全、优雅停机时间小于
         # terminationGracePeriodSeconds、非 root + rootfs 只读、不用 :latest、多副本必配 PG…）
@@ -65,29 +95,21 @@ jobs:
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
         # 副作用是——**如果 CI 里的 service 没连上，它们会静默跳过、CI 依然绿**，
         # 于是"在 CI 里验证 PG"这句话就是空的。这条把那种情况变成明确失败。
-        # 三个文件都要列上：只要有 PG 依赖的测试漏进来就会静默跳过，守卫必须覆盖全。
-        # `--no-cov`：这条只看"跑没跑"，跑子集必然覆盖不足，不能让它被覆盖率门槛误伤。
-        run: |
-          set -o pipefail
-          out=$(uv run --frozen pytest tests/test_postgres_integration.py \
-                tests/test_store_interface.py tests/test_notify_event_bus.py \
-                -p no:cacheprovider --no-cov 2>&1 | tail -1)
-          echo "$out"
-          case "$out" in
-            *skipped*)
-              echo "::error::PostgreSQL 依赖的测试被跳过了——service 没连上？这条步骤就是防这个的"
-              exit 1 ;;
-          esac
+        # 脚本**按标记自动发现**所有 PG 依赖测试文件（`_pg_available` / `_postgres_available`
+        # / `_HAS_PG`，含 pg_dump 端到端），不再手写文件名清单——手写清单漏一个就留一个口子。
+        # 它直接解析上面 Pytest 步骤的 junit 报告（每个用例带文件信息），所以不必重复跑子集。
+        run: uv run --frozen python scripts/check_pg_tests_ran.py --junitxml /tmp/pytest-junit.xml
 
   container:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # 为什么单独一个 job：quality 里跑的全是"在源码树上"的检查——**镜像从来没被构建过**。
     # 于是 Dockerfile 改坏了（漏拷文件、依赖装不上、前端产物没拷进去）CI 发现不了，
     # 等真要交付时才发现"镜像构建不出来"。这个 job 真的 build + 起容器 + 打探针。
     # 它此前真的抓到过 bug：依赖用未加引号的 $(...) 展开，被 pywin32 的环境标记（含空格）
     # 切出一个 `==` 依赖名，pip 直接失败——镜像一直构建不出来而无人知晓。
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: 容器构建冒烟（build + run + 健康探针 + 鉴权 fail-closed）
         run: bash scripts/container_smoke.sh warden-agent:ci
       - name: 校验 Prometheus 规则语法（promtool）
@@ -112,12 +134,13 @@ jobs:
 
   security:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     # 依赖漏洞扫描：按 uv.lock 固定的**运行依赖**做门禁。
     # 为什么单独一个 job、而不是塞进 quality：它跟"代码质量"是两条独立的信号
     # （代码全绿但依赖爆了 CVE 是完全可能的），分开跑能让红的是哪一类一眼看清。
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
         with:
           python-version: "3.12"
           enable-cache: true
@@ -154,6 +177,7 @@ jobs:
 
   migration:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # 交付面缺口 item 5：migration 检查。
     # item 4 删掉 `store/migrations.py` 后，迁移改成**显式 schema 版本**（启动补列 +
     # 把目标版本写进 `__schema_version__` 单行表）。这套机制缺一个守门人：谁加了表/列
@@ -182,8 +206,8 @@ jobs:
       WARDEN_TEST_PG_USER: postgres
       WARDEN_TEST_PG_PASSWORD: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
         with:
           python-version: "3.12"
           enable-cache: true
@@ -196,13 +220,14 @@ jobs:
 
   sbom:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # 交付面缺口 item 5：SBOM（软件物料清单）。
     # 为什么要有它：trivy 只回答"**当前**基镜像里有没有已知漏洞"，不回答"这个镜像里
     # 到底装了什么"。SBOM 是**成分清单**（OS 包 + Python 依赖 + 版本 + 许可证），
     # 它让"某天爆出一个新 CVE、我受不受影响"变成一次本地查询，而不是重建镜像再扫。
     # 扫的是**真镜像**（不是源码树）：交付出去的是镜像，OS 层的包只有镜像里才有。
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: 构建镜像（SBOM 的扫描对象就是交付镜像本身）
         # 与 container job 的构建重复是有意的：SBOM 必须描述"按当前源码构建出的那个镜像"，
         # 不能描述一个可能过期的缓存产物。将来 publish 步骤落地后，
@@ -211,7 +236,7 @@ jobs:
       - name: 生成 SBOM（syft / SPDX JSON）并上传为构建产物
         # anchore/sbom-action 底层就是 syft；用 action 而不是手写 `docker run syft`，
         # 是为了顺带处理"产物上传"（upload-artifact: true）与版本固定。
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0
         with:
           image: warden-agent:sbom
           format: spdx-json
@@ -229,12 +254,14 @@ jobs:
     # 这与"新门禁不得误伤 PR"的取向一致。
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # 覆盖顶层的 contents: read：这里需要写 GHCR + OIDC。
     permissions:
       contents: read
       packages: write     # 推镜像到 GHCR
       id-token: write     # cosign keyless：用 GitHub OIDC 换**短期**签名证书，无长期私钥可泄露
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - name: 构建并推送到 GHCR
         # GHCR 的仓库路径必须小写，而 github.repository 保留大小写 → 显式转小写。
         run: |
@@ -246,7 +273,7 @@ jobs:
             -u "${{ github.actor }}" --password-stdin
           docker push "$image"
       - name: 安装 cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
       - name: cosign keyless 签名（签名存回 registry，与镜像 digest 绑定）
         # keyless：不管理任何长期私钥；cosign 用 OIDC 身份换 Fulcio 短期证书，
         # 签名与证书进 Rekor 透明日志，事后可审计"谁在什么时候签的"。
