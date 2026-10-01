@@ -56,6 +56,22 @@ def test_正常相对路径仍可解析与定位() -> None:
     assert doc.files[0].target_path == "src/pkg/mod.py"
 
 
+@pytest.mark.parametrize(
+    ("path", "expected_reason"),
+    [
+        ("../escape.txt", "拒绝含 '..' 的路径：'../escape.txt'"),
+        ("/tmp/escape.txt", "拒绝绝对路径：'/tmp/escape.txt'"),
+        ("C:/Windows/x.txt", "拒绝绝对路径：'C:/Windows/x.txt'"),
+        ("..\\escape.txt", "拒绝含反斜杠的路径：'..\\\\escape.txt'"),
+    ],
+)
+def test_拒绝理由逐字_模型看到的解释不能丢(path: str, expected_reason: str) -> None:
+    """只看异常类型挡不住“文案被改成 None”——而模型与审计读到的就是这句话。"""
+    with pytest.raises(PatchConflict) as ei:
+        UnifiedPatchParser().parse(_write_diff(path))
+    assert ei.value.reason == expected_reason
+
+
 # ---- 应用期：兜底包含校验（即使 parser 被绕过也要挡住）----
 
 

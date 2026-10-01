@@ -29,6 +29,12 @@ dev = [
     "pytest>=8",
     "pytest-cov",
     "pytest-asyncio",
+    # 单条用例超时兜底：**没有它，"卡死"和"跑得慢"在 CI 里长得一模一样**。
+    # 真实事故：一条用裸 `threading.Barrier` 同步的并发用例，某个工作线抛出异常后
+    # 其余工作线永久等待，整个套件静默死在 45%——直到日志超时被杀，没有任何失败信息。
+    # 有了它，超时会打印**所有线程的调用栈**并以非 0 退出（本地同 CI 行为一致）。
+    # 阈值与方法见 `[tool.pytest.ini_options]` 里的 `timeout` / `timeout_method`。
+    "pytest-timeout>=2.3",
     "ruff>=0.5",
     "mypy>=1.10",
     "pyright",
@@ -37,6 +43,12 @@ dev = [
     "pip-audit>=2.7",
     # 静态安全扫描（SAST）：CI 门禁为"Medium 及以上必须为 0"
     "bandit>=1.7",
+    # 变异测试（mutation testing）：证明"测试绿"不是假绿——把源码里的比较/边界/布尔
+    # 翻转掉，看测试会不会变红。**不答应"测试全过就等于测得好"**。
+    # 只对安全关键小模块开门禁，见 `[tool.mutmut]` 与 `.github/workflows/ci.yml` 的 mutation job。
+    # 注意：mutmut 3 在**原生 Windows 上直接拒跑**（官方要求 WSL）；本地要么 WSL，
+    # 要么用容器——`scripts/mutation.sh` 两种都支持。
+    "mutmut>=3.8",
     # 告警规则/仪表盘的 YAML 与 JSON 守卫测试要用（tests/test_alert_rules.py）——
     # 此前**没声明**，本机恰好装着才没暴露；`uv run --frozen pytest` 会直接 ModuleNotFoundError
     "pyyaml>=6.0",
@@ -55,6 +67,17 @@ packages = ["src/warden_agent"]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["error"]
+# 单条用例的硬超时（秒）。**存在的意义不是"跑得快"，是让挂住必顶出现形**：
+# 整个套件实跑约 430 秒 / 1473 项（机器忙时实测到过 460 秒），最慢的单条是几十秒级的并发与真库用例，
+# 120 秒对现存用例留了足够余量；而不设限时，一个永久等待的用例会让整次运行
+# 悬到外部超时才被杀（日志里看不到是哪一条、卡在哪一行）。
+timeout = 120
+# 用 thread 而不是默认的 signal：Python 的 SIGALRM 在 **Windows 上根本不存在**，
+# 用默认值会变成"本地没保护、CI 才有保护"这种东西。thread 法两边行为一致：
+# 超时时打印**所有线程的调用栈**（直接告诉你卡在哪行）后终止本次运行。
+# 代价：它不能"杀掉超时用例再继续跑后面的"，而是果断终止——这正好是我们想要的
+# （一条用例真的卡住了，后面的结论已经不可信了）。
+timeout_method = "thread"
 # src 布局：让 pytest 能找到 warden_agent 包，也能把 tests 当包导入
 pythonpath = ["src", "."]
 asyncio_mode = "auto"
@@ -86,6 +109,49 @@ branch = true
 # 留 ~1.7 个点余量。为什么不留小一点：门槛贴着当前值会变成"加任何代码都可能红"的噪声门禁，
 # 而**会被关掉的门禁等于没有门禁**（同一条取向见镜像扫描的 `--ignore-unfixed`）。
 # 低覆盖区主要是启动装配与演示/CLI 路径（靠端到端与容器冒烟验证，不靠单测堆）。
-fail_under = 84
+#
+# 2026-09-29 复测：全量 1460 passed / 4 skipped 下为 **89%**（10 个点里的 10381 行语句，
+# 漏 903 行 + 348 个分支未走全）。原始门槛 84% 是贴着 85.7% 定的，而现在已经 89%——
+# **5 个点的余量太宽了**（能默默放过一批回退），所以提到 **86%**（当前值下留 3 个点）。
+# 为什么不多留：CI 带真 PG 跑，通过项比本地多，覆盖率只会更高；而本地无 PG 是最差情况，
+# 以它为基准定门槛才不会出现"本地绿、CI 红"。改完请用上面那条命令复测一遍再下结论。
+fail_under = 86
 show_missing = true
 skip_covered = true
+
+[tool.mutmut]
+# 注意：本段由 `scripts/mutation_shards.py` 生成（当前写入的是 `core-security` 分片：脱敏 / 安全响应头 / 审批决策）。
+#    改配置请改那个脚本里的 SHARDS 表，再重新生成（换成别的分片就换最后一个参数）：
+#        ./.venv/Scripts/python.exe scripts/mutation_shards.py render core-security
+#    `tests/test_mutation_shards.py` 会检查"这段"与"表"一致；不一致直接红，
+#    为的是不让"表格说一套、CI 跑另一套"这种最隐蔽的失真发生。
+#
+# 为什么分片：变异测试是**逐个突变体**跑测试的，一次全量测试约 5 分钟 ⇒ 串行整仓是小时级。
+# 分片后每片只跑"覆盖到它"的那几个测试文件，于是可以并行（CI matrix），也可以只跑改动涉及的那片。
+# 全部分片、各片门槛与实测基线见 `scripts/mutation_shards.py`；裁决表与口径见 `docs/mutation.md`。
+source_paths = ["src"]
+# 本片变异的实现（每条都是"写错就是安全事故或静默失效"的地方）：
+#   redaction.py             脱敏：漏一个分支就是明文密钥进日志/事件（CWE-532）
+#   security_headers.py      CSP 与安全响应头：写错等于浏览器侧防护静默失效
+#   policy.py                审批决策：ASK/DENY 判错就是越权执行
+only_mutate = [
+    "src/warden_agent/core/redaction.py",
+    "src/warden_agent/web/security_headers.py",
+    "src/warden_agent/policy/policy.py",
+]
+# 突变体只跑"覆盖到它"的那几个测试文件（mutmut 用 pytest 收集 + 覆盖信息做映射）；
+# 不限定的话每个突变体都要跑整套测试，成本直接翻几十倍。
+# 注意：往这些模块**加测试**就是"把变异测试的命门收窄"的正路。
+pytest_add_cli_args_test_selection = [
+    "tests/test_redaction.py",
+    "tests/test_security_headers.py",
+    "tests/test_policy.py",
+]
+# 实测基线：96.4% → 门槛 94.4%（killed=242 / total=251，2026-09-29 容器内 Linux）
+# `-x`：一个用例红了就停（"杀死"突变体要快）；`-p no:cacheprovider`：别写 .pytest_cache
+pytest_add_cli_args = ["-x", "-q", "-p", "no:cacheprovider"]
+max_children = 4
+# 只变异“被选中的测试跑过的行”：否则每条突变体都要跑整套测试，成本直接翻几十倍。
+# 代价是**选窄了不会报错**，只会静默不再守着那些行——所以上面的 test_selection
+# 必须盖住本片模块“被任何测试覆盖过”的所有行（scripts/mutation_shards.py 的 check-tests 按住这点）。
+mutate_only_covered_lines = true
