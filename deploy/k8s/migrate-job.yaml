@@ -1,0 +1,104 @@
+# 数据库迁移 Job（先于新版本 Deployment 生效）
+#
+# 为什么必须单独一个 Job、且**先于** Deployment：
+#   deployment.yaml 是 `replicas: 2` + RollingUpdate。迁移里的 DDL（ALTER TABLE ADD COLUMN 等）
+#   若交给应用启动时执行，两个新副本会**并发**跑同一批 DDL。虽然本项目迁移是幂等的
+#   （SQLite 用 pragma 判列、PG 用 CREATE TABLE IF NOT EXISTS），并发 DDL 仍可能互相持锁、
+#   甚至让某个副本启动时撞上另一个正在加的列。用一个"跑完就退出"的 Job 串行执行，
+#   把"结构升级"与"实例滚动"解耦，是最小风险的做法（nginx 式滚动 + 前置迁移）。
+#
+# 迁移入口是什么（重要，别猜）——本仓库**没有** `warden migrate` 这类独立子命令：
+#   - 迁移机制是"显式 schema 版本 + 启动时补列/建表"：SqliteStore.__init__ 调
+#     _init_schema() + _init_migrations()；PostgresStore.__init__ 调 _init_schema()，
+#     两者都用 CREATE TABLE IF NOT EXISTS / 缺列才 ALTER，并把目标版本写进 __schema_version__。
+#   - 因此"迁移入口"就是**构造 store**——也就是应用启动时走的同一条代码路径
+#     （run_server.py 的 _store_from_env → PostgresStore(...)）。
+#   - scripts/check_migrations.py 是**检查器**（起一个全新临时库、对比结构指纹与
+#     schema_snapshot.json），它**不**迁移生产库，所以这里不用它。
+#   下面 command 直接构造 PostgresStore（= 触发 _init_schema 应用全部幂等 DDL），
+#   与主应用启动时执行的迁移代码完全一致，没有引入第二套迁移逻辑。
+#
+# 为什么不用 Helm hook / kustomize：
+#   本目录是**纯 YAML 参考清单**、不带 Helm chart，也没有 kustomization.yaml。
+#   没有 hook 机制时，顺序由"分步 kubectl apply + wait"保证（见 README 的 apply 顺序一节）。
+#
+# 复用主应用的镜像 / ConfigMap / Secret：迁移脚本读的是同一套 WARDEN_PG_* 与
+#   WARDEN_PG_PASSWORD，保证"迁移连的库"和"应用连的库"是同一个。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: warden-migrate
+  labels:
+    app.kubernetes.io/name: warden-agent
+    app.kubernetes.io/component: migrate
+spec:
+  # 迁移失败只重试 1 次：DDL 失败通常是结构冲突/权限，重试无益，应人工介入
+  backoffLimit: 1
+  # 完成后 1 小时自动清理 Job 对象（便于看日志，又不长期占资源）
+  ttlSecondsAfterFinished: 3600
+  # 迁移硬超时 10min：连不上/锁住时不要拖住发布
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: warden-agent
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      # 与主应用同一个专用 SA，且不投 SA token：迁移作业只需要连 PG，不需要 K8s API
+      serviceAccountName: warden-agent
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001            # 与主应用一致
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # 与 deployment.yaml **同镜像同 tag**（别用 `latest`）。
+          # 这里也不写假 digest：真 digest 由 scripts/pin_image_digests.sh --app-image <ref>
+          # 统一回写（deploy/** 里所有应用镜像引用由那一步改），见文件顶部说明。
+          image: REPLACE_ME/warden-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["python"]
+          args:
+            - "-c"
+            - |
+              import os, sys
+              from warden_agent.store.postgres import PostgresStore
+
+              host = os.environ.get("WARDEN_PG_HOST", "").strip()
+              # 这个 Job 只用于多副本 + PostgreSQL 的部署。WARDEN_PG_HOST 为空时
+              # 若静默退回 SQLite，等于迁移了一个一次性的空库、生产库没动——比报错更危险。
+              if not host or host.startswith("REPLACE_ME"):
+                  sys.exit("WARDEN_PG_HOST 未配置（或仍是 REPLACE_ME 占位符）：本 Job 需要真实的 PostgreSQL。")
+
+              store = PostgresStore(
+                  host=host,
+                  port=int(os.environ.get("WARDEN_PG_PORT", "5432")),
+                  dbname=os.environ.get("WARDEN_PG_DB", "warden"),
+                  user=os.environ.get("WARDEN_PG_USER", "postgres"),
+                  password=os.environ.get("WARDEN_PG_PASSWORD", ""),
+              )
+              # 构造即完成迁移（_init_schema 应用幂等 DDL）。打印版本作为"迁移完成"的证据。
+              print("migrate ok: schema_version =", store.schema_version())
+              store.close()
+          envFrom:
+            - configMapRef:
+                name: warden-config
+            - secretRef:
+                name: warden-secrets
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}

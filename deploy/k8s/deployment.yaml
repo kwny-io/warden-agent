@@ -24,6 +24,12 @@ spec:
     spec:
       # 必须**大于** WARDEN_SHUTDOWN_GRACE_S（30s）：给应用时间排空请求 + 关资源
       terminationGracePeriodSeconds: 45
+      # 专用 ServiceAccount（不用 default）：应用**不调 K8s API**，但 default SA 上可能
+      # 挂有别人加的权限。给一个什么都不绑的专用 SA，等于把这个模糊面清零。
+      serviceAccountName: warden-agent
+      # 关键：不把 SA token 投进容器。默认会投（/var/run/secrets/kubernetes.io/serviceaccount），
+      # 一旦 RCE，攻击者就白拿一份集群凭证——而本应用从不需要它。成本为零，收益是一整类攻击面。
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001          # 与镜像里的 warden 用户一致
@@ -41,9 +47,23 @@ spec:
               app.kubernetes.io/name: warden-agent
       containers:
         - name: app
-          # 用不可变 tag（digest 更佳）：`latest` 会让"回滚"变成"再拉一次不知道拉到什么"
+          # 用**明确 tag**（不用 `latest`）：`latest` 会让"回滚"变成
+          # "再拉一次、但不知道拉到什么"。
+          # ⚠️ 这里**故意不写 `@sha256:` 假 digest**：占位符能过 kubeconform/语法校验，
+          #    却让拉取直接 `manifest unknown` —— 风险从"apply 时暴露"推到"上线后才暴露"。
+          #    真 digest 由发布流水线回写：
+          #      scripts/pin_image_digests.sh --app-image <repo>:<tag>
+          #    （脚本 fail-closed：解析不出 digest 就非 0 退出，不静默跳过。）
+          #    本地试跑直接把 REPLACE_ME 换成你的仓库即可。
           image: REPLACE_ME/warden-agent:0.1.0
           imagePullPolicy: IfNotPresent
+          # 私仓场景打开（现在注释着）：占位名不算凭据，真值用
+          #   kubectl -n warden create secret docker-registry warden-registry \
+          #     --docker-server=... --docker-username=... --docker-password=...
+          # 注意：**开着且 Secret 不存在**会让 Pod 直接起不来（secret not found），
+          # 所以默认注释掉，比"看着配好了实际卡在拉镜像"诚实。
+          # imagePullSecrets:
+          #   - name: warden-registry
           ports:
             - name: http
               containerPort: 8000
@@ -52,6 +72,15 @@ spec:
                 name: warden-config
             - secretRef:
                 name: warden-secrets
+          # 启动探针：把"启动慢"与"运行中卡死"分开。
+          # 没它的时候 liveness 从 initialDelaySeconds 起就生效，冷启动（导入 + 连 PG）
+          # 慢一点就会被反复重启，而重启后又更慢——经典的 CrashLoop 自锁。
+          # 有它的时候：启动期间 liveness/readiness 都被挂起，最多宽容 5×30=150s。
+          startupProbe:
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
           # 存活：进程活着就 200（不查依赖 —— 依赖问题由 readiness 表达，
           # 否则数据库一抖就会把好端端的进程反复重启）
           livenessProbe:

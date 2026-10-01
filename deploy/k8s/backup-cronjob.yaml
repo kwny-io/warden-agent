@@ -1,0 +1,142 @@
+# PostgreSQL 每日备份 CronJob
+#
+# 做什么：pg_dump -Fc 到 PVC（backup-pvc.yaml）→ 立刻校验产物 → 按保留策略清理旧 dump。
+#
+# 为什么用独立 postgres 镜像而不是应用镜像：
+#   应用镜像（Dockerfile 的 python:3.12-slim 阶段）**没有安装 postgresql-client**，
+#   所以仓库自带的 `warden backup-pg`（cli.py 的 backup-pg 子命令）在这个镜像里会因
+#   找不到 pg_dump 而明确报错（docs/operations.md 也写了"backup-pg 依赖 pg_dump/pg_restore"）。
+#   备份是**失败也不能静默**的操作，所以这里直接用自带 pg_dump/pg_restore 的 postgres 镜像，
+#   不赌应用镜像里有没有客户端。
+#
+# 为什么不用 K8s 的 "backup sidecar / VolumeSnapshot"：本仓库的 PG 是**外部/托管**的
+#   （configmap 的 WARDEN_PG_HOST 是占位符），拿不到它的数据卷做快照，逻辑备份（pg_dump）
+#   是唯一跨托管方案都成立的做法。
+#
+# ⚠️ 密码：只从 Secret（warden-secrets 的 WARDEN_PG_PASSWORD）注入 PGPASSWORD 环境变量，
+#    **本文件不含任何明文口令**。pg_dump 走 libpq 标准变量，密码不进命令行（命令行会进 ps/history）。
+#
+# ⚠️ 备份失败的告警（交付要求）：
+#    本 CronJob 失败时会产生失败的 Job/Pod。请把下面两类信号接到 Alertmanager
+#    （deploy/observability/alertmanager.yml 已按 severity 路由）：
+#      1) kube-state-metrics 的 `kube_job_status_failed{job_name=~"warden-pg-backup.*"} > 0`；
+#      2) `kube_cronjob_status_last_successful_time` 距今超过 ~26h（说明"没成功过"，
+#         比"失败了一次"更关键的静默失效模式）。
+#    这两条基于 kube-state-metrics，**不属于**本项目自定义的 warden_* 指标，
+#    故不写进 alerts/*.rules.yml（那条规则库有测试断言 metrics 必须真实存在于代码里）。
+#    接入方式见 deploy/observability/README.md。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: warden-pg-backup
+  labels:
+    app.kubernetes.io/name: warden-agent
+    app.kubernetes.io/component: backup
+spec:
+  schedule: "0 3 * * *"            # 每天 UTC 03:00（低峰期）；集群时区按 kube-controller-manager 设定
+  timeZone: "Etc/UTC"              # 显式钉时区，避免"集群时区一改、备份时间漂移"
+  concurrencyPolicy: Forbid        # 上一次没跑完就跳过本次，绝不并发写同一个备份目录
+  startingDeadlineSeconds: 600     # 错过调度窗口超过 10min 就放弃本次（避免堆积后连环补跑）
+  successfulJobsHistoryLimit: 3    # 成功的 Job 只留 3 个，便于回看"最近成功时间"
+  failedJobsHistoryLimit: 3        # 保留失败历史，便于定位（配合上面的告警）
+  jobTemplate:
+    spec:
+      # 失败重试 2 次就放弃：备份失败通常是配置/网络问题，重试太多次只会刷告警
+      backoffLimit: 2
+      # 单次备份硬超时 30min（大库也要有个上限，否则挂住的 Job 会一直占着 RWO 卷）
+      activeDeadlineSeconds: 1800
+      # 完成后一小时自动清理 Job 对象（CronJob 的历史计数已单独限制）
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: warden-agent
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: Never
+          # 与主应用同一个专用 SA，且不投 SA token：备份只需读取 PG 与写 PVC
+          serviceAccountName: warden-agent
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            # 与主应用 Deployment 一致（deployment.yaml runAsUser: 10001）
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001            # 让挂载的备份 PVC 对 10001 可写
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: pg-backup
+              # 只用 tag，**不在这里写假 digest**（全 0 的 sha256 能过语法校验，
+              # 但 Pod 调度时会 `manifest unknown`——备份会“看起来配了、其实从没产出过”）。
+              # 发布流水线负责把这一行钉成真实 digest：
+              #   scripts/pin_image_digests.sh --also postgres:16-alpine --app-image <ref>
+              # 手工核实 digest 的方式：docker buildx imagetools inspect postgres:16-alpine
+              image: postgres:16-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+                  out="/backups/warden-${ts}.dump"
+                  # -Fc = 自定义格式（压缩 + 支持 pg_restore 选择性恢复）
+                  pg_dump -Fc \
+                    -h "${WARDEN_PG_HOST}" -p "${WARDEN_PG_PORT}" \
+                    -U "${WARDEN_PG_USER}" -d "${WARDEN_PG_DB}" \
+                    -f "${out}"
+                  # 产物校验：列不出目录就报错，**不留"看起来有、其实坏了"的备份**
+                  # （与 docs/operations.md 里 backup-pg 的校验口径一致）
+                  pg_restore --list "${out}" > /dev/null
+                  # 保留策略：**按文件名时间戳**只保留最新 14 份，与 CLI
+                  # `warden backup-prune --keep 14` 同一口径。
+                  # 为什么不用 `find -mtime +14 -delete`：那是按 **mtime** 删、
+                  # **没有“最少保留份数”下限**——∅ 一旦卷里出现被 touch / 被 pg_restore
+                  # 写过的文件、或节点时钟漂移，就可能把唯一可用的备份删掉；
+                  # 删备份比不删危险得多（删了不可逆，磁盘满了还能处理）。
+                  total=$(ls -1 /backups/*.dump 2>/dev/null | wc -l)
+                  if [ "$total" -gt 14 ]; then
+                    ls -1 /backups/*.dump | sort | awk -v drop="$((total - 14))" -v cur="${out}" \
+                      'NR <= drop && $0 != cur { print }' | while read -r old; do
+                        rm -f -- "$old" && echo "pruned: ${old}"
+                    done
+                  fi
+                  echo "backup ok: ${out} ($(du -h "${out}" | cut -f1))"
+              env:
+                # 非敏感连接参数与主应用共用同一份 ConfigMap，避免两处漂移
+                - name: WARDEN_PG_HOST
+                  valueFrom:
+                    configMapKeyRef: { name: warden-config, key: WARDEN_PG_HOST }
+                - name: WARDEN_PG_PORT
+                  valueFrom:
+                    configMapKeyRef: { name: warden-config, key: WARDEN_PG_PORT }
+                - name: WARDEN_PG_DB
+                  valueFrom:
+                    configMapKeyRef: { name: warden-config, key: WARDEN_PG_DB }
+                - name: WARDEN_PG_USER
+                  valueFrom:
+                    configMapKeyRef: { name: warden-config, key: WARDEN_PG_USER }
+                # 口令只来自 Secret；pg_dump 通过 libpq 的 PGPASSWORD 读取
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: warden-secrets, key: WARDEN_PG_PASSWORD }
+                # pg_dump 需要 HOME 可写（只读 rootfs 下指到 /tmp）
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests: { cpu: "100m", memory: "128Mi" }
+                limits:   { cpu: "500m", memory: "512Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true   # pg_dump/pg_restore 不需要写镜像层
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: backups, mountPath: /backups }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: warden-backups
+            - name: tmp
+              emptyDir: {}

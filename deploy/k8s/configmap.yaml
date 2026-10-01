@@ -16,6 +16,17 @@ data:
   # rootfs 只读，SQLite（审计/记忆）与临时文件必须有可写卷 —— 见 Deployment 的 volumeMounts
   WARDEN_DB_PATH: "/data/warden.db"
 
+  # ---- 反向代理 / Ingress ----
+  # 入口是 ingress-nginx（见 ingress.yaml），所以**必须**配这个：不配的话
+  # `request.client.host` 只会是代理的 IP，于是①按调用者分桶的限流**塔成一个桶**
+  # （一个客户端能把别人挤成 429）；②两个客户端用同一个 `Idempotency-Key` 时
+  # **后到的会读到前一个的缓存响应体**（鉴权开启时作用域用 user_id，只有匿名模式才真的串）。
+  # 详见 docs/deployment-boundaries.md「反向代理后面的来源 IP」。
+  # 取值 = **代理自己的地址/网段，不是客户端网段**：按你的 CNI 填，例如
+  #   10.244.0.0/16（flannel 默认）/ 10.0.0.0/8（EKS 常见）/ 172.20.0.0/16（kubeadm 默认）
+  # 写成 `*` 或 `0.0.0.0/0` 会被启动校验直接拒绝（那等于信任任何人自带的 XFF）。
+  WARDEN_TRUSTED_PROXIES: "REPLACE_ME-pod-cidr"
+
   # ---- 存储：多副本必须用 PostgreSQL ----
   # 配了 WARDEN_PG_HOST 就用 PostgreSQL（见 run_server._store_from_env）；密码在 Secret 里。
   WARDEN_PG_HOST: "REPLACE_ME-pg-host"
@@ -34,6 +45,10 @@ data:
   # 所以多副本可以（也应该）开审计；SQLite 后端只在单副本下用。
   # ⚠️ 审计链密钥 WARDEN_AUDIT_KEY 必须在 Secret 里配，否则链退化为无密钥（挡不住重算整链）。
   WARDEN_AUDIT: "1"
+  # 审计链**密钥门禁**：配了 WARDEN_AUDIT_KEY 之外再开它，则"审计开、但没配密钥"时
+  # **拒绝启动**（默认行为只是告警）。生产应有密钥，所以打开它把"忘配密钥"变成启动即失败，
+  # 而不是上线后才发现链是无密钥的（无密钥链挡不住"改完重算整条链"）。
+  WARDEN_AUDIT_REQUIRE_KEY: "1"
 
   # ---- 停机 ----
   # 收到 SIGTERM 后最多等 30s 把在飞请求跑完，然后关资源并退出。
@@ -41,9 +56,48 @@ data:
   WARDEN_SHUTDOWN_GRACE_S: "30"
 
   # ---- 可观测性 ----
+  # 日志格式：json = 一行一个 JSON 对象（采集端按 trace_id/level 成字段）；text = 人看的单行文本。
+  # 容器里 stdout 不是终端，默认就会选 json；这里显式写出来是为了**不让默认值悄悄变**。
+  WARDEN_LOG_FORMAT: "json"
   WARDEN_TRACING: "1"
+  # OTLP 导出端点（标准 OTEL 变量名，见 core/otel.py）。
+  # 不配 = 只打结构化日志（span 不导出）；配了即把 span 送 OTLP 收集器。
+  # ⚠️ 这是**占位符**，指向集群内 observability 命名空间的 collector（NetworkPolicy 已放行 4318/4317）。
+  #    换成你实际的 collector 地址；没有 collector 时导出失败只告警、不影响业务。
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"
+  OTEL_SERVICE_NAME: "warden-agent"
+  # 告警投递 webhook（挂起 Run 等的主动通知）。留空 = 不做 webhook 推送。
+  # 可指到 Alertmanager 或直接指到企业微信/钉钉/Slack 网关（头里的凭据放 Secret）。
+  WARDEN_ALERT_WEBHOOK_URL: ""
 
   # ---- 多租户 / 角色 ----
   # 管理员名单（逗号分隔的用户 id）。**不配就没有管理员**（fail-closed）。
   WARDEN_ADMIN_PRINCIPALS: "REPLACE_ME-ops-user"
+  # 只读角色名单（逗号分隔）。留空 = 无人被降为只读；给审计方/观察者只读访问时填。
+  WARDEN_VIEWER_PRINCIPALS: ""
   WARDEN_TENANT: "REPLACE_ME-tenant"
+
+  # ---- 限流 / 出站配额 / 请求上限（护住成本与稳定性）----
+  # 值均取应用默认值（core/settings.py 的基本口径），这里显式写出便于灰度调参。
+  # 每站点每窗口请求数 `次数/秒数`；多副本要用共享存储计数（WARDEN_SHARED_STATE=1）。
+  WARDEN_RATE_LIMIT: "600/60"
+  # 出站总速率 / 单 host 速率 / 同时出站请求数上限。
+  WARDEN_OUTBOUND_LIMIT: "120/60"
+  WARDEN_OUTBOUND_HOST_LIMIT: "20/60"
+  WARDEN_OUTBOUND_MAX_CONCURRENCY: "8"
+  # 出站每日配额（0 = 不限）。接真模型/搜索时建议设一个“每日成本闸门”。
+  WARDEN_OUTBOUND_DAILY_QUOTA: "0"
+  # 请求 body 上限（字节，默认 1 MiB）；超限回 413。0 = 关闭。
+  WARDEN_MAX_REQUEST_BYTES: "1048576"
+  # 单站 /chat/stream 并发 SSE 连接上限（超出回 503）。0 = 关闭。
+  WARDEN_SSE_MAX_CONNECTIONS: "100"
+
+  # ---- 后台维护 / 幂等 / 会话缓存 ----
+  # 后台维护扫描间隔秒数（0 = 关闭）。清过期幂等记录等。
+  WARDEN_MAINTENANCE_INTERVAL_S: "300"
+  # 幂等记录存活秒数（默认 86400）。
+  WARDEN_IDEMPOTENCY_TTL_S: "86400"
+  # 进程内事件总线每个 run 保留的最近事件数（默认 500）。
+  WARDEN_EVENT_KEEP: "500"
+  # HTTP 会话内存缓存上限（LRU 淘汰，默认 1000）。
+  WARDEN_SESSION_CACHE_MAX: "1000"

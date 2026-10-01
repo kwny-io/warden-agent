@@ -1,0 +1,48 @@
+# ServiceMonitor（Prometheus Operator CRD）——把 Warden 的 /metrics 接入 Operator 管理的 Prometheus
+#
+# 前提：集群里已装 Prometheus Operator（否则这个 CRD 不存在，apply 会报
+#   "no matches for kind ServiceMonitor"）。**没装 Operator 就用静态配置**，
+#   见同目录 README.md「没有 Operator 时怎么用 static_configs 代替」。
+#
+# 为什么不用手写 prometheus.yml：Operator 通过 CRD 发现目标，抓取配置由 Operator 生成，
+#   增删服务不用重载 Prometheus 配置。本文件与 prometheus.yml（本地 compose 演练用）
+#   是两条并行路径，**别同时启用以免重复抓取**。
+#
+# ⚠️ /metrics 受鉴权保护（本项目 fail-closed：开了鉴权，业务端点含指标都要 Bearer）。
+#   所以下面必须带 bearerTokenSecret。secret 的 key 放**一个有效的 API key**
+#   （多用户模式 WARDEN_API_KEYS 里的任意一个，或单用户模式的 WARDEN_API_KEY）。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: warden-agent
+  namespace: warden
+  labels:
+    app.kubernetes.io/name: warden-agent
+    # ⚠️ Operator 通常只选带 release=<你的 kube-prometheus-stack release> 标签的 ServiceMonitor。
+    # 把 prometheus 换成 helm release 名（kubectl get prometheus -A 看 spec.serviceMonitorSelector）。
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: warden-agent
+  namespaceSelector:
+    matchNames: ["warden"]
+  endpoints:
+    - port: http                 # 对应 service.yaml 的 port 名 http（80 -> targetPort 8000）
+      path: /metrics
+      scheme: http
+      interval: 15s              # 与本地 / 默认抓取间隔一致
+      scrapeTimeout: 10s
+      # 关键：`/metrics` **不是**公开路径（`web/server.py:_is_public` 里只放了 / 、/docs、
+      # /redoc、/openapi.json、/health/*）⇒ 抓取必须带有效 Bearer，否则 401 ⇒
+      # `up{job="warden-agent"}==0` 会把 WardenServiceDown 打成长期 critical，
+      # **真实告警反而被淹没（比不监控更危险）**。
+      #
+      # 引用的是一个 **Secret 数据键**（不是环境变量名）：它的值必须是某个
+      # principal 的 key，且那个 principal 应该是**只读身份**：
+      #   1) `WARDEN_API_KEYS=prometheus:sk-xxx`（多用户模式；单键模式下用那个 key）
+      #   2) `WARDEN_VIEWER_PRINCIPALS=prometheus` → 降为只读（否则拿它就能调 /approve）
+      #   3) Secret 里 `WARDEN_METRICS_BEARER: sk-xxx`（见 secret.example.yaml）
+      bearerTokenSecret:
+        name: warden-secrets
+        key: WARDEN_METRICS_BEARER

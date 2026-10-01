@@ -1,0 +1,84 @@
+# 命名空间基线治理：Namespace + ResourceQuota + LimitRange
+#
+# 为什么把这三样放在一个文件里：它们是"同一个决定"的三面——
+#   Namespace 标签 = **准入时**就挡掉不合规的 Pod（Pod Security Admission）；
+#   ResourceQuota = 命名空间的**总量**上限（谁都不许把这个命名空间吃光）；
+#   LimitRange   = **单容器**的形状约束 + 给没写 resources 的容器兜默认值。
+# 只做 Deployment 里的 securityContext 是不够的：那只约束"这一个 Deployment"，
+# 而命名空间里还有迁移 Job、备份 CronJob、以及人手 `kubectl run` 的排障 Pod。
+#
+# ⚠️ 用 `kubectl apply -f namespace.yaml` 建命名空间，**不要**再 `kubectl create namespace`。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: warden
+  labels:
+    app.kubernetes.io/name: warden-agent
+    # Pod Security Admission：restricted 档 —— 与 deployment.yaml 里已经写好的
+    # runAsNonRoot / allowPrivilegeEscalation:false / drop ALL / seccompProfile 对齐。
+    # 这是**准入**层的硬门禁：不合规的 Pod 直接被 API server 拒绝创建，
+    # 而不是"跑起来以后被人 review 发现"。
+    # （审计/告警档位放宽一级到 baseline：只记录不拦截的部分留给"知道自己在干什么"的场景。）
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# 命名空间总量上限。为什么要它：没有配额时，"某个 Pod 内存泄漏"或"有人跑了个
+# 大批量 Job"可以把整个节点的资源吃干，把同节点的其他服务一起拖死——爆的一方不付费。
+# ⚠️ 配额里列了 cpu/memory 的 requests 与 limits，就意味着**该命名空间内所有容器都必须声明**
+#    这两项（或由下面的 LimitRange 兜默认值）。本目录的 app/迁移/备份都已声明。
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: warden-quota
+  namespace: warden
+  labels:
+    app.kubernetes.io/name: warden-agent
+spec:
+  hard:
+    # 按 deployment.hpa 的 maxReplicas: 6 估算：6 × (requests 200m / limits 1) ≈ 1.2 / 6
+    # 留出滚动更新（maxSurge 1）+ 迁移 Job + 备份 Job 的余量。
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    # Pod 数量上限：防"失控的 Job/CronJob 刷一堆 Pod"（CronJob 的 history limits 只管 Job 对象，
+    # 管不了同时存在的 Pod）。本目录常态 ≤ 2 副本 + 1 迁移 + 1 备份 + 排障 Pod。
+    pods: "20"
+    # 备份卷 + 将来可能的其他卷。限住它是为了防"PB 级 PVC 申请"把存储类打满。
+    persistentvolumeclaims: "4"
+    requests.storage: 100Gi
+---
+# 单容器形状约束 + 默认值。
+# 为什么要默认值：配额一旦生效，"没写 resources 的容器"会被直接拒绝创建。
+# 这个 LimitRange 给它们兜一个保守默认值，这样
+#   ①CI/演练里 `kubectl run` 的临时 Pod 不会因为"忘了写 resources"而莫名起不来；
+#   ②真出问题时它们也不会无限制地吃内存。
+# max 的用意不同：它挡住"有人把 limits 写成 8 核 32G"——那等价于绕过配额（申请那一刻就占满）。
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: warden-limits
+  namespace: warden
+  labels:
+    app.kubernetes.io/name: warden-agent
+spec:
+  limits:
+    - type: Container
+      # 没写 resources 时兜底（保守值，够跑一个小排障容器）
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        cpu: 500m
+        memory: 512Mi
+      # 单容器上限（app 的 limits 是 1 核 / 512Mi，留了余量）
+      max:
+        cpu: "2"
+        memory: 2Gi
+      # 下限：挡住 `cpu: 1m` 这类"几乎不申请"的写法——它会让调度器把一堆 Pod
+      # 塞到同一个节点，实际用超了才炸（Requests 是调度的唯一依据）。
+      min:
+        cpu: 10m
+        memory: 32Mi

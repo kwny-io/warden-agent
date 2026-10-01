@@ -21,23 +21,43 @@
 
 | 文件 | 作用 |
 |---|---|
+| `namespace.yaml` | 命名空间 `warden` + PSA `restricted` + ResourceQuota + LimitRange（**必须最先 apply**；文件顶部明确禁止 `kubectl create namespace`） |
+| `serviceaccount.yaml` | ServiceAccount `warden-agent`（**必须 apply**：deployment / migrate-job / backup-cronjob 都写死了这个 SA 名，缺它 Pod 起不来） |
 | `deployment.yaml` | 2 副本、滚动更新先起后停、探针、非 root + rootfs 只读、`/data` 与 `/tmp` 可写卷 |
 | `configmap.yaml` | 非敏感配置：PG 连接、共享状态、事件总线、停机宽限、管理员名单 |
-| `secret.example.yaml` | 密钥**示例**（值全是 `REPLACE_ME`），用前替换或改用外部密钥服务 |
+| `secret.example.yaml` | 密钥**示例**（值全是 `REPLACE_ME`），用前替换或改用外部密钥服务；含 `WARDEN_METRICS_TOKEN`（供 ServiceMonitor 抓 `/metrics`，与用户 API key 分开） |
 | `service.yaml` / `ingress.yaml` | ClusterIP + 入口（SSE 关缓冲、会话粘性） |
 | `hpa.yaml` / `pdb.yaml` | 按 CPU 扩缩（2~6）、维护时至少留 1 个副本 |
+| `networkpolicy.yaml` | **默认拒绝**（ingress+egress 双方向）+ 白名单：ingress-nginx 入站、DNS、PG、OTLP、外网 443；显式排除云元数据 `169.254.169.254/32` |
+| `migrate-job.yaml` | 迁移 Job：复用应用镜像/ConfigMap/Secret，构造 `PostgresStore` 触发幂等 DDL；**必须先于** Deployment 成功 |
+| `backup-pvc.yaml` | 备份落盘卷（`warden-backups`，RWO 20Gi） |
+| `backup-cronjob.yaml` | 每日 `pg_dump -Fc` + 产物校验 + 14 天保留；口令只从 Secret 注入（CronJob 见下） |
 
 ## 用之前要替换的（环境相关）
 
-1. **镜像**：`deploy/k8s/deployment.yaml` 的 `image:` → 你的仓库与 tag（**别用 `:latest`**）。
+1. **镜像**：`deploy/k8s/deployment.yaml` 的 `image:` → 你的仓库与 tag**@sha256:digest**
+   （**别用 `:latest`**）。清单与 `Dockerfile` 里的 digest 都是**全 0 占位符**，CI 负责替换：
+   `docker buildx imagetools inspect <repo>:<tag> --format '{{.Manifest.Digest}}'`。未替换会 `manifest unknown`。
+   `migrate-job.yaml` / `backup-cronjob.yaml` 用的是同一个占位符，别漏改。
 2. **PostgreSQL**：`configmap.yaml` 的 `WARDEN_PG_HOST`；密码放 Secret 的 `WARDEN_PG_PASSWORD`。
    没现成的库就用云厂商托管 PG，或另起一个 StatefulSet（不在本目录范围）。
 3. **鉴权**：`secret.example.yaml` 的 `WARDEN_API_KEYS`（`用户id:密钥` 逗号分隔）。
    **必须配**——对外监听 + 无鉴权时应用会 fail-closed 拒绝启动。
 4. **管理员**：`configmap.yaml` 的 `WARDEN_ADMIN_PRINCIPALS`（不配就没有管理员）。
 5. **域名/TLS**：`ingress.yaml` 的 host 与 `secretName`（以及 `ingressClassName` 按你的网关改）。
+   ⚠️ 同一个 `configmap.yaml` 里的 `WARDEN_TRUSTED_PROXIES` 要填**代理自己的网段**
+   （不是客户端网段；不知道就先 `kubectl -n ingress-nginx get pods -o wide` 看一眼 pod IP）。
+   不填的后果不是「限流偏一点」，而是所有匿名调用者共用一个限流桶，且同一个
+   `Idempotency-Key` 会**跳调用者串响应体**——见 `docs/deployment-boundaries.md`。
 6. **容量**：`resources` 的 requests/limits 按你的实测调（**先跑 `scripts/load_test.py` 拿数字**，
    别照抄这里的 200m/1 核）。
+7. **网络策略**：`networkpolicy.yaml` 里 `REPLACE_ME_PG_CIDR` → 你托管 PG 的网段；
+   入口网关若不在 `ingress-nginx` 命名空间，改 `namespaceSelector` 的标签值。
+   ⚠️ **NetworkPolicy 要生效，集群 CNI 必须支持它**（Calico/Cilium/Antrea 支持；
+   裸 flannel 不执行策略——apply 成功但流量照样通，等于没配）。
+8. **备份**：`backup-pvc.yaml` 的 `storage` 与 `storageClassName` 按库体量和你的存储类改。
+9. **OTLP**：`configmap.yaml` 的 `OTEL_EXPORTER_OTLP_ENDPOINT` → 你的 collector 地址
+   （默认指向 `observability` 命名空间的 `otel-collector`；不接后端就删掉这个 key，只打结构化日志）。
 
 ## 校验（不含真实集群）
 
@@ -53,16 +73,214 @@ docker run --rm -v "$PWD/deploy/k8s:/m:ro" ghcr.io/yannh/kubeconform:v0.6.7 \
 kubectl -n warden apply --dry-run=server -f deploy/k8s/
 ```
 
-## 部署顺序建议
+## 部署 / 升级顺序（迁移先于 Deployment）
+
+**为什么不能一把梭 `kubectl apply -f deploy/k8s/`**：本目录是纯参考清单，
+**没有 Helm chart**（所以没有 `pre-upgrade` hook）、**也没有 `kustomization.yaml`**
+（所以没有 `depends_on`/`sortOptions`）。一次性 apply 时，`deployment.yaml` 的滚动
+可能在 `migrate-job.yaml` 跑完之前就发生——而 `deployment.yaml` 是 `replicas: 2`，
+两个副本会**并发**跑迁移 DDL（原因见 `migrate-job.yaml` 顶部注释）。
+所以顺序只能由**分步 apply + wait** 自己保证：
 
 ```bash
-kubectl create namespace warden
-kubectl -n warden create secret generic warden-secrets --from-literal=...   # 见 secret.example.yaml 顶部
-kubectl -n warden apply -f deploy/k8s/            # ConfigMap/Secret 之外的都在这
+# 0) 命名空间与 ServiceAccount：**必须最先 apply**。
+#    · 用 `apply -f namespace.yaml` 而**不是** `kubectl create namespace`：
+#      namespace.yaml 里带了 PSA `restricted`、ResourceQuota、LimitRange，
+#      `create` 建出来的裸命名空间会让这些约束全部失效（而文件顶部也明确写了别用 create）。
+#    · serviceaccount.yaml 也**不能跳**：deployment.yaml / migrate-job.yaml /
+#      backup-cronjob.yaml 都写死了 `serviceAccountName: warden-agent`，
+#      SA 不存在时迁移 Job 会卡在 `serviceaccount "warden-agent" not found`，
+#      下面的 `kubectl wait` 必然超时 → 按本文件自己的约定会 `exit 1` 停止发布。
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/serviceaccount.yaml
+
+# 1) 无依赖的先落地（ConfigMap / 存储 / 网络 / 路由）
+kubectl -n warden apply -f deploy/k8s/configmap.yaml
+kubectl -n warden apply -f deploy/k8s/networkpolicy.yaml
+kubectl -n warden apply -f deploy/k8s/backup-pvc.yaml
+kubectl -n warden apply -f deploy/k8s/service.yaml
+kubectl -n warden apply -f deploy/k8s/ingress.yaml
+kubectl -n warden apply -f deploy/k8s/hpa.yaml
+kubectl -n warden apply -f deploy/k8s/pdb.yaml
+
+# 2) 密钥（值见 secret.example.yaml 顶部；别把明文写进 shell history）
+kubectl -n warden create secret generic warden-secrets --from-literal=...
+
+# 3) ⚠️ 迁移**先于**新版本 Deployment：跑完且成功，才允许滚动
+kubectl -n warden apply -f deploy/k8s/migrate-job.yaml
+kubectl -n warden wait --for=condition=complete job/warden-migrate --timeout=10m \
+  || { kubectl -n warden logs job/warden-migrate; echo '迁移失败，停止发布'; exit 1; }
+
+# 4) 迁移成功后再滚动应用
+kubectl -n warden apply -f deploy/k8s/deployment.yaml
+kubectl -n warden rollout status deploy/warden-agent
+
+# 5) 备份（可选，随附）
+kubectl -n warden apply -f deploy/k8s/backup-cronjob.yaml
+```
+
+顺序约束的两种"正统"替代（本目录未采用，仅说明为什么现在要手工保证）：
+- **Helm hook**：把迁移做成 `pre-install,pre-upgrade` hook 的 Job，`helm upgrade` 会等它完成；
+- **kustomize**：`sortOptions`/依赖编排，或把迁移放进 `preSync`（Argo CD）阶段。
+  两者都需要把本目录变成 chart/overlay——目前刻意保持"纯 YAML 参考"，所以用上面的分步命令。
+
+> 重复执行：Job 的 `spec` 不可变，**已完成的** `warden-migrate` 再次 apply 是 no-op（不会重跑）。
+> 要强制重跑迁移：`kubectl -n warden delete job warden-migrate` 再 apply。
+> （`ttlSecondsAfterFinished: 3600` 也会在一小时后把它删掉，下次 apply 自然重跑。）
+
+升级用**镜像 tag@digest** 换新版滚动（`maxUnavailable: 0`，滚动期间不中断）。
+
+## 回滚 / 恢复
+
+### 回滚应用（代码问题）
+
+```bash
+kubectl -n warden rollout undo deploy/warden-agent
 kubectl -n warden rollout status deploy/warden-agent
 ```
 
-升级用**镜像 tag** 换新版滚动（`maxUnavailable: 0`，滚动期间不中断）；
-回滚 `kubectl -n warden rollout undo deploy/warden-agent`。
+⚠️ **回滚不会回滚数据库结构**：项目迁移是"只增不删"的幂等补列/建表（见 `migrate-job.yaml`），
+旧版本代码遇到新增列会忽略。所以"代码回滚"通常直接可用；
+只有当你回了**一个不认识某列/表**的旧版本时，才需要走下面的备份恢复。
+
+### 恢复备份（数据损坏 / 误删）
+
+前置：**先让应用停止写库**，否则 `pg_restore --clean` 会与在线写入打架：
+
+```bash
+export NS=warden
+kubectl -n $NS scale deploy/warden-agent --replicas=0
+# 暂停备份（CronJob 的 scale 已废弃，用 suspend），避免它往同一个 RWO 卷写
+kubectl -n $NS patch cronjob warden-pg-backup -p '{"spec":{"suspend":true}}'
+```
+
+1) 挂**同一个 PVC** 起一个临时 shell（备份卷是 RWO，务必确认没有别的 Pod 还在挂它）：
+
+```bash
+kubectl -n $NS apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-restore
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+  containers:
+    - name: pg
+      image: postgres:16-alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      command: ["sleep", "infinity"]
+      envFrom:
+        - configMapRef: { name: warden-config }
+      env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef: { name: warden-secrets, key: WARDEN_PG_PASSWORD }
+      volumeMounts:
+        - { name: backups, mountPath: /backups }
+  volumes:
+    - name: backups
+      persistentVolumeClaim: { claimName: warden-backups }
+EOF
+kubectl -n $NS wait --for=condition=Ready pod/pg-restore --timeout=2m
+```
+
+2) 选一份 dump 并**先校验可读**（坏备份恢复出来更糟）：
+
+```bash
+kubectl -n $NS exec -it pg-restore -- sh -lc 'ls -lh /backups'
+kubectl -n $NS exec -it pg-restore -- sh -lc 'pg_restore --list /backups/warden-<时间戳>.dump | head'
+```
+
+3) 恢复（`--clean --if-exists` 先删后建；`--no-owner` 避免角色名不一致报错）：
+
+```bash
+kubectl -n $NS exec -it pg-restore -- sh -lc \
+  'pg_restore -h "$WARDEN_PG_HOST" -p "$WARDEN_PG_PORT" -U "$WARDEN_PG_USER" \
+     -d "$WARDEN_PG_DB" --clean --if-exists --no-owner /backups/warden-<时间戳>.dump'
+```
+
+4) 核**审计链**（恢复后最容易"静默不一致"的地方）：
+
+```bash
+warden audit-verify --pg      # 期望链连续；否则审计链与数据已不一致，需从更新的 dump 重建
+```
+
+5) 清理并恢复服务：
+
+```bash
+kubectl -n $NS delete pod pg-restore
+kubectl -n $NS patch cronjob warden-pg-backup -p '{"spec":{"suspend":false}}'
+kubectl -n $NS scale deploy/warden-agent --replicas=2
+kubectl -n $NS rollout status deploy/warden-agent
+```
+
+> ⚠️ **备份卷的保留窗口是 14 天**（`backup-cronjob.yaml` 的 `find ... -mtime +14 -delete`）：
+> 发现数据损坏越晚，可恢复的窗口越窄。要更久请同步到对象存储（见 `backup-pvc.yaml` 顶部）。
+> 备份失败/静默失效的告警接线见 `deploy/observability/README.md`。
+
 灰度的**自动化门控**在 `scripts/canary_rollout.sh`（它只做"能不能放量"的判定，
 权重切换在你网关侧），可观测性栈见 `deploy/observability/`。
+
+## 配置项 → 来源（configmap / secret / 默认值）
+
+清单里的每一条都来自 `src/warden_agent/core/settings.py` 的 `ENV_SPECS`（唯一事实源）。
+下表把它逐项对齐到清单：**清单里没有的 = 用代码默认值**（"默认值"列给关键默认，
+其余见 `ENV_SPECS`）。标 🔒 的是敏感值，只能放 Secret；标 "(示例注释)" 的是
+`secret.example.yaml` 里**默认注释掉**的可选项（不用的保持注释，见该文件说明）。
+
+| 配置项 | 来源 | 默认 / 参考值 |
+|---|---|---|
+| `WARDEN_API_KEYS` | secret 🔒 | 必填（多用户 `用户id:key` 逗号分隔） |
+| `WARDEN_API_KEY` | secret 🔒 | 单用户模式 / 指标抓取 token（示例注释） |
+| `WARDEN_ADMIN_PRINCIPALS` | configmap | 必填（不配 = 无管理员） |
+| `WARDEN_VIEWER_PRINCIPALS` | configmap | `""` = 无人只读 |
+| `WARDEN_TENANT` | configmap | `REPLACE_ME-tenant`（代码默认 `local`） |
+| `WARDEN_HOST` / `PORT` | configmap | `0.0.0.0` / `8000` |
+| `WARDEN_TRUSTED_PROXIES` | configmap | **必填**（入口是 ingress-nginx）：取值 = 代理/pod 网段，**不是客户端网段**；不配会塔桶 + 幂等跳调用者串响应（**新增**） |
+| `WARDEN_DB_PATH` | configmap | `/data/warden.db`（多副本下仅临时文件用） |
+| `WARDEN_PG_HOST` / `WARDEN_PG_PORT` / `WARDEN_PG_DB` / `WARDEN_PG_USER` | configmap | `5432` / `warden` / `postgres`(清单里 `warden`) |
+| `WARDEN_PG_PASSWORD` | secret 🔒 | 必填 |
+| `WARDEN_SHARED_STATE` | configmap | `1`（多副本必须） |
+| `WARDEN_AUDIT` | configmap | `1` |
+| `WARDEN_AUDIT_REQUIRE_KEY` | configmap | `1`（**新增**：开了审计又没配 `WARDEN_AUDIT_KEY` → 拒绝启动） |
+| `WARDEN_AUDIT_KEY` | secret 🔒 | 必填（配合 `REQUIRE_KEY`） |
+| `WARDEN_EVENT_BUS` | configmap | `notify`（仅 PG 有效，不满足回落 `poll`） |
+| `WARDEN_EVENT_KEEP` | configmap | `500`（**新增**） |
+| `WARDEN_SESSION_CACHE_MAX` | configmap | `1000`（**新增**） |
+| `WARDEN_SHUTDOWN_GRACE_S` | configmap | `30`（须 < deployment 的 `terminationGracePeriodSeconds: 45`） |
+| `WARDEN_RATE_LIMIT` | configmap | `600/60`（**新增**） |
+| `WARDEN_OUTBOUND_LIMIT` / `WARDEN_OUTBOUND_HOST_LIMIT` | configmap | `120/60` / `20/60`（**新增**） |
+| `WARDEN_OUTBOUND_MAX_CONCURRENCY` / `WARDEN_OUTBOUND_DAILY_QUOTA` | configmap | `8` / `0`（**新增**） |
+| `WARDEN_MAX_REQUEST_BYTES` | configmap | `1048576`（**新增**） |
+| `WARDEN_SSE_MAX_CONNECTIONS` | configmap | `100`（**新增**） |
+| `WARDEN_MAINTENANCE_INTERVAL_S` | configmap | `300`（**新增**） |
+| `WARDEN_IDEMPOTENCY_TTL_S` | configmap | `86400`（**新增**） |
+| `WARDEN_TRACING` | configmap | `1` |
+| `WARDEN_LOG_FORMAT` | configmap | `json`（**新增**；不配则按 stdout 是否终端自动选，容器里本来就是 json） |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | configmap | **新增**，占位指向 `observability/otel-collector:4318` |
+| `OTEL_SERVICE_NAME` | configmap | `warden-agent`（**新增**） |
+| `OTEL_EXPORTER_OTLP_HEADERS` | secret 🔒 | (示例注释) |
+| `WARDEN_ALERT_WEBHOOK_URL` | configmap | `""` = 不推送（**新增**） |
+| `WARDEN_ALERT_WEBHOOK_HEADERS` | secret 🔒 | (示例注释) |
+| `WARDEN_CREDENTIAL_KEY` | secret 🔒 | 必填（不设 = 重启后解不开密文） |
+| `WARDEN_CREDENTIAL_OLD_KEYS` | secret 🔒 | (示例注释) 轮换期旧密钥 |
+| `WARDEN_KMS_PROVIDER` / `WARDEN_KMS_WRAPPED_KEY` / `WARDEN_VAULT_*` | secret 🔒 | 默认 `env`（未启用托管） |
+| 模型 key（`DEEPSEEK_` / `OPENAI_` / `ZHIPU_` / `DASHSCOPE_` / `WARDEN_MODEL_API_KEY`） | secret 🔒 | (示例注释)；不配则用离线假模型 |
+| `WARDEN_BASE_URL` / `WARDEN_MODEL` | secret / 默认 | custom 网关用；默认 `deepseek-chat` |
+| `WARDEN_SEARCH_PROVIDER` / `WARDEN_SEARCH_ENDPOINT` / `WARDEN_SEARCH_API_KEY` | 未配 / secret 🔒 | 不配 = 离线 mock 搜索 |
+| `WARDEN_EMBED_BASE_URL` / `WARDEN_EMBED_API_KEY` / `WARDEN_EMBED_MODEL` | 未配 / secret 🔒 | 不配 = 词频哈希（**非语义**）检索 |
+| `WARDEN_STABILITY` | 默认 | `1`（清单未列出 = 用默认） |
+| `WARDEN_PLANNER` / `WARDEN_MAX_CONTEXT_CHARS` / `WARDEN_KNOWLEDGE` / `WARDEN_WEB_FETCH` | 默认 | 关 / 空 |
+| `GIT_WORKDIR` / `SKILLS_DIR` / `MCP_SERVER` / `WARDEN_MCP_TIMEOUT_S` | 默认 | 未启用（`git.apply_patch`/技能/MCP 关） |
+| `WARDEN_MULTIAGENT` | 默认 | `0`（不注册子 Agent 卡；`1` = 注册 `research`/`write`，会多花模型调用） |
+| `WARDEN_WEB_DIST` / `WARDEN_ISOLATION_PREFIX` | 默认 | 镜像内默认（前端目录 / 沙箱档探测） |
+| `PGPASSWORD` | secret 🔒 | 仅 `backup-cronjob.yaml` 用（`pg_dump` 的 libpq 变量） |
+| `WARDEN_SERVER_URL` | — | 仅 CLI 用，默认 `http://127.0.0.1:8000` |
+
+> 拼错的 `WARDEN_*` 变量不会被静默忽略：应用启动时会比对 `ENV_SPECS` 并**告警**
+> （`unknown_warden_variables()`），格式错误直接拒绝启动（`validate_env()`）。
+> 所以"清单里写错一个名字"会在 Pod 日志里露出来，不会悄悄用默认值跑。

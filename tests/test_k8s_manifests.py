@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -127,3 +128,100 @@ def test_密钥示例里没有真实凭据() -> None:
     data = _by_kind("Secret")["stringData"]
     for key, value in data.items():
         assert "REPLACE_ME" in value, f"{key} 的值看起来不是占位符：{value!r}"
+
+
+# —— 以下是 2026-09-27 交付审计（三路只读 reviewer）挑出来的"清单存在但清单跑不起来"类问题，
+#    每条都对应一个**真实会炸的运行期后果**，所以固化成断言，避免下次改动又悄悄丢。——
+
+
+# ServiceMonitor 不在 deploy/k8s 下，单独指路
+_OBS = Path(__file__).resolve().parents[1] / "deploy" / "observability"
+
+
+def _workloads() -> list[dict]:
+    """所有会起 Pod 的资源（Deployment / Job / CronJob）。"""
+    return [d for d in _load_all() if d.get("kind") in ("Deployment", "Job", "CronJob")]
+
+
+def _pod_spec(wl: dict) -> Any:
+    """取 Pod 模板的 spec：CronJob 比 Deployment/Job 多一层 jobTemplate。"""
+    if wl["kind"] == "CronJob":
+        return wl["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    return wl["spec"]["template"]["spec"]
+
+
+def test_ServiceMonitor引用的Secret键必须真实存在() -> None:
+    """引用一个默认不存在的 Secret key ⇒ 抓取 401 ⇒ `up{job=...}==0` 把 WardenServiceDown
+    打成长期 critical，**真实告警反而被淹没**（比不监控更危险）。
+
+    这一条就是审计里的 D-B4：ServiceMonitor 引用 `WARDEN_API_KEY`，而示例 Secret 只给
+    `WARDEN_API_KEYS`（复数）——两个名字差一个字母，运行时才发现（而且是在 Prometheus 上发现）。
+    """
+    sm = yaml.safe_load((_OBS / "servicemonitor.yaml").read_text(encoding="utf-8"))
+    ep = sm["spec"]["endpoints"][0]
+    ref = ep["bearerTokenSecret"]
+    assert ref["name"] == _by_kind("Secret")["metadata"]["name"], "引用的 Secret 名与示例不一致"
+    keys = _by_kind("Secret")["stringData"]
+    assert ref["key"] in keys, (
+        f"ServiceMonitor 要的 Secret 键 {ref['key']!r} 不在 secret.example.yaml 里：{sorted(keys)}"
+    )
+    # /metrics 不在公开路径白名单（server.py:_is_public）——所以必须有 token，不能“以为公开”
+    assert ep["path"] == "/metrics"
+
+
+def test_所有工作负载引用的ServiceAccount必须存在() -> None:
+    """SA 不存在 ⇒ Pod 卡在 `serviceaccount "warden-agent" not found`。
+
+    审计里的 D-B1：deployment / migrate-job / backup-cronjob 都写死了
+    `serviceAccountName: warden-agent`，但 `serviceaccount.yaml` 从未被创建（连文档都没提
+    要 apply 它）⇒ **照文档走必然发布失败**。
+    """
+    names = {
+        d["metadata"]["name"]
+        for d in _load_all()
+        if d.get("kind") == "ServiceAccount"
+    }
+    for wl in _workloads():
+        sa = _pod_spec(wl).get("serviceAccountName")
+        if sa is None:
+            continue
+        who = f"{wl['kind']}/{wl['metadata']['name']}"
+        assert sa in names, f"{who} 引用了不存在的 ServiceAccount {sa!r}"
+
+
+def test_部署文档必须包含命名空间与SA这两步() -> None:
+    """D-B1：README 的分步顺序里缺 namespace.yaml / serviceaccount.yaml。
+
+    为什么不能只靠"清单对不对"：这一步错了，`kubectl wait --for=condition=complete` 必然超时，
+    按文档自己的约定 `exit 1` 停发布——**文档就是部署脚本**，所以文档也要测。
+    """
+    text = (K8S / "README.md").read_text(encoding="utf-8")
+    assert "apply -f deploy/k8s/namespace.yaml" in text, (
+        "部署顺序缺 namespace.yaml（PSA/配额/LimitRange 会一起失效）"
+    )
+    assert "apply -f deploy/k8s/serviceaccount.yaml" in text, "部署顺序缺 serviceaccount.yaml"
+    for name in ("namespace.yaml", "serviceaccount.yaml"):
+        assert f"| `{name}` |" in text, f"文件表缺 {name} 一行"
+
+
+def test_清单里不许留全0占位digest() -> None:
+    """`postgres:16-alpine@sha256:000…0` 能过任何语法校验，却让 Pod 调度时 `manifest unknown`
+    ——备份会"看起来配了、其实从没产出过"（审计 D-B2）。"""
+    bad = "sha256:" + "0" * 64
+    for path in sorted(K8S.glob("*.yaml")) + sorted(_OBS.glob("*.yaml")):
+        assert bad not in path.read_text(encoding="utf-8"), f"{path.name} 里还有全 0 占位 digest"
+
+
+def test_备份保留策略不许按mtime删() -> None:
+    """`find -mtime +14 -delete` 没有"最少保留份数"下限：卷里出现被 touch / 被 pg_restore
+    写过的文件、或节点时钟漂移，就可能删掉唯一可用的备份（删备份不可逆，比不删危险）。"""
+    cj = _by_kind("CronJob")
+    script = "\n".join(_pod_spec(cj)["containers"][0]["args"])
+    # 只看真命令，不看注释（注释里会提到被否掉的写法）
+    dangerous = [
+        ln.strip()
+        for ln in script.splitlines()
+        if not ln.strip().startswith("#") and "find" in ln and "-delete" in ln
+    ]
+    assert not dangerous, f"备份保留不许用 find -delete（按 mtime、无最少保留份数）：{dangerous}"
+    assert "pruned:" in script or "backup-prune" in script, "保留策略应显式按时间戳保留固定份数"

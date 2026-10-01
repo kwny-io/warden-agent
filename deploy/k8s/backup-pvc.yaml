@@ -1,0 +1,24 @@
+# PostgreSQL 备份落盘卷
+#
+# 为什么单独一个 PVC：备份必须**离开生产库所在节点/卷**才有意义——和生产库同盘
+# 等于没备份。这里给 CronJob 一个独立卷；生产上更好的做法是把 dump 再同步到对象存储
+# （S3/GCS/OSS）或异地，本 PVC 只保证"备份不丢在容器临时层里"。
+#
+# accessModes 用 ReadWriteOnce 足够：`concurrencyPolicy: Forbid` 保证同一时刻只有一个
+# 备份 Pod 在写，RWO 不会成为约束，也避免用 RWX 引入共享文件系统的额外依赖。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: warden-backups
+  labels:
+    app.kubernetes.io/name: warden-agent
+    app.kubernetes.io/component: backup
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      # 容量按"单份 dump 大小 × 保留份数 × 余量"估：默认保留 14 天、每天 1 份。
+      # 请按你的库体量调整（先跑一次 CronJob 看实际 dump 大小）。
+      storage: 20Gi
+  # 未指定 storageClassName：用集群默认存储类。生产建议显式指定你验证过的存储类
+  # （如 storageClassName: gp3 / standard），避免"默认类被改"导致行为漂移。

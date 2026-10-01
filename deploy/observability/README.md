@@ -8,6 +8,7 @@
 | `alerts/warden.rules.yml` | 告警规则库：可用性 / 错误率 / 延迟 / 业务（挂起 Run、限流激增） |
 | `alerts/warden.slo.yml` | SLO 记录规则（可用性、延迟）+ 多窗口燃烧率告警 |
 | `prometheus.yml` | 抓取配置（**带 Bearer**，因为 `/metrics` 受鉴权保护）+ 规则加载 + 告警转发 |
+| `servicemonitor.yaml` | **Prometheus Operator** 版的抓取声明（装了 Operator 才用；与 `prometheus.yml` 二选一） |
 | `alertmanager.yml` | 告警路由（critical 立刻发、warning 打包发） |
 | `docker-compose.yml` | 一键起栈，用于本地演练 |
 
@@ -40,6 +41,50 @@ docker run --rm --entrypoint promtool \
 仓库里另有一条测试 `tests/test_alert_rules.py`：解析这些 YAML，并断言**引用的每个
 `warden_*` 指标都真实存在于代码里**、SLO 记录规则被其后的告警引用——防止"改了个指标名、
 规则库悄悄指向一个不存在的指标"这类漂移。
+
+## 没有 Operator 时怎么用 static_configs 代替
+
+`servicemonitor.yaml` 是 **Prometheus Operator 的 CRD**，只有集群里装了 Operator
+（如 kube-prometheus-stack）才能 apply——否则 `kubectl apply` 会报
+`no matches for kind "ServiceMonitor"`。**本地 / 小集群 / 手装 Prometheus 的替代做法**：
+直接在 `prometheus.yml` 里写静态抓取目标（本仓已有的这条就是范例，可直接照抄）：
+
+```yaml
+scrape_configs:
+  - job_name: warden-agent
+    scheme: http
+    metrics_path: /metrics
+    # 因为 /metrics 受鉴权保护，必须带 Bearer；token 文件内容 = 一个有效 API Key
+    bearer_token_file: /etc/prometheus/warden_token
+    static_configs:
+      - targets: ["warden-agent.warden.svc.cluster.local:80"]   # Service 的 80 -> 8000
+        labels:
+          service: warden-agent
+```
+
+生成 token 与挂载方式（同 `docker-compose.yml` 里的做法）：
+
+```bash
+printf '%s' "$WARDEN_API_KEY" > deploy/observability/warden_token   # 已 .gitignore，别提交
+# 集群里建议把 token 放 Secret，再挂成文件（不要写明文进 prometheus.yml）
+```
+
+> 两条路径**别同时启用**（会重复抓取，`up` 计数与 SLO 都会翻倍）。
+> ServiceMonitor 路需要额外两件事：(1) Service **必须有带名字的 port**（本仓 `service.yaml` 的
+> `name: http`）；(2) ServiceMonitor 要带 `release: <你的 prometheus release>` 标签
+> 才会被 Operator 选中（见 `servicemonitor.yaml` 注释）。
+
+## 备份失败 / 静默失效的告警（代理层，非 warden_* 指标）
+
+`deploy/k8s/backup-cronjob.yaml` 的备份失败**不会**产生 `warden_*` 指标
+（那是 kube-state-metrics 的事实），所以不能写进 `alerts/*.rules.yml`
+（那条规则库有测试断言：引用的每个指标必须真实存在于代码里）。请另加两条：
+
+- 备份 Job 失败：`kube_job_status_failed{job_name=~"warden-pg-backup.*"} > 0`
+- **长期没成功过**（更关键的静默失效）：`time() - kube_cronjob_status_last_successful_time{cronjob="warden-pg-backup"} > 26*3600`
+
+接线位置：你的 Prometheus 能抓到 kube-state-metrics 即可，路由沿用 `alertmanager.yml`
+（severity 分档），不需要改本仓任何规则文件。
 
 ## 口径与边界（别误读）
 

@@ -1,0 +1,129 @@
+# 网络策略：默认拒绝 + 白名单放行
+#
+# 设计要点（先读这段，再看规则）：
+#   1. **K8s NetworkPolicy 没有 "deny" 规则**——它只有 allow 列表，语义是
+#      "选中 pod 的某个方向一旦有任何 policy 生效，未被任何 allow 命中的流量一律拒绝"。
+#      所以"default-deny"的表达方式是：本对象同时声明 `policyTypes: [Ingress, Egress]`
+#      且**只列白名单**；没有列出的目标 = 默认拒绝。
+#   2. 正因如此，"**显式拒绝云元数据**"（169.254.169.254/32）**不是**一条 deny 规则，
+#      而是靠"**不把它放进任何 allow 规则**"来实现的。这里额外用
+#      `ipBlock.except` 把整段链路本地地址（169.254.0.0/16）从 443 放行里挖掉，
+#      双保险——即使将来有人加了 0.0.0.0/0 的宽放行，元数据端点也不会被顺带放出去。
+#      云上必须开这条：否则 SSRF/被攻陷的进程可直连 IMDS 拿节点角色凭证。
+#   3. 应用本身**没有**内置"云元数据"逻辑；这是纯纵深防御，成本几乎为零。
+#   4. ⚠️ 本仓库当前**没有 Redis**（事件总线要么进程内、要么 PG LISTEN/NOTIFY；
+#      见 docs/deployment-boundaries.md：刻意"不引入 Redis 等新依赖"）。
+#      所以下面是**注释掉的** Redis 占位：真要接 Redis/NATS 事件总线时打开，
+#      端口用 6379，命名空间按你实际的部署改。**不要**凭空调一条放行出去。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: warden-agent
+  labels:
+    app.kubernetes.io/name: warden-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: warden-agent
+  # 两个方向都纳管 = 该 pod 的出/入站默认全拒，只有下面 allow 的能过
+  policyTypes: ["Ingress", "Egress"]
+
+  ingress:
+    # 只允许来自 ingress-nginx 命名空间的入站。用 namespaceSelector（标签匹配）
+    # 而不是 ipBlock：Pod IP 会变，按 namespace 身份放行在节点漂移后依然成立。
+    # `kubernetes.io/metadata.name` 是 K8s 1.21+ 自动给每个 namespace 打的标签，
+    # 无需手工维护。若你的网关不在 ingress-nginx，改这里的标签值即可。
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        # 只放容器真正监听的 8000（Service 的 80 -> targetPort http=8000）。
+        # 不放开探针端口之外的东西；探针来自 kubelet 节点，不受 NetworkPolicy 限制。
+        - protocol: TCP
+          port: 8000
+
+  egress:
+    # ---- 集群 DNS（kube-system/ kube-dns）----
+    # 没有这条，所有按域名出站都会解析失败（应用会表现为"模型/搜索全都连不上"）。
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # ---- PostgreSQL ----
+    # 端口对齐 configmap.yaml 的 WARDEN_PG_PORT: "5432"。
+    # 本仓库的 PG 是**外部/托管**的（configmap 里 WARDEN_PG_HOST 是占位符，不是集群内
+    # Service），所以这里用 ipBlock 而不是 namespaceSelector。
+    # ⚠️ 把 REPLACE_ME_PG_CIDR 换成托管 PG 的网段（如 10.20.0.0/16）。
+    #    若你的 PG 也在集群内，请改成 namespaceSelector + podSelector 的写法，
+    #    并删掉这条 ipBlock（更精确、不依赖网段）。
+    - to:
+        - ipBlock:
+            cidr: REPLACE_ME_PG_CIDR
+      ports:
+        - protocol: TCP
+          port: 5432
+
+    # ---- OTLP collector ----
+    # 与 configmap.yaml 新增的 OTEL_EXPORTER_OTLP_ENDPOINT 对齐（默认 HTTP 4318，
+    # gRPC 4317 一并放开以便换协议）。collector 通常装在 observability 命名空间。
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4318
+        - protocol: TCP
+          port: 4317
+
+    # ---- 外网 443：模型供应商 / 搜索 / Web 抓取 API ----
+    # ⚠️ 生产建议**不要**直接放 0.0.0.0/0：应改走 egress gateway / 固定出口 IP
+    #    （NAT 网关或集群 egress 组件），把这里换成"只到 egress gateway pod 的 443"，
+    #    这样出口 IP 固定、可被对方 allowlist，也能集中审计出站。
+    #    `except` 挖掉链路本地段：**这就是"拒绝云元数据"的落点**（见文件顶部第 2 点）。
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32   # AWS/GCP/Azure IMDS：显式排除
+              - 169.254.0.0/16       # 整段链路本地，连 169.254.170.x（ECS task metadata）一起挡
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # ---- （可选）集群内 PostgreSQL 的另一种写法示例 ----
+    # 若 PG 在集群内，用这条替代上面的 ipBlock（注释保留，避免有人抄错）：
+    # - to:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: data
+    #       podSelector:
+    #         matchLabels:
+    #           app.kubernetes.io/name: postgres
+    #   ports:
+    #     - protocol: TCP
+    #       port: 5432
+
+    # ---- （可选）Redis / NATS 事件总线 ----
+    # 本仓库当前**不使用** Redis（见文件顶部第 4 点）。仅当你在架构里真的引入
+    # Redis 作为共享事件总线时，才取消注释并把命名空间/端口改成实际值：
+    # - to:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: data
+    #       podSelector:
+    #         matchLabels:
+    #           app.kubernetes.io/name: redis
+    #   ports:
+    #     - protocol: TCP
+    #       port: 6379

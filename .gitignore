@@ -51,3 +51,20 @@ Thumbs.db
 # 工具缓存（ZCode 计划存储等）
 .zcode/
 .mimosa/
+
+# 测试/覆盖率产物（本地跑 pytest/mypy/vitest 都会生成；CI 自己算，不靠提交产物）
+.vitest/
+coverage.json
+coverage.xml
+htmlcov/
+web/coverage/
+
+# Playwright 真浏览器 e2e 产物（失败时的 trace/截图/HTML 报告都很大）
+web/test-results/
+web/playwright-report/
+web/blob-report/
+web/.playwright/
+
+# 变异测试产物：mutants/ 里是「每个突变体一份源码副本」，体积远超仓库本身，
+# 且每次跑都重新生成——绝不提交（scripts/mutation.sh 会在这里写 stats / 日志）
+mutants/

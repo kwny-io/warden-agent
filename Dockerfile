@@ -8,6 +8,19 @@
 #
 # T10 起：多阶段构建。第 1 阶段用 node 构建 React+TS+Tailwind 前端，
 # 第 2 阶段把构建产物放进 /app/web/dist，由 FastAPI 单端口托管（/ 是 SPA，API 同源）。
+#
+# ⚠️ 基础镜像用什么引用形式（tag vs tag@sha256:digest）：
+#    理想是 `node:20-slim@sha256:<digest>` —— tag 可变，"同名 tag 被重新推送"会让"回滚"
+#    变成"再拉一次、但不知道拉到什么"；digest 不可变，构建/发布可复现。
+#    但**本文件故意只写 tag**，因为一条真实的地雷：留 `@sha256:000…0` 这类占位符能过
+#    kubeconform / 语法校验，却让每一次 `docker build` 直接 `manifest unknown` ——
+#    风险从"构建期立刻暴露"被推到了"上线期才暴露"。默认能构建 >> 形式上有 digest。
+#    所以钉 digest 交给发布流水线里的一个显式步骤：
+#      scripts/pin_image_digests.sh                    # 只钉本文件的两个基础镜像
+#      scripts/pin_image_digests.sh --app-image <ref>  # 顺便把已推送的应用镜像 digest
+#                                                      # 回写 deploy/k8s/deployment.yaml
+#    该脚本 fail-closed：没有 docker buildx、或 registry 不可达时**非 0 退出**并给出可执行的
+#    下一步，绝不静默跳过（"以为钉过了、其实没钉"比不钉更糟）。CI 在构建前调用它即可。
 
 # ---------- 阶段 1：构建 React 前端 ----------
 FROM node:20-slim AS web-build

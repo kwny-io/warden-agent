@@ -20,3 +20,24 @@ tests/
 web/node_modules/
 web/dist/
 ts/node_modules/
+# 任意层级的 node_modules（子包/工作区）
+**/node_modules/
+
+# Python 缓存（根级通配不覆盖嵌套目录，显式再补一条）
+**/__pycache__/
+*.pyc
+.coverage
+htmlcov/
+
+# 编辑器/钩子工具状态（误提交过多）：
+.mimosa/
+**/.mimosa/
+.zcode/
+
+# 仅用于本地/CI 的目录，Dockerfile 不 COPY：不进构建上下文（更小、更不易泄露）
+deploy/
+scripts/
+.github/
+.k8s-schemas/
+audit-exports/
+*.dump

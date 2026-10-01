@@ -4,6 +4,16 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  # 手动触发：发布链路的"能不能真跑一次"不该只有"推一个公开 tag"这一条路。
+  # 没有这个入口时，想验证签名链路就必须先对外发布——等于用"发布"换"验证"，
+  # 门槛高到没人会去验，于是"签名流水线"永远停在"存在但从未运行"。
+  # tag 入参声明为 required：手动跑也**必须**显式给出发布版本，不让分支名冒充版本号。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并签名的发布 tag（必须显式给出，形如 v0.1.0）"
+        required: true
+        type: string
   # 每周定时跑一次：**依赖与基镜像的新 CVE 不需要改代码就会出现**，
   # 只在 push/PR 上扫描的话，"没人提交"就等于"没人检查"。
   schedule:
@@ -66,14 +76,34 @@ jobs:
           node-version: "20"
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: 构建前端 SPA（含类型检查，让 SPA 服务测试不再静默跳过）
-        # `npm run typecheck`（`tsc --noEmit`）**必须显式跑**：`vite build` 只用 esbuild
-        # 转译、**不做类型检查**，所以此前 TS 类型错误能让 CI 全绿（类型门禁形同虚设）。
+      - name: 前端门禁（lint + 类型检查 + 单测与覆盖率 + 构建）
+        # 四件事都要显式跑，每一件都补过一个真实的口子：
+        #  · `npm run lint`（eslint）：hooks 依赖数组漏项这类错误**类型系统看不见**，
+        #    只有 hooks 规则能拦（eslint-plugin-react-hooks）。
+        #  · `npm run typecheck`（`tsc --noEmit`）：`vite build` 只用 esbuild **转译、
+        #    不做类型检查**，所以此前 TS 类型错误能让 CI 全绿（类型门禁形同虚设）。
+        #  · `npm run test:coverage`（vitest）：前端此前**零测试**；现在 11 个文件 /
+        #    129 个用例，并带覆盖率下限（vite.config.ts 里 thresholds）。
+        #  · `npm run build`：产出 `web/dist`，让后端 SPA 服务测试（tests/test_web.py::test_t10）
+        #    不再因产物缺失而静默跳过。
         working-directory: web
         run: |
           npm ci
+          npm run lint
           npm run typecheck
+          npm run test:coverage
           npm run build
+      - name: 真浏览器 e2e（Playwright：CSP 在真引擎里不挡自己的资源）
+        # 为什么要占 CI 时间：CSP 的失败模式是**静默降级**——响应头存在不代表页面能跑。
+        # 行内 style、动态注入的脚本、SSE 一旦被策略挡住，页面不会报错，只是功能悄悄消失。
+        # 而 `tests/` 里的断言跑在 TestClient 上（根本没浏览器引擎），挡不住这类回归；
+        # 这一条用真 chromium 加载**打包产物**（不是 vite dev server）才能暴露。
+        # `--with-deps` 装系统库（Linux runner 上缺库会直接起不来 chromium）；
+        # 后端由 web/e2e/start-e2e-server.mjs 起（回环 + WARDEN_ALLOW_ANON=1，理由写在该文件里）。
+        working-directory: web
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:e2e
       - name: Ruff (lint)
         run: uv run --frozen ruff check src tests scripts
       - name: Mypy (strict)
@@ -82,7 +112,7 @@ jobs:
         # `-rs` 让跳过原因也打进日志：CI 里"跳过"和"通过"看起来一样绿，
         # 不写原因就没法判断是不是该跑的被静默跳过了。
         # `--cov` 同时**执行覆盖率门禁**：`fail_under` 配在 pyproject.toml（单一事实源，
-        # 基线 85.7% / 门槛 84%），这里不再重复写数字——避免"两个地方各写一个阈值"漂移。
+        # 基线 89% / 门槛 86%，见那里的注释），这里不再重复写数字——避免"两个地方各写一个阈值"漂移。
         # `--junitxml` 产出机器可读报告，供下一条"防静默跳过"守卫解析（不必再重跑一遍子集）。
         run: |
           uv run --frozen pytest --tb=short -rs -p no:cacheprovider --cov=warden_agent \
@@ -178,6 +208,51 @@ jobs:
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
             detect --source /repo --no-banner --redact -v
 
+  mutation:
+    name: 变异测试（${{ matrix.shard }}）
+    # 变异测试（mutation testing）：证明「测试全绿」不等于「测试有效」。
+    # 覆盖率只能回答「这行跑过没有」，回答不了「这行改错了会被发现吗」；变异测试把源码里的
+    # 比较符 / 边界 / 布尔 / 返回值逐个改掉再跑测试：测试仍绿 = 这段逻辑**没有任何测试约束它**。
+    # 本仓库最典型的两个风险点（评审批错 → 越权执行；脱敏漏一个分支 → 明文密钥进日志）
+    # 都不会让覆盖率掉一个点，却会被变异测试直接照出来。
+    #
+    # 为什么分片 + matrix：突变体是**逐个**跑的，一片 = 一个模块组 + 只跑覆盖它的那几个测试文件。
+    # 分片后每片一个小 job，彼此并行；否则串行的一大块只能夜间跑。
+    # 分片名单的**唯一来源**是 scripts/mutation_shards.py 的 SHARDS 表，下面这份 matrix 与它
+    # 一致性由 tests/test_mutation_shards.py 盯着（表格说一套、CI 跑另一套是最隐蔽的失真）。
+    # 本地想只跑改动涉及的片：python scripts/mutation_shards.py changed --only-affected
+    #
+    # 为什么只在夜间 + 手动跑：一批突变体仍然是「分钟级」的量，放进每次 PR 的 CI 里没人会等，
+    # 而「没人等」的门禁最后一定会被关掉。
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - core-security
+          - concurrency
+          - ratelimit
+          - patch-guard
+    # push / PR 上跳过，只在定时（每周一 03:00 UTC）和手动触发时跑。
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install（按 uv.lock 固定版本，含 dev —— mutmut 在 dev 组里）
+        run: uv sync --frozen --extra dev
+      - name: 变异测试 + 分数门禁（${{ matrix.shard }}）
+        # 分数口径见 scripts/mutation_gate.py：timeout 不算「杀死」（慢机器 ≠ 覆盖），
+        # 分母扣掉 skipped / no_tests（没配测试的代码不该被算作「测住了」）。
+        # 门槛由 scripts/mutation.sh 从**实测基线**往下留 2 个点给出；尚无实测基线的分片
+        # 只报告分数、不判红（编出来的门槛会被人关掉，而被关掉的门禁等于没有门禁）。
+        # 用 uv run 跑：mutmut 装在 .venv 里，不在 runner 的 PATH 上。
+        # 跑之前脚本会按分片表重写 [tool.mutmut]，退出时一定还原（trap），不会弄脏工作区。
+        run: uv run --frozen bash scripts/mutation.sh --shard=${{ matrix.shard }}
+
   migration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -247,15 +322,44 @@ jobs:
           artifact-name: warden-agent-sbom
           upload-artifact: true
 
+  evals-real:
+    # 真实模型质量门禁（提示注入 / 指令遵循 / 幻觉抵抗 / 工具选择）。
+    #
+    # 为什么单独一个 job，而不是塞进 quality：它要花真钱、要联网、而且是**概率性**的——
+    # 不能拖累那个"确定性、必须绿"的门禁。
+    #
+    # 为什么没 key 就**跳过**而不是失败：fork / 外部 PR 拿不到 secret，
+    # 把它们的 PR 直接弄红，只会让下一个人给这步加 `continue-on-error`，门禁名存实亡。
+    # 但跳过是**显式**的：日志里写明"未配置 key → 跳过"，不假装跑过（也不出"质量 100%"）。
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install (按 uv.lock 固定版本)
+        run: uv sync --frozen
+      - name: 模型质量评测（--mode real）
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -z "$DEEPSEEK_API_KEY" ]; then
+            echo "::notice::未配置 DEEPSEEK_API_KEY → 跳过真实模型质量评测（既不失败，也不算跑过）"
+            exit 0
+          fi
+          # 退码 1 = 低于阈值（真门禁）；退码 2 = 环境/参数问题（含"忘了配 key"）
+          uv run --frozen python -m warden_agent.evals --mode real --min-pass-rate 0.6 --detail
+
   image-signing:
-    # 交付面缺口 item 5：镜像签名。
-    # 只对**打 tag（v*）的 push** 触发：cosign keyless 需要把签名推到 registry，
-    # 而现在仓库**还没有 publish 步骤**（container job 只 build 本地镜像、不 push）。
-    # 所以这里把"发布"也一并做了：先 push 到 GHCR 再签。将来 publish 独立成步骤后，
-    # 把这里的 build+push 换成引用那一步产出的 digest 即可（签名对象是 digest，不是 tag）。
-    # ⚠️ PR 上**不会**触发（if 已限定 push tag）：没有可发布对象，硬签只会把 PR 弄红——
-    # 这与"新门禁不得误伤 PR"的取向一致。
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # 交付面缺口 item 5：镜像签名（先 push GHCR，再签）。
+    # 两个入口：push v* tag（正式发布）｜workflow_dispatch（手动真跑一次）。
+    # ⚠️ PR 上**不会**触发：没有可发布对象，硬签只会把 PR 弄红——
+    # 与"新门禁不得误伤 PR"的取向一致。
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # 覆盖顶层的 contents: read：这里需要写 GHCR + OIDC。
@@ -263,21 +367,80 @@ jobs:
       contents: read
       packages: write     # 推镜像到 GHCR
       id-token: write     # cosign keyless：用 GitHub OIDC 换**短期**签名证书，无长期私钥可泄露
+    env:
+      # 两个入口的 tag 来源不同，先归一：push tag → ref_name；手动 → 显式入参。
+      # 手动入口的入参在 workflow 层声明为 required，所以这里不会是空值。
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-      - name: 构建并推送到 GHCR
+      - name: 发布 tag 合法性（fail-closed）
+        # 分支名或任意字符串不能被当成发布版本：容器 tag 与签名身份都以它为锚，
+        # 事后审计"这一版是什么"必须一眼可读。
+        run: |
+          case "$RELEASE_TAG" in
+            v[0-9]*) echo "release tag: $RELEASE_TAG" ;;
+            *) echo "::error::发布 tag 必须以 v<数字>… 开头（当前: '$RELEASE_TAG'）。手动触发请在 tag 入参里显式给出，例如 v0.1.0"
+               exit 1 ;;
+          esac
+      - name: 构建并推送到 GHCR（并取回 registry 的权威 digest）
+        id: push
         # GHCR 的仓库路径必须小写，而 github.repository 保留大小写 → 显式转小写。
         run: |
           repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          image="ghcr.io/${repo}:${{ github.ref_name }}"
+          image="ghcr.io/${repo}:${RELEASE_TAG}"
           echo "IMAGE=$image" >> "$GITHUB_ENV"
           docker build --pull -t "$image" .
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
             -u "${{ github.actor }}" --password-stdin
           docker push "$image"
+          # 签名对象必须是 **digest**，不是 tag：tag 可以被移动/覆盖，签名跟着 tag 走
+          # 就等于"签了一个以后可能指向别的东西的名字"。digest 不可变，签名才落得实。
+          # 取值走 registry（imagetools inspect）而不是本地镜像的 RepoDigests：
+          # 本地那份是"我推上去的那个"，registry 那份才是"别人会拉到的那个"。
+          digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
+          if ! printf '%s' "$digest" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::从 registry 取回的 digest 不合法: '$digest'"
+            exit 1
+          fi
+          echo "IMAGE_DIGEST=ghcr.io/${repo}@${digest}" >> "$GITHUB_ENV"
+          {
+            echo "### 不可变引用（部署就用这一串）"
+            echo '```'
+            echo "ghcr.io/${repo}@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: 安装 cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
-      - name: cosign keyless 签名（签名存回 registry，与镜像 digest 绑定）
+      - name: cosign keyless 签名（对象 = 镜像 digest）
         # keyless：不管理任何长期私钥；cosign 用 OIDC 身份换 Fulcio 短期证书，
         # 签名与证书进 Rekor 透明日志，事后可审计"谁在什么时候签的"。
-        run: cosign sign --yes "$IMAGE"
+        run: |
+          cosign sign --yes "$IMAGE_DIGEST"
+      - name: 立刻独立校验这条签名（只签名不验证 = "我以为签上了"）
+        # 用**外部可复现的**验证者约束去验：本 workflow 的 OIDC 身份 + GitHub 的 issuer。
+        # 等于把"别人将来能不能验"提前跑一遍；命令原样写进 summary，便于事后自查。
+        run: |
+          cosign verify "$IMAGE_DIGEST" \
+            --certificate-identity-regexp '^https://github\.com/${{ github.repository }}/\.github/workflows/' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+          {
+            echo "### 事后独立校验这条签名（复制即可复跑）"
+            echo '```bash'
+            echo "cosign verify ${IMAGE_DIGEST} \\"
+            echo "  --certificate-identity-regexp '^https://github\\.com/${{ github.repository }}/\\.github/workflows/' \\"
+            echo "  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 把 digest 钉进部署清单（产出可直接 apply 的引用）
+        # 复用仓库自己的脚本（fail-closed：解析不出 digest 就非 0 退出，绝不静默跳过），
+        # 在 runner 里改写 deploy/k8s/*.yaml 的占位 image:，再把 diff 打进 job summary——
+        # 这样"签名的那一个"与"准备部署的那一个"是**同一个字符串**，不靠人抄。
+        run: |
+          scripts/pin_image_digests.sh --app-image "$IMAGE"
+          git --no-pager diff --stat
+          {
+            echo "### 已钉进清单的引用（把这份 diff 落到部署分支即可）"
+            echo '```diff'
+            git --no-pager diff -- deploy/k8s | sed -n '1,120p'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
