@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -105,9 +106,39 @@ def test_只能释放自己的锁() -> None:
 
 
 def test_owner_id包含主机与进程信息() -> None:
+    """格式 = 主机名:pid:8 位十六进制随机后缀，三段各自有用途，都要掐住。
+
+    主机名定位机器、pid 定位进程、随机后缀保证"同一进程重启前后不撞"。
+    后缀必须断言**长度与字符集**：`token_hex(5)`（长度变了）、`token_hex(None)`（直接抛错）
+    这类改动"看起来还能用"，只有掐住长度/字符集才守得住；而随机后缀正是
+    "同一进程重启后 owner 撞车 → 误判成自己还持有锁"的唯一防线。
+    """
     owner = new_owner_id()
-    assert ":" in owner
+    host, pid, suffix = owner.rsplit(":", 2)
+    assert host and host != "None", f"主机名不能退化：{owner!r}"
+    assert pid == str(os.getpid()), f"pid 段必须是本进程：{owner!r}"
+    assert len(suffix) == 8, f"随机后缀应是 token_hex(4) = 8 位，实际={suffix!r}"
+    assert all(c in "0123456789abcdef" for c in suffix), f"后缀必须是十六进制：{suffix!r}"
     assert new_owner_id() != owner       # 不应重复
+
+
+def test_边界_恰好到期这一刻就能被接管且不能续租() -> None:
+    """`expires_at > now` 与 `expires_at <= now` 用不用等号，决定"恰好到期"这一瞬的归属：
+    写松一点就是"多占一个 TTL"（另一个副本以为没人持有——并发驱动），
+    写紧一点就是"还活着却被判定过期"。
+
+    **关键在顺序**：这里故意不先调 `owner_of`。实现里 `owner_of` 会顺手删掉过期条目，
+    先调它就把"已过期但条目还在"这个状态抹掉了，等号写错也照样通过——突变体正是靠这个活下来的。
+    """
+    clock = _Clock()
+    lock = InProcessRunLock(ttl_seconds=60, clock=clock)
+    assert lock.acquire("run-1", "A") is True
+
+    clock.advance(60)                                  # 恰好到期（不早不晚）
+    assert lock.acquire("run-1", "B") is True, "到期这一刻就该能接管（`> now` 才算还持有）"
+
+    clock.advance(60)                                  # B 也恰好到期
+    assert lock.renew("run-1", "B") is False, "到期这一刻就不该能续租（`<= now` 即已失效）"
 
 
 # ---------------------------------------------------------------------------
@@ -160,20 +191,69 @@ def test_shared为假时用进程内锁() -> None:
                       InProcessRunLock)
 
 
-def test_shared为真且存储支持时用共享锁() -> None:
-    lock = run_lock_for(SqliteStore(Path(tempfile.mkdtemp()) / "t.db"), shared=True)
+class _LockableStore:
+    """具备取锁方法的假存储：用来证明 run_lock_for **真的把 store 交下去了**。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def acquire_run_lock(self, run_id: str, owner: str, expires_at: float, now: float) -> bool:
+        self.calls.append(("acquire", f"{run_id}/{owner}/{expires_at - now:.0f}"))
+        return True
+
+    def renew_run_lock(self, run_id: str, owner: str, expires_at: float, now: float) -> bool:
+        self.calls.append(("renew", f"{run_id}/{owner}"))
+        return True
+
+    def release_run_lock(self, run_id: str, owner: str) -> None:
+        self.calls.append(("release", f"{run_id}/{owner}"))
+
+    def run_lock_owner(self, run_id: str, now: float) -> str | None:
+        return "from-store"
+
+
+def test_shared为真且存储支持时用共享锁且真的把存储交下去了() -> None:
+    """只断言 `isinstance(lock, SqlRunLock)` 是不够的：`SqlRunLock(None)` 同样是实例。
+
+    要守住的是"锁拿到的是**这个** store"——否则多副本下等于锁在一张不存在的表上，
+    而且要到第一次取锁时才炸。另外 TTL 必须是"取锁时算的 now + ttl"，
+    直接透传给 SQL 版才有多副本下的同一套过期语义。
+    """
+    store = _LockableStore()
+    lock = run_lock_for(store, shared=True)
     assert isinstance(lock, SqlRunLock)
+    assert lock.acquire("run-1", "A", ttl_seconds=60) is True
+    assert store.calls == [("acquire", "run-1/A/60")], (
+        f"取锁必须打到传进来的 store 上：{store.calls}"
+    )
+    assert lock.owner_of("run-1") == "from-store", "查询持有者也必须走这个 store"
 
 
 def test_shared为真但存储不支持时回落并告警(caplog: pytest.LogCaptureFixture) -> None:
-    """能力不够要**明说**，不能假装多副本下是安全的。"""
-    class _Bare:  # 只有 RunStore 的一部分能力，没有取锁方法
+    """能力不够要**明说**，不能假装多副本下是安全的。
+
+    告警是这件事唯一的可观测面，所以三个信息都要守住：
+    打在哪个 logger（过滤/排查靠它）、说明里带上**存储的真实类型名**
+    （否则看到告警也不知道该换哪个存储）、以及结尾给出的正确做法。
+    """
+    class _BareStore:  # 只有 RunStore 的一部分能力，没有取锁方法
         pass
 
     with caplog.at_level("WARNING"):
-        lock = run_lock_for(_Bare(), shared=True)
+        lock = run_lock_for(_BareStore(), shared=True)
     assert isinstance(lock, InProcessRunLock)
-    assert any("Run 锁" in r.message for r in caplog.records)
+    warnings = [r for r in caplog.records if "Run 锁" in r.getMessage()]
+    assert warnings, f"回落必须告警，实际记录={[r.getMessage() for r in caplog.records]}"
+    record = warnings[0]
+    assert record.name == "warden_agent.runtime.locking", (
+        f"告警要打在模块自己的 logger 上，实际={record.name}"
+    )
+    message = record.getMessage()
+    assert message.startswith("请求共享 Run 锁，但存储 "), f"告警开头是排查契约：{message!r}"
+    assert "_BareStore" in message, f"告警里要能看出实际拿到的是什么存储：{message!r}"
+    assert message.endswith("请改用 SqliteStore / PostgresStore"), (
+        f"告警结尾要给出正确做法：{message!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -167,6 +167,99 @@ def test_流式_stream逐增量产出事件() -> None:
     assert sess.is_terminal()
 
 
+def test_流式工具执行结果作为事件推出且与落库正文一致() -> None:
+    """工具结果必须上屏：以前只有模型看得到（界面只有"🔧 调用工具：x"）。
+
+    stream() 要在执行后推一条 `tool_result`，且文本与**落库的 tool 消息正文完全一致**：
+    两边各拼一份的话，界面显示的与喂回模型的内容会慢慢分叉（审计时看到的东西就不是
+    模型当时看到的东西了）。这条断言就是"单一来源"的钉子。
+    """
+    store = _store()
+    model = ScriptedModel([
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="c1", name="weather.get", arguments={"city": "上海"})],
+            finish_reason="tool_calls"),
+        ChatResponse(content="天晴。", finish_reason="stop"),
+    ])
+    sess = AgentSession(run_id="r-toolres", model=model, catalog=weather_tool(),
+                        policy_engine=_policy(Decision.ALLOW), store=store)
+    events = list(sess.stream("查上海天气"))
+    types = [e["type"] for e in events]
+    # 调用在前、结果在后，都在 final 之前
+    assert types.index("tool") < types.index("tool_result") < types.index("final")
+    ev = next(e for e in events if e["type"] == "tool_result")
+    assert ev["name"] == "weather.get"
+    assert ev["ok"] is True
+    stored = [m for m in store.load_messages("r-toolres") if m.role == "tool"]
+    assert [m.content for m in stored] == [ev["text"]]  # 事件文本 == 落库正文
+    assert ev["text"].strip() != ""
+
+
+def test_流式工具失败时tool_result带ok为假且正文带失败前缀() -> None:
+    """失败的工具也要上屏（并且要一眼看出来失败了）。
+
+    前端就是靠正文的失败前缀把气泡标成琥珀色的，前缀文案变了这套标注会静默失效，
+    所以这里把它当契约钉住（前端 `lib/display.ts` 的判定配合使用）。
+    """
+    store = _store()
+    model = ScriptedModel([
+        ChatResponse(content=None, tool_calls=[
+            ToolCall(id="c1", name="nope.absent", arguments={})],
+            finish_reason="tool_calls"),
+        ChatResponse(content="换一招。", finish_reason="stop"),
+    ])
+    sess = AgentSession(run_id="r-toolres-fail", model=model, catalog=weather_tool(),
+                        policy_engine=_policy(Decision.ALLOW), store=store)
+    events = list(sess.stream("调一个不存在的工具"))
+    ev = next(e for e in events if e["type"] == "tool_result")
+    assert ev["ok"] is False
+    assert ev["text"].startswith("[工具 nope.absent 执行失败")
+    # 失败也照样落库，且与事件文本同源
+    stored = [m for m in store.load_messages("r-toolres-fail") if m.role == "tool"]
+    assert [m.content for m in stored] == [ev["text"]]
+
+
+def test_跨上下文逐块推进流式会话不炸() -> None:
+    """回归（来自真实浏览器 e2e 里抓到的 500）：**生成器每个 next() 都在不同的 context 里跑**。
+
+    uvicorn/Starlette 会把同步生成器丢进线程池逐块 next()，每块各持一份 context 副本。
+    所以任何“包住整个流式生成器”的 ContextVar set/reset 都会错配：
+
+        ValueError: <Token var=<ContextVar name='warden_memory_owner'> ...>
+                    was created in a different Context
+
+    现场表现：真实浏览器连发第二条消息 → 服务端 500（“正式 chat 失败”）。修法是把
+    owner_scope 从 stream() 挪到 _execute()（不跨 yield，详见 session.py 里的注释）。
+    本用例用 copy_context() 逐块推进来复现那个时序：修复前会在推完最后一块时报错，
+    修复后必须与单 context 版本产出完全一致的事件序列。
+    """
+    import concurrent.futures as cf
+    import contextvars
+
+    store = _store()
+    model = StreamScriptedModel(deltas=["你", "好", "！"], final_text="你好！")
+    sess = AgentSession(run_id="r-ctx", model=model, catalog=weather_tool(),
+                        policy_engine=_policy(Decision.ALLOW), store=store)
+
+    gen = sess.stream("你好")
+
+    def advance() -> dict | None:
+        # 每块都在“另一个 context”里推进：等价于服务器线程池里换了个工作线程
+        return contextvars.copy_context().run(lambda: next(gen, None))
+
+    events: list[dict] = []
+    with cf.ThreadPoolExecutor(max_workers=1) as pool:
+        while True:
+            event = pool.submit(advance).result(timeout=30)
+            if event is None:
+                break
+            events.append(event)
+
+    assert [e["type"] for e in events] == ["start", "delta", "delta", "delta", "final"]
+    assert [e["text"] for e in events if e["type"] == "delta"] == ["你", "好", "！"]
+    assert sess.is_terminal()
+
+
 def test_会话完成后新消息可开启新一轮() -> None:
     """回归：同一 run_id 多轮对话。第一轮完成后，第二条消息应重开执行周期，
     而不是在状态机上撞 COMPLETED -> WAITING_APPROVAL 非法转换（UI 曾报 500）。"""

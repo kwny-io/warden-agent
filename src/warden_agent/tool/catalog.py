@@ -236,6 +236,10 @@ class ToolCatalog:
     def all(self) -> list[ToolSpec]:
         return list(self._by_name.values())
 
+    def names(self) -> set[str]:
+        """已注册的工具名集合（技能 `requires` 依赖门禁就是拿它与声明比对）。"""
+        return set(self._by_name)
+
     def execute(self, name: str, arguments: dict[str, Any]) -> Any:
         """根据名字找到工具并执行。AI 不能拿着没注册的名字来调用。
 

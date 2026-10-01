@@ -17,9 +17,13 @@
 
   没有这三条，注册表就只是文档——而文档是不会自己变红的。
 
-口径说明：扫描规则是「`.get("字面量")` / `["字面量"]` 且字面量形如环境变量名」。
-所以代码里读配置要写成 `.get("WARDEN_XXX")` 这种**字面量**形式；
-把变量名当参数传给 helper（`helper(env, "WARDEN_XXX")`）会扫不到，本项目已约定不用那种写法。
+口径说明：扫描规则是「`.get("字面量")` / `["字面量"]` / `env_bool("字面量")`」，
+且字面量形如环境变量名。
+**模块级字符串常量也算**（`ENV_X = "WARDEN_X"` 然后 `env_bool(ENV_X)`）——这条能力是补上的：
+原先只认调用处的**字面量**，于是一个把变量名写成常量的模块能静默绕过登记与越权检查
+（`web/server.py` 的 `ENV_APPROVAL_ALLOW_SELF` 就是这么漏掉的），而**能静默绕过的守卫**
+比没有守卫更坑（它让人相信"每个变量都登记了"）。
+局部变量仍扫不到（`name = os.environ.get("K"); env_bool(name)` 这种就别写）。
 若将来出现同形状、但**不是**环境变量的全大写常量，加进 `_NON_ENV_CONSTANTS` 即可。
 
 注：本文件里的"密钥"全是**运行时拼出来的假值**，源码里刻意不出现任何像凭据的字面量。
@@ -60,17 +64,49 @@ def _fake_value(tag: str) -> str:
     return f"faux-{tag}-" + secrets.token_hex(8)
 
 
-def _read_literal(node: ast.AST) -> str | None:
+def _module_constants(tree: ast.Module) -> dict[str, str]:
+    """收集模块级字符串常量：`ENV_X = "WARDEN_X"` / `ENV_X: str = "WARDEN_X"`。
+
+    为什么要收：把变量名写成常量再传给 helper（`env_bool(ENV_APPROVAL_ALLOW_SELF)`）
+    曾经能从守卫眼底滑过去——它当时只看调用处的字面量。
+
+    前缀式常量（`PROJECT_ENV_PREFIX = "WARDEN_"`）刻意不算：它是前缀不是变量名，
+    当成变量名去登记表里找只会得到误报。
+    """
+    consts: dict[str, str] = {}
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets, value = list(node.targets), node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
+            continue
+        if not _ENV_LIKE.match(value.value) or value.value.endswith("_"):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                consts[target.id] = value.value
+    return consts
+
+
+def _read_literal(node: ast.AST, consts: dict[str, str] | None = None) -> str | None:
     """判断这个 AST 节点是否在"读某个名字的环境变量"，是则返回变量名字面量。
 
     覆盖三种读法：
       - `x.get("NAME")`（`x` 可能是 `os.environ`，也可能是注入进来的 Mapping）
       - `x["NAME"]`
       - 类型化访问器 `env_int("NAME", ...)` / `settings.env_bool("NAME")`
+    第一个参数也可以是**模块级字符串常量**（传 `consts` 时才能解析）。
     """
     if isinstance(node, ast.Call) and node.args:
         first = node.args[0]
-        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            literal = first.value
+        elif isinstance(first, ast.Name) and consts is not None and first.id in consts:
+            literal = consts[first.id]
+        else:
             return None
         func = node.func
         is_get = isinstance(func, ast.Attribute) and func.attr == "get"
@@ -79,7 +115,7 @@ def _read_literal(node: ast.AST) -> str | None:
             or (isinstance(func, ast.Attribute) and func.attr in _ENV_ACCESSORS)
         )
         if is_get or is_accessor:
-            return first.value
+            return literal
         return None
     if (
         isinstance(node, ast.Subscript)
@@ -99,8 +135,9 @@ def _collect_env_reads() -> dict[str, set[str]]:
         except SyntaxError:  # pragma: no cover - 语法错误由 ruff/mypy 先拦
             continue
         rel = path.relative_to(SRC).as_posix()
+        consts = _module_constants(tree)
         for node in ast.walk(tree):
-            literal = _read_literal(node)
+            literal = _read_literal(node, consts)
             if literal and _ENV_LIKE.match(literal) and literal not in _NON_ENV_CONSTANTS:
                 reads.setdefault(literal, set()).add(rel)
     return reads
@@ -235,6 +272,31 @@ def test_守卫能识别类型化访问器() -> None:
     # 把变量名放进变量再传 → 扫不到。这是**约定**：变量名必须在调用处是字面量。
     node3 = ast.parse("v = env_int(name_var)").body[0].value
     assert _read_literal(node3) is None
+
+
+def test_守卫能识别模块级常量别名() -> None:
+    """把变量名写成模块级常量再传，也必须能扫到（`server.py` 曾靠这招漏过登记）。"""
+    tree = ast.parse('ENV_SELF = "WARDEN_APPROVAL_ALLOW_SELF"\nv = env_bool(ENV_SELF)')
+    consts = _module_constants(tree)
+    assert consts == {"ENV_SELF": "WARDEN_APPROVAL_ALLOW_SELF"}
+    node = tree.body[1].value
+    assert _read_literal(node, consts) == "WARDEN_APPROVAL_ALLOW_SELF"
+    # 不传常量表时依旧扫不到——保证"漏登记"不会被悄悄兼容掉
+    assert _read_literal(node) is None
+
+
+def test_前缀式常量不当成变量名() -> None:
+    """`PROJECT_ENV_PREFIX = "WARDEN_"` 是前缀不是变量名，不能因此误报“未登记”。"""
+    tree = ast.parse('PREFIX = "WARDEN_"')
+    assert _module_constants(tree) == {}
+
+
+def test_本仓实际读到的审批逃生门已登记(env_reads: dict[str, set[str]]) -> None:
+    """这是**修的那个具体盲区**的回归：常量别名读法现在会被算进 env_reads。"""
+    assert "WARDEN_APPROVAL_ALLOW_SELF" in env_reads
+    # 读取点随 server.py 拆分搬到了 http_kit.py（SoD 判定与它的“逃生门”在同一个模块）；
+    # 这里**故意写死模块名**：写死才能发现“读取点悄悄搬走、而登记表没跟着改”。
+    assert env_reads["WARDEN_APPROVAL_ALLOW_SELF"] == {"web/http_kit.py"}
 
 
 def test_访问器解析口径统一() -> None:

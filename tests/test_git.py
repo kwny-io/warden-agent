@@ -17,6 +17,7 @@ from warden_agent.git.coordinator import (
 from warden_agent.git.patch import PatchConflict, PatchDocument, UnifiedPatchParser
 from warden_agent.git.revision import (
     DirectGitProbe,
+    ExecutionBrokerGitRevisionProbe,
     GitCommandContextError,
     GitRepositoryRef,
     GitRevision,
@@ -272,3 +273,62 @@ def test_build_agent_git_能力式集成(tdir) -> None:
     out = str(catalog.execute("git.apply_patch", {"diff": diff}))
     assert "已应用" in out
     assert "earth" in (tmp / "greet.txt").read_text(encoding="utf-8")
+
+
+# ---- git 基准探测的「实现可选」：以前 broker 版只是个注释里的承诺 ----
+def test_git_probe_default_is_direct() -> None:
+    """不配任何东西时，探测实现是直连版（默认行为可预测）。"""
+    from warden_agent.git.tools import make_git_probe
+
+    assert isinstance(make_git_probe(), DirectGitProbe)
+
+
+def test_git_probe_selectable_by_config(monkeypatch) -> None:
+    """`WARDEN_GIT_PROBE=broker` 能真的把受控探测换上去（不是只能写在注释里）。"""
+    from warden_agent.git.tools import make_git_probe
+
+    monkeypatch.setenv("WARDEN_GIT_PROBE", "broker")
+    assert isinstance(make_git_probe(), ExecutionBrokerGitRevisionProbe)
+
+
+def test_git_probe_invalid_value_fails_closed(monkeypatch) -> None:
+    """取值写错就报错，**不静默退回直连**——静默降级等于偷偷换掉安全属性。"""
+    from warden_agent.git.tools import make_git_probe
+
+    monkeypatch.setenv("WARDEN_GIT_PROBE", "sandbox")
+    with pytest.raises(ValueError, match="WARDEN_GIT_PROBE 取值非法"):
+        make_git_probe()
+
+
+@_NEEDS_GIT
+def test_broker_probe_can_apply_patch(tdir) -> None:
+    """broker 版探测不是摆设：拿它装配 git.apply_patch，patch 要真能落地。"""
+    from warden_agent.git import make_git_tools
+    from warden_agent.git.tools import make_git_probe
+
+    tmp, _commit = tdir
+    probe = make_git_probe("broker")
+    catalog = ToolCatalog()
+    for spec in make_git_tools(str(tmp), probe=probe):
+        catalog.register(spec)
+    diff = "--- a/greet.txt\n+++ b/greet.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+broker\n"
+    out = str(catalog.execute("git.apply_patch", {"diff": diff}))
+    assert "已应用" in out
+    assert "broker" in (tmp / "greet.txt").read_text(encoding="utf-8")
+
+
+@_NEEDS_GIT
+def test_broker_probe_rejects_revision_conflict(tdir) -> None:
+    """broker 版同样能挡住基准不一致的 patch（校验真的在跑，不是直接放行）。"""
+    from warden_agent.git import make_git_tools
+    from warden_agent.git.tools import make_git_probe
+
+    tmp, _commit = tdir
+    catalog = ToolCatalog()
+    for spec in make_git_tools(str(tmp), expected_base_commit="0" * 40,
+                               probe=make_git_probe("broker")):
+        catalog.register(spec)
+    diff = "--- a/greet.txt\n+++ b/greet.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+broker\n"
+    out = str(catalog.execute("git.apply_patch", {"diff": diff}))
+    assert "REVISION_CONFLICT" in out
+    assert "world" in (tmp / "greet.txt").read_text(encoding="utf-8")  # 没落地

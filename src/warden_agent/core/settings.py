@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from collections.abc import Mapping
@@ -103,6 +104,14 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
              "auth.py 也读它：名单解析与角色判定的纯函数放在那一层（可单独测）",
     ),
     EnvSpec(
+        "WARDEN_APPROVAL_ALLOW_SELF",
+        "单操作员部署的逃生门：显式设 1 才允许「自己批自己」（默认不允许）",
+        "web/http_kit.py", ("web/http_kit.py",), kind="bool",
+        note="职责分离（SoD）默认开启：发起人不能批自己的单，**admin 也不豁免**——"
+             "否则拿到一个 user 凭证就能 `shell.run(rm -rf …)` 然后自己点批准。"
+             "只为了单操作员/本机部署留这个口，失败方向选严格（默认撞 403，报错里告诉你这个开关）",
+    ),
+    EnvSpec(
         "WARDEN_TENANT",
         "租户 id（审计与授权按它隔离）",
         "web/run_server.py", ("web/run_server.py",),
@@ -123,6 +132,18 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     EnvSpec(
         "PORT", "HTTP 端口", "web/run_server.py", ("web/run_server.py",),
         default="8000", kind="int",
+    ),
+    EnvSpec(
+        "WARDEN_TRUSTED_PROXIES",
+        "前置代理的地址/网段（逗号分隔）——**只有列在这里的对端**的 X-Forwarded-For 才被采信",
+        "web/run_server.py", ("web/run_server.py",),
+        kind="proxies",
+        note="不配 = 不信任 XFF（uvicorn 默认只信回环）。于是 `request.client.host` 永远是"
+             "代理的 IP，三件事一起退化：①按调用者分桶的限流会**塌成一个桶**（一个客户端"
+             "把别人挤掉）；②幂等键的调用者作用域相撞——鉴权开启时作用域用 user_id，"
+             "只在**鉴权关闭 + 反代部署**时才会串响应体；③审计里的来源 IP 只剩代理。"
+             "写在 k8s Ingress / Nginx 后面就必须配它，取值 = 代理自身的地址（集群内网段），"
+             "**不是客户端网段**。",
     ),
     EnvSpec(
         "WARDEN_DB_PATH", "SQLite 文件路径（容器 rootfs 只读时必须指向可写卷）",
@@ -206,27 +227,45 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     # ---- 模型接入 ----
     EnvSpec(
         "DEEPSEEK_API_KEY", "DeepSeek 模型密钥", "model/deepseek.py",
-        ("model/deepseek.py", "web/run_server.py", "demo_e2e.py"),
-        sensitive=True, note="多模块读取是合理的：都只是把它交给模型客户端",
+        ("model/deepseek.py", "web/run_server.py", "demo_e2e.py", "evals/real_model.py"),
+        sensitive=True,
+        note=("多模块读取是合理的：都只是把它交给模型客户端（evals/real_model.py 用它跑"
+              "真实模型质量评测，取不到就明确报错退出，不退回假模型）"),
     ),
     EnvSpec("OPENAI_API_KEY", "OpenAI 模型密钥", "model/deepseek.py",
-            ("model/deepseek.py",), sensitive=True),
+            ("model/deepseek.py", "evals/real_model.py"), sensitive=True,
+            note="evals/real_model.py：OPENAI_API_BASE 指向本机/兼容端点时的质量评测"),
     EnvSpec("ZHIPU_API_KEY", "智谱 GLM 模型密钥", "model/deepseek.py",
             ("model/deepseek.py",), sensitive=True),
     EnvSpec("DASHSCOPE_API_KEY", "阿里百炼模型密钥", "model/deepseek.py",
             ("model/deepseek.py",), sensitive=True),
     EnvSpec(
         "WARDEN_MODEL_API_KEY", "custom 通用接入的模型密钥",
-        "model/deepseek.py", ("model/deepseek.py",), sensitive=True,
+        "model/deepseek.py", ("model/deepseek.py", "evals/real_model.py"), sensitive=True,
         note="**不是** WARDEN_API_KEY（那是鉴权）。本机网关/Ollama 填 not-needed 这类占位串",
     ),
     EnvSpec(
         "WARDEN_BASE_URL", "custom 通用接入的 OpenAI 兼容端点",
-        "model/deepseek.py", ("model/deepseek.py",),
+        "model/deepseek.py", ("model/deepseek.py", "evals/real_model.py"),
         note="**不是** CLI 要连的服务地址（那是 WARDEN_SERVER_URL）",
     ),
     EnvSpec("WARDEN_MODEL", "custom 通用接入的模型名", "model/deepseek.py",
-            ("model/deepseek.py",), default="deepseek-chat"),
+            ("model/deepseek.py", "evals/real_model.py"), default="deepseek-chat"),
+    EnvSpec(
+        "WARDEN_ALLOW_FAKE_MODEL",
+        "显式接受用「假模型」对外服务（回复是固定脚本，不是真实推理）",
+        "web/run_server.py", ("web/run_server.py",), kind="bool",
+        note="fail-closed 取向：非本机开发场景下用假模型会**拒绝启动**——"
+             "假模型的回复看起来像真能力（会调工具、会答话），被当成真实部署会让人误判系统能力。"
+             "演示实例请显式声明自己就是演示（启动日志与 /capabilities 都会如实标明）",
+    ),
+    EnvSpec(
+        "WARDEN_DEMO_INSTANCE",
+        "对外监听时的第二重演示声明（与 WARDEN_ALLOW_FAKE_MODEL 同时设才放行）",
+        "web/run_server.py", ("web/run_server.py",), kind="bool",
+        note="为什么要两个变量：生产配置里残留一句 ALLOW_FAKE_MODEL=1 这种事故，"
+             "一个开关拦不住；第二个变量要的是一个只可能故意写出口的词",
+    ),
     # ---- 能力开关 ----
     EnvSpec("WARDEN_STABILITY", "工具稳定性层（超时/重试/降级/熔断），0 关",
             "web/run_server.py", ("web/run_server.py",),
@@ -262,8 +301,19 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
             "web/run_server.py", ("web/run_server.py",), default="86400", kind="int"),
     EnvSpec("GIT_WORKDIR", "把指定 git 仓库暴露为 git.apply_patch 工具",
             "web/run_server.py", ("web/run_server.py",), kind="path"),
+    EnvSpec("WARDEN_GIT_PROBE",
+            "git 基准探测实现：`direct`（直连 git）/ `broker`（经能力校验的受控探测）",
+            "git/tools.py", ("git/tools.py",), default="direct",
+            note="取值非法时 fail-closed 拒绝启动（不静默退回 direct）——"
+                 "否则部署方以为在用受控探测、实际走直连，是静默降级"),
     EnvSpec("SKILLS_DIR", "技能目录（加载 SKILL.md）",
             "web/run_server.py", ("web/run_server.py",), kind="path"),
+    EnvSpec("WARDEN_MULTIAGENT",
+            "是否注册多 Agent 子 Agent 卡（research / write，主管模式）",
+            "web/run_server.py", ("web/run_server.py",), default="0", kind="bool",
+            note="默认关：子 Agent 会真的多花模型调用，所以不做默认开；"
+                 "子 Agent 只拿 pure=True 的只读工具（带副作用的工具要过人工审批，"
+                 "而子 Agent 跑在一次工具调用内部，没有审批对话通道）"),
     EnvSpec("MCP_SERVER", "MCP server 启动命令（需 node；工具先审查再导入）",
             "web/run_server.py", ("web/run_server.py",)),
     EnvSpec(
@@ -374,16 +424,53 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     ),
     # ---- 可观测性 ----
     EnvSpec(
+        "WARDEN_LOG_FORMAT",
+        "日志格式：json（一行一个 JSON 对象，给采集端）/ text（人看的单行文本）；"
+        "不配则按 stdout 是否终端自动选",
+        "core/logging_setup.py", ("core/logging_setup.py",),
+        default="auto",
+        note="默认 auto = stdout 是终端给 text（开发机）、不是终端给 json（容器/CI/重定向）。"
+             "为什么要分两档：结构化日志的价值在采集端（按 trace_id 串一次请求、按 level 告警），"
+             "但把 JSON 强塞给人看是自伤。取值写错**拒绝启动**，不按默认值猜——"
+             "否则上线后才发现采集端一无所获",
+    ),
+    EnvSpec(
         "WARDEN_TRACING", "链路追踪（W3C traceparent 传播 + span 日志），默认开，0 关",
         "core/tracing.py", ("core/tracing.py",),
         default="1", kind="bool",
         note="关掉后 span() 不碰 contextvar、开销接近零；出站与入站的链路上下文也随之不再生成",
     ),
+    # ---- 演示与开发（默认关，打开要显式声明） ----
+    EnvSpec(
+        "WARDEN_DEMO_TOOLS",
+        "注册演示工具 weather.get / fs.delete（默认关；开了才能在工具目录里看到这两张演示卡）",
+        "web/run_server.py", ("web/run_server.py",), default="0", kind="bool",
+        note="这两张卡只为演示「审批闸门真的会拦」而存在：天气返回固定值、fs.delete "
+             "**不会真的删文件**（返回值里也写明是演示卡）。它们原先是无条件注册的，"
+             "于是任何启动 run_server 的实例都会拿到「已删除 xxx」的成功文本、磁盘却毫无变化——"
+             "副作用声明与实际行为相反。现在默认不注册；打开时启动日志会打 WARNING",
+    ),
     # ---- 前端与沙箱 ----
-    EnvSpec("WARDEN_WEB_DIST", "前端静态文件目录", "web/server.py",
-            ("web/server.py",), kind="path"),
+    EnvSpec("WARDEN_WEB_DIST", "前端静态文件目录", "web/routes/spa.py",
+            ("web/routes/spa.py",), kind="path"),
     EnvSpec("WARDEN_ISOLATION_PREFIX", "沙箱隔离档前缀（容器/内核档探测）",
             "execution/sandbox.py", ("execution/sandbox.py",)),
+    EnvSpec(
+        "WARDEN_SANDBOX_ISOLATION",
+        "沙箱隔离档声明：auto（默认，能上内核档就上）/ kernel（要求内核档，给不了就拒绝）/ "
+        "semantic（显式接受「只有语义层把关」）",
+        "execution/sandbox.py", ("execution/sandbox.py",), default="auto",
+        note="为什么要显式声明：语义档**不是隔离**——它按命令长相的正则拦网络命令，"
+             "python -c 里写一句 socket 就绕过去了。生产部署若对外声称「有隔离」，"
+             "就该声明 kernel：声明与事实不符时是**启动失败**（fail-closed），"
+             "而不是悄悄降级成看起来隔离。取值写错同样拒绝启动（不按默认值猜）",
+    ),
+    EnvSpec(
+        "WARDEN_SANDBOX_REQUIRE_KERNEL",
+        "布尔写法的「要求内核级隔离」，语义等同 WARDEN_SANDBOX_ISOLATION=kernel",
+        "execution/sandbox.py", ("execution/sandbox.py",), kind="bool",
+        note="给偏好布尔开关的部署方式留的口子；内核档不可得时同样 refuse（注册 shell.run 时抛错）",
+    ),
     # ---- CLI ----
     EnvSpec(
         "PGPASSWORD", "PostgreSQL 密码（`warden backup-pg` 传给 pg_dump 用）",
@@ -548,7 +635,53 @@ def _format_problem(spec: EnvSpec, value: str, raw: str) -> str | None:
             f"{spec.name} 格式错误：{spec.masked(raw)}。"
             "应为 `次数/窗口秒数`，例如 600/60（或 0 关闭）"
         )
+    if spec.kind == "proxies":
+        bad = _proxies_problem(value)
+        if bad:
+            return (
+                f"{spec.name} 取值可疑：{spec.masked(raw)}——{bad}。"
+                "应为 IP 或网段（逗号分隔），例如 10.0.0.0/8,172.17.0.1。"
+                "**取值是代理自己的地址，不是客户端网段**：写宽了等于信任任意客户端"
+                "自带的 X-Forwarded-For（可伪造来源 IP，绕过按调用者分桶的限流）；"
+                "写成 `*` / /0 这类全信任值一律拒绝。"
+            )
     return None
+
+
+def _proxies_problem(value: str) -> str | None:
+    """检查 `WARDEN_TRUSTED_PROXIES` 的每一项，返回第一处问题的描述（None = 通过）。
+
+    做这层检查是因为 uvicorn 自己的解析器**格式错也静默**（非法 IP 会被当成普通字面量，
+    见 `uvicorn/middleware/proxy_headers.py` 里 `_TrustedHosts` 的注释），于是"网段写错一位"
+    的表现是"XFF 忽然不生效了"，很难查。而写宽（`*`、`0.0.0.0/0`）的表现是"谁都能伪造来源 IP"，
+    更危险——所以这两类在这里就判错（fail-closed，与鉴权同一取向）。
+    """
+    for item in value.split(","):
+        host = item.strip()
+        if not host:
+            return "列表里有空项（多余逗号？）"
+        if host in {"*", "0.0.0.0/0", "::/0"}:
+            return f"`{host}` 等于信任所有对端"
+        if "/" in host:
+            try:
+                net = ipaddress.ip_network(host, strict=False)
+            except ValueError:
+                return f"`{host}` 不是合法的网段"
+            if net.prefixlen == 0:
+                return f"`{host}` 等于信任所有对端"
+        elif _looks_like_ip(host):
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                return f"`{host}` 不是合法的 IP"
+        elif " " in host:
+            return f"`{host}` 含空格"
+    return None
+
+
+def _looks_like_ip(host: str) -> bool:
+    """像 IP（纯数字/点/冒号/十六进制），用于区分"IP 写错"与"刻意写的字面量（unix socket 名）"。"""
+    return bool(host) and all(c in "0123456789abcdefABCDEF:.%" for c in host)
 
 
 def _is_int(value: str) -> bool:

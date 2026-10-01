@@ -34,6 +34,9 @@ class RunStore(Protocol):
         tool_name: str,
         arguments: dict[str, Any],
         decision: str,
+        *,
+        approver_id: str | None = None,
+        approver_role: str | None = None,
     ) -> None: ...
 
     def list_approval_history(

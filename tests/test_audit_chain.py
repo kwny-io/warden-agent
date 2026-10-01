@@ -236,10 +236,17 @@ def test_从环境变量取密钥() -> None:
     assert audit_chain_key({"WARDEN_AUDIT_KEY": "material"}) == b"material"
 
 
-def test_cli_校验通过时退出码为0(tmp_path: Path) -> None:
+def test_cli_校验通过时退出码为0(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """退出码 0 的**可观测形式**：正常返回（不抛 SystemExit）且打印了通过标记。
+
+    CLI 的契约是"链被动过 → SystemExit(4)"，所以"没被打动"这一侧只能靠
+    "返回 None + 输出 ✅" 来断言；只写一行调用不抛异常，把打印路径删了也测不出来。
+    """
     _append_n(SqliteAuditStore(db_path=_db(tmp_path), chain_key=None), 3)
-    # 不抛 SystemExit 即通过
-    cli.main(["audit-verify", "--db", str(_db(tmp_path))])
+    assert cli.main(["audit-verify", "--db", str(_db(tmp_path))]) is None
+    out = capsys.readouterr().out
+    assert out.startswith("✅")
+    assert "❌" not in out
 
 
 def test_cli_链被动过时退出码为4(tmp_path: Path) -> None:

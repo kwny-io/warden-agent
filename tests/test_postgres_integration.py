@@ -408,14 +408,30 @@ def test_run锁并发抢占只有一个赢家() -> None:
 
     run_id = "pg-it-race-" + secrets.token_hex(5)
     replicas = 8
+    # 带超时的 barrier：这里以前是 `threading.Barrier(replicas)` + 裸 `wait()`。
+    # 只要有**一个**线程在建连接那步就抛了（库连接数打满、网络抖动、PG 刚重启），
+    # 其余线程会永远卡在 barrier 上——整个 pytest 会话既不失败也不退出，
+    # 表现成「跑到 47% 就静默不动」。外地看上去像"卡死"，实际是测试自己把
+    # 会话吊在半空：CF 的 pool.map 永远等不到结果，pytest 也没有超时机制能打断
+    # 卡在 C 层获锁的线程（Windows 上 --timeout 的 thread 方式注入不进去）。
+    # 加上超时后，这种情形会变成 BrokenBarrierError，被测到并给出可读的失败原因。
     barrier = threading.Barrier(replicas)
+    barrier_timeout = 30.0
 
     def attempt(n: int) -> bool:
         store = _store()  # 每个副本用自己的连接
         try:
             lock = SqlRunLock(store, ttl_seconds=60)
-            barrier.wait()  # 尽量让 8 个线程同时出手
+            barrier.wait(timeout=barrier_timeout)  # 尽量让 8 个线程同时出手
             return lock.acquire(run_id, f"replica-{n}")
+        except threading.BrokenBarrierError as exc:
+            # 这也包括"别的线程先超时把 barrier 打碎"的情况：一条明确断言
+            # 比挂死整轮能查得多（挂死时看不到任何栈，除非手动去抓线程转储）。
+            raise AssertionError(
+                f"replica-{n}: {barrier_timeout:.0f}s 内没凑齐 {replicas} 个并发副本——"
+                "多半是有副本在建连接/建表时失败或卡住，先查 PG 连通性、连接数上限，"
+                "以及 pg_stat_activity 里有没有在等锁的会话（并发建表竞态见下一条测试）"
+            ) from exc
         finally:
             store.close()
 
@@ -431,3 +447,77 @@ def test_run锁并发抢占只有一个赢家() -> None:
             cleanup.release_run_lock(run_id, owner)
     finally:
         cleanup.close()
+
+
+def test_多副本同时启动建表不会撞schema版本主键() -> None:
+    """N 个副本**同时**初始化 schema：必须全部成功，且版本表恰好一行。
+
+    这是修过的一个真 bug 的回归件（来自真实失败，不是假想）：
+    `PostgresStore` 用 `autocommit=True`（见 test_连接必须是autocommit），
+    于是 `_init_schema()` 里 `DELETE FROM __schema_version__` 与随后的 `INSERT`
+    是**两个独立事务**。多副本同时启动时都会先删再插同一个主键（version=5），
+    后到的那个直接撞唯一约束：
+
+        psycopg.errors.UniqueViolation: duplicate key value violates unique
+        constraint "__schema_version___pkey"
+        DETAIL:  Key (version)=(5) already exists.
+
+    后果是**其中一个副本启动即失败**。k8s 多副本同时拉起/滚动重启就是这个时序，
+    而任何单进程测试都碰不到。修法是：`pg_advisory_xact_lock` 把整段迁移串行化
+    + 版本写入本身幂等（`ON CONFLICT (version) DO UPDATE`）。
+
+    这条测试只在“真多副本”下有意义，所以必须真并发——串行调用会因为第二次起
+    表已存在而白白通过。
+    """
+    import concurrent.futures as cf
+    import threading
+
+    replicas = 8
+    start_together = threading.Barrier(replicas)
+
+    def boot(_n: int) -> tuple[int, int]:
+        # barrier 放在**构造之前**：让 8 个副本尽可能同一瞬间进建表那段，
+        # 否则线程池调度会把它们错开，竞态就测不出来了。
+        start_together.wait(timeout=30)
+        store = _store()  # 构造即建表：撞主键的异常就从这里抛出来
+        try:
+            return store.schema_version(), _count_schema_version_rows()
+        finally:
+            store.close()
+
+    with cf.ThreadPoolExecutor(max_workers=replicas) as pool:
+        futures = [pool.submit(boot, n) for n in range(replicas)]
+        # 不用 pool.map：它没有超时，任一副本挂住就会把 pytest 会话吊死
+        # （这正是上一条测试踩过的坑）。这里超时变成一条可读断言。
+        done, not_done = cf.wait(futures, timeout=60)
+        assert not not_done, (
+            f"{len(not_done)}/{replicas} 个副本 60s 内没起来——并发初始化卡住了。"
+            "先看 pg_stat_activity 里有没有等锁的会话（pg_advisory_xact_lock 没拿到会等）"
+        )
+        results = [f.result() for f in done]  # UniqueViolation 会在这里原样抛出
+
+    expected = _store()
+    try:
+        version = expected.schema_version()
+    finally:
+        expected.close()
+    assert [r[0] for r in results] == [version] * replicas, (
+        f"每个副本都应读到同一版本号 {version}，实际 {[r[0] for r in results]}"
+    )
+    assert all(r[1] == 1 for r in results), (
+        "__schema_version__ 必须恰好一行（先删再写 + 幂等冲突更新），"
+        f"实际各副本看到 {[r[1] for r in results]} 行"
+    )
+
+
+def _count_schema_version_rows() -> int:
+    """版本表行数（并发初始化后必须是 1，多行会让 schema_version() 变成掷骰子）。"""
+    import psycopg  # 本文件顶层没引它（只在 _pg_available 内部按需引），这里也要自己引
+
+    conn = psycopg.connect(**_pg_params(), autocommit=True)  # type: ignore[arg-type]
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM __schema_version__")
+            return int(cur.fetchone()[0])
+    finally:
+        conn.close()

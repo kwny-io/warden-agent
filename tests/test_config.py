@@ -32,4 +32,11 @@ def test_load_env_不覆盖已存在的环境变量(tmp_path: Path) -> None:
 
 
 def test_load_env_文件不存在不报错(tmp_path: Path) -> None:
-    load_env(tmp_path / "no-such-file.env")  # 不应抛异常
+    """文件不存在不该抛异常，也不该往环境里塞东西。
+
+    断言"什么也没改变"而不是"没抛错"：这个函数是**启动路径**的一部分，
+    静默地塞一个空字符串变量比报错更难查（下游按"设了但为空"处理）。
+    """
+    before = dict(os.environ)
+    load_env(tmp_path / "no-such-file.env")
+    assert dict(os.environ) == before

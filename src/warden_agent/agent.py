@@ -125,13 +125,23 @@ class InMemoryRunStore:
         tool_name: str,
         arguments: dict[str, Any],
         decision: str,
+        *,
+        approver_id: str | None = None,
+        approver_role: str | None = None,
     ) -> None:
-        """记录一条审批决策（approved / rejected），供历史追溯。"""
+        """记录一条审批决策（approved / rejected），供历史追溯。
+
+        内存版**不**留参数正文（只留工具名与决策）：参数里可能带凭据，而内存账本
+        没有 sqlite/pg 那套脱敏+持久化的保护，少留一份更安全。
+        approver_id / approver_role 是职责分离的**证据**——出事时要能回答"谁批的"。
+        """
         self._approval_history.append({
             "run_id": run_id,
             "approval_id": approval_id,
             "tool_name": tool_name,
             "decision": decision,
+            "approver_id": approver_id,
+            "approver_role": approver_role,
             "created_at": _now_iso(),
         })
 
@@ -320,6 +330,9 @@ def augment_catalog(
     sandbox: bool = False,
     sandbox_spec: SandboxSpec | None = None,
     outbound_limiter: Any = None,
+    multiagent: bool = False,
+    multiagent_model: Any = None,
+    policy_engine: Any = None,
 ) -> Any:
     """把 Memory / RAG / Skill / Web / MCP 的能力工具注册进目录（可复用给 HTTP 层）。
 
@@ -327,6 +340,9 @@ def augment_catalog(
       传 `SqliteMemoryStore(...)` 则**跨会话的用户级记忆才真的记得住**。
     - `knowledge`：RAG 知识来源。`VectorStore` 实例 / `True`（内置离线语料）/ 目录路径；
       不传则不注册 `knowledge.search`。
+    - `multiagent` + `multiagent_model`：打开"主管 + 子 Agent"（见 multiagent/registry.py）。
+      默认关：子 Agent 会真的多花模型调用。开了却不给模型 → 抛错，不静默装出空壳。
+    - `policy_engine`：透给子 Agent 的审批策略（它们只拿只读工具，通常用不上审批）。
 
     返回：注入的运行时依赖（额外能力），如 MemoryService（所有会话共享）。
     不做任何抛出——能力不可用（如没 node）就静默跳过，保证降级不崩溃。
@@ -361,7 +377,21 @@ def augment_catalog(
             for alias, text in skills.items():
                 skill_catalog.load_skill(alias, parser.parse(text), source="inline")
         for alias in skill_catalog.aliases():
-            catalog.register(skill_activation_tool(skill_catalog, alias))
+            # `available` 传可调用而不是快照：Web / MCP / Git 等工具在这一行之后才注册，
+            # 快照会把它们误判为缺失，让 SKILL.md 里的 `requires` 门禁反过来害人。
+            catalog.register(
+                skill_activation_tool(
+                    skill_catalog, alias, available=lambda: catalog.names(),
+                )
+            )
+        # 技能触发路由（`skill.trigger.pick`）：**以前只在 demo 与评测里注册**，
+        # 产品路径上"按任务意图选该用哪本 SKILL.md"这件承诺实际不存在——
+        # 模型只看得到一份份激活卡，得自己猜该翻哪本。读卡的判断是纯计算（pure=True），
+        # 不花额外模型调用，所以这里默认直接接上，不需要额外开关。
+        from warden_agent.skill.trigger import build_skill_trigger
+
+        catalog.register(build_skill_trigger(skill_catalog).tool())
+        extra["skill_trigger"] = True
         extra["skill_catalog"] = skill_catalog
 
     # 3. Web 搜索/抓取
@@ -382,6 +412,17 @@ def augment_catalog(
             type(search_provider).__name__
             if search_provider is not None
             else "LocalMockSearchProvider"
+        )
+        # 演示/离线标记 + 降级原因。类名已经能看出 provider 是 mock，但**看不出“为什么退回 mock”**
+        # ——故此把原因也上报：控制台要能回答“这个搜索为什么这么差/怎么打开真搜索”。
+        extra["web_search_mock"] = bool(
+            getattr(search_provider, "is_mock", True) if search_provider is not None else True
+        )
+        extra["web_fetch_mock"] = bool(
+            getattr(fetch_provider, "is_mock", True) if fetch_provider is not None else True
+        )
+        extra["web_degraded_reason"] = str(
+            getattr(search_provider, "degraded_reason", "") or ""
         )
 
     # 4. MCP（需 node；可用则导入经过审查的工具）
@@ -409,16 +450,33 @@ def augment_catalog(
 
     # 6. 沙箱（受控命令执行：只读副本 + 默认禁网 + 预算约束）
     if sandbox:
-        from warden_agent.execution.sandbox import SandboxSpec
+        from warden_agent.execution.sandbox import (
+            SandboxSpec,
+            default_sandbox_isolation,
+            isolation_tier_from_env,
+        )
 
+        # 隔离档**先按部署级声明解析**：声明了内核档（WARDEN_SANDBOX_ISOLATION=kernel /
+        # WARDEN_SANDBOX_REQUIRE_KERNEL=1）而平台给不了时，这里直接抛
+        # IsolationUnavailableError —— 宁可不注册 shell.run，也不要注册一个
+        # 「看起来隔离了、实际只是正则拦网」的工具。
+        tier = isolation_tier_from_env()
         if sandbox_spec is None:
             # `shell.run` 的 workspace 参数是**模型给的**（不可信），所以默认把工作区根目录
             # 限定在当前工作目录——否则模型可传任意宿主路径（如 ~/.ssh）把文件拷进沙箱读出来。
             import os
 
-            sandbox_spec = SandboxSpec(workspace_root=os.getcwd())
+            sandbox_spec = SandboxSpec(
+                workspace_root=os.getcwd(),
+                isolation=default_sandbox_isolation(),
+            )
         catalog.register(_make_sandbox_tool(sandbox_spec))
         extra["sandbox"] = True
+        # 隔离档如实上报（含「只是语义层」这个事实）。/capabilities 与文档都引用它——
+        # 把语义档讲成隔离是本项目最容易被戳穿的那种夸大，所以宁可自己先说清。
+        extra["sandbox_isolation"] = tier.name
+        extra["sandbox_isolation_available"] = tier.available
+        extra["sandbox_isolation_note"] = tier.describe()
 
     # 7. RAG 知识库（检索 + 来源引用）
     #    此前 rag/ 只被 demo 与评测引用，产品路径从不构造 VectorStore ——
@@ -432,6 +490,28 @@ def augment_catalog(
         # 嵌入器名要能被打进日志：在词频嵌入下宣称"语义检索"是过度声称
         extra["knowledge_embedder"] = embedder_name
         extra["knowledge_sources"] = sources
+
+    # 8. 多 Agent（主管 + 子 Agent 卡）：默认关，`WARDEN_MULTIAGENT=1` 才打开。
+    #    放在**最后**：子 Agent 从主目录复制只读工具（knowledge.search / web.* 等），
+    #    必须等这些能力都注册完再复制。
+    if multiagent and multiagent_model is not None:
+        from warden_agent.multiagent.registry import make_multiagent_tools
+
+        for spec in make_multiagent_tools(
+            multiagent_model, catalog,
+            policy_engine=policy_engine,
+            memory_service=extra.get("memory_service"),
+            memory_scope=extra.get("memory_scope"),
+        ):
+            catalog.register(spec)
+        extra["multiagent"] = True
+    elif multiagent:
+        # 开了开关却没给模型：不静默降级成"什么都没有"，否则部署方以为多 Agent 开着
+        # 而实际目录里一张子 Agent 卡都没有（与 WARDEN_GIT_PROBE 同一口径）。
+        raise ValueError(
+            "multiagent=True 但没有传 multiagent_model：子 Agent 不知道用哪个模型，"
+            "拒绝静默装配出一个没有子 Agent 的\"多 Agent 目录\"。"
+        )
 
     return extra
 
@@ -459,6 +539,7 @@ def build_agent(
     intent: Any = None,
     max_context_chars: int = 0,
     outbound_limiter: Any = None,
+    multiagent: bool = False,
 ) -> Agent:
     """一键装配一个 Agent：模型 + 工具 + 策略 + 存储 +（可选）能力。
 
@@ -485,6 +566,8 @@ def build_agent(
       mcp_server     MCP server 启动命令（有 node 则导入其工具）。
       sandbox        True=暴露受沙箱管控的 shell.run 工具（只读工作区副本 +
                      默认禁网 + 超时/输出预算约束）；sandbox_spec 可自定义 SandboxSpec。
+      multiagent    True=加上"主管 + 子 Agent"卡（research / write）。默认关：
+                     子 Agent 会真的多花模型调用。子 Agent 只拿只读工具。
     """
     # 模型：字符串=厂商名走真实模型；有 chat 方法的对象=直接当模型实例；None=离线假模型
     model: AgentChatModel
@@ -510,6 +593,7 @@ def build_agent(
         mcp_server=mcp_server, git_workdir=git_workdir,
         sandbox=sandbox, sandbox_spec=sandbox_spec,
         outbound_limiter=outbound_limiter,
+        multiagent=multiagent, multiagent_model=model if multiagent else None,
     )
 
     # 策略与存储

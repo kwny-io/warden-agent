@@ -32,7 +32,7 @@ from warden_agent.memory import (
     SqliteMemoryStore,
 )
 from warden_agent.memory.models import new_uid
-from warden_agent.model.model import ChatResponse
+from warden_agent.model.model import ChatResponse, ToolCall
 from warden_agent.policy.policy import PolicyEngine
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog
@@ -286,6 +286,67 @@ async def test_http读不到别人的记忆_跨租户隔离() -> None:
         assert items == [], f"不应看到他人记忆，实际：{items}"
 
 
+@pytest.mark.asyncio
+async def test_http候选流_可确认可拒绝_并拒绝越权() -> None:
+    """产品路径的两阶段记忆：候选可看、可确认、可拒绝；别人的候选既看不到也动不了。
+
+    这条锁住的是"`memory.remember` 写的是待确认候选"这句承诺：候选必须在 HTTP 面上
+    真的看得见（否则确认环节只是文案），且确认/拒绝必须按归属隔离
+    （否则任一用户就能替别人把内容写进记忆，或删掉别人的候选）。
+    """
+    repository = SqliteMemoryStore(_db())
+    service = MemoryService(repository)
+    # 一条待确认候选（属于调用者）+ 一条别人的候选（不得出现）
+    mine = service.propose(
+        MemoryScope.USER, "city", MemoryContent(text="用户常驻上海"), owner="demo-user",
+    )
+    service.propose(
+        MemoryScope.USER, "secret", MemoryContent(text="别人的草稿"), owner="someone-else",
+    )
+
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")]),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=SqliteStore(Path(tempfile.mkdtemp()) / "t.db"),
+        memory=True,
+        memory_repository=repository,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        pending = (await c.get("/memory/user/candidates")).json()
+        assert [p["key"] for p in pending] == ["city"], f"不应看到他人候选：{pending}"
+        assert pending[0]["status"] == "PENDING"
+
+        # 待确认的内容不能提前生效
+        assert (await c.get("/memory/user")).json() == []
+
+        # 越权确认：uid 存在但不归调用者 ⇒ 404（不分化"存在"与"不归你"）
+        other = service.candidates(MemoryScope.USER, owner="someone-else")[0]
+        r = await c.post(f"/memory/user/candidates/{other.item.uid}/confirm")
+        assert r.status_code == 404
+
+        # 自己的可以确认，确认后候选区清空、/memory/{scope} 看得到
+        r = await c.post(f"/memory/user/candidates/{mine.item.uid}/confirm")
+        assert r.status_code == 200, r.text
+        assert (await c.get("/memory/user/candidates")).json() == []
+        active = (await c.get("/memory/user")).json()
+        assert [i["text"] for i in active] == ["用户常驻上海"]
+
+        # 拒绝：软删（候选消失，且不会出现在已生效列表里）
+        again = service.propose(
+            MemoryScope.USER, "noise", MemoryContent(text="不该留下的"), owner="demo-user",
+        )
+        r = await c.post(f"/memory/user/candidates/{again.item.uid}/reject")
+        assert r.status_code == 200
+        assert (await c.get("/memory/user/candidates")).json() == []
+        assert [i["key"] for i in (await c.get("/memory/user")).json()] == ["city"]
+
+        # 已确认/已拒绝的 uid 再确认一次 ⇒ 404（不能重放）
+        r = await c.post(f"/memory/user/candidates/{mine.item.uid}/confirm")
+        assert r.status_code == 404
+
+
 def test_老库没有owner列_按迁移路径仍可读(tmp_path: Path) -> None:
     """升级兼容：`owner` 列是后加的，老库（没有该列）必须能被自动迁移且数据不丢。
 
@@ -337,3 +398,58 @@ def test_老库没有owner列_按迁移路径仍可读(tmp_path: Path) -> None:
     assert item.owner == "", "老行的 owner 迁移后应为空串（部署级共享）"
     # 隔离口径：具体用户查不到这条（老数据不属于任何用户）
     assert repo.latest(MemoryScope.USER, "city", owner="alice") is None
+
+
+@pytest.mark.asyncio
+async def test_会话里调memory_remember_归属自动落到调用者() -> None:
+    """产品路径回归：`memory.remember` 的归属来自**运行期上下文**，不是工具入参。
+
+    `make_memory_tools(owner=None)` 是产品路径的用法（固定 owner 只给 SDK/测试）：
+    归属从 `current_owner()` 读，而它是 AgentSession 在**执行工具那一刻**设置的
+    （runtime/session.py 的 `_execute` → owner_scope）。
+
+    这条测试是配合那次修复的回归件：owner_scope 原先包住整个流式生成器，在真实服务器上
+    （uvicorn/Starlette 把生成器丢线程池逐块 next()）会跨 Context 报错——
+        ValueError: <Token ... was created in a different Context>
+    表现为浏览器连发第二条消息就 500。改成只包 `_execute` 后，模型在会话里提的候选
+    必须带上调用者身份（匿名开发模式是 demo-user），否则 `/memory/user/candidates`
+    查不到东西，用户永远没得确认，记忆功能就是半残。
+    """
+    repository = SqliteMemoryStore(_db())
+    service = MemoryService(repository)
+    app = build_app(
+        model=ScriptedModel([
+            ChatResponse(content=None, tool_calls=[
+                ToolCall(id="c1", name="memory.remember",
+                         arguments={"key": "city", "text": "用户常驻上海"})],
+                finish_reason="tool_calls"),
+            ChatResponse(content="记住了。", finish_reason="stop"),
+        ]),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=SqliteStore(Path(tempfile.mkdtemp()) / "t.db"),
+        memory=True,
+        memory_repository=repository,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.post("/chat/run-mem-owner", json={"text": "记住我常驻上海"})
+        assert r.status_code == 200, r.text
+        assert r.json()["kind"] == "final", r.json()   # 工具真被执行了，不是挂起等审批
+        # memory.remember 的默认范围是 SESSION（工具入参只能给 key/text，模型选不了范围）
+        candidates = (await c.get("/memory/session/candidates")).json()
+        # 归属只能来自凭证/服务端身份：候选面**故意忽略** ?user_id=（_identity(request, None)），
+        # 否则任一匿名调用者就能用查询参数把自己的候选挂在别人名下、或看到别人的候选。
+        spoof = (await c.get("/memory/session/candidates?user_id=alice")).json()
+
+    assert [x["key"] for x in candidates] == ["city"], (
+        f"会话里提的候选没按调用者归属落库，实际：{candidates}"
+    )
+    assert candidates[0]["owner"] == "demo-user"
+    assert candidates[0]["status"] == "PENDING", "remember 写的是待确认候选，不是直接生效"
+    assert spoof == candidates, (
+        f"候选面不能被 ?user_id= 冒充身份改写（应当原样忽略），实际：{spoof}"
+    )
+    # 归属不能来自工具入参：模型没有（也不该有）办法自报身份
+    assert [c.item.owner for c in service.candidates(MemoryScope.SESSION, owner="demo-user")] \
+        == ["demo-user"]

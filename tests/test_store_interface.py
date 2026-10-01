@@ -52,7 +52,12 @@ def _postgres_available() -> bool:
     not _postgres_available(), reason="需要可用的 PostgreSQL 服务器才会运行"
 )
 def test_postgres_存储全流程() -> None:
-    """真实 PG 集成测试。没有数据库时自动跳过。"""
+    """真实 PG 集成测试。没有数据库时自动跳过。
+
+    断言写在 `_postgres_full_flow()` 里（存完读回来必须真是 QUEUED 状态）。
+    形如"测试函数体内无 assert"的静态扫描会把这一条当成无断言测试——
+    这里是误报，在此注明以免下次又去"修"它。
+    """
     _postgres_full_flow()
 
 

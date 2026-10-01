@@ -89,6 +89,34 @@ def test_main装配默认_维护清扫与入站上限透传(tmp_path: Path, monk
     created["memory_repository"].close()
 
 
+def test_main_受信代理透传给uvicorn(tmp_path: Path, monkeypatch) -> None:
+    """`WARDEN_TRUSTED_PROXIES` → uvicorn 的 `forwarded_allow_ips`。
+
+    不配时**不能**出现这个 kwarg（哪怕写 None）：uvicorn 把 `forwarded_allow_ips=None`
+    当成 "自己从 `FORWARDED_ALLOW_IPS` 环境变量/默认值里读"，显式传 None 会把它
+    默认的「只信回环」盖掉。所以只能"设了才传"。
+    """
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_TRUSTED_PROXIES", "10.0.0.0/8,172.17.0.1")
+
+    run_server.main()
+
+    assert captured["forwarded_allow_ips"] == "10.0.0.0/8,172.17.0.1"
+    created["store"].close()
+    created["memory_repository"].close()
+
+
+def test_main_不配受信代理时不传该参数(tmp_path: Path, monkeypatch) -> None:
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.delenv("WARDEN_TRUSTED_PROXIES", raising=False)
+
+    run_server.main()
+
+    assert "forwarded_allow_ips" not in captured
+    created["store"].close()
+    created["memory_repository"].close()
+
+
 def test_main_0间隔时维护清扫关闭(tmp_path: Path, monkeypatch) -> None:
     captured, created = _patch_common(monkeypatch, tmp_path)
     monkeypatch.setenv("WARDEN_MAINTENANCE_INTERVAL_S", "0")
@@ -127,3 +155,85 @@ def test_main_对外监听无鉴权_拒绝启动(tmp_path: Path, monkeypatch) ->
     with pytest.raises(SystemExit) as e:
         run_server.main()
     assert e.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# 假模型不许当成真能力对外服务（待办：演示/假模型 fail-closed）
+# ---------------------------------------------------------------------------
+
+def test_假模型_回环地址永远放行() -> None:
+    """判定看的是"外部能不能连进来"，不是"配置看起来多正式"。
+
+    本机跑假模型（哪怕开了鉴权）不拦：没有任何远端能连进来，而为了
+    "试一下鉴权"还得先声明是个演示会很烦。
+    """
+    for mode in ("anon-dev", "bearer"):
+        assert run_server.ensure_model_is_real(
+            is_fake=True, host="127.0.0.1", auth_mode=mode, env={},
+        ) is None
+    assert run_server.ensure_model_is_real(
+        is_fake=True, host="::1", auth_mode="bearer", env={},
+    ) is None
+
+
+def test_假模型_对外监听必须要显式声明() -> None:
+    """0.0.0.0 上的固定脚本回复会被当成"系统真能干活"的证据 → 必须显式声明。
+
+    声明的意义在于它会在启动日志与 `/capabilities` 里变成 `demo_instance=true`：
+    看见的人得到的是"这是演示"，而不是"它居然能自己选工具"。
+    """
+    with pytest.raises(run_server.DemoModelRefusedError) as e:
+        run_server.ensure_model_is_real(
+            is_fake=True, host="0.0.0.0", auth_mode="bearer", env={},
+        )
+    assert "WARDEN_ALLOW_FAKE_MODEL=1" in str(e.value)   # 报错里给出路，不是死胡同
+    assert "WARDEN_DEMO_INSTANCE=1" in str(e.value)
+
+    # 只声明一半不够：一个变量拦不住"生产配置里残留一句 ALLOW_FAKE_MODEL"这种事故，
+    # 第二个变量要的是一个只可能故意写出口的词。
+    with pytest.raises(run_server.DemoModelRefusedError):
+        run_server.ensure_model_is_real(
+            is_fake=True, host="0.0.0.0", auth_mode="bearer",
+            env={"WARDEN_ALLOW_FAKE_MODEL": "1"},
+        )
+
+    assert run_server.ensure_model_is_real(
+        is_fake=True, host="0.0.0.0", auth_mode="bearer",
+        env={"WARDEN_ALLOW_FAKE_MODEL": "1", "WARDEN_DEMO_INSTANCE": "1"},
+    ) is None
+
+
+def test_真模型从不因地址被拦() -> None:
+    """反向保护：这个门禁只针对假模型，别把正常部署拦了。"""
+    assert run_server.ensure_model_is_real(
+        is_fake=False, host="0.0.0.0", auth_mode="bearer", env={},
+    ) is None
+
+
+def test_main_对外监听跑假模型_未声明则拒绝启动(tmp_path: Path, monkeypatch) -> None:
+    """端到端：容器里最可能出错的组合（0.0.0.0 + 有 key + 没糊模型凭据）。"""
+    _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_HOST", "0.0.0.0")
+    monkeypatch.setenv("WARDEN_API_KEY", "secret-key")   # 过了"对外必须鉴权"那道门
+    monkeypatch.delenv("WARDEN_ALLOW_FAKE_MODEL", raising=False)
+    monkeypatch.delenv("WARDEN_DEMO_INSTANCE", raising=False)
+
+    with pytest.raises(SystemExit) as e:
+        run_server.main()
+    assert e.value.code == 2
+
+
+def test_main_对外监听跑演示实例_声明后放行(tmp_path: Path, monkeypatch) -> None:
+    """显式声明是开的口子：声明了就允许，且模型确实是假模型（标记为演示）。"""
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_HOST", "0.0.0.0")
+    monkeypatch.setenv("WARDEN_API_KEY", "secret-key")
+    monkeypatch.setenv("WARDEN_ALLOW_FAKE_MODEL", "1")
+    monkeypatch.setenv("WARDEN_DEMO_INSTANCE", "1")
+
+    run_server.main()
+
+    assert captured["host"] == "0.0.0.0"      # 真的对外监听了
+    assert created["model_id"] == "fake"      # 而模型确实是演示
+    created["store"].close()
+    created["memory_repository"].close()

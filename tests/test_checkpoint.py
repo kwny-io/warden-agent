@@ -129,6 +129,12 @@ def test_completion_guard_requires_content() -> None:
 
 
 def test_completion_guard_passes_when_clean() -> None:
+    """干净路径：既没挂起工具、又有最终回答 → 不抛错。
+
+    断言"返回 None"而不是"不抛异常"：这个函数的契约就是"没通过则抛，
+    通过了就什么都不返回"；如果哪天它开始返回一个"问题清单"，
+    这里会立刻炸，而不是默认把返回的真值当成了通过。
+    """
     run = AgentRun("r1")
     guard = CompletionGuard()
-    guard.validate(run, pending_tools=0, has_final_content=True)  # 不抛
+    assert guard.validate(run, pending_tools=0, has_final_content=True) is None

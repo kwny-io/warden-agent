@@ -1,124 +1,671 @@
 {
   "tables": {
-    "__schema_version__": [
-      "applied_at",
-      "version"
-    ],
-    "approval_history": [
-      "approval_id",
-      "arguments",
-      "created_at",
-      "decision",
-      "id",
-      "run_id",
-      "tool_name"
-    ],
-    "audit_anchor": [
-      "at",
-      "head_hash",
-      "id",
-      "last_id",
-      "row_count"
-    ],
-    "audit_log": [
-      "at",
-      "correlation_id",
-      "hash",
-      "id",
-      "method",
-      "operation",
-      "path",
-      "prev_hash",
-      "principal_id",
-      "principal_type",
-      "product_id",
-      "run_id",
-      "status",
-      "tenant_id"
-    ],
-    "checkpoints": [
-      "data",
-      "run_id"
-    ],
-    "credential_leases": [
-      "expires_at",
-      "issued_at",
-      "lease_id",
-      "name",
-      "scope"
-    ],
-    "credentials": [
-      "data",
-      "name",
-      "scope",
-      "updated_at"
-    ],
-    "idempotency": [
-      "created_at",
-      "key",
-      "payload"
-    ],
-    "memories": [
-      "actor_id",
-      "actor_kind",
-      "audit",
-      "conflicts_with",
-      "content_data",
-      "content_kind",
-      "content_text",
-      "created_at",
-      "expires_at",
-      "key",
-      "owner",
-      "scope",
-      "status",
-      "supersedes",
-      "uid",
-      "updated_at",
-      "version"
-    ],
-    "messages": [
-      "content",
-      "id",
-      "role",
-      "run_id",
-      "tool_call"
-    ],
-    "pending_approvals": [
-      "approval_id",
-      "arguments",
-      "created_at",
-      "reason",
-      "run_id",
-      "tool_name"
-    ],
-    "rate_limits": [
-      "bucket_key",
-      "count",
-      "window_start"
-    ],
-    "run_events": [
-      "created_at",
-      "data",
-      "id",
-      "run_id"
-    ],
-    "run_locks": [
-      "acquired_at",
-      "expires_at",
-      "owner",
-      "run_id"
-    ],
-    "runs": [
-      "run_id",
-      "status",
-      "updated_at",
-      "user_id"
-    ],
-    "users": [
-      "created_at",
-      "user_id"
-    ]
+    "__schema_version__": {
+      "columns": {
+        "applied_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "version": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "integer"
+        }
+      },
+      "indexes": {}
+    },
+    "approval_history": {
+      "columns": {
+        "approval_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "approver_id": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "approver_role": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "arguments": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "created_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "decision": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "integer"
+        },
+        "run_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "tool_name": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "audit_anchor": {
+      "columns": {
+        "at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "real"
+        },
+        "head_hash": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "integer"
+        },
+        "last_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "integer"
+        },
+        "row_count": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "integer"
+        }
+      },
+      "indexes": {}
+    },
+    "audit_log": {
+      "columns": {
+        "at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "real"
+        },
+        "correlation_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "hash": {
+          "default": "''",
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "integer"
+        },
+        "method": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "operation": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "path": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "prev_hash": {
+          "default": "''",
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "principal_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "principal_type": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "product_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "run_id": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "status": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "integer"
+        },
+        "tenant_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "checkpoints": {
+      "columns": {
+        "data": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "run_id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "credential_leases": {
+      "columns": {
+        "expires_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "issued_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "lease_id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "name": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "scope": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        }
+      },
+      "indexes": {
+        "idx_credential_leases_expiry": {
+          "columns": [
+            "scope",
+            "expires_at"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "credentials": {
+      "columns": {
+        "data": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "name": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "scope": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "updated_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "idempotency": {
+      "columns": {
+        "created_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "key": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "payload": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {
+        "idx_idempotency_created": {
+          "columns": [
+            "created_at"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "memories": {
+      "columns": {
+        "actor_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "actor_kind": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "audit": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "conflicts_with": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "content_data": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "content_kind": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "content_text": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "created_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "expires_at": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "key": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "owner": {
+          "default": "''",
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "scope": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "status": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "supersedes": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "uid": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "updated_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "version": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "integer"
+        }
+      },
+      "indexes": {
+        "idx_memories_owner": {
+          "columns": [
+            "owner",
+            "scope"
+          ],
+          "unique": false
+        },
+        "idx_memories_ref": {
+          "columns": [
+            "scope",
+            "key"
+          ],
+          "unique": false
+        },
+        "idx_memories_status": {
+          "columns": [
+            "scope",
+            "status"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "messages": {
+      "columns": {
+        "content": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "integer"
+        },
+        "role": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "run_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "tool_call": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "pending_approvals": {
+      "columns": {
+        "approval_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "arguments": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "created_at": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "reason": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "run_id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "tool_name": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "rate_limits": {
+      "columns": {
+        "bucket_key": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "count": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "integer"
+        },
+        "window_start": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "real"
+        }
+      },
+      "indexes": {
+        "idx_rate_limits_window": {
+          "columns": [
+            "window_start"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "run_events": {
+      "columns": {
+        "created_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "data": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "integer"
+        },
+        "run_id": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {
+        "idx_run_events_run": {
+          "columns": [
+            "run_id",
+            "id"
+          ],
+          "unique": false
+        }
+      }
+    },
+    "run_locks": {
+      "columns": {
+        "acquired_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "real"
+        },
+        "expires_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "real"
+        },
+        "owner": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "run_id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "runs": {
+      "columns": {
+        "run_id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        },
+        "status": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "updated_at": {
+          "default": null,
+          "nullable": true,
+          "pk": false,
+          "type": "text"
+        },
+        "user_id": {
+          "default": "''",
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    },
+    "users": {
+      "columns": {
+        "created_at": {
+          "default": null,
+          "nullable": false,
+          "pk": false,
+          "type": "text"
+        },
+        "user_id": {
+          "default": null,
+          "nullable": false,
+          "pk": true,
+          "type": "text"
+        }
+      },
+      "indexes": {}
+    }
   },
-  "version": 4
+  "version": 5
 }

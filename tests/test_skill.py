@@ -226,6 +226,32 @@ def test_requires_满足则可激活() -> None:
     assert "干活" in str(out)
 
 
+def test_requires_传可调用则每次激活时取值() -> None:
+    """`available` 给可调用时，必须在**激活那一刻**才去取集合。
+
+    工具是装配过程中陆续注册的（记忆 → 技能 → Web → MCP → Git），
+    若在造技能卡时就把集合定死，后来才注册的工具会被误判为缺失。
+    """
+    binding = _trusted_binding("withreq3", "requires: [web.fetch]")
+    registered: set[str] = set()
+    tool = skill_to_tool(binding, available=lambda: registered)
+
+    try:
+        tool.function(goal="先跑一次")  # type: ignore[union-attr]
+        assert False, "依赖未注册时不应能激活"
+    except SkillRequirementError:
+        pass
+
+    registered.add("web.fetch")  # "后来才注册进来的"
+    assert "正文" in str(tool.function(goal="再跑一次"))  # type: ignore[union-attr]
+
+
+def test_requires_不给集合则不校验_保持向后兼容() -> None:
+    binding = _trusted_binding("withreq4", "requires: [code.read]")
+    tool = skill_to_tool(binding)
+    assert "正文" in str(tool.function(goal="干活"))  # type: ignore[union-attr]
+
+
 def _trusted_binding(alias: str, extra_front: str):
     """造一个 trusted 的技能绑定（extra_front 可追加 requires 等 frontmatter 行）。"""
     md = f"---\nname: {alias}\ndescription: d\ntrust: trusted\n{extra_front}\n---\n\n正文内容"

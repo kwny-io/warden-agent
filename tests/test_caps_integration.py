@@ -10,6 +10,7 @@ from tests.conftest import weather_tool
 
 from warden_agent.agent import build_agent
 from warden_agent.policy.policy import PolicyEngine
+from warden_agent.skill import SkillRequirementError
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog
 from warden_agent.web.server import build_app
@@ -48,11 +49,49 @@ def test_build_agent_skills_注册技能工具() -> None:
     assert "skill.deep-dive.run" in names
 
 
+_SKILL_MD_WITH_REQUIRES = """---
+name: web-digest
+description: 联网调研后成稿
+trust: trusted
+requires: [web.fetch]
+---
+
+# Web Digest
+先抓页再总结。
+"""
+
+
+def test_build_agent_技能requires_缺依赖则拒绝激活() -> None:
+    """产品路径的依赖门禁真的会拦人。
+
+    审计发现：以前 `build_agent` 调 `skill_activation_tool` 时没传 `available`，
+    SKILL.md 里的 `requires` 声明完全无效（声明了前置依赖却从未有人校验）。
+    这条锁住“没注册 web.fetch 就不允许激活”。
+    """
+    agent = build_agent(skills={"web-digest": _SKILL_MD_WITH_REQUIRES})
+    catalog = agent._new_session().catalog
+    with pytest.raises(SkillRequirementError, match="web.fetch"):
+        catalog.execute("skill.web-digest.run", {"goal": "调研"})
+
+
+def test_build_agent_技能requires_依赖齐全则放行() -> None:
+    """开 `web=True` 后 `web.fetch` 已注册（且在技能卡之后才注册，
+    所以必须是“激活时取集合”才判得对），激活应成功。"""
+    agent = build_agent(skills={"web-digest": _SKILL_MD_WITH_REQUIRES}, web=True)
+    catalog = agent._new_session().catalog
+    out = catalog.execute("skill.web-digest.run", {"goal": "调研"})
+    assert "Web Digest" in str(out)
+    assert "调研" in str(out)
+
+
 def test_build_agent_memory_能记住并取回() -> None:
-    """记忆工具真的可用：remember 存、recall 取。"""
+    """记忆走真两阶段：remember 只入候选，confirm 后才 recall 得到。"""
     agent = build_agent(memory=True)
     catalog = agent._new_session().catalog
-    catalog.execute("memory.remember", {"key": "preference", "text": "用户喜欢简洁"})
+    queued = catalog.execute("memory.remember", {"key": "preference", "text": "用户喜欢简洁"})
+    assert "待确认" in str(queued)
+    assert "用户喜欢简洁" not in str(catalog.execute("memory.recall", {"key": "preference"}))
+    catalog.execute("memory.confirm", {"key": "preference"})
     out = catalog.execute("memory.recall", {"key": "preference"})
     assert "用户喜欢简洁" in str(out)
 

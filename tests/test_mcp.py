@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from collections.abc import Iterator
 
 import pytest
@@ -72,27 +73,46 @@ def test_审查_关闭危险拦截全放行() -> None:
 
 # ---- 集成：连接真实 MCP stdio server（仅当 node + 服务器可用）----
 _SERVER = "npx -y @modelcontextprotocol/server-everything"
-# 预热用的宽松超时：冷启动（npx 解析/下载 + node 启动）在负载下可能很慢，
-# 预热只跑一次，跑通后 npx 缓存已热，后续操作就快。
-_WARMUP_TIMEOUT_S = 600
+# 预热超时（秒）：冷启动含 npx 解析 + node 启动，本机实测 30.5s（13 个工具），
+# 留 3 倍余量到 90s。**这里的上限是个安全阀，不是"宽松一点更保险"**：
+# 这个值曾经写成 600，结果一次冷启动变慢就让**整套回归静默卡了 10 分钟以上**
+# （日志停在 `tests/test_mcp.py .....` 后面，看起来像死锁而不像"在等外部进程"）。
+# 一个测试能拖住整套回归多久，必须是**有界且看得见**的——见下面 fixture 里的进度输出。
+_WARMUP_TIMEOUT_S = 90
 
 
 @pytest.fixture(scope="session")
-def warm_client() -> Iterator[McpClient]:
+def warm_client(request: pytest.FixtureRequest) -> Iterator[McpClient]:
     """会话级预热：真实服务器的冷启动只做一次，之后再复用同一个已热客户端。
 
     这样定时断言面对的是“已就绪”的服务器，而不是每次重新冷启 npx（原 flake 的根因）。
     注意：环境已由 `client_ready()` 在收集期判定过；**预热失败即真失败**，不静默跳过
     （与“连接失败就该失败”的约定一致）。环境不具备条件时由 `requires_mcp_server` 跳过，
     此时本 fixture 根本不会被建立。
+
+    预热期间**主动往终端写一行进度**：这一段最长要等 `_WARMUP_TIMEOUT_S` 秒，
+    没有任何输出的话，人在看日志时无法区分“在等外部进程”和“死锁了”。
     """
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    write_line = getattr(reporter, "write_line", None)
     prev = os.environ.get("WARDEN_MCP_TIMEOUT_S")
     os.environ["WARDEN_MCP_TIMEOUT_S"] = str(_WARMUP_TIMEOUT_S)
+    started = time.monotonic()
+    if callable(write_line):
+        write_line(f"[mcp] 预热真实 server（npx+node 冷启动，上限 {_WARMUP_TIMEOUT_S}s）…")
     try:
         client = McpClient(_SERVER)
         tools = client.list_tools()  # 预热：把 npx/node 拉起来一次
         assert tools, "预热未发现任何工具（服务器异常）"
+        if callable(write_line):
+            write_line(f"[mcp] 预热完成：{len(tools)} 个工具，{time.monotonic() - started:.1f}s")
         yield client
+    except Exception as exc:
+        # 把耗时带进失败信息：这样"连不上"和"连上了但很慢"一眼可分
+        raise AssertionError(
+            f"MCP server 预热失败（{time.monotonic() - started:.1f}s / "
+            f"上限 {_WARMUP_TIMEOUT_S}s）：{type(exc).__name__}: {exc}"
+        ) from exc
     finally:
         if prev is None:
             os.environ.pop("WARDEN_MCP_TIMEOUT_S", None)

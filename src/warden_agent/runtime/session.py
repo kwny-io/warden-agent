@@ -650,14 +650,19 @@ class AgentSession:
     #   {"type":"start"}                    会话开始/继续
     #   {"type":"delta","text":"..."}       模型生成的增量（一个或多个字符）
     #   {"type":"tool","name":"...","arguments":{...}}  想调用工具
+    #   {"type":"tool_result","name":"...","ok":bool,"text":"..."}  工具执行结果（已落库的那段文本）
+    #   {"type":"tool_hint","name":"...","text":"..."}  调用前校验给出的提示（不执行，让模型换招）
     #   {"type":"final","text":"..."}       最终回答（模型说完了）
     #   {"type":"needs_approval","approval":{...}}       需要审批
     def stream(self, user_text: str) -> Iterator[dict[str, Any]]:
-        """流式入口：包一层"失败即标记 FAILED"，实现体见 `_stream_impl`。"""
+        """流式入口：包一层"失败即标记 FAILED"，实现体见 `_stream_impl`。
+
+        ⚠️ 这里**故意不加** `owner_scope`：本函数是生成器，set/reset 会跨 yield 落到不同
+        Context 里，导致真实服务器上第二条消息 500（详见 `_execute` 的注释）。
+        归属者现在只在工具执行那一小段生效（`_execute`）。
+        """
         try:
-            # owner_scope：让 memory.remember 这类共享工具知道"当前是谁在用"
-            with owner_scope(self.run.user_id):
-                yield from self._stream_impl(user_text)
+            yield from self._stream_impl(user_text)
         except PolicyDenied:
             # 流式路径的确定性策略拒绝同样不可重试
             self._mark_failed(retryable=False)
@@ -747,9 +752,16 @@ class AgentSession:
                         self.store.append_message(self.run_id, hint_msg)
                         yield {"type": "tool_hint", "name": call.name, "text": hint}
                         continue
-                    # 流式下也把工具结果落库（复用 _execute，携带 tool_call_id；含稳定性+错误喂回）
+                    # 流式下也把工具结果落库（复用 _execute_with_result，传 tool_call_id；
+                    # 含稳定性包装 + 错误喂回）
                     self._checkpoint("tool_exec", iteration)
-                    if self._execute(call) is not None:
+                    error, tool_text = self._execute_with_result(call)
+                    # 【工具结果可见】把落库的结果原样推给前端：这是审计员/运维最想看的东西
+                    # （以前只有模型看得到——调用记录里只有"🔧 调用工具：x"，结果永远不显示）。
+                    # 文本直接透传，不在后端截断：前端按行数折叠展示，审计时点开即可看全。
+                    yield {"type": "tool_result", "name": call.name,
+                           "ok": error is None, "text": tool_text}
+                    if error is not None:
                         round_failed = True
                     else:
                         round_ok = True
@@ -835,7 +847,29 @@ class AgentSession:
 
     def _execute(self, call: ToolCall) -> str | None:
         """执行一次工具调用并落库；返回错误串（成功返回 None）供调用方推进规划。"""
-        result, error = exec_tool(self.catalog, self.stability, call.name, call.arguments)
+        error, _ = self._execute_with_result(call)
+        return error
+
+    def _execute_with_result(self, call: ToolCall) -> tuple[str | None, str]:
+        """执行一次工具调用并落库；返回 `(错误串 | None, 落库的结果文本)`。
+
+        为什么拆成两个入口：非流式路径只关心成败（推进规划用），流式路径还要把结果
+        **原样推给前端**（工具结果不该只有模型看得到）。落库内容必须只有一份实现，
+        否则两条路径会慢慢长成两种内容（这正是"看起来修了"类问题的温床）。
+        """
+        # owner_scope 必须**贴在这里**，而不能包住整个 stream()：
+        # stream() 是生成器，`with owner_scope(...)` 的 set/reset 会跨 yield 执行，
+        # 而真实服务器上（uvicorn + Starlette 把同步生成器丢线程池逐块 next()）
+        # 每个 next() 拿到的是 context 的**副本** —— set 在一个副本里、reset 在另一个副本里，
+        # reset 于是直接抛：
+        #   ValueError: <Token var=<ContextVar name='warden_memory_owner'> ...>
+        #               was created in a different Context
+        # 表现为：真实浏览器连发第二条消息就 500（日志里是“正式 chat 失败”），
+        # 而 TestClient 的同步路径不长这样，所以单测一直没暴露。
+        # 包在工具执行这一小段（普通函数调用、不跨 yield）就足够——ContextVar 的唯一
+        # 消费者是 memory/tools.py:103 的 current_owner()（memory.remember/recall 推断归属）。
+        with owner_scope(self.run.user_id):
+            result, error = exec_tool(self.catalog, self.stability, call.name, call.arguments)
         # 关键：工具结果必须携带与 assistant.tool_calls[].id 一致的 call 引用，
         # 否则真实 API 要求"assistant 发起的 tool_call 必须一一被 tool 消息响应"，
         # 会报 400（mock 测不出这条，只有真实调用会暴露）。
@@ -847,7 +881,7 @@ class AgentSession:
         msg = Message(role="tool", content=content, tool_call=call)
         self.messages.append(msg)
         self.store.append_message(self.run_id, msg)
-        return error
+        return error, content
 
     def _clear_approval(self) -> None:
         self._gated = None

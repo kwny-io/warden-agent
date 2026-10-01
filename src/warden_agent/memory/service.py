@@ -153,6 +153,70 @@ class MemoryService:
             if scope is None or item.scope == scope
         ]
 
+    def candidates(
+        self, scope: MemoryScope, *, owner: str,
+    ) -> list[MemoryProposal]:
+        """列出该作用域下、**属于 owner** 且等人确认的候选（PENDING + CONFLICTED）。
+
+        三个口径为什么要这么定：
+        - 按 `owner` 过滤：候选区是"等人处理的东西"，不按归属过滤的话 HTTP 面
+          一开口就把别人的待确认内容泄露出去了（同租户 ≠ 同一个人）。
+        - 含 `CONFLICTED`：冲突项才是最需要人看一眼的——只列 PENDING 会让
+          "和已有记忆冲突"的候选从界面上消失，等于冲突检测白做。
+        - 与 `pending()` 分开：`pending()` 是旧的"全量 PENDING"枚举（无 owner 概念），
+          保留它以免破坏已有调用方；新代码请用 `candidates()`。
+        """
+        return [
+            MemoryProposal(item)
+            for item in self._repo.list_by_status(None, 1000)
+            if item.status in (MemoryStatus.PENDING, MemoryStatus.CONFLICTED)
+            and item.scope == scope
+            and item.owner == owner
+        ]
+
+    def conflict_preview(self, proposal: MemoryProposal) -> str:
+        """冲突候选要替掉的旧记忆正文（给人看清楚"要替掉什么"）；无冲突/查不到返回空串。
+
+        意义：只看得到新候选、看不到会没掉的那条旧记忆，人根本没法判断该不该点确认。
+        """
+        uid = proposal.item.conflicts_with
+        if not uid:
+            return ""
+        old = self._repo.find(uid)
+        return "" if old is None else old.content.text
+
+    def approve_candidate(
+        self, uid: str, *, scope: MemoryScope, owner: str, replace_existing: bool = True,
+    ) -> MemoryItem | None:
+        """确认（生效）一条候选：`uid` 必须属于 `owner` 且在同一作用域，否则返回 None。
+
+        归属校验放在服务层而不是路由层：接口多一条（HTTP / 工具卡 / 以后的 CLI）
+        就多处实现一次，漏一处就是越权。越权与"找不到"都返回 None（不区分），
+        免得把"这个 uid 存在但不归你"当成探针。
+        """
+        item = self._repo.find(uid)
+        if (
+            item is None
+            or item.scope != scope
+            or item.owner != owner
+            or item.status not in (MemoryStatus.PENDING, MemoryStatus.CONFLICTED)
+        ):
+            return None
+        return self.approve(MemoryProposal(item), replacing=replace_existing)
+
+    def reject_candidate(self, uid: str, *, scope: MemoryScope, owner: str) -> bool:
+        """拒绝一条候选（软删）。同样要求 uid 属于 owner 且在作用域内，否则 False。"""
+        item = self._repo.find(uid)
+        if (
+            item is None
+            or item.scope != scope
+            or item.owner != owner
+            or item.status not in (MemoryStatus.PENDING, MemoryStatus.CONFLICTED)
+        ):
+            return False
+        self.reject(MemoryProposal(item))
+        return True
+
     # ---- 冲突消解 ----
     def resolve_conflict(self, proposal: MemoryProposal, keep_new: bool) -> None:
         """处理冲突候选：keep_new=True 替代旧的；False 放弃新的保留旧的。"""

@@ -63,6 +63,41 @@ def test_多用户格式错误时拒绝启动(bad: str) -> None:
         resolve_auth({"WARDEN_API_KEYS": bad})
 
 
+def test_同一个用户两个key都有效用于零停机轮换() -> None:
+    """轮换契约：新旧 key 同时在配，两份都能用、都指向同一个身份。
+
+    这是“把密钥换成新的”不把在飞客户端打成 401 的前提：先发新 key → 确认能用 →
+    再删旧 key。如果不支持两把 key，换 key 就只能“停服改配置重启”，
+    或者硬打一个 401 窗口。
+    """
+    keys, mode = resolve_auth({"WARDEN_API_KEYS": "alice:k-old,alice:k-new"})
+    assert mode == "bearer"
+    assert keys is not None
+    assert keys["k-old"].user_id == "alice"
+    assert keys["k-new"].user_id == "alice"
+    # 身份完全一致（同一租户/角色/product，换 key 不改归属）
+    assert keys["k-old"] == keys["k-new"]
+    # 旧 key 删掉后只剩新的
+    keys2, _ = resolve_auth({"WARDEN_API_KEYS": "alice:k-new"})
+    assert keys2 is not None and "k-old" not in keys2
+
+
+def test_同一个密钥配给两个用户时拒绝启动() -> None:
+    """静默覆盖是最危险的形态：alice 拿着自己的 key 却以 bob 的身份记账。
+
+    会话归属、越权拦截、审计归属全都建立“身份由 key 决定”上，所以这里必须
+    fail-closed，而不是最后写入者获胜。
+    """
+    with pytest.raises(AuthConfigError, match="同一个密钥被配给了两个用户"):
+        resolve_auth({"WARDEN_API_KEYS": "alice:k-same,bob:k-same"})
+
+
+def test_轮换写法不会被当成重复密钥冲突() -> None:
+    """同一用户重复出现是轮换，不能误报成冲突（回归保护）。"""
+    keys, _ = resolve_auth({"WARDEN_API_KEYS": "alice:k-1,alice:k-2,alice:k-3"})
+    assert keys is not None and len(keys) == 3
+
+
 def test_多用户key优先于单key() -> None:
     keys, mode = resolve_auth({"WARDEN_API_KEYS": "alice:k-a", "WARDEN_API_KEY": "k-single"})
     assert mode == "bearer"
@@ -114,8 +149,10 @@ def test_对外监听且无鉴权时拒绝启动() -> None:
 
 
 def test_对外监听且有鉴权时放行() -> None:
-    ensure_listen_is_safe("0.0.0.0", "bearer")
+    """契约是"不抛错"，所以断言显式写出来：这种“放行”函数一旦被改成
+    提前 return（没真的检查）也不会有人发现。"""
+    assert ensure_listen_is_safe("0.0.0.0", "bearer") is None
 
 
 def test_本机监听无鉴权时放行() -> None:
-    ensure_listen_is_safe("127.0.0.1", "anon-dev")
+    assert ensure_listen_is_safe("127.0.0.1", "anon-dev") is None

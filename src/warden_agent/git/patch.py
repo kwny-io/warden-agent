@@ -6,6 +6,8 @@ r"""Unified diff（统一 diff）解析与逐 hunk 应用到工作区文件。
   - 预算：max_files / max_lines / max_bytes，NUL 抛错，换行归一化 LF。
   - 应用校验：逐 hunk 按 old line 数定位应用；加上"每文件预期 hash"校验
     （expectedHashes + expectedRevision）。
+    **写回一律 LF**（`newline="\n"`）：统一 diff 是 LF 语义，同一份 diff 在不同平台上
+    必须写出同样的字节——否则 Windows 上会把仓库文件整体改成 CRLF。
 
 设计要点：只改动 patch 里明确列出的文件/行，绝不隐式改动其它地方，且应用前校验基准。
 """
@@ -234,7 +236,9 @@ class PatchApplier:
                         path=fp.target_path)
             new_lines = self._apply_file(fp, old_text)
             abs_path.parent.mkdir(parents=True, exist_ok=True)
-            abs_path.write_text("\n".join(new_lines), encoding="utf-8")
+            # newline 显式给 "\n"：默认值 None 会把 \n 转成 os.linesep（Windows 上 CRLF），
+            # 那就变成"同一份 diff 在不同平台写出不同字节"。
+            abs_path.write_text("\n".join(new_lines), encoding="utf-8", newline="\n")
             changed.append(fp.target_path)
         return changed
 

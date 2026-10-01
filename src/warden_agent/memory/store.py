@@ -33,6 +33,7 @@ from warden_agent.memory.models import (
     MemoryStatus,
     make_ref,
 )
+from warden_agent.store.pg_schema import serialized_schema_init
 
 
 class MemoryRepository(Protocol):
@@ -445,7 +446,24 @@ class PostgresMemoryStore:
         self._init()
 
     def _init(self) -> None:
-        with self._conn.cursor() as cur:
+        """建表 + 补列。
+
+        ⚠️ **必须在多副本同时启动时也安全**：这里的 DDL 都带 `IF NOT EXISTS`，
+        但 PG 的 `IF NOT EXISTS` 是"先查存在性再创建"，**两个副本同时启动时会双双通过
+        存在性检查**，后到的那个撞 `pg_class` 的命名唯一索引：
+
+            psycopg.errors.UniqueViolation: duplicate key value violates unique
+            constraint "pg_class_relname_nsp_index"
+            DETAIL:  Key (relname, relnamespace)=(idx_memories_status, 2200) already exists.
+
+        后果是**其中一个副本启动即死**（k8s 同时拉起/滚动重启的必现时序，生产里表现为
+        间歇性 CrashLoopBackOff）。这是多副本 e2e 首跑抓到的——注意它不是"新 bug"：
+        `store/postgres.py` 早就因为同类问题拿过建议锁，只是当时没把这个修法
+        复用到记忆存储上。现在两边都走 `store/pg_schema.py` 的唯一入口。
+        """
+        # 事务与建议锁都由 serialized_schema_init 负责（原来这里是裸 `conn.cursor()` +
+        # 事后 `commit()`，既没有锁、也没把 DDL 包在一个事务里）。
+        with serialized_schema_init(self._conn, local_lock=self._lock) as cur:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memories (
@@ -482,7 +500,8 @@ class PostgresMemoryStore:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories (owner, scope)"
             )
-        self._conn.commit()
+        # 不需要再 commit：serialized_schema_init 开的是显式事务（autocommit=True 的连接上
+        # `conn.transaction()` 仍然会 BEGIN/COMMIT），提交时建议锁一并释放。
 
     def save(self, item: MemoryItem) -> None:
         with self._lock, self._conn.cursor() as cur:

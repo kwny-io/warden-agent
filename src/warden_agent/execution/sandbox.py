@@ -33,11 +33,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from warden_agent.core.settings import env_str
+from warden_agent.core.settings import env_bool, env_str
 from warden_agent.execution.broker import ExecutionBroker, ExecutionBudget, ExecutionResult
 
 # 常见的"会碰网络"的命令/参数片断（小写匹配）。用于 NetworkPolicy 语义层判断。
@@ -165,11 +165,15 @@ class SandboxSpec:
     max_files）。broker 会用 budget 构造平台限流器（POSIX rlimit / Windows Job Object）。
     例：SandboxSpec(budget=ExecutionBudget(max_memory_mb=256, max_cpu_seconds=10))
 
-    isolation 取值：
-      "auto"             —— 自动探测（默认）：能上内核档就上，不能就退回语义档并如实报告
-      "linux-net-namespace" —— 强制要求内核档；平台不支持时**拒绝执行**（fail-closed，
-                             而不是偷偷降级成"看起来隔离了"）
-      "semantic"         —— 明确只用语义档（用于测试或已知安全的命令）
+    isolation 取值（别名归一，报错时只认这三个词）：
+      "auto"                 —— 自动探测（默认）：能上内核档就上，不能就退回语义档并如实报告
+      "kernel"（别名 linux-net-namespace / os）
+                             —— 强制要求内核档；平台不支持时**拒绝执行**（fail-closed，
+                             而不是偷偷降级成「看起来隔离了」）
+      "semantic"             —— 明确只用语义档（用于测试或已知安全的命令）
+
+    注：这是**参数层**的取值。部署级的声明在环境变量里（见 `isolation_tier_from_env`），
+    两者与平台能力取「更严的那个」——环境声明了内核档而平台给不了，就直接抛错。
     """
 
     allow_network: bool = False          # 默认禁网
@@ -196,7 +200,7 @@ def resolve_isolation_tier(isolation: str) -> IsolationTier:
     detected = detect_isolation_tier()
     if isolation == "auto":
         return detected
-    if isolation in ("linux-net-namespace", "os"):
+    if isolation in ("linux-net-namespace", "os", "kernel"):
         if not detected.available:
             raise IsolationUnavailableError(
                 "要求内核级隔离 isolation=" + repr(isolation)
@@ -206,6 +210,104 @@ def resolve_isolation_tier(isolation: str) -> IsolationTier:
     if isolation == "semantic":
         return IsolationTier("semantic-only", False, "按配置显式只用语义档")
     raise ValueError("未知 isolation 取值: " + repr(isolation))
+
+
+# 档位声明的合法取值 → 归一。**写错不猜**：与 core/settings.py 里布尔开关的口径一致
+# （拼错的环境变量应该立刻炸，而不是悄悄按默认值跑、让人以为隔离生效了）。
+_ISOLATION_VALUES = frozenset({"auto", "kernel", "semantic"})
+
+
+def sandbox_isolation_policy(env: Mapping[str, str] | None = None) -> tuple[str, bool]:
+    """读部署级的隔离声明：`WARDEN_SANDBOX_ISOLATION` / `WARDEN_SANDBOX_REQUIRE_KERNEL`。
+
+    返回 (归一后的档位取值, 是否强制内核档)。取值只会是 auto / kernel / semantic；
+    拼错的取值直接 ValueError —— 不静默按 auto 跑。
+    """
+    raw = env_str("WARDEN_SANDBOX_ISOLATION", "auto", env).strip().lower()
+    if raw not in _ISOLATION_VALUES:
+        raise ValueError(
+            "WARDEN_SANDBOX_ISOLATION 取值必须是 auto / kernel / semantic，收到 "
+            + repr(raw) + "（写错不猜：静默按默认值跑会让你以为隔离生效了）"
+        )
+    require = env_bool("WARDEN_SANDBOX_REQUIRE_KERNEL", False, env)
+    return raw, require
+
+
+def default_sandbox_isolation(env: Mapping[str, str] | None = None) -> str:
+    """`SandboxSpec.isolation` 的默认取值（来自部署级声明）。"""
+    return sandbox_isolation_policy(env)[0]
+
+
+def isolation_tier_from_env(
+    env: Mapping[str, str] | None = None,
+    *,
+    probe: Callable[[list[str]], bool] | None = None,
+    platform: str | None = None,
+) -> IsolationTier:
+    """按部署级声明解析实际生效的隔离档；声明了内核档却给不了 → 报错（fail-closed）。
+
+    三种声明与实际行为的对应（本模块最需要说清的一张表）：
+
+    | 声明 | 环境给得了内核档 | 环境给不了 |
+    |---|---|---|
+    | auto（默认）| 内核档 | 语义档，并如实说明（**不声称隔离**）|
+    | kernel / REQUIRE_KERNEL=1 | 内核档 | 抛 IsolationUnavailableError |
+    | semantic | 语义档（尊重声明，明说不是隔离）| 语义档 |
+
+    auto 之所以允许退回：开发机（Windows / WSL / 默认 Docker 容器）根本做不到内核档，
+    而开发机上 shell.run 的价值是「跑脚本」而不是「隔离不可信代码」。
+    但**生产不能靠 auto**：所以对外声称有隔离的部署要显式写 kernel，
+    让「声明与事实不符」变成启动失败，而不是一份好看的安全报告。
+    """
+    value, require = sandbox_isolation_policy(env)
+    detected = detect_isolation_tier(platform=platform, probe=probe)
+    if value == "kernel" or require:
+        if not detected.available:
+            raise IsolationUnavailableError(
+                "环境声明了内核级隔离（"
+                + ("WARDEN_SANDBOX_REQUIRE_KERNEL=1" if require
+                   else "WARDEN_SANDBOX_ISOLATION=kernel")
+                + "），但当前环境给不了：" + detected.reason
+                + "。可选出路（都要显式选，不接受静默降级）："
+                "① 换成能建命名空间的环境（Linux 裸机，或容器加 CAP_SYS_ADMIN）；"
+                "② 把隔离边界交给容器/编排层（docker network_mode: none + 只读 rootfs、"
+                "k8s NetworkPolicy 拒 egress）并把声明改成 WARDEN_SANDBOX_ISOLATION=semantic；"
+                "③ 干脆不注册 shell.run（build_agent(sandbox=False)）"
+            )
+        return detected
+    if value == "semantic":
+        return IsolationTier(
+            "semantic-only", False,
+            "按声明 WARDEN_SANDBOX_ISOLATION=semantic 只用语义层把关（不是操作系统隔离）",
+        )
+    return detected
+
+
+def resolve_enforced_isolation(
+    spec_isolation: str,
+    env: Mapping[str, str] | None = None,
+    *,
+    probe: Callable[[list[str]], bool] | None = None,
+    platform: str | None = None,
+) -> IsolationTier:
+    """把「参数层取值」与「部署级声明」合并成实际生效的档位，取**更严的那个**。
+
+    规则：
+      1. 部署级声明先解析（它可能直接抛错——声明内核档但给不了）；
+      2. 参数层显式写了非 auto 的值，按参数层解析（它也可能抛错）；
+      3. 两边都得出了结论时，取可用（内核档）的那个：参数层说语义档但环境能上内核档，
+         就用内核档——多一层隔离不是坏事，而反向的「把环境声明的内核档降成语义档」才是。
+
+    为什么不在 `SandboxedExecutionBroker` 里直接 `resolve_isolation_tier(spec.isolation)`：
+    那样默认的 `isolation="auto"` 会把部署级的 `REQUIRE_KERNEL=1` 当空气。
+    """
+    env_tier = isolation_tier_from_env(env, probe=probe, platform=platform)
+    if spec_isolation in ("", "auto"):
+        return env_tier
+    spec_tier = resolve_isolation_tier(spec_isolation)
+    if spec_tier.available:
+        return spec_tier
+    return env_tier
 
 
 def wrap_with_isolation(tier: IsolationTier, command: list[str]) -> list[str]:
@@ -219,7 +321,17 @@ def wrap_with_isolation(tier: IsolationTier, command: list[str]) -> list[str]:
 
 
 class NetworkPolicy:
-    """网络策略：默认拒绝。判断一条命令是否可放行。"""
+    """网络策略：默认拒绝。判断一条命令是否可放行。
+
+    ⚠️ **这是一道绊线（tripwire），不是边界。** 它看的是「命令长什么样」——
+    正则匹配 curl/wget/… 这些字符片段。已知绕过（故意留在这里，免得有人把它当隔离）：
+      · `python -c "import socket; socket.create_connection(('1.1.1.1',80))"`
+      · `bash -c 'exec 3<>/dev/tcp/1.1.1.1/80'`
+      · `git clone` / `pip install`（可以从 URL 拉东西）
+      · 任何被拆开的写法（`c''url`、变量拼接、base64 解码后再执行）
+    它的价值是「拦住随手写的网络命令 + 让默认行为是禁网」，
+    真正的边界只能是内核档（网络命名空间）或容器层（network_mode: none）。
+    """
 
     def __init__(self, allow_network: bool = False) -> None:
         self.allow_network = allow_network
@@ -248,7 +360,8 @@ class SandboxedExecutionBroker:
         self.spec = spec or SandboxSpec()
         self.inner = inner or ExecutionBroker(self.spec.budget)
         self.policy = NetworkPolicy(allow_network=self.spec.allow_network)
-        self.tier = resolve_isolation_tier(self.spec.isolation)
+        # 参数层与部署级声明取更严的那个（见 resolve_enforced_isolation）
+        self.tier = resolve_enforced_isolation(self.spec.isolation)
 
     def isolation_note(self) -> str:
         """当前隔离档的可读说明 —— 对外汇报时请直接引用它，别自己措辞。"""

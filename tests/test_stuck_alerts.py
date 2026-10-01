@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 
 import httpx
@@ -148,7 +149,7 @@ def test_渲染成可读文本(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CLI：接 cron 告警用（有输出 → 退出码 3）
+# CLI：接 cron 告警用（**退出码 3 = 有人工待处理超时**；输出无论如何都会打印一行）
 # ---------------------------------------------------------------------------
 
 
@@ -160,13 +161,19 @@ def test_cli_stuck_有超时则退出码为3(tmp_path: Path) -> None:
     assert exc.value.code == 3
 
 
-def test_cli_stuck_无超时则退出码为0(tmp_path: Path) -> None:
-    """CLI 走的是**真实时钟**（不是测试的假 now），所以"新鲜"要用当前时间造。"""
+def test_cli_stuck_无超时则退出码为0(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """CLI 走的是**真实时钟**（不是测试的假 now），所以"新鲜"要用当前时间造。
+
+    断言用 `--json`：干净时必须是空列表，而**不是**靠"有没有打印"来判断——
+    `stuck` 无论如何都会打印一行人类可读结论，真正接 cron/监控的只有退出码。
+    """
     store = _store(tmp_path)
     just_now = dt.datetime.now(dt.UTC).isoformat()
     _make_run(store, "run-fresh", RunStatus.WAITING_APPROVAL, updated_at=just_now)
-    cli.main(["stuck", "--db", str(_db(tmp_path)), "--older-than-min", "60"])
-    # 正常返回（不抛 SystemExit）——刚刚挂起的 run 不该被报超时
+    assert cli.main([
+        "stuck", "--db", str(_db(tmp_path)), "--older-than-min", "60", "--json",
+    ]) is None
+    assert json.loads(capsys.readouterr().out) == []
 
 
 def test_cli_stuck_支持json输出(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

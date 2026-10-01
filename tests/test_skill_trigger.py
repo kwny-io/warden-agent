@@ -77,3 +77,40 @@ def test_触发器暴露为工具() -> None:
     catalog.register(tool)
     result = catalog.execute("skill.trigger.pick", {"task": "帮我写周报"})
     assert "周报" in str(result)
+
+
+# ---- 产品接线：触发器真的进了产品目录（以前只有 demo/评测注册） ----
+
+def test_技能目录装配后_产品目录里有触发卡() -> None:
+    """装配了技能（`skills=`）→ 目录里就该有 `skill.trigger.pick`。
+
+    改之前：`agent.augment_catalog` 只注册 `skill.<alias>.run` 激活卡，
+    触发器只在 `demo_e2e.py` 与 `evals/runner.py` 里注册——产品路径上
+    “按任务意图选该用哪本 SKILL.md”这件事实际不存在。
+    """
+    from warden_agent.agent import augment_catalog
+    from warden_agent.tool.catalog import ToolCatalog
+
+    catalog = ToolCatalog()
+    augment_catalog(catalog, skills={"weekly": _WEEKLY})
+    assert "skill.trigger.pick" in catalog.names()
+
+
+def test_触发卡是只读的_不需要审批() -> None:
+    """触发器只做读卡判断（`pure=True`），不该被审批闸门拦下。"""
+    from warden_agent.agent import augment_catalog
+    from warden_agent.tool.catalog import ToolCatalog
+
+    catalog = ToolCatalog()
+    augment_catalog(catalog, skills={"weekly": _WEEKLY})
+    assert catalog.get("skill.trigger.pick").pure is True
+
+
+def test_没装技能就不注册触发卡() -> None:
+    """没技能可挑时不注册空触发器：给了也没东西可挑，徒增一张卡。"""
+    from warden_agent.agent import augment_catalog
+    from warden_agent.tool.catalog import ToolCatalog
+
+    catalog = ToolCatalog()
+    augment_catalog(catalog)
+    assert "skill.trigger.pick" not in catalog.names()

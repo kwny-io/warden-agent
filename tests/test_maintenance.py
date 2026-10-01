@@ -82,7 +82,10 @@ def test_清扫线程_间隔为零则不启动() -> None:
 
 
 def test_老库打开后补列并记录schema版本(tmp_path: Path) -> None:
-    """旧 schema（runs 无 updated_at/user_id）打开后应补列，并把版本记成 4。"""
+    """旧 schema（runs 无 updated_at/user_id）打开后应补列，并把版本记成当前目标版本。
+
+    这里不写死字面量 5：迁移到 v5 时正是这条断言先拦住了"改了结构忘了改测试"。
+    """
     import sqlite3
 
     db = tmp_path / "old.db"
@@ -95,7 +98,7 @@ def test_老库打开后补列并记录schema版本(tmp_path: Path) -> None:
     try:
         assert store._has_column("runs", "updated_at")
         assert store._has_column("runs", "user_id")
-        assert store.schema_version() == 4
+        assert store.schema_version() == SqliteStore._SCHEMA_VERSION
     finally:
         store.close()
 

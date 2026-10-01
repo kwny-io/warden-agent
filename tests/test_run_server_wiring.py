@@ -136,16 +136,59 @@ def test_数据库路径默认值() -> None:
 # ---------- 演示目录与策略（装配出来的东西要能用）----------
 
 
-def test_演示目录里有天气与删除工具() -> None:
+def test_演示目录默认不注册演示卡() -> None:
+    """默认目录里**没有**演示卡：weather.get / fs.delete 都要显式 WARDEN_DEMO_TOOLS=1。
+
+    `run_server` 是真被启动的入口，默认就把“假天气 + 假删除”塞进模型可见的工具列表，
+    等于让调用方拿到假的成功文本 —— 这是本项目最不该有的那类“形同虚设”。
+    """
     names = {t.name for t in _build_catalog().all()}
+    assert "weather.get" not in names
+    assert "fs.delete" not in names
+
+
+def test_显示打开后才注册演示卡() -> None:
+    names = {t.name for t in _build_catalog({"WARDEN_DEMO_TOOLS": "1"}).all()}
     assert {"weather.get", "fs.delete"} <= names
+
+
+def test_演示卡不谎报做了没做的事(tmp_path) -> None:
+    """副作用声明与实际行为必须一致：删除卡**不删文件**，而且返回值里要写清是演示。
+
+    旧写法 `return f"已删除 {path}"` 是纯粹的空壳谎报：一句话回成功、磁盘毫无变化。
+    """
+    catalog = _build_catalog({"WARDEN_DEMO_TOOLS": "1"})
+    victim = tmp_path / "keep-me.txt"
+    victim.write_text("还在这儿", encoding="utf-8")
+
+    from warden_agent.tool.catalog import FunctionToolSpec
+
+    spec = catalog.get("fs.delete")
+    assert isinstance(spec, FunctionToolSpec) and spec.function is not None
+    out = str(spec.function(path=str(victim)))
+    assert victim.exists(), "演示卡居然真删了文件（演示卡不做真删除）"
+    assert "演示" in out, f"返回值不能谎称成功：{out!r}"
+    assert "已删除" not in out
+
+    assert "演示" in spec.description, "工具描述也要写明这是演示卡"
+    assert spec.pure is False, "演示卡的副作用声明要保持保守（非 pure → 走审批）"
+
+
+def test_演示卡的天气返回也标注演示() -> None:
+    from warden_agent.tool.catalog import FunctionToolSpec
+
+    catalog = _build_catalog({"WARDEN_DEMO_TOOLS": "1"})
+    spec = catalog.get("weather.get")
+    assert isinstance(spec, FunctionToolSpec) and spec.function is not None
+    out = str(spec.function(city="上海"))
+    assert "演示" in out, f"固定值天气必须自称演示，不能让调用方当成真实数据：{out!r}"
 
 
 def test_演示策略把删除列为需要审批() -> None:
     """`fs.delete` 必须落在 ASK 上——它是演示"人工闸门真的会拦"的那个高危工具。"""
     from warden_agent.policy.policy import Decision
 
-    policy = _build_policy(_build_catalog())
+    policy = _build_policy(_build_catalog({"WARDEN_DEMO_TOOLS": "1"}))
     assert policy.evaluate("fs.delete", {"path": "x"}).decision == Decision.ASK
     assert policy.evaluate("weather.get", {"city": "上海"}).decision == Decision.ALLOW
 

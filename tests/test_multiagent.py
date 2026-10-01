@@ -145,9 +145,10 @@ def test_多agent共享workingmemory() -> None:
     svc = MemoryService(InMemoryMemoryStore())
     share_memory(svc, researcher, writer, scope=MemoryScope.WORKSPACE)
 
-    # 研究员写入一条工作记忆
+    # 研究员写入一条工作记忆候选，并确认生效（两阶段：remember → confirm）
     researcher.catalog.execute("memory.remember",
                                {"key": "调研发现", "text": "年假是15天"})
+    researcher.catalog.execute("memory.confirm", {"key": "调研发现"})
     # 写手（另一个 AgentLoop，同一 WORKSPACE）能读到
     out = writer.catalog.execute("memory.recall", {"key": "调研发现"})
     assert "年假是15天" in str(out)
@@ -235,3 +236,102 @@ def test_分派器_单个失败不中止整批() -> None:
     assert "bad" in res.errors
     assert "失败" in res.outputs["bad"]
     assert res.unfinished == []
+
+
+# ---- 产品接线：多 Agent 真的进了产品目录（默认关，显式打开） ----
+
+def test_产品路径默认不注册子agent卡() -> None:
+    """默认关：没人显式打开时，主管目录里不该多出子 Agent 卡（也不该多花模型调用）。"""
+    from warden_agent.agent import augment_catalog
+
+    catalog = ToolCatalog()
+    augment_catalog(catalog)
+    assert "research" not in catalog.names()
+    assert "write" not in catalog.names()
+
+
+def test_产品路径打开开关后注册子agent卡() -> None:
+    """`multiagent=True` + 模型 → 目录里真的多出 research / write。"""
+    from warden_agent.agent import augment_catalog
+
+    catalog = ToolCatalog()
+    extra = augment_catalog(
+        catalog, multiagent=True,
+        multiagent_model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")]),
+    )
+    names = catalog.names()
+    assert {"research", "write"} <= names
+    assert extra["multiagent"] is True
+
+
+def test_子agent卡要审批() -> None:
+    """子 Agent 卡 `pure=False`：它会真的发起模型调用，按本项目口径应落在审批闸门内。"""
+    from warden_agent.agent import augment_catalog
+
+    catalog = ToolCatalog()
+    augment_catalog(
+        catalog, multiagent=True,
+        multiagent_model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")]),
+    )
+    assert catalog.get("research").pure is False
+    assert catalog.get("write").pure is False
+
+
+def test_子agent只拿只读工具_且不拿自己() -> None:
+    """子 Agent 的工具面 = 主目录里的 pure 工具，且排除子 Agent 卡本身（防递归）。"""
+    from warden_agent.multiagent.registry import readonly_tools
+    from warden_agent.tool.catalog import function_tool
+
+    @function_tool("read.only", "只读", {"type": "object", "properties": {}}, pure=True)
+    def _ro() -> str:
+        return "ok"
+
+    @function_tool("danger.write", "有副作用", {"type": "object", "properties": {}}, pure=False)
+    def _rw() -> str:
+        return "done"
+
+    catalog = ToolCatalog()
+    for spec in (_ro, _rw):
+        catalog.register(spec)
+    catalog.register(function_tool(
+        "research", "子 Agent 卡", {"type": "object", "properties": {}}, pure=False
+    )(lambda: "x"))
+
+    sub = readonly_tools(catalog, exclude=frozenset({"research"}))
+    assert sub.names() == {"read.only"}, "只该有只读工具，且不含子 Agent 卡自身"
+
+
+def test_开关开着却不给模型_报错而不是空壳() -> None:
+    """开了 `multiagent` 却没给模型 → 抛错：不静默装出一个没有子 Agent 的目录。"""
+    from warden_agent.agent import augment_catalog
+
+    catalog = ToolCatalog()
+    try:
+        augment_catalog(catalog, multiagent=True)
+        assert False, "应抛 ValueError"
+    except ValueError as e:
+        assert "multiagent_model" in str(e)
+    assert "research" not in catalog.names()
+
+
+def test_http产品路径注册子agent卡() -> None:
+    """HTTP 层（build_app）打开开关后，会话目录里看得到 research / write。"""
+    import tempfile
+    from pathlib import Path
+
+    from tests.conftest import weather_tool
+
+    from warden_agent.policy.policy import PolicyEngine
+    from warden_agent.store.sqlite import SqliteStore
+    from warden_agent.web.server import build_app
+
+    store = SqliteStore(Path(tempfile.mkdtemp()) / "t.db")
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="你好", finish_reason="stop")]),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=store,
+        multiagent=True,
+    )
+    names = app.state.session_registry._catalog.names()
+    assert {"research", "write"} <= names

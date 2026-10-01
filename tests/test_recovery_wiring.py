@@ -192,3 +192,90 @@ def test_cli_recover_空库不报错(capsys, tmp_path: Path) -> None:
 
     cli.main(["recover", "--db", str(tmp_path / "empty.db")])
     assert "没有可恢复的 run" in capsys.readouterr().out
+
+
+# ---------- GET /recovery/plan?run_id=（单个 Run 直接问"能不能续"）----------
+
+
+@pytest.mark.asyncio
+async def test_recovery_plan单run直接回答能不能续() -> None:
+    """`?run_id=`：不必自己从四组列表里反推，端点直接给结论。
+
+    这条也是 `RecoveryController.can_resume()` 的**产品路径**：写它的时候它只有单测在调，
+    产品代码从不使用——"有接口没人用"和没有没区别，所以把它接到这个端点上。
+    """
+    from warden_agent.core.run.status import RunStatus
+    from warden_agent.runtime.checkpoint import Checkpoint, checkpoint_store_for
+
+    store = _store()
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")]),
+        catalog=weather_tool(), policy=PolicyEngine(), store=store,
+    )
+    cp_store = checkpoint_store_for(store)
+    assert cp_store is not None
+    cp_store.save(Checkpoint("run-live", RunStatus.RUNNING, 3, "model_call"))
+    cp_store.save(Checkpoint("run-done", RunStatus.COMPLETED, 9, "done"))
+    cp_store.save(Checkpoint("run-wait", RunStatus.WAITING_APPROVAL, 4, "awaiting_approval"))
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        live = (await c.get("/recovery/plan", params={"run_id": "run-live"})).json()
+        assert live["run_id"] == "run-live"
+        assert live["decision"] == "resume"
+        assert live["resumable"] is True
+
+        done = (await c.get("/recovery/plan", params={"run_id": "run-done"})).json()
+        assert done["decision"] == "skip"
+        assert done["resumable"] is False
+
+        # 等人工的**不能**自动续：can_resume 只认 "resume"，await_human 不算
+        wait = (await c.get("/recovery/plan", params={"run_id": "run-wait"})).json()
+        assert wait["decision"] == "await_human"
+        assert wait["resumable"] is False
+
+        # 完全没有存档点的 run：明确答"不知道"，而不是假装不能续
+        unknown = (await c.get("/recovery/plan", params={"run_id": "nope"})).json()
+        assert unknown["decision"] is None
+        assert unknown["resumable"] is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_plan单run越权返回404() -> None:
+    """别人的 Run 用 `?run_id=` 问，一律 404 —— 不泄漏"这个 run 存不存在"。"""
+    from warden_agent.core.run.status import RunStatus
+    from warden_agent.runtime.checkpoint import Checkpoint, checkpoint_store_for
+    from warden_agent.web.auth import TrustedCaller
+
+    store = _store()
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")]),
+        catalog=weather_tool(), policy=PolicyEngine(), store=store,
+        api_keys={"k-alice": TrustedCaller("t", "user", "alice")},
+    )
+    cp_store = checkpoint_store_for(store)
+    assert cp_store is not None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        # 先让 alice 真的拥有这个 Run（落 ownership），再在它上面落一个“还在跑”的存档点
+        await c.post("/chat/run-alice", json={"text": "hi"},
+                     headers={"Authorization": "Bearer k-alice"})
+        cp_store.save(Checkpoint("run-alice", RunStatus.RUNNING, 3, "model_call"))
+        # alice 自己问得到
+        mine = await c.get("/recovery/plan", params={"run_id": "run-alice"},
+                           headers={"Authorization": "Bearer k-alice"})
+        assert mine.status_code == 200
+        assert mine.json()["resumable"] is True
+
+    app_bob = build_app(
+        model=ScriptedModel([ChatResponse(content="好", finish_reason="stop")]),
+        catalog=weather_tool(), policy=PolicyEngine(), store=store,
+        api_keys={"k-bob": TrustedCaller("t", "user", "bob")},
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_bob), base_url="http://test"
+    ) as c2:
+        r = await c2.get("/recovery/plan", params={"run_id": "run-alice"},
+                         headers={"Authorization": "Bearer k-bob"})
+        assert r.status_code == 404

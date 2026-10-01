@@ -258,13 +258,27 @@ def test_嵌入端点拒绝本机与内网地址(bad: str) -> None:
 
 
 def test_公网域名放行(monkeypatch: pytest.MonkeyPatch) -> None:
+    """公网域名（解析到公网 IP）可以构造；并且**调用时还会再校验一次**。
+
+    后半句才是这个函数真正的契约（"每次请求前再校验，防 DNS rebinding"）：
+    构造时是公网、调用时已被换成内网 —— 必须在那次调用上报错，而不是把请求发出去。
+    不需要网络：校验在发 HTTP 之前就撊住。
+    """
     monkeypatch.setattr(
         "warden_agent.rag.knowledge.socket.getaddrinfo",
         _fake_resolution("93.184.216.34"),
     )
-    openai_compatible_embedder(
+    embed = openai_compatible_embedder(
         base_url="https://embed.example.com/v1", api_key="k", model="m",
     )
+    assert callable(embed)
+    # 构造成功 ≠ 以后都安全：把解析换成内网，这一次调用必须拒绝
+    monkeypatch.setattr(
+        "warden_agent.rag.knowledge.socket.getaddrinfo",
+        _fake_resolution("10.0.0.9"),
+    )
+    with pytest.raises(ValueError):
+        embed("你好")
 
 
 def test_域名解析到内网时拒绝_防DNS重绑定(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -21,6 +21,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Concatenate, cast
 
+from warden_agent.core.redaction import redact_arguments
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.credential.vault import (
     StoredCredential,
@@ -34,6 +35,7 @@ from warden_agent.store.codec import (
     encode_versioned,
     normalize_utc_iso,
 )
+from warden_agent.store.pg_schema import SCHEMA_INIT_LOCK_KEY, serialized_schema_init
 
 
 def _now_iso() -> str:
@@ -82,7 +84,7 @@ class PostgresStore:
 
     backend = "postgres"
     # 目标 schema 版本（与 SqliteStore 对齐；每次加表/加列 +1）
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
     # 连接坏掉后的**有界**重连重试次数（不含首次尝试）。刻意很小：
     # 重连本应几乎必成，连续失败说明 DB 真的不可用，尽早把错误抛给上层比死等更好。
     _RECONNECT_ATTEMPTS = 2
@@ -191,8 +193,38 @@ class PostgresStore:
             old.close()
         self.conn = self._connect()
 
+    # 迁移锁：全项目只此一把（advisory lock 的键空间是“库级”的，只有写死常量才能保证
+    # 所有副本抢的是同一把）。取值本身无含义，只要求稳定且不与其它用途撞。
+    # 锁键本身定义在 pg_schema（唯一入口）——这里保留别名只是为了不让引用过它的
+    # 测试/文档断掉，值不允许在这里重新写一份（两处写就会漂移）。
+    _MIGRATION_LOCK_KEY = SCHEMA_INIT_LOCK_KEY
+
     def _init_schema(self) -> None:
-        with self.conn.cursor() as cur:
+        """建表 + 补列 + 记录 schema 版本。
+
+        ⚠️ **必须在多副本同时启动时也安全**——这是修过的一个真问题：
+        本类用 `autocommit=True`（见 __init__ 的说明），于是这里的
+        `DELETE FROM __schema_version__` 与随后的 `INSERT` 是**两个独立事务**。
+        两个副本同时启动时都会先 DELETE 再 INSERT 同一个主键（version=5），
+        后到的那个撞唯一约束：
+            UniqueViolation: duplicate key value violates unique constraint
+            "__schema_version___pkey"  DETAIL: Key (version)=(5) already exists.
+        结果就是**其中一个副本启动即失败**（k8s 多副本同时拉起/滚动重启时必然撞到）。
+        （SQLite 版同样写法却没这个坑：python sqlite3 的隐式事务把 DELETE+INSERT 包在一起，
+        拿到写锁后别人插不进来——所以问题只在 Postgres 上暴露。）
+
+        修法两层：
+          1. `pg_advisory_xact_lock` 把整段迁移**串行化**：不只解决版本号写入，
+             也避免并发 `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE` 之间的锁等待与死锁；
+             xact 版随事务结束自动释放，不会因为忘了 unlock 把库锁死。
+          2. 版本号写入本身改成幂等（`ON CONFLICT DO UPDATE`），
+             万一有人绕过锁（手工连库跑迁移）也不会炸。
+        另加 `lock_timeout`：拿不到迁移锁就在 30s 内**明确失败**，而不是让启动无限期挂着。
+
+        这两层现在都在 `store/pg_schema.py` 里（唯一入口）——本类是第一个踩坑并修好的，
+        但当时只在本地修，于是 memory store 与 audit store 又各踩了一次（见该模块的注释）。
+        """
+        with serialized_schema_init(self.conn, local_lock=self._lock) as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
@@ -228,8 +260,10 @@ class PostgresStore:
                     run_id      TEXT NOT NULL,
                     approval_id TEXT NOT NULL,
                     tool_name   TEXT NOT NULL,
-                    arguments   TEXT,
+                    arguments   TEXT,           -- 已脱敏（见 core/redaction.py）
                     decision    TEXT NOT NULL,
+                    approver_id   TEXT,         -- 谁批的（职责分离的证据）
+                    approver_role TEXT,
                     created_at  TEXT NOT NULL
                 )
             """)
@@ -324,6 +358,14 @@ class PostgresStore:
                     expires_at  DOUBLE PRECISION NOT NULL
                 )
             """)
+            # 老库补列：审批人身份（v5）。`ADD COLUMN IF NOT EXISTS` 天然幂等，
+            # 与 SQLite 那边的 pragma 判定等价，不需要异常做控制流。
+            cur.execute(
+                "ALTER TABLE approval_history ADD COLUMN IF NOT EXISTS approver_id TEXT"
+            )
+            cur.execute(
+                "ALTER TABLE approval_history ADD COLUMN IF NOT EXISTS approver_role TEXT"
+            )
             # schema 版本（与 SqliteStore 对齐）：单行表，每次启动记录目标版本。
             # PG 的补列用 `ADD COLUMN IF NOT EXISTS`——它本身就是幂等的、不会用异常做控制流，
             # 所以不需要 SQLite 那套 pragma 判定。
@@ -333,12 +375,14 @@ class PostgresStore:
                     applied_at TEXT NOT NULL
                 )
             """)
+            # 单行表（先清再写，避免历史多行）。这个 DELETE 与下面的 INSERT 现在同属
+            # 上面那个事务、且已被 advisory lock 串行化，不再有“两个副本各写一行/撞主键”的窗口。
             cur.execute("DELETE FROM __schema_version__")
             cur.execute(
-                "INSERT INTO __schema_version__ (version, applied_at) VALUES (%s, %s)",
+                "INSERT INTO __schema_version__ (version, applied_at) VALUES (%s, %s) "
+                "ON CONFLICT (version) DO UPDATE SET applied_at = EXCLUDED.applied_at",
                 (self._SCHEMA_VERSION, _now_iso()),
             )
-        self.conn.commit()
 
     @_reconnecting
     def schema_version(self) -> int:
@@ -395,15 +439,23 @@ class PostgresStore:
         tool_name: str,
         arguments: dict[str, Any],
         decision: str,
+        *,
+        approver_id: str | None = None,
+        approver_role: str | None = None,
     ) -> None:
-        """记录一条审批决策（approved / rejected），供历史追溯。"""
+        """记录一条审批决策（approved / rejected），供历史追溯。
+
+        参数落库前先脱敏（与 SqliteStore 同一层，理由见 core/redaction.py）。
+        """
         with self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO approval_history "
-                "(run_id, approval_id, tool_name, arguments, decision, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
+                "(run_id, approval_id, tool_name, arguments, decision,"
+                " approver_id, approver_role, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (run_id, approval_id, tool_name,
-                 json.dumps(arguments, ensure_ascii=False), decision, _now_iso()),
+                 json.dumps(redact_arguments(arguments), ensure_ascii=False),
+                 decision, approver_id, approver_role, _now_iso()),
             )
         self.conn.commit()
 
@@ -415,21 +467,24 @@ class PostgresStore:
         with self.conn.cursor() as cur:
             if owner:
                 cur.execute(
-                    "SELECT h.run_id, h.approval_id, h.tool_name, h.decision, h.created_at "
+                    "SELECT h.run_id, h.approval_id, h.tool_name, h.decision, h.created_at, "
+                    "h.approver_id, h.approver_role "
                     "FROM approval_history h JOIN runs r ON r.run_id = h.run_id "
                     "WHERE r.user_id = %s ORDER BY h.id DESC LIMIT %s",
                     (owner, limit),
                 )
             else:
                 cur.execute(
-                    "SELECT run_id, approval_id, tool_name, decision, created_at "
+                    "SELECT run_id, approval_id, tool_name, decision, created_at, "
+                    "approver_id, approver_role "
                     "FROM approval_history ORDER BY id DESC LIMIT %s",
                     (limit,),
                 )
             rows = cur.fetchall()
         return [
             {"run_id": r[0], "approval_id": r[1], "tool_name": r[2],
-             "decision": r[3], "created_at": r[4]}
+             "decision": r[3], "created_at": r[4],
+             "approver_id": r[5], "approver_role": r[6]}
             for r in rows
         ]
 

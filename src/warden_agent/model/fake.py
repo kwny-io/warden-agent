@@ -12,6 +12,10 @@
 1. 如果用户消息里出现了某个工具的名字（比如 "weather"），
    它就返回一个"我要调这个工具"的请求，参数从消息里猜（比如把"上海"当城市名）。
 2. 如果消息里没提到任何工具，它就回复一句固定的客套话，表示"我干完了"。
+
+**每条回复都自带 `[演示模型]` 前缀**（P0）：这个模型会选工具、会答话、事件流也完整，
+看起来和真模型一模一样——于是演示输出很容易被当成"系统真实能力"的证据。前缀是
+故意加的：宁可字面难看，也不要让人把脚本回复当成推理结果。真实实现请不要学这个前缀。
 """
 from __future__ import annotations
 
@@ -25,9 +29,17 @@ from warden_agent.model.model import (
     ToolCall,
 )
 
+# 每句回复都带的前缀：让"演示脚本"在**聊天记录里**就无法被看成真实推理。
+# 真实模型实现不要加前缀。
+DEMO_PREFIX = "[演示模型]"
+
 
 class FakeModel(AgentChatModel):
-    """不联网的假模型，用写死的规则演示 AI 与工具配合的完整流程。"""
+    """不联网的假模型，用写死的规则演示 AI 与工具配合的完整流程。
+
+    它是**演示档**，不是"降级后的真模型"：回复是写死的，参数是猜的（`_guess_args`），
+    所以每次回复都带 `[演示模型]` 前缀（见 `DEMO_PREFIX`）——避免演示输出被当成系统能力。
+    """
 
     def __init__(self) -> None:
         self._counter = 0  # 给每次工具调用编个唯一的号
@@ -70,7 +82,13 @@ class FakeModel(AgentChatModel):
         #        我们就假装"看到了结果"，直接给出最终结论，结束循环。
         #        （否则假模型会永远要求调工具，导致循环不收敛。）
         if any(m.role == "tool" for m in request.messages):
-            return ChatResponse(content="已完成，结果已获取。", finish_reason="stop")
+            return ChatResponse(
+                content=(
+                    f"{DEMO_PREFIX} 已读到上面的工具结果，直接给出结论。"
+                    "（本回复是写死的演示脚本，没有做任何推理；参数是猜的，结论不要当真。）"
+                ),
+                finish_reason="stop",
+            )
 
         # 规则1：用户提到了某个工具名 -> 假装想调它
         for tool in request.tools:
@@ -87,7 +105,13 @@ class FakeModel(AgentChatModel):
                 )
 
         # 规则2：没提到任何工具 -> 表示完成
-        return ChatResponse(content="我没有可用的工具来处理这件事，已结束。", finish_reason="stop")
+        return ChatResponse(
+            content=(
+                f"{DEMO_PREFIX} 我没在自己的脚本规则里匹配到任何工具，就此结束。"
+                "（这是演示用的固定回复，不代表模型真的『判断过』这句话。）"
+            ),
+            finish_reason="stop",
+        )
 
     @staticmethod
     def _guess_args(tool_schema: dict[str, object], text: str) -> dict[str, object]:

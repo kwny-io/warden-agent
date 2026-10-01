@@ -44,7 +44,12 @@ def test_崩溃后从存档点恢复() -> None:
     # 第一轮：normal 模型 + 空目录，跑一句并存盘
     store = SqliteStore(db)
     loop = AgentLoop(model=FakeModel(), catalog=ToolCatalog())
-    first = RecoveryAssistant(store, loop).resume("run-9", "你好")
+    # 教学版恢复必须"一用就响"：它在 CI（filterwarnings=error）与线上日志里都要能暴露，
+    # 否则有人把它当真实恢复入口引用，中间状态会被静默丢掉。
+    import pytest as _pytest
+
+    with _pytest.warns(DeprecationWarning, match="教学版恢复"):
+        first = RecoveryAssistant(store, loop).resume("run-9", "你好")
     assert first
     # 假装程序崩溃、关闭连接
     store.close()

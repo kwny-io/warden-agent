@@ -267,7 +267,12 @@ class RunLease:
                 self.run_id, self.owner,
             )
             if self._on_lost is not None:
-                self._on_lost()
+                try:
+                    self._on_lost()
+                except Exception:
+                    # 回调抛错不能把心跳线程带走（线程里抛异常只会打到 stderr，无声无息），
+                    # 也不能吞掉：记下异常，否则调用方"没收到通知"会被误读成"没丢锁"。
+                    logger.exception("Run 租约 on_lost 回调抛错：丢锁通知没能送达调用方")
             return
 
 

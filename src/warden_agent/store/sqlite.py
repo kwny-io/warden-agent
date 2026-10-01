@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Concatenate, cast
 
+from warden_agent.core.redaction import redact_arguments
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.credential.vault import (
     StoredCredential,
@@ -136,8 +137,10 @@ class SqliteStore:
                 run_id      TEXT NOT NULL,
                 approval_id TEXT NOT NULL,
                 tool_name   TEXT NOT NULL,
-                arguments   TEXT,
+                arguments   TEXT,              -- 已脱敏（见 core/redaction.py）
                 decision    TEXT NOT NULL,     -- approved / rejected
+                approver_id   TEXT,            -- 谁批的（职责分离的证据）
+                approver_role TEXT,            -- 以什么角色批的
                 created_at  TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS users (
@@ -203,7 +206,7 @@ class SqliteStore:
         self.conn.commit()
 
     # 目标 schema 版本：每次加表/加列就 +1。老库补完列后版本被更新到它。
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
 
     def _has_column(self, table: str, column: str) -> bool:
         """该表是否已有某列（用 `pragma_table_info` 表值函数 + 参数化查询，不拼 SQL）。"""
@@ -238,6 +241,19 @@ class SqliteStore:
         # v4：pending_approvals 加 created_at（挂起超时告警算准确时长；历史行为 NULL 时退回近似）
         if not self._has_column("pending_approvals", "created_at"):
             self.conn.execute("ALTER TABLE pending_approvals ADD COLUMN created_at TEXT")
+            self.conn.commit()
+        # v5：approval_history 记“谁批的”（approver_id / approver_role）。
+        # 历史行留 NULL 而不是回填 “unknown”：当时确实没记这个人，伪造成一个
+        # 看起来像真的 principal 反而会在事后追责时误导人。
+        if not self._has_column("approval_history", "approver_id"):
+            self.conn.execute(
+                "ALTER TABLE approval_history ADD COLUMN approver_id TEXT"
+            )
+            self.conn.commit()
+        if not self._has_column("approval_history", "approver_role"):
+            self.conn.execute(
+                "ALTER TABLE approval_history ADD COLUMN approver_role TEXT"
+            )
             self.conn.commit()
 
         # 记录当前版本（单行表：先清再写，避免多行）
@@ -350,15 +366,24 @@ class SqliteStore:
         tool_name: str,
         arguments: dict[str, Any],
         decision: str,
+        *,
+        approver_id: str | None = None,
+        approver_role: str | None = None,
     ) -> None:
-        """记录一条审批决策（approved / rejected），供历史追溯。"""
+        """记录一条审批决策（approved / rejected），供历史追溯。
+
+        参数在这里**落库前先脱敏**（这里是最靠近数据库的写入点，放在这一层
+        就不依赖调用方记得脱敏——server / cli / 未来的别的入口都自动受保护）。
+        """
         with self._lock:
             self.conn.execute(
                 "INSERT INTO approval_history "
-                "(run_id, approval_id, tool_name, arguments, decision, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(run_id, approval_id, tool_name, arguments, decision,"
+                " approver_id, approver_role, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (run_id, approval_id, tool_name,
-                 json.dumps(arguments, ensure_ascii=False), decision, _now_iso()),
+                 json.dumps(redact_arguments(arguments), ensure_ascii=False),
+                 decision, approver_id, approver_role, _now_iso()),
             )
             self.conn.commit()
 
@@ -373,20 +398,23 @@ class SqliteStore:
         """
         if owner:
             rows = self.conn.execute(
-                "SELECT h.run_id, h.approval_id, h.tool_name, h.decision, h.created_at "
+                "SELECT h.run_id, h.approval_id, h.tool_name, h.decision, h.created_at, "
+                "h.approver_id, h.approver_role "
                 "FROM approval_history h JOIN runs r ON r.run_id = h.run_id "
                 "WHERE r.user_id = ? ORDER BY h.id DESC LIMIT ?",
                 (owner, limit),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT run_id, approval_id, tool_name, decision, created_at "
+                "SELECT run_id, approval_id, tool_name, decision, created_at, "
+                "approver_id, approver_role "
                 "FROM approval_history ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [
             {"run_id": r[0], "approval_id": r[1], "tool_name": r[2],
-             "decision": r[3], "created_at": r[4]}
+             "decision": r[3], "created_at": r[4],
+             "approver_id": r[5], "approver_role": r[6]}
             for r in rows
         ]
 
