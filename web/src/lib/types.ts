@@ -27,22 +27,53 @@ export interface ChatMessage {
 }
 
 // SSE 流式事件 /chat/stream/{run_id}
+//
+// `disconnected` 不是服务端发的事件，而是**客户端**在流「没说完就结束」时补的：
+// 连接被掐断（代理 idle 超时 / 切网 / 客户端被回收）时后端那一轮往往还在跑，
+// 所以 UI 要提示「回复仍在后台继续」并去 /events/{run_id} 续读，而不是静默收尾。
 export type StreamEvent =
   | { type: "start" }
   | { type: "delta"; text: string }
   | { type: "tool"; name: string; arguments: Record<string, unknown> }
+  // 工具执行结果（后端在 _execute 落库后原样推出来）。`ok=false` 表示工具失败，
+  // `text` 是喂回模型的那段文本（失败时带 "执行失败，请修正后重试" 前缀）。
+  | { type: "tool_result"; name: string; ok: boolean; text: string }
+  // 调用前校验给的提示：**这次没有执行**，把提示喂回模型让它换招。
+  | { type: "tool_hint"; name: string; text: string }
   | { type: "final"; text: string }
   | { type: "needs_approval"; approval: Approval }
+  | { type: "disconnected" }
   | { type: "error"; message: string };
 
 // GET /capabilities
 export interface Capabilities {
   tools: string[];
+  /**
+   * 能力清单。
+   *
+   * 为什么这里有一堆“到底是不是真的”的标记：后端可能是**离线演示**档（FakeModel、
+   * mock 搜索），而演示档的返回值与真能力长得一模一样。控制台不把这件事摆出来，
+   * 用户就会把演示当成系统能力——“能力错觉”比能力缺失危险得多。
+   * 约定：`null` = 后端没上报（不确定），前端**不据此下任何结论**；`false` = 明确说了不是。
+   */
   features: {
     memory: boolean;
     skills: string[];
     web: boolean;
     mcp_server: string | null;
+    /** 记忆是否落盘（null = 未上报）；false = 进程内，重启即丢 */
+    memory_persistent?: boolean | null;
+    /** web.search / web.fetch 是不是离线演示 provider */
+    web_search_mock?: boolean | null;
+    web_fetch_mock?: boolean | null;
+    /** 为什么退回了离线 mock（配置不全 / provider 名写错）——给运维看 */
+    web_degraded_reason?: string;
+    /** 模型是真实推理还是演示脚本（FakeModel） */
+    model_kind?: string | null;
+    model_kind_now?: string | null;
+    demo_instance?: boolean;
+    /** 知识库用的是哪种嵌入器（词频 vs 语义） */
+    knowledge_embedder?: string | null;
   };
 }
 
@@ -52,6 +83,18 @@ export interface MemoryItem {
   key: string;
   text: string;
   status: string;
+}
+
+// GET /memory/{scope}/candidates —— 待确认记忆候选（两阶段记忆的第一阶段）
+export interface MemoryCandidate {
+  /** 候选 id：确认/拒绝都靠它，缺了就点不动（不能拿 key 当 id 用，同 key 可能有多个候选） */
+  uid: string;
+  scope: string;
+  key: string;
+  text: string;
+  status: string;
+  /** 非空 = 确认后会替掉这条已有记忆（界面必须说清楚，否则就是静默覆盖别人的旧值） */
+  replaces_text: string;
 }
 
 // 健康检查

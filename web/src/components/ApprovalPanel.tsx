@@ -3,35 +3,42 @@
 
 import { useCallback } from "react";
 import type { Approval, ApprovalHistoryItem } from "../lib/types";
+import { toApprovalHistory, toApprovals } from "../lib/guards";
 import { usePolling } from "../lib/usePolling";
 import { api } from "../lib/api";
 
-export default function ApprovalPanel() {
+export default function ApprovalPanel({ onDecided }: { onDecided?: () => void } = {}) {
   const { data: approvals, error, refresh } = usePolling<Approval[]>(
-    () => api.approvals(),
+    // signal 必须透传：否则切面板/卸载时只丢结果不断连接，后端还在算
+    (signal) => api.approvals({ signal }),
     2000,
   );
   // 审批决策历史（已批准/已拒绝），5s 轮询
   const { data: history } = usePolling<ApprovalHistoryItem[]>(
-    () => api.approvalHistory(),
+    (signal) => api.approvalHistory({ signal }),
     5000,
   );
-  const historyList = history ?? [];
+  const historyList = toApprovalHistory(history);
 
   const act = useCallback(
     async (runId: string, action: "approve" | "reject") => {
       try {
+        // 响应体里带着"恢复后这一轮的最终回答"（后端 /approve 会接着把会话跑完）。
+        // 这里**不能丢掉它**：队列批准的入口不在聊天区，用户批完只看到队列空了一格，
+        // 聊天区还是那句"需要审批"——看起来像"批了但什么都没发生"。
+        // 所以决策成功后通知上层（App 会让聊天区重拉一次会话记录）。
         if (action === "approve") await api.approve(runId);
         else await api.reject(runId);
         refresh();
+        onDecided?.();
       } catch (e) {
         alert(e instanceof Error ? e.message : String(e));
       }
     },
-    [refresh],
+    [refresh, onDecided],
   );
 
-  const list = approvals ?? [];
+  const list = toApprovals(approvals);
 
   return (
     <div className="wpanel p-3.5">

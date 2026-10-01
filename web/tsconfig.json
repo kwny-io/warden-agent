@@ -16,7 +16,12 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    // 下标/数组访问一律当作可能 undefined：`caps.tools[0]` 这类越界在被守卫
+    // 收窄前不再静默通过（本次开启时实测生产代码零新增报错，只暴露了测试里
+    // 十几处 `mock.calls[0]` 直接取值的写法）。
+    "noUncheckedIndexedAccess": true
   },
   "include": ["src"]
 }

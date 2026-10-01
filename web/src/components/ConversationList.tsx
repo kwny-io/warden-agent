@@ -3,6 +3,7 @@
 
 import { useState, type MouseEvent as ReactMouseEvent } from "react";
 import type { RunInfo } from "../lib/types";
+import { toRunInfos } from "../lib/guards";
 import { usePolling } from "../lib/usePolling";
 import { api } from "../lib/api";
 
@@ -44,11 +45,12 @@ export default function ConversationList({
   onDeleted: (deletedId: string, remaining: RunInfo[]) => void;
 }) {
   const { data, refresh } = usePolling<RunInfo[]>(
-    () => api.runs(userId),
+    (signal) => api.runs(userId, { signal }),
     5000,
     userId, // 换账号立刻重拉并清空旧列表
   );
-  const runs = data ?? [];
+  // 畸形元素（缺 run_id / 非对象）由 toRunInfos 滤掉，不让 `r.run_id` 炸渲染
+  const runs = toRunInfos(data);
   const [newId, setNewId] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -94,6 +96,7 @@ export default function ConversationList({
           <button
             onClick={onCollapse}
             title="收起对话栏"
+            aria-label="收起对话栏"
             className="ml-auto w-6 h-6 rounded-md text-warden-fg/40 hover:text-warden-fg hover:bg-white/[0.06] transition"
           >
             ⟨
@@ -115,6 +118,7 @@ export default function ConversationList({
             value={newId}
             onChange={(e) => setNewId(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && create()}
+            aria-label="新会话 ID"
             placeholder="输入 USER_ID…"
             className="flex-1 min-w-0 bg-black/30 border border-white/10 rounded-lg px-2.5 py-1.5 text-[13px] font-mono outline-none focus:border-warden-accent/70"
           />
@@ -169,6 +173,7 @@ export default function ConversationList({
                 <button
                   onClick={(e) => remove(e, r)}
                   title="删除对话"
+                  aria-label="删除对话"
                   className="absolute top-1.5 right-1 w-5 h-5 rounded text-[11px] leading-none text-zinc-600 opacity-0 group-hover:opacity-100 hover:text-warden-danger hover:bg-white/[0.06] transition"
                 >
                   🗑

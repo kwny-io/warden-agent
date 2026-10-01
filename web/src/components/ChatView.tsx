@@ -3,28 +3,26 @@
 //  - 非流式：POST /chat/{run_id} 等一次性结果
 // 同时展示审批请求（needs_approval）内联的批准/拒绝按钮。
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { StreamEvent } from "../lib/types";
 import { api } from "../lib/api";
+import { toChatMessages } from "../lib/guards";
+import { nextId, toDisplayMsgs, type DisplayMsg } from "../lib/display";
 import MarkdownText from "./MarkdownText";
 
-export interface DisplayMsg {
-  id: number;
-  role: "user" | "assistant" | "tool" | "system";
-  text: string;
-  // 若这是一条"需要审批"的气泡，带上审批信息
-  approval?: {
-    approval_id: string;
-    tool_name: string;
-    arguments: Record<string, unknown>;
-    reason: string;
-  };
-}
+/** 工具结果默认折叠到这么多行 / 字符（展开后看全，不隐藏）。 */
+const COLLAPSED_LINES = 6;
+const COLLAPSED_CHARS = 600;
 
-let seq = 0;
-const nextId = () => ++seq;
+const SUGGESTIONS = [
+  "查一下上海天气",
+  "帮我算 23 × 47",
+  "记住我喜欢喝美式咖啡",
+  "总结一个项目的上线风险",
+];
 
-const SUGGESTIONS = ["查一下上海天气", "帮我算 23 × 47", "记住我喜欢喝美式咖啡", "总结一个项目的上线风险"];
+// 类型从 lib/display 再导出：气泡形状与转换逻辑放在一起，这里只做转发。
+export type { DisplayMsg };
 
 export default function ChatView({
   runId,
@@ -32,62 +30,96 @@ export default function ChatView({
   onApprovalAction,
   onToggleRail,
   railOpen,
+  refreshTick = 0,
 }: {
   runId: string;
   userId: string; // 当前中控台账号：新会话归属它
   onApprovalAction: () => void;
   onToggleRail: () => void;
   railOpen: boolean;
+  // 自增计数：“别处发生了审批决策”的信号（见下面那个 effect）。
+  refreshTick?: number;
 }) {
   const [msgs, setMsgs] = useState<DisplayMsg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 连接中断（流没说完就断了）：null = 没中断；"resuming" = 正在续读；
+  // "lost" = 没取回。断线不等于那一轮白跑了，所以要提示 + 自动续读，不能静默收尾。
+  const [disconnected, setDisconnected] = useState<"resuming" | "lost" | null>(null);
+  // 正在提交的审批 id：防止同一个（或两个不同）审批被重复提交，也给按钮一个禁用态
+  const [actingId, setActingId] = useState<string | null>(null);
   const activeBubbleRef = useRef<number | null>(null);
   const msgBoxRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // 在途流式请求的取消句柄：卸载时 abort，底层 reader 随之 cancel
+  const abortRef = useRef<AbortController | null>(null);
+  // 在途流的序号：「当前这一条」才有权改 busy / 清句柄。停止后立刻再发一条时，
+  // 旧流的 finally 会晚到，不加这个门就会把新流的状态一起抹掉。
+  const streamSeq = useRef(0);
+  // 卸载守卫：慢请求 / 流式回调都可能晚到，卸载后一律不再 setState
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  // 审批决策可能来自**侧栏审批队列**而不是聊天气泡里的按钮：那条路径上 ChatView 毫不知情，
+  // 但它已经让服务端把这一轮接着跑完了（/approve 会写出最终回答）。
+  // App 用一个自增的 refreshTick 告诉我们"有决策发生了"——这时从服务端把会话重拉一遍。
+  // 不这么做的话，用户从队列批完只看到队列少了一格，聊天区还停在那句"需要审批"，
+  // 看上去就像"我批了，但什么都没发生"。
+  useEffect(() => {
+    if (refreshTick === 0) return; // 初次挂载：runId 那个 effect 已经拉过了
+    if (abortRef.current) return; // 在途流式请求会把结果自己写进来，不要抢（用 ref 判断，不是状态）
+    void reloadFromServer();
+    // 只认 refreshTick 的变化：runId / 函数身份变化不该触发重拉
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshTick]);
+
+  const scrollToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      const el = msgBoxRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+  }, []);
 
   // 刷新 / 切 run 后从后端恢复历史对话。
   // system 与 tool 结果消息不入聊天区，保持和流式视图一致的观感。
+  // 先过 toChatMessages 收窄：`as ChatMessage[]` 只是编译期断言，
+  // 后端给 null 元素 / 非对象项时直接 for-of 会 TypeError。
   useEffect(() => {
+    const ctrl = new AbortController();
     let cancelled = false;
+    // 切会话时必须把**在途的流式请求**一起断掉。ChatView 不随 runId 重挂载，
+    // 只有历史请求（下面那个 ctrl）被 abort 了：旧 run 留下来的流会继续把
+    // delta/final 写进新会话的消息列表（跨会话串号，治理台最不能接受的事），
+    // 且 busy 一直是 true，新会话输入框 disabled，用户根本发不出话。
+    streamSeq.current++;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setBusy(false);
     setMsgs([]);
     setError(null);
     activeBubbleRef.current = null;
     api
-      .messages(runId)
-      .then((list) => {
+      .messages(runId, { signal: ctrl.signal })
+      .then((raw) => {
         if (cancelled) return;
-        const restored: DisplayMsg[] = [];
-        for (const m of list) {
-          if (m.role === "user") {
-            restored.push({ id: nextId(), role: "user", text: m.content ?? "" });
-          } else if (m.role === "assistant" && m.tool_call?.name) {
-            restored.push({
-              id: nextId(),
-              role: "tool",
-              text: `🔧 调用工具：${m.tool_call.name}`,
-            });
-          } else if (m.role === "assistant" && m.content) {
-            restored.push({ id: nextId(), role: "assistant", text: m.content });
-          }
-        }
-        setMsgs(restored);
+        // toChatMessages 先做收窄（服务端可能返回垃圾），toDisplayMsgs 与断线兜底同一份逻辑
+        setMsgs(toDisplayMsgs(toChatMessages(raw)));
         scrollToBottom();
       })
       .catch(() => {});
     return () => {
       cancelled = true;
+      ctrl.abort(); // 切 run / 卸载时取消在途请求
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId]);
-
-  const scrollToBottom = () => {
-    requestAnimationFrame(() => {
-      const el = msgBoxRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    });
-  };
+  }, [runId, scrollToBottom]);
 
   const patchById = (
     id: number,
@@ -105,6 +137,7 @@ export default function ChatView({
   };
 
   const handleStreamEvent = (ev: StreamEvent) => {
+    if (!aliveRef.current) return; // 组件已卸载：别再往 state 里写
     switch (ev.type) {
       case "delta": {
         // 把增量追加到当前 assistant 气泡尾部（打字机）
@@ -127,7 +160,36 @@ export default function ChatView({
         push({
           id: nid,
           role: "tool",
+          toolKind: "call",
           text: `🔧 调用工具：${ev.name}`,
+        });
+        scrollToBottom();
+        break;
+      }
+      case "tool_result": {
+        // 工具真执行完了：结果原样上屏（长文本在 MsgBubble 里默认折叠）。
+        // 以前这条信息只存在库里和模型的上下文里：用户只看到“调用工具”，
+        // 工具到底输出了什么、成功还是失败，界面上一点都看不到。
+        activeBubbleRef.current = null;
+        push({
+          id: nextId(),
+          role: "tool",
+          toolKind: "result",
+          toolOk: ev.ok,
+          text: ev.text,
+        });
+        scrollToBottom();
+        break;
+      }
+      case "tool_hint": {
+        // 调用前校验拦下：**这次没执行**，把提示喂回模型让它换招。
+        // 必须上屏：否则用户会以为工具已经跑过了（静默丢弃 = 信息失真）。
+        activeBubbleRef.current = null;
+        push({
+          id: nextId(),
+          role: "tool",
+          toolKind: "hint",
+          text: `⏸ 未执行（先修正调用）：${ev.text}`,
         });
         scrollToBottom();
         break;
@@ -155,6 +217,13 @@ export default function ChatView({
         scrollToBottom();
         break;
       }
+      case "disconnected": {
+        // 流断了，但后端那一轮很可能还在跑：保留已渲染的部分，提示 + 续读（见
+        // resumeAfterDisconnect）。不要往聊天区塞红条——这通常不是用户的错。
+        setDisconnected("resuming");
+        activeBubbleRef.current = null;
+        break;
+      }
       case "error": {
         setError(ev.message);
         activeBubbleRef.current = null;
@@ -166,7 +235,52 @@ export default function ChatView({
     }
   };
 
-  // 审批动作容错：409 = 该审批已在别处处理过（如右栏队列），静默清掉过期气泡
+  /**
+   * 断线续读：连接断了不等于那一轮白跑了——后端仍在跑完，并把最终回答**同时**发到
+   * 事件总线（见 src/warden_agent/web/server.py 的 chat_stream）。连回
+   * /events/{run_id} 就能把同一份结果捡回来：不重跑模型、不重复扣 token、不丢掉
+   * 用户已经等了几十秒的那一次回答。取不到就退化成「重新加载会话」。
+   */
+  async function resumeAfterDisconnect(mySeq: number) {
+    const stillMine = () => aliveRef.current && streamSeq.current === mySeq;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl; // 让「停止」按钮也能提前掐掉续读（它同样是一条长连接）
+    try {
+      let got = false;
+      await api.watchEvents(
+        runId,
+        (ev) => {
+          if (!stillMine()) return;
+          got = true;
+          handleStreamEvent(ev);
+        },
+        { signal: ctrl.signal, timeoutMs: 120_000 },
+      );
+      if (stillMine()) setDisconnected(got ? null : "lost");
+    } catch {
+      if (stillMine()) setDisconnected("lost");
+    } finally {
+      if (abortRef.current === ctrl) abortRef.current = null;
+      if (stillMine()) setBusy(false);
+    }
+  }
+
+  /** 兜底：从服务端拉一次已保存的会话记录（断线且续读失败时用）。
+   *
+   * 与初次加载走**同一个** toDisplayMsgs——两条路径一旦各写一份，就会慢慢长成
+   * 两种渲染（历史上就真的长成了：一边显示工具结果、一边不显示）。
+   */
+  async function reloadFromServer() {
+    try {
+      const list = await api.messages(runId);
+      setMsgs(toDisplayMsgs(toChatMessages(list)));
+      setDisconnected(null);
+      setError(null);
+      scrollToBottom();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
   const handleApprovalError = (e: unknown) => {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg.includes("没有等待审批")) {
@@ -178,30 +292,32 @@ export default function ChatView({
   };
 
   const doApprove = async (approvalId: string) => {
+    setActingId(approvalId);
     try {
       // 后端 /approve/{run_id} 按会话 run 批准（当前 runId 即该会话）
       const r = await api.approve(runId);
       // 批准后：清掉审批气泡，若拿到 final 文本就展示
-      setMsgs((prev) =>
-        prev.filter((m) => !(m.approval && m.approval.approval_id === approvalId)),
-      );
+      setMsgs((prev) => prev.filter((m) => !(m.approval && m.approval.approval_id === approvalId)));
       if (r.text) push({ id: nextId(), role: "assistant", text: r.text });
       onApprovalAction();
     } catch (e) {
       handleApprovalError(e);
+    } finally {
+      if (aliveRef.current) setActingId(null);
     }
   };
 
   const doReject = async (approvalId: string) => {
+    setActingId(approvalId);
     try {
       const r = await api.reject(runId);
-      setMsgs((prev) =>
-        prev.filter((m) => !(m.approval && m.approval.approval_id === approvalId)),
-      );
+      setMsgs((prev) => prev.filter((m) => !(m.approval && m.approval.approval_id === approvalId)));
       if (r.text) push({ id: nextId(), role: "assistant", text: r.text });
       onApprovalAction();
     } catch (e) {
       handleApprovalError(e);
+    } finally {
+      if (aliveRef.current) setActingId(null);
     }
   };
 
@@ -211,16 +327,56 @@ export default function ChatView({
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
     setError(null);
+    setDisconnected(null);
     push({ id: nextId(), role: "user", text });
     setBusy(true);
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    const mySeq = ++streamSeq.current;
+    // 会话归属守卫：事件只在「我发起的这一条流」仍然有效时才处理。
+    // 切会话/点停止/又发了一条都会让 seq 变化，旧流的迟到事件一律丢弃。
+    // 断线标记：流「正常结束」却没给终态事件时由 api 层报出（见 lib/api.ts）。
+    let brokeOff = false;
+    const onEvent = (ev: StreamEvent) => {
+      if (!aliveRef.current || streamSeq.current !== mySeq) return;
+      if (ev.type === "disconnected") brokeOff = true;
+      handleStreamEvent(ev);
+    };
     try {
-      await api.streamChat(runId, text, handleStreamEvent, userId);
+      await api.streamChat(runId, text, onEvent, userId, { signal: ctrl.signal });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (aliveRef.current && streamSeq.current === mySeq) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBusy(false);
-      scrollToBottom();
+      // 只有「当前这一条」的收尾才能改状态：
+      //  · 旧流晚到的 finally 若无条件 `abortRef.current = null`，会把新流的 controller
+      //    搞丢（停止按钮对第二条消息直接失灵）；无条件 `setBusy(false)` 又会让正在
+      //    跑的第二条流看起来空闲，用户能再发第三条，两条回答交错写进同一个气泡。
+      if (streamSeq.current === mySeq) {
+        abortRef.current = null;
+        if (aliveRef.current) {
+          setBusy(false);
+          scrollToBottom();
+        }
+      }
+      // 断线自动续读：只认「我这一条」的断线，且用户没有在这中间点停止 / 切会话
+      // （seq 变了就不续）。放 finally 里保证不管上面哪条路径都会试一次。
+      if (brokeOff && aliveRef.current && streamSeq.current === mySeq) {
+        void resumeAfterDisconnect(mySeq);
+      }
     }
+  };
+
+  // 用户主动打断：中断在途 SSE（后端按客户端断开收尾），立刻恢复输入可用。
+  // SSE 一旦断开，后端不再往回送 delta，已经渲染的部分保留在聊天区里。
+  const stop = () => {
+    streamSeq.current++; // 作废当前流：它迟到收尾不再改状态
+    const ctrl = abortRef.current;
+    abortRef.current = null;
+    ctrl?.abort();
+    setBusy(false);
+    scrollToBottom();
   };
 
   // 多行输入框自适应高度（上限 160px，再多出滚动）
@@ -236,6 +392,7 @@ export default function ChatView({
         <button
           onClick={onToggleRail}
           title={railOpen ? "收起对话列表" : "展开对话列表"}
+          aria-label={railOpen ? "收起对话列表" : "展开对话列表"}
           className={`w-6 h-6 rounded-md text-sm leading-none transition ${
             railOpen
               ? "text-warden-accent hover:bg-white/[0.06]"
@@ -254,6 +411,10 @@ export default function ChatView({
       <div
         ref={msgBoxRef}
         className="flex-1 min-h-0 overflow-y-auto px-6 py-5 flex flex-col"
+        // 流式新增的内容是“静默变更”，读屏软件默认感知不到；polite 让它读完当前句
+        // 再报新增，不打断用户正在听的内容。
+        aria-live="polite"
+        aria-relevant="additions text"
       >
         {msgs.length === 0 && (
           <div className="m-auto flex flex-col items-center gap-5 text-center py-10">
@@ -262,9 +423,7 @@ export default function ChatView({
             </div>
             <div>
               <p className="text-base font-medium text-zinc-200">有什么可以帮你？</p>
-              <p className="text-sm text-zinc-500 mt-1">
-                高危操作会先暂停，等你批准后再执行。
-              </p>
+              <p className="text-sm text-zinc-500 mt-1">高危操作会先暂停，等你批准后再执行。</p>
             </div>
             <div className="flex flex-wrap justify-center gap-2 max-w-md">
               {SUGGESTIONS.map((s) => (
@@ -288,6 +447,7 @@ export default function ChatView({
               <MsgBubble
                 key={m.id}
                 msg={m}
+                busy={m.approval !== undefined && actingId === m.approval.approval_id}
                 onApprove={doApprove}
                 onReject={doReject}
               />
@@ -296,8 +456,33 @@ export default function ChatView({
         )}
       </div>
 
+      {disconnected && (
+        <div
+          role="status"
+          className="shrink-0 mx-6 mb-1 text-sm text-amber-300 bg-amber-400/10 border border-amber-400/40 rounded-xl px-3 py-2 flex items-center gap-3"
+        >
+          {disconnected === "resuming" ? (
+            <span>🔌 连接中断，正在从服务端续读本轮回复…</span>
+          ) : (
+            <>
+              <span>🔌 连接中断，本轮回复未能取回。</span>
+              <button
+                type="button"
+                className="shrink-0 underline decoration-dotted hover:text-amber-200"
+                onClick={() => void reloadFromServer()}
+              >
+                重新加载会话
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {error && (
-        <div className="shrink-0 mx-6 mb-1 text-sm text-warden-danger bg-warden-danger/10 border border-warden-danger/40 rounded-xl px-3 py-2">
+        <div
+          role="alert"
+          className="shrink-0 mx-6 mb-1 text-sm text-warden-danger bg-warden-danger/10 border border-warden-danger/40 rounded-xl px-3 py-2"
+        >
           ⚠️ {error}
         </div>
       )}
@@ -306,9 +491,7 @@ export default function ChatView({
       <div className="shrink-0 px-6 pb-4 pt-1">
         <div className="mx-auto w-full max-w-[720px]">
           <div className="rounded-2xl border border-white/[0.08] bg-[#1c1c1f]/90 shadow-[0_8px_28px_rgba(0,0,0,0.4)] p-2.5 flex items-end gap-2 transition-all duration-300 focus-within:border-warden-accent/70 focus-within:shadow-[inset_0_0_24px_rgba(94,129,172,0.08),0_8px_28px_rgba(0,0,0,0.4)]">
-            <span className="pl-1.5 pb-2 text-zinc-500 text-sm leading-none select-none">
-              ❯
-            </span>
+            <span className="pl-1.5 pb-2 text-zinc-500 text-sm leading-none select-none">❯</span>
             <textarea
               ref={inputRef}
               value={input}
@@ -322,6 +505,7 @@ export default function ChatView({
                   send();
                 }
               }}
+              aria-label="给 Warden Agent 发消息"
               placeholder="给 Warden Agent 发消息…"
               disabled={busy}
               rows={1}
@@ -342,6 +526,16 @@ export default function ChatView({
                 </svg>
               )}
             </button>
+            {busy && (
+              <button
+                onClick={stop}
+                aria-label="停止生成"
+                title="停止生成（会断开与后端的流式连接，已生成的内容保留）"
+                className="btn-sheen w-9 h-9 shrink-0 rounded-full border border-warden-danger/60 text-warden-danger hover:bg-warden-danger/10 transition flex items-center justify-center"
+              >
+                <span className="inline-block w-3 h-3 bg-current rounded-[2px]" />
+              </button>
+            )}
           </div>
           <p className="text-[11px] text-zinc-600 text-center mt-2">
             Enter 发送 · Shift+Enter 换行
@@ -352,17 +546,69 @@ export default function ChatView({
   );
 }
 
+/**
+ * 工具结果气泡：多行输出默认折叠。
+ *
+ * 「默认折叠」不是审美选择：工具输出动辄几百行（拉日志、列目录、diff），
+ * 直接展开会让长会话的 DOM 节点数与滚动重排失控；折叠后审计时点「展开」仍能看全——
+ * **不隐藏，只收起**。`ok === false` 用琥珀色标出，和成功的灰区分开。
+ */
+function ToolResultBubble({ text, ok }: { text: string; ok: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const lines = text.split("\n");
+  const tooLong = lines.length > COLLAPSED_LINES || text.length > COLLAPSED_CHARS;
+  const clipped =
+    !expanded && tooLong
+      ? lines.slice(0, COLLAPSED_LINES).join("\n").slice(0, COLLAPSED_CHARS)
+      : text;
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-1.5 text-[11px]">
+        <span className={ok ? "text-zinc-500" : "text-amber-400"}>{ok ? "⚙" : "⚠"}</span>
+        <span className={ok ? "text-zinc-500" : "text-amber-300"}>
+          {ok ? "工具结果" : "工具执行失败"}
+        </span>
+      </div>
+      <pre className="whitespace-pre-wrap break-all font-mono text-xs text-zinc-300">
+        {clipped}
+      </pre>
+      {tooLong && (
+        <button
+          type="button"
+          className="self-start text-[11px] text-zinc-400 underline decoration-dotted hover:text-zinc-200"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? "收起" : `展开全部（共 ${lines.length} 行）`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function MsgBubble({
   msg,
+  busy,
   onApprove,
   onReject,
 }: {
   msg: DisplayMsg;
+  /** 该气泡的审批正在提交（禁用按钮，避免重复提交） */
+  busy: boolean;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
 }) {
+  // 审批是治理动作，误点即执行高危工具：先把按钮切成“确认”再真发，并禁止重复提交。
+  const [confirming, setConfirming] = useState<null | "approve" | "reject">(null);
+  useEffect(() => {
+    if (!confirming) return;
+    // 4s 没确认就退回初始态，避免把“已点过一次”一直挂在界面上
+    const t = setTimeout(() => setConfirming(null), 4000);
+    return () => clearTimeout(t);
+  }, [confirming]);
+
   // 审批气泡优先级最高
   if (msg.approval) {
+    const approvalId = msg.approval.approval_id;
     return (
       <div className="self-start w-full rounded-xl border border-warden-warn/40 bg-[#1d1b12] p-3.5 text-sm animate-[fadeInUp_.25s_ease_both]">
         <div className="font-medium text-warden-warn mb-1">
@@ -373,18 +619,53 @@ function MsgBubble({
         </div>
         <div className="text-zinc-500 text-xs mb-2.5">原因：{msg.approval.reason}</div>
         <div className="flex gap-2">
-          <button
-            onClick={() => onApprove(msg.approval!.approval_id)}
-            className="btn-sheen px-4 py-1.5 rounded-md bg-warden-ok/80 text-[#08130f] font-medium text-sm hover:brightness-110 transition"
-          >
-            ✅ 批准
-          </button>
-          <button
-            onClick={() => onReject(msg.approval!.approval_id)}
-            className="btn-sheen px-4 py-1.5 rounded-md bg-warden-danger/80 text-[#160705] font-medium text-sm hover:brightness-110 transition"
-          >
-            🚫 拒绝
-          </button>
+          {confirming ? (
+            <>
+              <button
+                onClick={() => {
+                  const which = confirming;
+                  setConfirming(null);
+                  if (which === "approve") onApprove(approvalId);
+                  else onReject(approvalId);
+                }}
+                disabled={busy}
+                aria-busy={busy}
+                className={`btn-sheen px-4 py-1.5 rounded-md font-medium text-sm transition disabled:opacity-50 ${
+                  confirming === "approve"
+                    ? "bg-warden-ok/80 text-[#08130f] hover:brightness-110"
+                    : "bg-warden-danger/80 text-[#160705] hover:brightness-110"
+                }`}
+              >
+                {busy ? "处理中…" : confirming === "approve" ? "确认批准？" : "确认拒绝？"}
+              </button>
+              <button
+                onClick={() => setConfirming(null)}
+                disabled={busy}
+                className="btn-sheen px-3 py-1.5 rounded-md border border-zinc-600 text-zinc-300 text-sm hover:border-zinc-400 transition disabled:opacity-50"
+              >
+                取消
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => setConfirming("approve")}
+                disabled={busy}
+                aria-busy={busy}
+                className="btn-sheen px-4 py-1.5 rounded-md bg-warden-ok/80 text-[#08130f] font-medium text-sm hover:brightness-110 transition disabled:opacity-50"
+              >
+                ✅ 批准
+              </button>
+              <button
+                onClick={() => setConfirming("reject")}
+                disabled={busy}
+                aria-busy={busy}
+                className="btn-sheen px-4 py-1.5 rounded-md bg-warden-danger/80 text-[#160705] font-medium text-sm hover:brightness-110 transition disabled:opacity-50"
+              >
+                🚫 拒绝
+              </button>
+            </>
+          )}
         </div>
       </div>
     );
@@ -411,10 +692,14 @@ function MsgBubble({
         <span className="absolute -left-[5px] bottom-3 w-2.5 h-2.5 rotate-45 bg-[#1a1a1f] rounded-[2px] border-b border-l border-white/[0.07]" />
       )}
       {msg.role === "tool" ? (
-        <div className="flex items-start gap-1.5">
-          <span className="text-warden-accent select-none">❯</span>
-          <span className="break-all">{msg.text}</span>
-        </div>
+        msg.toolKind === "result" ? (
+          <ToolResultBubble text={msg.text} ok={msg.toolOk !== false} />
+        ) : (
+          <div className="flex items-start gap-1.5">
+            <span className="text-warden-accent select-none">❯</span>
+            <span className="break-all">{msg.text}</span>
+          </div>
+        )
       ) : msg.role === "assistant" ? (
         <MarkdownText text={msg.text} />
       ) : (

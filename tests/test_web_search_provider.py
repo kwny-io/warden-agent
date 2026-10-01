@@ -11,6 +11,7 @@ import secrets
 import httpx
 
 from warden_agent.web.search import (
+    HttpFetchProvider,
     HttpSearchProvider,
     LocalMockSearchProvider,
     providers_from_env,
@@ -166,3 +167,47 @@ def test_端点域名解析到内网时被拒绝且不发请求() -> None:
     )
     assert p.search("x") == []
     assert called["n"] == 0, "解析到内网的端点不应发出任何请求"
+    assert "URL 策略拒绝" in p.last_error
+
+
+# ---------- 演示标记与降级原因（“不是真的就说不是真的”）----------
+
+
+def test_默认mock自报演示() -> None:
+    search, fetch = providers_from_env({})
+    assert search.is_mock is True and fetch.is_mock is True
+
+
+def test_真实provider不自报演示() -> None:
+    search, _ = providers_from_env({
+        "WARDEN_SEARCH_PROVIDER": "tavily",
+        "WARDEN_SEARCH_API_KEY": _KEY,
+        "WARDEN_WEB_FETCH": "1",
+    })
+    assert search.is_mock is False
+    assert HttpFetchProvider().is_mock is False
+
+
+def test_配不全退回mock时记住降级原因() -> None:
+    """“为什么退回 mock”要能带出去——只写日志的话运维看得到、用户看不到。"""
+    search, _ = providers_from_env({"WARDEN_SEARCH_PROVIDER": "tavily"})
+    assert isinstance(search, LocalMockSearchProvider)
+    assert "WARDEN_SEARCH_API_KEY" in search.degraded_reason
+
+    search2, _ = providers_from_env({"WARDEN_SEARCH_PROVIDER": "custom"})
+    assert isinstance(search2, LocalMockSearchProvider)
+    assert "WARDEN_SEARCH_ENDPOINT" in search2.degraded_reason
+
+
+def test_provider名写错算配错而不是造个永远返回空的真provider() -> None:
+    """名字打错（tavliy）过去会造出 `HttpSearchProvider`（endpoint 空 → 永远返回 []），
+
+    表现为“世上没有这条信息”——配置错误伪装成搜索无结果，是最难查的一类 bug。
+    """
+    search, _ = providers_from_env({
+        "WARDEN_SEARCH_PROVIDER": "tavliy",
+        "WARDEN_SEARCH_API_KEY": _KEY,
+    })
+    assert isinstance(search, LocalMockSearchProvider)
+    assert "tavliy" in search.degraded_reason
+    assert "custom" in search.degraded_reason, "给原因时要顺手给出可选取值"

@@ -224,3 +224,82 @@ def test_未声明联网的provider默认走严格校验(monkeypatch) -> None:
     out = _catalog_with(_Undeclared()).execute(
         "web.fetch", {"url": "https://evil.example/x"})
     assert "[拒绝]" in str(out)
+
+
+# ---------- “不是真的就说不是真的”（离线演示 provider）----------
+
+
+def test_演示搜索结果必须自报演示() -> None:
+    """模型分不出 mock 和真结果：给模型看的文本里必须写清“这是演示数据”。
+
+    否则内置样例里的链接会被当成事实引用——能力少不可怕，装作有能力才可怕。
+    """
+    out = str(_catalog().execute("web.search", {"query": "Agent"}))
+    assert out.startswith("[离线演示数据]"), out
+    assert "不是真实互联网结果" in out
+    assert "哈法 Agent 中文文档" in out, "标了演示也要照旧返回结果（它是演示用数据）"
+
+
+def test_演示搜索无结果也带演示前缀() -> None:
+    out = str(_catalog().execute("web.search", {"query": "不存在的乱七八糟"}))
+    assert out.startswith("[离线演示数据]")
+    assert "没有搜到" in out
+
+
+def test_演示抓取失败不能讲成404() -> None:
+    """离线 provider 里没有这条 URL，**不等于真实网络上 404**。
+
+    说成 404，模型会得出“这个链接是死链”的结论——而真相是它根本没联网。
+    """
+    out = str(_catalog().execute("web.fetch", {"url": "https://warden.local/没有的页面"}))
+    assert out.startswith("[离线演示数据]")
+    assert "不是真实网络请求失败" in out
+
+
+def test_真provider不加演示前缀() -> None:
+    """“没这条前缀”必须是真结果的标志，否则前缀就失去意义了。"""
+
+    class _RealSearch:
+        requires_network = False
+        is_mock = False
+
+        def search(self, query: str, top_k: int = 5) -> list[WebSearchResult]:
+            return [WebSearchResult("真结果", "https://example.com/real", "真的")]
+
+    catalog = ToolCatalog()
+    for spec in make_web_tools(search_provider=_RealSearch()):
+        catalog.register(spec)
+    out = str(catalog.execute("web.search", {"query": "x"}))
+    assert out == "1. 真结果: https://example.com/real\n   真的", out
+
+
+def test_搜索没打通不能报成没有结果() -> None:
+    """provider 故障（网络错误/配置写错）过去被压成空列表 → 工具回“没有搜到相关结果”，
+
+    模型会理解成“世上没有这条信息”，然后基于“没有”继续编。必须分开说。
+    """
+
+    class _BrokenSearch:
+        requires_network = False
+        is_mock = False
+        last_error = "搜索请求失败：httpx.ConnectError: boom"
+
+        def search(self, query: str, top_k: int = 5) -> list[WebSearchResult]:
+            return []
+
+    catalog = ToolCatalog()
+    for spec in make_web_tools(search_provider=_BrokenSearch()):
+        catalog.register(spec)
+    out = str(catalog.execute("web.search", {"query": "x"}))
+    assert "[搜索失败]" in out, out
+    assert "httpx.ConnectError" in out, "失败原因要带出来，不然运维无从下手"
+    assert "没有搜到" not in out, "故障不能讲成“没有结果”"
+
+
+def test_搜索端点为空时也报失败而不是没有结果() -> None:
+    """回归：`HttpSearchProvider` 没端点时曾经静默返回 []。"""
+    from warden_agent.web.search import HttpSearchProvider
+
+    p = HttpSearchProvider("custom", api_key="test-key", endpoint="")
+    assert p.search("x") == []
+    assert "WARDEN_SEARCH_ENDPOINT" in p.last_error

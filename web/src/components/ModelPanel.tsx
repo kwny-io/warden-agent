@@ -3,18 +3,21 @@
 
 import { useState } from "react";
 import type { ModelsInfo } from "../lib/types";
+import { toModelsInfo } from "../lib/guards";
 import { usePolling } from "../lib/usePolling";
 import { api } from "../lib/api";
 
 export default function ModelPanel() {
-  const { data, refresh } = usePolling<ModelsInfo>(() => api.models(), 5000);
+  const { data, refresh } = usePolling<ModelsInfo>((signal) => api.models({ signal }), 5000);
   const [keyFor, setKeyFor] = useState<string | null>(null); // 正在为哪个模型输入 Key
   const [keyValue, setKeyValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const models = data?.models ?? [];
-  const current = data?.current ?? "";
+  // models 不是数组（缺字段/后端改形）时降级为空列表，而不是在 .map 上炸
+  const info = toModelsInfo(data);
+  const models = info?.models ?? [];
+  const current = info?.current ?? "";
 
   const select = async (id: string, apiKey?: string) => {
     setBusy(true);
@@ -98,6 +101,7 @@ export default function ModelPanel() {
                     type="password"
                     value={keyValue}
                     onChange={(e) => setKeyValue(e.target.value)}
+                    aria-label={`${m.name} 的 API Key`}
                     placeholder="粘贴 API Key…"
                     className="flex-1 min-w-0 bg-black/30 border border-white/10 rounded px-2 py-1 text-[11px] font-mono outline-none focus:border-warden-accent/70"
                   />

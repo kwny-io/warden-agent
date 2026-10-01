@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, getApiKey, setApiKey } from "./lib/api";
+import { api, getApiKey, isApiKeyRemembered, setApiKey } from "./lib/api";
+import { readRunFromUrl, writeRunToUrl } from "./lib/deepLink";
+import { toUserInfos } from "./lib/guards";
 import ChatView from "./components/ChatView";
 import ApprovalPanel from "./components/ApprovalPanel";
 import InfoPanel from "./components/InfoPanel";
 import ConversationList from "./components/ConversationList";
 import ModelPanel from "./components/ModelPanel";
+import { PanelBoundary } from "./components/ErrorBoundary";
 
 // 两侧栏宽度：最大 = 三栏默认布局；最小 = 0（收起），拖拽全程连续跟手
 const LEFT_DEFAULT = 240;
@@ -12,16 +15,21 @@ const RIGHT_DEFAULT = 256;
 
 export default function App() {
   // 当前中控台账号（USER_ID）：整个控制台以它的视角展示对话
-  const [userId, setUserId] = useState(
-    () => localStorage.getItem("warden.userId") || "demo-user",
-  );
+  const [userId, setUserId] = useState(() => localStorage.getItem("warden.userId") || "demo-user");
   const [userIdInput, setUserIdInput] = useState(userId);
   // 访问密钥：服务端设了 WARDEN_API_KEY 时业务接口都要带 Bearer，这里填。
   // 存在 localStorage（只在本机浏览器），留空表示服务端未开鉴权。
   const [apiKeyInput, setApiKeyInput] = useState(() => getApiKey());
+  // "记住密钥"：初始值取自当前存储位置（localStorage 里有东西就说明上次勾了）
+  const [remember, setRemember] = useState(() => isApiKeyRemembered());
   // 当前 run_id（对话）；每次打开页面都从全新会话开始（多账号下避免串号），
   // 历史对话从左栏列表一键找回
-  const [runId, setRunId] = useState(() => `run-${Date.now().toString(36)}`);
+  // 会话 ID：优先取 URL 里的深链（`?run=xxx`，可分享/可刷新），否则新开一个。
+  // 不把"上次看的会话"存 localStorage：那个值可能已经被服务端清理，刷新后拿一个不存在的
+  // run 去拉历史，用户看到的是一个空会话而不是"会话已不在"（比现在这样更糊涂）。
+  const [runId, setRunId] = useState(
+    () => readRunFromUrl(window.location.search) ?? `run-${Date.now().toString(36)}`,
+  );
   const [approvalTick, setApprovalTick] = useState(0);
   // 布局：左对话栏折叠状态；右信息栏三栏常驻，按钮可弹跳收起/展开
   const [leftWidth, setLeftWidth] = useState(240);
@@ -39,7 +47,10 @@ export default function App() {
   const [userListOpen, setUserListOpen] = useState(false);
   const [knownUsers, setKnownUsers] = useState<string[]>([]);
   const refreshUsers = useCallback(() => {
-    api.users().then((list) => setKnownUsers(list.map((u) => u.user_id))).catch(() => {});
+    api
+      .users()
+      .then((list) => setKnownUsers(toUserInfos(list).map((u) => u.user_id)))
+      .catch(() => {});
   }, []);
   useEffect(() => {
     refreshUsers();
@@ -61,6 +72,10 @@ export default function App() {
     try {
       await api.createUser(next); // 幂等：存在即切换，不存在即创建
       localStorage.setItem("warden.userId", next);
+      // 输入框必须一起回写：从下拉列表点选时调用方传的是 id，输入框里还留着旧
+      // 账号名——界面上显示 demo-user、实际却是 alice，再敲一次回车会切回去（
+      // 记账/归属跟着错）。显示值必须永远等于真实生效的账号。
+      setUserIdInput(next);
       setUserId(next);
       setApprovalTick((t) => t + 1);
     } catch (e) {
@@ -75,6 +90,11 @@ export default function App() {
     setRunId(next);
     setApprovalTick((t) => t + 1);
   };
+
+  // 会话变化就写回 URL（replaceState：不新增历史条目，否则“后退”会一步步退会话）
+  useEffect(() => {
+    writeRunToUrl(runId);
+  }, [runId]);
 
   // 新对话创建流程：展开左栏并打开创建输入行（ID 由用户输入，不再随机生成）
   const [createOpen, setCreateOpen] = useState(false);
@@ -125,6 +145,7 @@ export default function App() {
           <button
             onClick={() => setLeftWidth((w) => (w === 0 ? LEFT_DEFAULT : 0))}
             title="对话列表"
+            aria-label="切换对话列表"
             className={`btn-sheen w-8 h-8 shrink-0 rounded-lg border transition ${
               leftWidth > 0
                 ? "border-warden-accent/70 text-zinc-100"
@@ -146,22 +167,45 @@ export default function App() {
               value={userIdInput}
               onChange={(e) => setUserIdInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && applyUser()}
+              aria-label="USER_ID"
               className="w-40 sm:w-44 bg-black/30 border border-slate-600/50 rounded-full px-3 py-1.5 font-mono text-xs outline-none focus:border-warden-accent/70 transition"
               placeholder="demo-user"
             />
             {/* 访问密钥：服务端设了 WARDEN_API_KEY 时必填；留空即"服务端没开鉴权"。
-                用 password 类型遮显；回车或失焦即写入 localStorage，后续请求自动带 Bearer。 */}
+                用 password 类型遮显；回车或失焦即写入，后续请求自动带 Bearer。
+                默认只存 sessionStorage（关标签页即失效）；要跨重启保留得勾"记住"。 */}
             <span className="text-warden-fg/50 text-xs hidden sm:inline">KEY</span>
             <input
               type="password"
               value={apiKeyInput}
               onChange={(e) => setApiKeyInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && setApiKey(apiKeyInput)}
-              onBlur={() => setApiKey(apiKeyInput)}
+              onKeyDown={(e) => e.key === "Enter" && setApiKey(apiKeyInput, { remember })}
+              onBlur={() => setApiKey(apiKeyInput, { remember })}
+              aria-label="访问密钥（API Key）"
               title="服务端设了 WARDEN_API_KEY 时填这里；留空表示服务端未开鉴权"
               className="w-28 sm:w-32 bg-black/30 border border-slate-600/50 rounded-full px-3 py-1.5 font-mono text-xs outline-none focus:border-warden-accent/70 transition"
               placeholder="API KEY"
             />
+            {/* "记住密钥"：勾上才落到 localStorage（跨浏览器重启有效），默认不勾。
+                明确不默认为勾：这把 key 是控制面全权凭证，而页面要渲染模型输出的 Markdown。 */}
+            <label
+              title="勾选后密钥写入 localStorage，浏览器重启后仍有效；不勾只在本标签页有效"
+              className="flex items-center gap-1 text-[10px] text-warden-fg/50 cursor-pointer select-none"
+            >
+              <input
+                type="checkbox"
+                checked={remember}
+                aria-label="记住密钥"
+                onChange={(e) => {
+                  const next = e.target.checked;
+                  setRemember(next);
+                  // 立即按新选择重写一次：不然"勾上去没反应"要等下次输入才生效
+                  setApiKey(apiKeyInput, { remember: next });
+                }}
+                className="accent-warden-accent"
+              />
+              记住
+            </label>
             {/* 切换按钮：点开展开已创建的 USER_ID 列表，选中即切换（可与信息按钮同排弹性布局） */}
             <div className="relative">
               <button
@@ -209,6 +253,7 @@ export default function App() {
             <button
               onClick={toggleRight}
               title="信息栏"
+              aria-label="切换信息栏"
               className={`btn-sheen px-3 py-1.5 rounded-full border text-xs transition ${
                 rightWidth > 0
                   ? "border-warden-accent/70 text-zinc-100"
@@ -235,24 +280,31 @@ export default function App() {
           }`}
           style={{ width: leftWidth }}
         >
-          <ConversationList
-            userId={userId}
-            activeRunId={runId}
-            onSwitch={(id) => switchRun(id)}
-            onCollapse={() => {
-              setLeftWidth(0);
-              setCreateOpen(false);
-            }}
-            createOpen={createOpen}
-            onOpenCreate={openCreate}
-            onCreateDone={() => setCreateOpen(false)}
-            onDeleted={(deletedId, remaining) => {
-              // 删掉的是当前会话 → 切到该账号剩下的第一个，没有就开个新 ID
-              if (deletedId === runId) {
-                switchRun(remaining[0]?.run_id ?? `run-${Date.now().toString(36)}`);
-              }
-            }}
-          />
+          {/* 折叠到 0 时**不渲染**内容，而不是留一个宽度 0 的容器：
+              后者里的按钮仍然可被 Tab 聚焦、被读屏朗读（看不见却能操作），
+              且 5s 轮询会接着白烧请求。展开时重挂载换取干净状态。 */}
+          {leftWidth > 0 && (
+            <PanelBoundary name="对话列表">
+              <ConversationList
+                userId={userId}
+                activeRunId={runId}
+                onSwitch={(id) => switchRun(id)}
+                onCollapse={() => {
+                  setLeftWidth(0);
+                  setCreateOpen(false);
+                }}
+                createOpen={createOpen}
+                onOpenCreate={openCreate}
+                onCreateDone={() => setCreateOpen(false)}
+                onDeleted={(deletedId, remaining) => {
+                  // 删掉的是当前会话 → 切到该账号剩下的第一个，没有就开个新 ID
+                  if (deletedId === runId) {
+                    switchRun(remaining[0]?.run_id ?? `run-${Date.now().toString(36)}`);
+                  }
+                }}
+              />
+            </PanelBoundary>
+          )}
         </div>
         {leftWidth > 0 && (
           <div
@@ -271,15 +323,16 @@ export default function App() {
 
         {/* 中：聊天 */}
         <main className="flex-1 min-w-0 min-h-0 flex">
-          <ChatView
-            runId={runId}
-            userId={userId}
-            onApprovalAction={() => setApprovalTick((t) => t + 1)}
-            onToggleRail={() =>
-              setLeftWidth((w) => (w === 0 ? LEFT_DEFAULT : 0))
-            }
-            railOpen={leftWidth > 0}
-          />
+          <PanelBoundary name="对话区">
+            <ChatView
+              runId={runId}
+              userId={userId}
+              onApprovalAction={() => setApprovalTick((t) => t + 1)}
+              refreshTick={approvalTick}
+              onToggleRail={() => setLeftWidth((w) => (w === 0 ? LEFT_DEFAULT : 0))}
+              railOpen={leftWidth > 0}
+            />
+          </PanelBoundary>
         </main>
 
         {/* 右：信息栏（显式 stretch 齐高 + 百分比封顶防裁切） */}
@@ -303,11 +356,24 @@ export default function App() {
           }`}
           style={{ width: rightWidth }}
         >
-          <div className="w-full flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-1">
-            <ApprovalPanel key={approvalTick} />
-            <InfoPanel runId={runId} />
-            <ModelPanel />
-          </div>
+          {/* 同左栏：收起（宽度 0）时直接不渲染，避免“看不见但能 Tab 到”的按钮
+              与后台白跑的审批/记忆轮询 */}
+          {rightWidth > 0 && (
+            <div className="w-full flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-1">
+              <PanelBoundary name="审批队列">
+                <ApprovalPanel
+                  key={approvalTick}
+                  onDecided={() => setApprovalTick((t) => t + 1)}
+                />
+              </PanelBoundary>
+              <PanelBoundary name="运行信息">
+                <InfoPanel runId={runId} />
+              </PanelBoundary>
+              <PanelBoundary name="模型面板">
+                <ModelPanel />
+              </PanelBoundary>
+            </div>
+          )}
         </aside>
       </div>
 

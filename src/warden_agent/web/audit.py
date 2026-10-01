@@ -47,6 +47,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 from warden_agent.core.settings import secret_bytes
+from warden_agent.store.pg_schema import serialized_schema_init
 from warden_agent.web.auth import LOCAL_CALLER, RunOperation, TrustedCaller
 
 logger = logging.getLogger(__name__)
@@ -549,7 +550,17 @@ class PostgresAuditStore:
         return self._chain_key is not None
 
     def _init(self) -> None:
-        with self._conn.cursor() as cur:
+        """建表 + 补列。
+
+        ⚠️ **必须在多副本同时启动时也安全**：`CREATE TABLE IF NOT EXISTS` 在 PG 里
+        并不并发安全（它实现成"先查存在性、再创建"，两个副本可以双双通过检查，
+        后到的那个撞 `pg_class` 的命名唯一索引）。这里原来是裸游标 + 事后
+        `commit()`：既没有建议锁、也没把 DDL 包进一个事务——与 memory store
+        那次"副本启动即死"是同一个成因（只是还没在线上爆出来）。
+        现在统一走 `store/pg_schema.py` 的唯一入口；`tests/test_pg_concurrent_init.py`
+        会逐个存储断言"建表确实拿了锁"，所以以后新加的存储忘了拿锁会在测试里红。
+        """
+        with serialized_schema_init(self._conn, local_lock=self._lock) as cur:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_log (
@@ -589,7 +600,7 @@ class PostgresAuditStore:
                 )
                 """
             )
-        self._conn.commit()
+        # 不需要再 commit：serialized_schema_init 里的事务在退出时提交（建议锁也一并释放）。
 
     def append(self, record: AuditRecord) -> None:
         # 整段放进一个事务 + 咨询锁：多副本并发写时链头只被一方推进（见类说明）。

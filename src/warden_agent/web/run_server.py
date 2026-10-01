@@ -58,6 +58,7 @@ from warden_agent.core.settings import (
     unknown_warden_variables,
     validate_env,
 )
+from warden_agent.execution.sandbox import sandbox_isolation_policy
 from warden_agent.loop.intent import ToolIntentRouter
 from warden_agent.loop.planner import ModelPlanner
 from warden_agent.model.deepseek import DeepSeekModel
@@ -92,30 +93,55 @@ logger = get_logger("run_server")
 DEFAULT_MAX_CONTEXT_CHARS = 60000
 
 
-def _build_catalog() -> ToolCatalog:
-    """造一张演示用的技能卡（天气 + 高危删除）。真实场景注册你自己的工具。"""
+def _build_catalog(env: Mapping[str, str] | None = None) -> ToolCatalog:
+    """造工具目录：**演示卡默认不注册**，要显式 `WARDEN_DEMO_TOOLS=1`。
+
+    这里原先无条件注册两张"演示卡"，而 `run_server` 是**真被启动的那个入口**：
+
+      · `weather.get` → 固定返回「晴, 25 度」，不是任何真实天气接口；
+      · `fs.delete`   → 函数体只 `return f"已删除 {path}"`，**根本没碰文件系统**。
+
+    最坏的地方不是"没实现"，而是**副作用声明与实际行为相反**：模型和调用方拿到
+    「已删除」的成功文本，磁盘上什么都没发生。真工具的目录（memory / web / skill /
+    mcp / git，其中 `git.apply_patch`、`shell.run` 才真有副作用）是 `build_app(...)`
+    用 `augment_catalog` 注进去的——**演示卡从来不是产品能力**。
+
+    现在：默认目录里只有 `augment_catalog` 注入的真工具；演示卡必须显式打开，打开后
+    工具描述与返回值都写明"演示"（返回值不再谎称"已删除"），并在启动日志里喊一声。
+    演示卡仍然 `pure=False`，所以"审批闸门真的会拦"这件事照样能演示。
+    """
     catalog = ToolCatalog()
+    if not env_bool("WARDEN_DEMO_TOOLS", False, env):
+        return catalog
+
+    logger.warning(
+        "WARDEN_DEMO_TOOLS=1：注册演示工具 weather.get（固定值，非真实天气接口）"
+        "与 fs.delete（**不会真的删文件**）。它们只为演示审批闸门而存在，"
+        "对外服务前请关掉这个开关。",
+    )
 
     @function_tool(
         "weather.get",
-        "获取某城市的天气",
+        "获取某城市的天气（**演示用固定值**，不是真实天气接口）",
         {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
         pure=True,
     )
     def get_weather(city: str) -> str:
-        return f"{city}: 晴, 25 度"
+        return f"{city}: 晴, 25 度（演示固定值）"
 
     catalog.register(get_weather)
 
-    # 演示"需要审批的高危工具"：删除文件必须人工批准
+    # 演示"需要审批的高危工具"：删除文件必须人工批准。
+    # 注意这里**不做真删除**——演示卡没有 workspace_root 兜底，真删一个任意路径反而是风险。
+    # 返回值写清"未真正删除"，不让模型/调用方拿到假的成功。
     @function_tool(
         "fs.delete",
-        "删除一个文件（高危，需要审批）",
+        "删除一个文件（高危，需要审批）——**演示卡：不会真的删文件**",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         pure=False,
     )
     def delete_file(path: str) -> str:
-        return f"已删除 {path}"
+        return f"[演示] 未真正删除 {path}：这是演示卡，只用来演示审批闸门"
 
     catalog.register(delete_file)
     return catalog
@@ -124,7 +150,14 @@ def _build_catalog() -> ToolCatalog:
 # 无副作用豁免名单：只写**本项目自己**的数据（租户内、可回滚、不碰外部系统），
 # 把它们也堵在审批上只会把日常操作变成"点确认"的体力活。
 # 想更严的部署：把这个集合改成 frozenset()（连 memory.remember 也要人工批准）。
-_POLICY_BENIGN_TOOLS: frozenset[str] = frozenset({"memory.remember"})
+#
+# 为什么不豁免 memory.confirm：现在两阶段分得很清——
+# **memory.remember / memory.remember_text 只往候选区写一条待确认**（不生效、可回滚），
+# 所以豁免它们没有风险（`remember_text` 多做的只是"用规则从原话里抽句子"，
+# 抽完仍然只是一条候选）；
+# **memory.confirm 才真的把记忆生效**（还会替掉冲突的旧条目），那一步必须有人在场，
+# 所以它不在名单里，会被默认策略拦成待审批。
+_POLICY_BENIGN_TOOLS: frozenset[str] = frozenset({"memory.remember", "memory.remember_text"})
 
 
 def _is_pure_tool(catalog: ToolCatalog, name: str) -> bool:
@@ -217,6 +250,13 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
     `alice:sk-aaa,bob:sk-bbb`。每个 key 绑定一个用户身份——**身份由 key 决定，
     客户端无法自称**。这是会话归属与越权拦截能成立的前提：单 key 模式下所有调用者
     都是同一个身份，谈不上隔离。
+
+    **密钥轮换（零停机）**：同一个用户写两次即可，两份 key 同时有效——
+    `alice:新key,alice:旧key`：先把新 key 发给部署、确认新 key 能用，再把旧 key 从配置里
+    删掉、重启。区间内新旧都能用，不会因为“换 key 的那一秒”把在飞的客户端打成 401。
+    同一个密钥写给**两个不同用户**会被拒绝（见下），因为那会让一个人的调用以另一个
+    人的身份记账；同一个用户给两个 key 则是轮换，合法。
+
     单 key 模式（`WARDEN_API_KEY`）的身份取 `WARDEN_API_USER`（默认 `demo-user`，
     与控制台默认账号一致）。租户取 `WARDEN_TENANT`（默认 `local`）。
     """
@@ -239,7 +279,19 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
                     "例如 alice:sk-aaa,bob:sk-bbb"
                 )
             uid = user_id.strip()
-            keys[key.strip()] = _caller_for(uid, tenant, role_for(uid, admins, viewers))
+            clean_key = key.strip()
+            # 同一个密钥挂在两个不同用户上 = 配置错误，而且错得很险：后一个会把前一个
+            # **静默替掉**，于是 alice 拿着自己的 key 却以 bob 的身份出现（或反之）。
+            # 密钥轮换是合法的“同一个用户两个 key”（alice:old,alice:new），那不是冲突。
+            existing = keys.get(clean_key)
+            if existing is not None and existing.principal_id != uid:
+                raise AuthConfigError(
+                    f"WARDEN_API_KEYS 里同一个密钥被配给了两个用户："
+                    f"{existing.principal_id!r} 与 {uid!r}。"
+                    "这会让其中一个人的调用以另一个人的身份记账（会话归属与越权拦截全部失效）。"
+                    "同一个用户配两个 key（轮换用）是允许的：alice:旧,alice:新"
+                )
+            keys[clean_key] = _caller_for(uid, tenant, role_for(uid, admins, viewers))
         if keys:
             return keys, "bearer"
 
@@ -261,7 +313,7 @@ def resolve_auth(env: Mapping[str, str]) -> tuple[dict[str, TrustedCaller] | Non
 
 
 def ensure_listen_is_safe(host: str, auth_mode: str) -> None:
-    """校验"监听地址 × 鉴权模式"这个组合是否安全。不安全则抛 AuthConfigError。
+    """校验「监听地址 × 鉴权模式」这个组合是否安全。不安全则抛 AuthConfigError。
 
     单独抽出来是为了可测：main() 里只负责把异常变成退出码。
     """
@@ -270,6 +322,65 @@ def ensure_listen_is_safe(host: str, auth_mode: str) -> None:
             f"WARDEN_HOST={host} 是对外监听地址，但未开启鉴权 —— 拒绝启动。"
             "请设置 WARDEN_API_KEY，或把 WARDEN_HOST 改回 127.0.0.1。"
         )
+
+
+class DemoModelRefusedError(RuntimeError):
+    """非本机开发场景却要拿假模型对外服务。"""
+
+
+def ensure_model_is_real(
+    *, is_fake: bool, host: str, auth_mode: str, env: Mapping[str, str]
+) -> None:
+    """假模型 + 「真的会给别人用」的组合 → 拒绝启动（fail-closed）。
+
+    为什么这算 P0 而不是「一个小提醒」：FakeModel 的回复是固定脚本，但它**看起来像真能力**
+    （会选工具、会答话、事件流完整）。把它跑在容器/对外端口上，评审者、集成方、
+    演示观众都会把「假模型的输出」当成系统真实能力的证据——这类「能力错觉」
+    比直接报错危险得多，所以要把「到底是真模型还是演示」变成一个**必须显式声明**的事实。
+
+    判定用的是**能不能被机器外的人连上**，而不是"配置看起来多正式"：
+      · 回环地址（默认 `127.0.0.1`）→ 允许。本机怎么跑都行；这里即使开了鉴权也不报，
+        因为**没有任何远端能连进来**，而为了"试一下鉴权"就得先声明是个演示会很烦。
+        仅在「开鉴权 + 假模型」时给一条 warning（这种组合多半是照着生产配置改的）。
+      · 已**双重显式声明** `WARDEN_ALLOW_FAKE_MODEL=1` **且** `WARDEN_DEMO_INSTANCE=1`
+        → 允许（演示实例；启动日志与 `/capabilities` 会标明）
+      · 其余（对外监听 0.0.0.0 / 具体网卡地址）→ 拒绝启动，并给出去路
+
+    为什么要**两个**变量而不是一个：像生产配置里残留一句 `ALLOW_FAKE_MODEL=1`（本来是
+    为了跑一次演示）这种事故，一个变量拦不住。第二个变量要的是一个**只可能故意写**的词
+    ——把"我这就是个演示实例"讲出口，而不是顺手留个开关。
+
+    容器里的坑：容器内必须 `WARDEN_HOST=0.0.0.0` 才能被端口映射进来，那是"对外"，
+    所以容器跑演示实例必须把两个都写上——这正是我们想要的。
+    """
+    if not is_fake:
+        return
+    if is_loopback_host(host):
+        if auth_mode == "bearer":
+            logger.warning(
+                "假模型 + 鉴权模式同时开着（%s）：回复是固定脚本，别当成系统真实能力。"
+                "对外暴露前请配真实模型凭据。", host,
+            )
+        return
+    declared_demo = env_bool("WARDEN_ALLOW_FAKE_MODEL", False, env) and env_bool(
+        "WARDEN_DEMO_INSTANCE", False, env
+    )
+    if declared_demo:
+        logger.warning(
+            "以演示实例启动（%s）：模型是假模型，回复是写死脚本；"
+            "/chat 响应会带 X-Warden-Model-Kind: fake 与 Warning 标头。",
+            host,
+        )
+        return
+    raise DemoModelRefusedError(
+        f"未配置任何真实模型凭据，却要以假模型对外服务 {host}（鉴权模式 {auth_mode}）——"
+        "拒绝启动（fail-closed）。假模型的回复是固定脚本，看起来却像真能力。\n"
+        "  · 演示实例：显式设 WARDEN_ALLOW_FAKE_MODEL=1 **且** WARDEN_DEMO_INSTANCE=1"
+        "（会被当作演示并如实标注）\n"
+        "  · 真实部署：设 DEEPSEEK_API_KEY，或改用 custom provider（WARDEN_BASE_URL + "
+        "WARDEN_MODEL_API_KEY）\n"
+        "  · 仅本机开发：WARDEN_HOST=127.0.0.1（回环地址无需任何声明，开鉴权也不拦）"
+    )
 
 
 def _knowledge_from_env(env: Mapping[str, str]) -> Any:
@@ -315,6 +426,21 @@ def _shared_state_from_env(env: Mapping[str, str]) -> bool:
     解析统一走 `core.settings.env_bool`，避免同一个变量出现多个解析口径。
     """
     return env_bool("WARDEN_SHARED_STATE", False, env)
+
+
+def trusted_proxies_from_env(env: Mapping[str, str] | None = None) -> str | None:
+    """前置代理的地址/网段（`WARDEN_TRUSTED_PROXIES`）；未配置或空串返回 None。
+
+    None 的含义是「谁也不信」：uvicorn 于是完全忽略 `X-Forwarded-For`，
+    `request.client.host` 就是 TCP 对端（= 代理自己的 IP）。这是**安全的那一侧**默认，
+    但它有一个副作用：在 Ingress 后面，所有匿名调用者的 `client.host` 全一样，
+    「按调用者分桶」的限流与幂等作用域会塔成一个桶（一个客户端把别人挤掉）。
+    所以放在反代后面必须配它，取值 = **代理自己的地址**。
+
+    返回原字符串交给 uvicorn 解析（它的 `_TrustedHosts` 支持 IP / CIDR / 字面量列表）；
+    格式把关在 `core.settings.validate_env` 里做（启动时就挑出非法值与全信任值）。
+    """
+    return env_str("WARDEN_TRUSTED_PROXIES", "", env).strip() or None
 
 
 def _db_path() -> str:
@@ -420,15 +546,9 @@ def main() -> None:
     # 多副本必须走 PostgreSQL + WARDEN_SHARED_STATE=1，否则各副本一个库、协调状态各自为政。
     store = _store_from_env(os.environ)
 
-    # 模型：有 key 用真 DeepSeek，否则用假模型（离线可跑）
-    model: AgentChatModel
-    api_key = env_opt("DEEPSEEK_API_KEY")
-    if api_key:
-        model = DeepSeekModel(api_key=api_key)
-        logger.info("使用真实 DeepSeek 模型")
-    else:
-        model = FakeModel()
-        logger.info("未设置 DEEPSEEK_API_KEY，使用离线假模型（设置 key 可接真实 DeepSeek）")
+    # 模型：有 key 用真 DeepSeek，否则用假模型（离线可跑）。
+    # 注意：假模型 + 对外服务 = 拒绝启动（见下面的 ensure_model_is_real）——
+    # 所以这里不直接构造模型，而是把它放到「鉴权与监听地址都定下来之后」。
 
     # 配置面校验（fail-fast）：格式写错、或把 WARDEN_* 拼错，都在启动时暴露，
     # 而不是悄悄按默认值跑——与"鉴权 fail-closed"同一个取向。
@@ -467,6 +587,37 @@ def main() -> None:
             "对外暴露端口前必须设置 WARDEN_API_KEY。", host,
         )
 
+    # 模型：有真实凭据用真 DeepSeek，否则用假模型（离线可跑）。
+    model: AgentChatModel
+    api_key = env_opt("DEEPSEEK_API_KEY")
+    if api_key:
+        model = DeepSeekModel(api_key=api_key)
+        logger.info("使用真实 DeepSeek 模型")
+    else:
+        model = FakeModel()
+        # 降级到 info 是错的：假模型的回复**看起来像真能力**（会选工具、会给答案），
+        # 日志里必须留下明显的痕迹，而且非本机开发场景直接拒绝启动。
+        logger.warning(
+            "未设置任何真实模型凭据 → 使用**离线假模型**：回复是固定脚本，不是真实推理。"
+            "实例会被标记为演示（/capabilities 里 demo_instance=true）"
+        )
+    try:
+        ensure_model_is_real(
+            is_fake=isinstance(model, FakeModel),
+            host=host, auth_mode=auth_mode, env=os.environ,
+        )
+    except DemoModelRefusedError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
+
+    # 沙箱隔离声明也要在这里 fail-fast：取值写错（如 kernel 拼错）不该等到
+    # 「某次真的要用 shell.run」才报错——那是运气，不是治理。
+    try:
+        sandbox_isolation_policy(os.environ)
+    except ValueError as exc:
+        logger.error("配置错误：%s", exc)
+        raise SystemExit(2) from exc
+
     audit_store: Any = None
     # 统一走 env_bool：此前这里是手写的 `in ("1","true","yes")`——**漏了 "on"**，
     # 与其它布尔开关的口径不一致（同一个变量的两种写法本来是这轮要消灭的东西）。
@@ -496,7 +647,7 @@ def main() -> None:
                 "（可设 WARDEN_AUDIT_REQUIRE_KEY=1 改为拒绝启动）。"
             )
 
-    catalog = _build_catalog()
+    catalog = _build_catalog(os.environ)
     planner, intent, ctx_chars = _cognition_from_env(os.environ, catalog, model)
     # RAG：按环境变量决定要不要挂 knowledge.search，以及索引什么
     knowledge = _knowledge_from_env(os.environ)
@@ -633,6 +784,14 @@ def main() -> None:
         "WARDEN_SSE_MAX_CONNECTIONS", DEFAULT_SSE_MAX_CONCURRENCY, os.environ
     )
     session_cache_max = _session_cache_max_from_env(os.environ)
+    # 多 Agent（主管 + 子 Agent 卡）：默认关。它不是零成本的装饰——子 Agent 会真的
+    # 多花模型调用，所以由部署方显式打开（`WARDEN_MULTIAGENT=1`）。
+    multiagent = env_bool("WARDEN_MULTIAGENT", False, os.environ)
+    if multiagent:
+        logger.info(
+            "多 Agent：已注册 research / write 两张子 Agent 卡（子 Agent 只拿只读工具）；"
+            "它们会额外发起模型调用——WARDEN_MULTIAGENT=0 可关。",
+        )
     logger.info(
         "入站保护：请求体上限 %s｜SSE 并发上限 %s（WARDEN_MAX_REQUEST_BYTES / "
         "WARDEN_SSE_MAX_CONNECTIONS，0 = 关闭）",
@@ -662,6 +821,7 @@ def main() -> None:
         intent=intent,
         max_context_chars=ctx_chars,
         rate_limiter=limiter,
+        multiagent=multiagent,
         shared_state=shared_state,
         # 把已经建好的事件总线与保留策略透传进去：`notify` 模式建的是
         # PostgresNotifyEventBus，若这里不传，build_app 会另建一条默认轮询总线，
@@ -676,6 +836,19 @@ def main() -> None:
         session_cache_max=session_cache_max,
     )
     port = env_int("PORT", 8000)
+    # 受信前置代理：**设了才透传**。不设时完全不传这个 kwarg，让 uvicorn 用它自己的默认
+    # （只信回环）——默认值写死在这里就会跟 uvicorn 漂移。
+    trusted_proxies = trusted_proxies_from_env(os.environ)
+    if trusted_proxies:
+        logger.info(
+            "受信前置代理: %s（只采信来自它们的 X-Forwarded-For / X-Forwarded-Proto）",
+            trusted_proxies,
+        )
+    else:
+        logger.info(
+            "未配 WARDEN_TRUSTED_PROXIES：不采信 X-Forwarded-For。"
+            "在 Ingress/反代后面必须配置它，否则限流按调用者分桶会塌成一个桶"
+        )
     logger.info("可视化控制台: http://127.0.0.1:%s/  (演示网页)", port)
     logger.info("OpenAPI 文档:  http://127.0.0.1:%s/docs", port)
     logger.info("健康检查:      /health/live  /health/ready")
@@ -685,6 +858,7 @@ def main() -> None:
     uvicorn.run(
         app, host=host, port=port,
         timeout_graceful_shutdown=env_positive_int("WARDEN_SHUTDOWN_GRACE_S", 30, os.environ),
+        **({"forwarded_allow_ips": trusted_proxies} if trusted_proxies else {}),
     )
 
 

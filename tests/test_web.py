@@ -14,6 +14,7 @@ from tests.conftest import ScriptedModel, weather_tool
 from warden_agent.model.model import ChatResponse, ToolCall
 from warden_agent.policy.policy import Decision, PolicyEngine, PolicyResult
 from warden_agent.store.sqlite import SqliteStore
+from warden_agent.web.auth import ROLE_USER, TrustedCaller
 from warden_agent.web.server import build_app
 
 
@@ -303,3 +304,64 @@ async def test_t10_react_spa_服务和资源() -> None:
     asset_resp = await client.get(m.group(1).split("?")[0])
     assert asset_resp.status_code == 200
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_开启鉴权时_spa外壳仍可匿名加载而数据接口照旧401(tmp_path, monkeypatch) -> None:
+    """**真缺陷回归**：开了 API 鉴权（`api_keys` 非空）之后，SPA **外壳**必须仍然匿名可加载。
+
+    这条为什么会存在（它抓到的是什么）：
+      浏览器加载 `<script type="module" src="/assets/index-xxx.js">` 时**带不上**
+      `Authorization` 头（HTML 规范如此，不是我们的代码能决定的）。所以只要 `/assets/*`
+      也进了鉴权，`/` 能返回 index.html、但它引用的 JS 拿 401 → React 从不挂载 →
+      页面上连"填访问密钥"的输入框都没有 → **开了鉴权的部署里，控制台是一张白纸，
+      谁也登不进来**。
+
+    为什么以前没被任何断言拦住：上面那条 `test_t10_react_spa_服务和资源` 用的是
+    **不带鉴权**的 app，而其它带鉴权的用例只打 API、不碰静态资源。两种配置各测一半，
+    合起来才完整——而没人把"api_keys 非空"与"静态资源"放进同一个 app 跑过。
+    （真浏览器 e2e `web/e2e/auth.spec.ts` 是先按真实用户路径撞出来的，这条 pytest 是
+    把它钉进 CI，不用每次开浏览器。）
+
+    反方向也要钉住：外壳公开 ≠ 数据公开，业务接口在同样配置下仍然必须 401。
+    """
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<!doctype html><html><body><div id="root"></div>'
+        '<script type="module" src="/assets/app.js"></script></body></html>',
+        encoding="utf-8",
+    )
+    (dist / "assets" / "app.js").write_text("console.log('warden')\n", encoding="utf-8")
+    # 用临时产物目录：不依赖本机 `npm run build` 过没跑过（不然这条会随环境时红时绿）
+    monkeypatch.setenv("WARDEN_WEB_DIST", str(dist))
+
+    app = build_app(
+        model=ScriptedModel([ChatResponse(content="ok", finish_reason="stop")]),
+        catalog=weather_tool(),
+        policy=PolicyEngine(),
+        store=SqliteStore(tmp_path / "t.db"),
+        api_keys={"k-alice": TrustedCaller("tenant-a", "user", "alice", role=ROLE_USER)},
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1) 外壳（index.html + 它引用的打包资源）匿名可读
+        index = await client.get("/")
+        assert index.status_code == 200
+        assert "/assets/app.js" in index.text
+        asset = await client.get("/assets/app.js")
+        assert asset.status_code == 200, (
+            "SPA 外壳的 JS 必须匿名可读：浏览器给 <script src> 带不了 Authorization 头，"
+            "这条一旦 401，控制台在启用鉴权的部署里就是白屏（登录入口自己把自己锁了）"
+        )
+        assert "warden" in asset.text
+
+        # 2) 数据面照旧：外壳公开不等于数据公开
+        assert (await client.get("/messages/run-x")).status_code == 401
+        assert (await client.get("/approvals")).status_code == 401
+
+        # 3) 带对凭证照常能过（没把鉴权整体关掉）
+        authed = await client.get(
+            "/messages/run-x", headers={"Authorization": "Bearer k-alice"}
+        )
+        assert authed.status_code == 200

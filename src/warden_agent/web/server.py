@@ -24,34 +24,35 @@
   - 会话状态由 SessionRegistry 管理在内存里，并落到 SQLite；重启服务可恢复。
   - ASK 审批真正"挂起"：模型想调被审批的工具时，API 返回 needs_approval，
     调用方拿到 approval 后调 approve/reject，会话才继续。
+
+**路由访问级别是谁说了算**：唯一权威在 `tests/test_route_surface.py` 的 `ROUTES` 表
+  （公开 / 认证 / 管理员三档 + 藏在请求体分支里的管理员限制）。新增任何路由都要在
+  那里登记一行，否则 CI 会红——目的是让"新加的路由没守住"被 **CI** 发现，
+  而不是被下一位审计者发现（`/metrics` 就给只读角色开过一个口子）。
 """
 
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
-import threading
 import time
 import uuid
-from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
-from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from warden_agent.core import tracing
 from warden_agent.core.metrics import metrics
-from warden_agent.core.settings import env_opt
 from warden_agent.credential.broker import CredentialBroker, SecretRedactor, default_broker
 from warden_agent.credential.vault import DEPLOYMENT_SCOPE, as_vault
-from warden_agent.model.model import AgentChatModel, Message
+from warden_agent.execution.sandbox import detect_isolation_tier, sandbox_isolation_policy
+from warden_agent.model.fake import FakeModel
+from warden_agent.model.model import AgentChatModel
 from warden_agent.policy.policy import PolicyEngine
 from warden_agent.runtime.locking import (
     InProcessRunLock,
@@ -59,10 +60,10 @@ from warden_agent.runtime.locking import (
     RunLock,
     new_owner_id,
 )
-from warden_agent.runtime.session import AgentSession, FinalReply, NeedsApproval
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.tool.catalog import ToolCatalog
 from warden_agent.tool.stability import build_stability_executor
+from warden_agent.web import security_headers
 from warden_agent.web.audit import AuditLogger, AuditStore
 from warden_agent.web.auth import (
     ApiKeyAuthenticator,
@@ -80,9 +81,86 @@ from warden_agent.web.coordination import (
     IdempotencyStore,
     coordination_for,
 )
-from warden_agent.web.health import HealthResult, liveness, readiness
+
+# 拆分后这些模块级辅助住在 http_kit / schemas / session_registry 里。
+# 名字仍从本模块**原样可导入**（`from warden_agent.web.server import X` 不受影响）：
+# 用 `X as X` 的显式再导出形式，避免被当成未使用的 import。
+from warden_agent.web.http_kit import (
+    ENV_APPROVAL_ALLOW_SELF as ENV_APPROVAL_ALLOW_SELF,
+)
+from warden_agent.web.http_kit import (
+    SseConcurrencyGate as SseConcurrencyGate,
+)
+from warden_agent.web.http_kit import (
+    _approval_actor as _approval_actor,
+)
+from warden_agent.web.http_kit import (
+    _checkpoint_store_for,
+    _drain_and_rebuild,
+    _extract_run_id,
+    _idem_response_from_store,
+    _is_approval_decision_path,
+    _is_public,
+    _model_key_name,
+    _problem,
+    _problem_for_status,
+)
+from warden_agent.web.http_kit import (
+    _credential_scope as _credential_scope,
+)
+from warden_agent.web.http_kit import (
+    _has_model_key as _has_model_key,
+)
+from warden_agent.web.http_kit import (
+    _memory_scope_or_400 as _memory_scope_or_400,
+)
+from warden_agent.web.http_kit import (
+    _memory_service_or_404 as _memory_service_or_404,
+)
+from warden_agent.web.http_kit import (
+    _model_kind_headers as _model_kind_headers,
+)
+from warden_agent.web.http_kit import (
+    _plan_to_dict as _plan_to_dict,
+)
+from warden_agent.web.http_kit import (
+    _registered_model_key as _registered_model_key,
+)
+from warden_agent.web.http_kit import (
+    _serialize_messages as _serialize_messages,
+)
+from warden_agent.web.http_kit import (
+    _split_version as _split_version,
+)
 from warden_agent.web.outbound import OutboundLimiter
 from warden_agent.web.ratelimit import RateLimiter, client_key
+from warden_agent.web.routes import approvals as _routes_approvals
+from warden_agent.web.routes import chat as _routes_chat
+from warden_agent.web.routes import memory as _routes_memory
+from warden_agent.web.routes import models as _routes_models
+from warden_agent.web.routes import ops as _routes_ops
+from warden_agent.web.routes import runs as _routes_runs
+from warden_agent.web.routes import spa as _routes_spa
+from warden_agent.web.routes.spa import _web_dist_dir
+from warden_agent.web.schemas import (
+    ApprovalDecisionIn as ApprovalDecisionIn,
+)
+from warden_agent.web.schemas import (
+    ChatRequestIn as ChatRequestIn,
+)
+from warden_agent.web.schemas import (
+    ChatResponseOut as ChatResponseOut,
+)
+from warden_agent.web.schemas import (
+    ModelSelectIn as ModelSelectIn,
+)
+from warden_agent.web.schemas import (
+    UserCreateIn as UserCreateIn,
+)
+from warden_agent.web.session_registry import (
+    DEFAULT_SESSION_CACHE_MAX as DEFAULT_SESSION_CACHE_MAX,
+)
+from warden_agent.web.session_registry import SessionRegistry as SessionRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -97,484 +175,18 @@ API_SUPPORTED_MAJORS: tuple[str, ...] = ("1",)
 # ---- 入站请求保护默认值（可在 build_app 覆盖；0 = 关闭）----
 # 请求体上限：默认 1 MiB。防的是超大 body 把内存/JSON 解析打爆（与限流互补：限流管次数）。
 DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
+
+# 可以带请求体的方法（HTTP 规范允许 DELETE 带 body）。请求体闸门按这个集合判，
+# 而不是只认 POST/PUT/PATCH：不然一个 DELETE 就能把闸门绕过去。
+_BODY_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # SSE 长连接并发上限：默认 100。长连接一直占线程/连接，不限并发时少量客户端就能耗尽连接池。
 DEFAULT_SSE_MAX_CONCURRENCY = 100
-# 会话内存缓存上限：默认 1000。任何 GET /status/<随机 id> 都会建一个 AgentSession，
-# 不透顶时内存可被客户端任意 run_id 撑爆；到上限按 LRU 淘汰最久未访问的会话。
-DEFAULT_SESSION_CACHE_MAX = 1000
+# SSE 心跳间隔（秒）：空闲这么久就发一条注释行。工具执行/长模型调用期间可能几十秒
+# 一个字节都不吐，中间层（nginx/CDN/浏览器）会把"零字节的长连接"当成死连接掐掉。
+# 测试里会 monkeypatch 成极小值，用来验证心跳确实发得出来。
+SSE_HEARTBEAT_SECONDS = 10.0
 
 
-class SseConcurrencyGate:
-    """SSE 长连接并发闸门：到上限**立刻拒绝**（不排队），名额用完释放才回收。
-
-    用 `threading.Lock`：流的生成器在 Starlette 的线程池里迭代，释放可能发生在工作线程，
-    `asyncio.Lock` 跨线程不安全；临界区只做自增/自减，开销可忽略。
-    `limit <= 0` 表示不限并发（`acquire()` 永远成功）。
-    """
-
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self._active = 0
-        self._lock = threading.Lock()
-
-    def acquire(self) -> bool:
-        """名额占得到返回 True；已到上限返回 False（调用方应立刻回 503）。"""
-        with self._lock:
-            if self.limit > 0 and self._active >= self.limit:
-                return False
-            self._active += 1
-            return True
-
-    def release(self) -> None:
-        """归还名额（幂等石旁：多发/多减不会把计数打到负）。"""
-        with self._lock:
-            self._active = max(0, self._active - 1)
-
-    @property
-    def active(self) -> int:
-        """当前在飞的长连接数（供运维/测试观察）。"""
-        with self._lock:
-            return self._active
-
-
-def _split_version(value: str) -> tuple[str, str] | None:
-    """把 `1.0` 拆成 `("1", "0")`；形态不对返回 None。"""
-    parts = value.strip().split(".")
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
-        return None
-    return parts[0], parts[1]
-
-
-async def _drain_and_rebuild(
-    response: Any, store: IdempotencyStore, key: str
-) -> Any:
-    """消费 body 流，把**完整快照**（状态码/头/body）写进幂等表，返回可重放的新 Response。
-
-    注意快照以**这次响应自己**为准，而不是去改那条"处理中"占位——占位的 status_code 是 0。
-    """
-    body_bytes = b"".join([chunk async for chunk in response.body_iterator])
-    store.put(key, {
-        "status_code": response.status_code,
-        "headers": dict(response.headers),
-        "body": body_bytes,
-    })
-
-    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
-    return JSONResponse(
-        status_code=response.status_code,
-        content=json.loads(body_bytes) if body_bytes else None,
-        headers=headers,
-    )
-
-
-def _idem_response_from_store(store: IdempotencyStore, key: str) -> Any | None:
-    item = store.get(key)
-    if not item or item.get("body") is None:
-        return None
-    body = item.get("body")
-    content: Any
-    try:
-        content = json.loads(body) if isinstance(body, (bytes, str)) else body
-    except (json.JSONDecodeError, TypeError):
-        content = body
-    return JSONResponse(
-        status_code=item["status_code"],
-        content=content,
-        headers={k: v for k, v in item["headers"].items() if k.lower() != "content-length"},
-    )
-
-
-
-# ---- 阶段13：problem+json 错误（RFC 7807 problem+json）----
-# 统一错误响应契约：**所有**错误（含端点里的 `raise HTTPException` 与请求体校验失败）
-# 都经下面的异常处理器变成同一种 problem+json 形状，不再混着 FastAPI 默认的 `{"detail": ...}`。
-# 状态码 → errorCode 的映射；端点需要更具体的 code 时可直接调 `_problem`。
-_STATUS_ERROR_CODES: dict[int, str] = {
-    400: "BAD_REQUEST",
-    401: "AUTHENTICATION_REQUIRED",
-    403: "AUTHORIZATION_DENIED",
-    404: "NOT_FOUND",
-    409: "CONFLICT",
-    413: "PAYLOAD_TOO_LARGE",
-    422: "VALIDATION_FAILED",
-    423: "RUN_LOCKED",
-    429: "RATE_LIMITED",
-    500: "INTERNAL_ERROR",
-    501: "NOT_IMPLEMENTED",
-    503: "SERVICE_UNAVAILABLE",
-}
-_API_TITLES: dict[int, str] = {
-    400: "Bad Request",
-    401: "Unauthorized",
-    403: "Forbidden",
-    404: "Not Found",
-    409: "Conflict",
-    413: "Payload Too Large",
-    422: "Unprocessable Entity",
-    423: "Locked",
-    429: "Too Many Requests",
-    500: "Internal Server Error",
-    501: "Not Implemented",
-    503: "Service Unavailable",
-}
-
-
-def _problem(
-    status: int,
-    code: str,
-    detail: str,
-    correlation_id: str,
-    extra_headers: dict[str, str] | None = None,
-) -> JSONResponse:
-    """构造 RFC 7807 风格的 problem+json 响应（RFC 7807 problem+json）。"""
-    return JSONResponse(
-        status_code=status,
-        content={
-            "type": f"urn:warden:problem:{code.lower()}",
-            "title": _API_TITLES.get(status, "Error"),
-            "status": status,
-            "errorCode": code,
-            "correlationId": correlation_id,
-            "detail": detail,
-            "timestamp": datetime.now(UTC).isoformat(),
-        },
-        headers={
-            "Content-Type": "application/problem+json",
-            "X-Warden-Api-Version": "1.0",
-            "X-Correlation-Id": correlation_id,
-            **(extra_headers or {}),
-        },
-    )
-
-
-def _problem_for_status(
-    status: int,
-    detail: str,
-    correlation_id: str,
-    extra_headers: dict[str, str] | None = None,
-) -> JSONResponse:
-    """按 HTTP 状态码给出统一的 problem+json（异常处理器用，errorCode 由状态码映射）。"""
-    return _problem(
-        status, _STATUS_ERROR_CODES.get(status, "ERROR"), detail,
-        correlation_id, extra_headers,
-    )
-
-
-def _extract_run_id(path: str) -> str | None:
-    """从请求路径里挖出 run_id（用于授权与审计），挖不到返回 None。
-
-    覆盖所有"针对某个 Run"的路由：chat / status / approve / reject / events / runs /
-    messages。少覆盖一条，归属授权（owner_authorizer）在那条路上就等于没开——
-    所以这里和路由表必须同步维护。
-    """
-    segments = path.rstrip("/").split("/")
-    if len(segments) >= 3:
-        # /chat/stream/{run_id} → ["", "chat", "stream", id]
-        if segments[1] == "chat" and len(segments) == 4 and segments[2] == "stream":
-            return segments[3]
-        if segments[1] in (
-            "chat", "status", "approve", "reject", "events", "runs", "messages",
-        ):
-            return segments[2]
-    return None
-
-
-def _is_public(path: str) -> bool:
-    """无需认证即可访问的路径：文档、演示首页、健康检查（负载均衡探活必经之路）。"""
-    public = {
-        "/",
-        "/docs",
-        "/redoc",
-        "/openapi.json",
-        "/health/live",
-        "/health/ready",
-    }
-    return path in public
-
-
-# ---- HTTP 请求/响应模型 ----
-class ChatRequestIn(BaseModel):
-    text: str
-
-
-class ModelSelectIn(BaseModel):
-    """POST /models/select 的请求体（模型切换 / 导入 API Key）。"""
-
-    id: str
-    api_key: str | None = None
-    # "self"（默认）= 只切自己的会话；"deployment" = 切**部署默认**（所有人没自选过的会话都受影响）
-    # ——后者是运维动作，**只有管理员**能做（见 /models/select 的 403 分支）。
-    scope: str = "self"
-
-
-class UserCreateIn(BaseModel):
-    """POST /users 的请求体（登记中控台用户）。"""
-
-    user_id: str
-
-
-class ChatResponseOut(BaseModel):
-    run_id: str
-    status: str
-    kind: str  # "final" | "needs_approval" | "error"
-    text: str | None = None
-    approval: dict[str, Any] | None = None
-    messages: list[dict[str, Any]] | None = None
-
-
-class SessionRegistry:
-    """管理所有在跑的会话：按 run_id 存 AgentSession，并锁住线程安全。"""
-
-    def __init__(
-        self,
-        model: AgentChatModel,
-        catalog: ToolCatalog,
-        policy: PolicyEngine,
-        store: SqliteStore,
-        system_prompt: str = "你是一个能使用工具的助手。",
-        extra: dict[str, Any] | None = None,
-        default_model_id: str = "",
-        stability: Any = None,
-        planner: Any = None,
-        intent: Any = None,
-        max_context_chars: int = 0,
-        checkpoint_store: Any = None,
-        max_sessions: int = DEFAULT_SESSION_CACHE_MAX,
-        session_ttl_s: float = 0.0,
-    ) -> None:
-        self._model = model
-        self._default_model_id: str = default_model_id
-        # 按归属者（用户）记的模型选择：多用户下不能让任一个人切走所有人的模型
-        # （那是跨租户影响：全体对话改走他的 key，或被他切成离线假模型）。
-        self._owner_models: dict[str, tuple[str, AgentChatModel]] = {}
-        self._catalog = catalog
-        self._policy = policy
-        self._store = store
-        self._system_prompt = system_prompt
-        self._stability = stability
-        self._planner = planner
-        self._intent = intent
-        self._max_context_chars = max_context_chars
-        self._checkpoint_store = checkpoint_store
-        self.extra = extra or {}  # 额外能力（如 memory_service / skill_catalog）
-        # 有界 LRU 缓存：`_sessions` 是 OrderedDict（队尾=最近访问），`_max_sessions`
-        # 到上限时淘汰队首（最久未访问）。`_session_seen` 记访问时刻供 TTL 淘汰。
-        # 为什么必须有界：任何 `GET /status/<随机 id>` 都会新建一个 AgentSession，
-        # 不限的话客户端用一个循环就能把内存撑爆。
-        self._sessions: OrderedDict[str, AgentSession] = OrderedDict()
-        self._session_seen: dict[str, float] = {}
-        self._max_sessions = max_sessions
-        self._session_ttl_s = session_ttl_s
-        # 防 run_id 抢注：首个“看到”某个 Run 的 principal（进程内）。
-        # 客户端自带的 run_id 是先到先得，不记下来就能被另一 principal 后手接管。
-        self._created_by: dict[str, str] = {}
-        # RLock（可重入）：`get()` 持锁时还要调 `model_for()` 解析归属者模型，
-        # 用普通 Lock 会自锁死。
-        self._lock = threading.RLock()
-
-    def note_creator(self, run_id: str, principal: str) -> None:
-        """记下某个 Run 的首个创建者（首次生效，后续调用不覆盖）。"""
-        with self._lock:
-            self._created_by.setdefault(run_id, principal)
-
-    def creator_of(self, run_id: str) -> str | None:
-        """某个 Run 在**本进程内**被谁首先创建；没记过则 None。"""
-        with self._lock:
-            return self._created_by.get(run_id)
-
-    def _evict_stale(self) -> None:
-        """清掉超过 TTL 未访问的会话（TTL<=0 则不做）。调用方须持锁。"""
-        if self._session_ttl_s <= 0:
-            return
-        now = time.monotonic()
-        for run_id in [
-            rid for rid, ts in self._session_seen.items()
-            if now - ts > self._session_ttl_s
-        ]:
-            self._evict(run_id)
-
-    def _evict_overflow(self) -> None:
-        """超过容量上限就淘汰队首（最久未访问）；`max_sessions<=0` = 不限。须持锁。"""
-        if self._max_sessions <= 0:
-            return
-        while len(self._sessions) > self._max_sessions:
-            run_id, sess = self._sessions.popitem(last=False)
-            self._session_seen.pop(run_id, None)
-            self._close_session(sess, run_id)
-
-    def _evict(self, run_id: str) -> None:
-        """按 run_id 淘汰一个会话（含关闭）。须持锁。"""
-        sess = self._sessions.pop(run_id, None)
-        if sess is not None:
-            self._session_seen.pop(run_id, None)
-            self._close_session(sess, run_id)
-
-    def _close_session(self, sess: AgentSession, run_id: str) -> None:
-        """关闭被淘汰的会话（释放它持有的资源）；关闭失败不得影响缓存淘汰。
-
-        注意：会话持有的模型/存储/记忆是**共享**的，`AgentSession.close()` 只做标记；
-        这里把“关闭”做成一个可覆盖的钩子（鸭子类型），方便扩展与测试。
-        """
-        close = getattr(sess, "close", None)
-        if not callable(close):
-            return
-        try:
-            close()
-        except Exception:  # noqa: BLE001 - 关闭失败不能拖垮请求
-            logger.warning("关闭被淘汰的会话失败 run=%s", run_id, exc_info=True)
-
-    def get(self, run_id: str) -> AgentSession:
-        """取会话；没有就基于数据库恢复/新建一个。"""
-        with self._lock:
-            self._evict_stale()
-            sess = self._sessions.get(run_id)
-            if sess is None:
-                sess = AgentSession(
-                    run_id=run_id,
-                    model=self._model,
-                    catalog=self._catalog,
-                    policy_engine=self._policy,
-                    store=self._store,
-                    system_prompt=self._system_prompt,
-                    stability=self._stability,
-                    # 认知能力：与 AgentLoop 共用 loop/cognition.py 同一实现，
-                    # 所以"记忆按需取用 / 阶段规划 / 意图路由 / 上下文裁剪"在产品路径也生效
-                    planner=self._planner,
-                    intent=self._intent,
-                    memory=self.extra.get("memory_service"),
-                    memory_scope=self.extra.get("memory_scope"),
-                    max_context_chars=self._max_context_chars,
-                    checkpoint_store=self._checkpoint_store,
-                )
-                self._sessions[run_id] = sess
-            else:
-                # 已有会话：按它的归属者解析模型（这也是 approve/reject 等驱动路径
-                # 不需要各自再解析一次的原因）
-                sess.model = self.model_for(sess.run.user_id or None)[1]
-            # LRU：本次访问移到队尾；记下访问时刻供 TTL 淘汰；再按上限淘汰最久未访问的。
-            self._sessions.move_to_end(run_id)
-            self._session_seen[run_id] = time.monotonic()
-            self._evict_overflow()
-            return sess
-
-    def remove(self, run_id: str) -> None:
-        """把会话从内存下线（删除会话时用，数据库由调用方清理）。"""
-        with self._lock:
-            self._sessions.pop(run_id, None)
-            self._session_seen.pop(run_id, None)
-            self._created_by.pop(run_id, None)
-
-    def run_ids(self) -> list[str]:
-        """当前在内存里的会话 id 快照（遍历用；不要在调用期间持有锁）。"""
-        with self._lock:
-            return list(self._sessions.keys())
-
-    def set_model(self, model: AgentChatModel, *, model_id: str = "",
-                  owner: str | None = None) -> None:
-        """切换模型。
-
-        `owner=None` → 部署默认（所有会话）；给定时 → **只切该归属者的会话**，
-        并把选择记在该用户名下。多用户部署里普通用户只能影响自己的会话。
-        """
-        with self._lock:
-            if owner is None:
-                self._model = model
-                self._default_model_id = model_id
-            else:
-                self._owner_models[owner] = (model_id, model)
-            for sess in self._sessions.values():
-                if owner is None or sess.run.user_id == owner:
-                    sess.model = model
-
-    def model_for(self, owner: str | None = None) -> tuple[str, AgentChatModel]:
-        """解析某归属者当前该用的 (model_id, model)：没选过就回落到部署默认。"""
-        with self._lock:
-            if owner:
-                got = self._owner_models.get(owner)
-                if got is not None:
-                    return got
-            return (self._default_model_id, self._model)
-
-    def apply_owner_model(self, sess: AgentSession) -> None:
-        """把会话的模型同步成"它的归属者选的那个"（首次绑定归属后调一次）。"""
-        sess.model = self.model_for(sess.run.user_id or None)[1]
-
-
-def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
-    return [
-        {
-            "role": m.role,
-            "content": m.content,
-            "tool_call": (m.tool_call.to_dict() if m.tool_call else None),
-        }
-        for m in messages
-    ]
-
-
-def _checkpoint_store_for(store: Any) -> Any:
-    """给具备 checkpoint 能力的存储套上 `CheckpointStore` 适配器（见 runtime 层实现）。"""
-    from warden_agent.runtime.checkpoint import checkpoint_store_for
-
-    return checkpoint_store_for(store)
-
-
-def _plan_to_dict(plan: Any, owner: str | None, owner_of: Any) -> dict[str, Any]:
-    """把 RecoveryPlan 转成 JSON 可序列化的字典，并按归属过滤（owner 给定时）。"""
-    def visible(cp: Any) -> bool:
-        return owner is None or owner_of(cp.run_id) == owner
-
-    return {
-        "decisions": {
-            rid: d
-            for rid, d in plan.decisions.items()
-            if owner is None or owner_of(rid) == owner
-        },
-        "to_resume": [cp.to_dict() for cp in plan.to_resume if visible(cp)],
-        "to_retry": [cp.to_dict() for cp in plan.to_retry if visible(cp)],
-        "awaiting_human": [cp.to_dict() for cp in plan.awaiting_human if visible(cp)],
-        "terminal": [cp.to_dict() for cp in plan.terminal if visible(cp)],
-    }
-
-
-def _model_key_name(model_id: str) -> str:
-    """模型 API Key 在凭证 broker 里的登记名。"""
-    return f"model:{model_id}"
-
-
-def _credential_scope(request: Request) -> str:
-    """凭证作用域 = 调用者身份。
-
-    多租户下 `tenant_id` 是**整租户共用**的（`WARDEN_TENANT`，默认 `local`），
-    用它做隔离会让同租户的 A、B 两用户互相读到对方导入的 key。所以这里用
-    `user_id`（= principal_id，来自凭证本身）作为隔离维度；匿名开发模式
-    （未开鉴权）回落到部署级作用域。
-    """
-    caller: TrustedCaller | None = getattr(request.state, "caller", None)
-    return caller.user_id if caller is not None else DEPLOYMENT_SCOPE
-
-
-def _has_model_key(broker: CredentialBroker, model_id: str, scope: str) -> bool:
-    """某作用域（或部署级）是否已登记该模型的 key——部署级 key 全体可用。"""
-    name = _model_key_name(model_id)
-    return broker.has(name, scope) or (
-        scope != DEPLOYMENT_SCOPE and broker.has(name, DEPLOYMENT_SCOPE)
-    )
-
-
-def _registered_model_key(
-    broker: CredentialBroker, model_id: str, scope: str
-) -> str | None:
-    """从 broker 取回某模型已导入的 key（走短租约；未登记返回 None）。
-
-    先看调用者自己的，再回落到部署级（启动时配的那把，全体共用）。
-    """
-    name = _model_key_name(model_id)
-    for candidate in (scope, DEPLOYMENT_SCOPE):
-        if not broker.has(name, candidate):
-            continue
-        lease = broker.issue(name, scope=candidate)
-        return lease.value.fields.get("api_key")
-    return None
 
 
 def build_app(
@@ -613,6 +225,7 @@ def build_app(
     sse_max_concurrency: int = DEFAULT_SSE_MAX_CONCURRENCY,
     session_cache_max: int = DEFAULT_SESSION_CACHE_MAX,
     session_ttl_s: float = 0.0,
+    multiagent: bool = False,
 ) -> FastAPI:
     """构建 FastAPI 应用。工厂方式便于测试注入假实现。
 
@@ -641,6 +254,11 @@ def build_app(
         mcp_server=mcp_server,
         git_workdir=git_workdir,
         outbound_limiter=outbound_limiter,
+        # 多 Agent：子 Agent 复用**同一个** HTTP 服务模型实例（同一密钥/超时/用量统计口径），
+        # 不另建一份模型连接。默认关，由 run_server 按 WARDEN_MULTIAGENT 打开。
+        multiagent=multiagent,
+        multiagent_model=model if multiagent else None,
+        policy_engine=policy,
     )
     registry = SessionRegistry(
         model, catalog, policy, store, system_prompt, extra,
@@ -655,6 +273,20 @@ def build_app(
         max_sessions=session_cache_max,
         session_ttl_s=session_ttl_s,
     )
+
+    # 下面三个值在**构建时**算一次：隔离档探测要 fork 一个 `unshare -rn true`
+    # （Linux 上），不该让每次 /capabilities 都去探一遍。
+    # `demo_instance`：这个进程启动时用的是不是假模型（FakeModel 的回复是固定脚本，
+    # 看起来却像真能力）；`model_kind_now`：**当前**默认模型是不是它——
+    # /models/select 允许把默认模型切成「离线假模型（免费）」，切完之后这个实例就变成
+    # 演示实例了，运维必须能一眼看到，而不是靠翻日志。
+    _demo_instance = isinstance(model, FakeModel)
+    try:
+        _declared_isolation = sandbox_isolation_policy()[0]
+    except ValueError:
+        # 取值写错不该让 /capabilities 直接 500（启动路径会 fail-fast 报错）
+        _declared_isolation = "invalid"
+    _detected_isolation = detect_isolation_tier().describe()
 
     def _close_quietly(resource: Any, what: str) -> None:
         """尽力关闭一个资源；失败只记日志——**停机路径里绝不能再抛异常**。
@@ -765,7 +397,6 @@ def build_app(
 
     # ---- 模型切换：傻瓜式接入的模型目录，/models 查询、/models/select 切换/导入 ----
     from warden_agent.model import deepseek as _ds
-    from warden_agent.model.fake import FakeModel
 
     model_catalog: dict[str, dict[str, Any]] = {
         "fake": {
@@ -809,69 +440,27 @@ def build_app(
     # 把脱敏器挂到 app 上，供其它处理器/扩展复用（密钥不进日志）
     app.state.secret_redactor = redactor
 
-    @app.get("/models")
-    def models_view(request: Request) -> dict[str, Any]:
-        """可用模型列表 + 当前使用的模型。
+    def _identity(request: Request, query_user_id: str | None) -> str:
+        """解析"这次请求属于哪个用户"。
 
-        `configured` 按调用者视角计算：自己导入过、或部署级配过，都算已配置。
+        认证模式：以**凭证派生的身份**为准（`caller.user_id`），忽略查询参数——
+        身份由服务端从 key 推出，客户端说了不算。这正是多租户与"按字段过滤"的分界。
+        匿名开发模式：沿用查询参数（前端靠它切换演示账号），缺省 `demo-user`。
         """
-        scope = _credential_scope(request)
-        owner = _identity(request, None)
-        return {
-            # 当前模型按**调用者自己的选择**报（没选过则显示部署默认）
-            "current": registry.model_for(owner)[0] or current_model_id,
-            "models": [
-                {
-                    "id": mid,
-                    "name": info["name"],
-                    "needs_key": info["needs_key"],
-                    "configured": (not info["needs_key"])
-                    or _has_model_key(broker, mid, scope),
-                }
-                for mid, info in model_catalog.items()
-            ],
-        }
-
-    @app.post("/models/select")
-    def models_select(body: ModelSelectIn, request: Request) -> dict[str, Any]:
-        """切换模型；带 api_key 视为"导入"（凭凭证 broker 加密落库，重启后仍在）。
-
-        导入的 key 记在**调用者自己的作用域**下：同租户的其他用户读不到、用不了；
-        部署级（启动配置）的那把则全体可见。
-
-        **切换只作用于调用者自己**：否则任一认证用户就能把所有人的对话切成离线假模型
-        （跨租户 DoS），或切到用自己的 key 计费（把别人的额度记到自己头上）。
-        """
-        scope = _credential_scope(request)
-        info = model_catalog.get(body.id)
-        if info is None:
-            raise HTTPException(status_code=404, detail=f"未知模型: {body.id}")
-        key = body.api_key or _registered_model_key(broker, body.id, scope)
-        if info["needs_key"] and not key:
-            raise HTTPException(
-                status_code=400, detail=f"{info['name']} 需要先导入 API Key"
-            )
-        owner = _identity(request, None)
         caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        if body.scope not in ("self", "deployment"):
-            raise HTTPException(status_code=400, detail="scope 只能是 self 或 deployment")
-        if body.scope == "deployment":
-            # 切部署默认模型影响**所有人**（包括没自选过的会话）——这是运维动作，
-            # 只有管理员能做。普通用户仍可切"自己的"（scope=self，默认）。
-            if caller is None or not caller.is_admin:
-                raise HTTPException(
-                    status_code=403,
-                    detail="切换部署级默认模型需要管理员角色（普通用户可用 scope=self 切自己的）",
-                )
-            # 部署默认 = owner=None（所有会话，且成为新会话的默认）
-            registry.set_model(info["make"](key), model_id=body.id, owner=None)
-        else:
-            registry.set_model(info["make"](key), model_id=body.id, owner=owner)
-        if body.api_key:
-            broker.register(_model_key_name(body.id), {"api_key": body.api_key}, scope)
-            redactor.add(body.api_key)
-        return {"ok": True, "current": registry.model_for(owner)[0] or body.id,
-                "scope": body.scope}
+        if caller is not None:
+            return caller.user_id
+        return query_user_id or "demo-user"
+
+    _routes_models.register(
+        app,
+        _identity=_identity,
+        broker=broker,
+        current_model_id=current_model_id,
+        model_catalog=model_catalog,
+        registry=registry,
+        redactor=redactor,
+    )
 
     # ---- T8 可观测性：指标定义（全局注册表，Prometheus 文本输出）----
     m = metrics()
@@ -910,25 +499,16 @@ def build_app(
     # 认证开启 → 启用授权：先过**角色权限**（能不能做这类动作），
     # 再过**按归属**（能不能碰这个 Run）。
     # 未认证（anon-dev）→ 保持旧的开放行为，本地开发不该被租户边界挡死。
-    authorizer = (
-        RunOperationAuthorizer(
-            combine_authorizers(permission_authorizer(), owner_authorizer(_owner_of))
-        )
-        if authenticator is not None
-        else RunOperationAuthorizer()
+    #
+    # `_approval_only_authorizer` 是**唯一**一条"管理员可跨归属"的例外，
+    # 见 `_is_approval_decision_path` 的注释：职责分离要求审批人不是发起人，
+    # 而归属授权会把"别人名下的 Run"一律拦下——两条规则叠加的默认结果是"谁也批不了"。
+    permission_only = permission_authorizer()
+    owner_gate = RunOperationAuthorizer(
+        combine_authorizers(permission_only, owner_authorizer(_owner_of))
     )
+    authorizer = owner_gate if authenticator is not None else RunOperationAuthorizer()
 
-    def _identity(request: Request, query_user_id: str | None) -> str:
-        """解析"这次请求属于哪个用户"。
-
-        认证模式：以**凭证派生的身份**为准（`caller.user_id`），忽略查询参数——
-        身份由服务端从 key 推出，客户端说了不算。这正是多租户与"按字段过滤"的分界。
-        匿名开发模式：沿用查询参数（前端靠它切换演示账号），缺省 `demo-user`。
-        """
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        if caller is not None:
-            return caller.user_id
-        return query_user_id or "demo-user"
 
     def _owner_scope(request: Request) -> str | None:
         """读路径的**归属过滤口径**：普通用户 = 自己；**管理员 = None（全局视图）**。
@@ -967,6 +547,10 @@ def build_app(
         caller: TrustedCaller | None = None
         status_code = 200
         _start = time.monotonic()  # T8：请求开始计时
+        # 幂等占位标记必须**在 try 之前**初始化：下面的兜底 except 要用它来决定是否释放占位，
+        # 而认证/授权阶段抛异常时 try 内那次赋值还没执行到——不初始化的话兜底块自己会
+        # UnboundLocalError，把「干净的 500 problem+json」变成未捕获异常（错误路径最脆）。
+        idem_reserved = False
         # 链路追踪：从入站 traceparent 接着上游的链（没有就起新链）。这里手动进入
         # 上下文（而非 with），是为了不把后面整段网关逻辑重新缩进一层；退出放在 finally。
         # 进入后 contextvar 里就有当前 trace，出站调用会用同一 trace_id 透传给下游。
@@ -978,25 +562,28 @@ def build_app(
         trace_ctx = trace_cm.__enter__()
         try:
             # 请求体大小上限：超限返 413。
-            # 只对带 body 的方法判定；先看 Content-Length（廉价），没有（chunked）就边读边计数——
-            # 否则一个不声明长度的客户端能把任意大的 body 灌进来。读完（未超限）后把已读字节
-            # 挂回 `request._body`：Starlette 的 BaseHTTPMiddleware 会把它透给下游，
-            # 下游照常能读到 body（口径与 request.body() 一致，但内存被上限封顶）。
-            if max_request_bytes > 0 and method in ("POST", "PUT", "PATCH"):
-                declared = request.headers.get("content-length")
-                too_big = (
-                    declared is not None
-                    and declared.isdigit()
-                    and int(declared) > max_request_bytes
-                )
-                if too_big:
+            # 判不判的依据是“这个请求可能带 body”，而不是“它是 POST/PUT/PATCH”：
+            # DELETE 按 HTTP 规范也可以带 body，旧口径把它放了过去——一个 DELETE 就能把
+            # 任意大的 body 灌进来（同一个闸门，同一份内存）。现在改为：
+            #   · 声明了 Content-Length（任何方法）→ 按声明值判；
+            #   · 没声明但方法本身可以带 body（POST/PUT/PATCH/DELETE）→ 边读边计数。
+            # 先看 Content-Length 是廉价路径；无声明时必须真读并计数，否则不声称长度的
+            # 客户端能绕过闸门。读完（未超限）后把已读字节挂回 `request._body`：
+            # Starlette 的 BaseHTTPMiddleware 会把它透给下游，下游照常能读到 body
+            # （口径与 request.body() 一致，但内存被上限封顶）。
+            declared = request.headers.get("content-length")
+            declared_bytes = int(declared) if declared and declared.isdigit() else None
+            if max_request_bytes > 0 and (
+                declared_bytes is not None or method in _BODY_METHODS
+            ):
+                if declared_bytes is not None and declared_bytes > max_request_bytes:
                     status_code = 413
                     return _problem(
                         413, "PAYLOAD_TOO_LARGE",
                         f"请求体超过上限 {max_request_bytes} 字节",
                         correlation_id,
                     )
-                if declared is None:
+                if declared_bytes is None:
                     chunks: list[bytes] = []
                     total = 0
                     async for chunk in request.stream():
@@ -1039,7 +626,19 @@ def build_app(
                     if run_id is not None:
                         registry.note_creator(run_id, caller.user_id)
                     try:
-                        authorizer.authorize(caller, operation, run_id)
+                        if caller.is_admin and _is_approval_decision_path(path):
+                            # 审批人（admin）跨归属批别人的 Run：这是与"职责分离"配套的
+                            # **窄权限**——只放开归属这一道，角色权限仍然照跑
+                            # （viewer 即便被写进 admin 名单也不会因此拿到 COMMAND）。
+                            # run_id 传 None = 不做归属校验。
+                            # 注意：`permission_authorizer()` 返回的是**裸回调**
+                            # （AuthorizeFn = Callable[[caller, operation, run_id], None]），
+                            # 不是 RunOperationAuthorizer 那种带 .authorize() 的对象。
+                            # 曾经写成 `permission_only.authorize(...)` → 必抛
+                            # AttributeError，于是「admin 跨归属审批」这条路径从来没真正跑通过。
+                            permission_only(caller, operation, None)
+                        else:
+                            authorizer.authorize(caller, operation, run_id)
                     except HttpAuthorizationError as e:
                         status_code = 403
                         return _problem(403, "AUTHORIZATION_DENIED", str(e), correlation_id)
@@ -1145,532 +744,58 @@ def build_app(
             # 放最后：这样 span 的耗时能覆盖到审计记录这一步。
             trace_cm.__exit__(None, None, None)
 
-    # ---- 阶段13：健康检查（liveness / readiness）----
-    @app.get("/health/live", include_in_schema=False)
-    def health_live() -> dict[str, Any]:
-        r = liveness()
-        return {"status": r.status, "checks": r.checks}
+    _routes_ops.register(
+        app,
+        _owner_of=_owner_of,
+        _owner_scope=_owner_scope,
+        audit=audit,
+        audit_store=audit_store,
+        audit_unkeyed=audit_unkeyed,
+        authenticator=authenticator,
+        logger=logger,
+        m_stuck=m_stuck,
+        store=store,
+    )
 
-    @app.get("/health/ready", include_in_schema=False)
-    def health_ready() -> JSONResponse:
-        r: HealthResult = readiness(store)
-        checks = dict(r.checks)
-        status = r.status
-        if audit_unkeyed:
-            # 审计开着却没有链密钥：能发现手改/删行，却挡不住会重算整条链的人。
-            # 就绪探针如实降级，让编排/监控能看见，而不是等出事才发现“以为在防篡改”。
-            checks["audit_chain"] = "unkeyed"
-            status = "degraded"
-        return JSONResponse(
-            status_code=200 if status == "ok" else 503,
-            content={"status": status, "checks": checks},
-        )
+    _routes_spa.register(app)
 
-    # ---- T8 可观测性：指标出口（Prometheus text，可被 Grafana 抓取）----
-    # 挂起数的缓存：抓取时"现算"能保证数是对的（不漂移），但每次抓取都扫库在抓取密集时
-    # 是浪费。这里加一个短 TTL 缓存：TTL 内复用上次结果，TTL 外重新扫描。
-    # 取 15s 与 Prometheus 默认抓取间隔一致——**不会让"挂起数"比告警评估周期更旧**。
-    _stuck_cache: dict[str, float] = {"at": -1e9, "value": 0.0}
-    _STUCK_TTL_S = 15.0
+    _routes_chat.register(
+        app,
+        _acquire_run=_acquire_run,
+        _identity=_identity,
+        bus=bus,
+        logger=logger,
+        registry=registry,
+    )
 
-    def _refresh_stuck_gauge() -> None:
-        """把"挂太久的 Run 数"写进 gauge（带 TTL 缓存）。失败绝不让 /metrics 挂掉。
+    _routes_runs.register(
+        app,
+        _identity=_identity,
+        registry=registry,
+        store=store,
+    )
 
-        为什么现算而不是在写入路径累加：累加式 gauge 在重启、多副本下都会漂移
-        （每个副本只知道自己见过的那部分），而告警恰恰最怕"数不对"。抓取时对存储做一次
-        只读扫描得到的是**当前真实值**；再加 TTL 缓存，避免"抓取越频繁、扫得越多"。
+    _routes_approvals.register(
+        app,
+        _acquire_run=_acquire_run,
+        _owner_scope=_owner_scope,
+        bus=bus,
+        m_approvals=m_approvals,
+        registry=registry,
+        store=store,
+    )
 
-        ⚠️ 刷新失败时**保留上一次的值**，绝不写 0：写 0 等于把告警悄悄消掉
-        （`warden_stuck_runs > 0` 立刻变假），那是比"指标空缺"严重得多的错。
-        """
-        now = time.monotonic()
-        if now - _stuck_cache["at"] < _STUCK_TTL_S:
-            m_stuck.set(_stuck_cache["value"], labels=("60m",))   # 缓存命中：不扫库
-            return
-        try:
-            from warden_agent.runtime.alerting import stuck_awaiting_human
-
-            cp_store = _checkpoint_store_for(store)
-            if cp_store is None:
-                return
-            stuck = stuck_awaiting_human(store, cp_store, older_than_seconds=3600.0)
-            value = float(len(stuck))
-        except Exception:  # noqa: BLE001 - 指标刷新失败不能影响 /metrics 本身
-            logger.debug("刷新 warden_stuck_runs 失败（保留上次值，不影响 /metrics）",
-                         exc_info=True)
-            return
-        _stuck_cache["at"] = now
-        _stuck_cache["value"] = value
-        m_stuck.set(value, labels=("60m",))
-
-    @app.get("/metrics", include_in_schema=False)
-    def metrics_view(request: Request) -> PlainTextResponse:
-        """Prometheus 指标出口。**仅管理员**可读。
-
-        为什么收紧：指标是**运维面**（全局请求量/错误率/挂起数/各 path 延时），不是用户数据面。
-        此前只要求认证，viewer（只读角色）也能读——与"只读=能看用户数据但不能动"的契约不符。
-        本地匿名开发模式（未开启鉴权）保持开放，行为不变。
-        """
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        if authenticator is not None and (caller is None or not caller.is_admin):
-            raise HTTPException(status_code=403, detail="查看指标需要管理员角色")
-        _refresh_stuck_gauge()
-        return PlainTextResponse(metrics().render())
-
-    # ---- 阶段13：审计查询 ----
-    @app.get("/audit")
-    def audit_view(request: Request) -> list[dict[str, Any]]:
-        """返回最近的审计轨迹（含 correlation_id / 调用者 / 操作 / 结果状态）。
-
-        认证模式下只返回**调用者自己**的记录。为什么是"按人"而不是"按租户"：
-        本项目的多用户配置（`WARDEN_API_KEYS`）默认共用同一个 `WARDEN_TENANT`（默认 `local`），
-        即**租户 ≠ 用户**——只按 tenant 过滤，等于把同租户其他人的操作账本（含 run_id、
-        身份、访问路径）交给任意一个认证用户，既能窥探又能枚举账号。
-        这里与 `/runs`、`/approvals` 保持同一口径：按调用者收敛。
-        **管理员例外**：看租户全部（运维需要全局视图来判断"是不是有人在乱用"）。
-        """
-        if audit is None:
-            raise HTTPException(status_code=404, detail="未开启审计(audit_store=None)")
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        tenant = caller.tenant_id if caller is not None else None
-        # 管理员看租户全部；普通用户只看自己（见 _owner_scope）
-        principal = _owner_scope(request)
-        records = audit_store.query(  # type: ignore[union-attr]
-            limit=200, tenant_id=tenant, principal_id=principal
-        )
-        return [r.to_dict() for r in records]
-
-    # ---- 跨 Run 恢复：崩溃/重启后"哪些该续、哪些该重试、哪些该等人" ----
-    @app.get("/recovery/plan")
-    def recovery_plan(request: Request) -> dict[str, Any]:
-        """读取全部存档点，产出恢复计划（只读判断，不执行任何动作）。
-
-        用途：进程崩溃/重启后，工作进程或运维据此决定续跑/重试/等待人工，
-        而不是"全部从头再跑一遍"。`RecoveryController` 本身只判断不执行，
-        真正的执行由调用方负责。认证模式下只暴露调用者自己名下的 Run。
-        """
-        from warden_agent.runtime.recovery import RecoveryController
-
-        cp_store = _checkpoint_store_for(store)
-        if cp_store is None:
-            raise HTTPException(status_code=501, detail="当前存储不支持存档点")
-        plan = RecoveryController(cp_store).plan()
-        owner = _owner_scope(request)   # 管理员 → None（全局视图）
-        return _plan_to_dict(plan, owner, _owner_of)
-
-    @app.get("/alerts/stuck")
-    def alerts_stuck(request: Request, older_than_min: float = 60.0) -> dict[str, Any]:
-        """**等待人工处理超时**的 Run —— 给监控/告警用。
-
-        为什么需要它：Run 进入 `WAITING_APPROVAL` 之后不会有任何动静（没有超时、没有重试、
-        没有通知），线上没人盯就一直挂着。这个端点把"挂太久了"变成可被定时抓取的事实：
-        返回非空列表就该有人去看。认证模式下只暴露调用者自己名下的 Run。
-
-        ⚠️ 口径："等了多久"用 Run 的最后活动时间近似（不是"进入等待那一刻"），所以只会**低估**、
-        不会虚报——"报了警"是可信的；"没报警"不等于一定没挂久。
-        **管理员**看全部（值班人要知道"整个系统有没有人卡着"）。
-        """
-        from warden_agent.runtime.alerting import stuck_awaiting_human
-
-        cp_store = _checkpoint_store_for(store)
-        if cp_store is None:
-            raise HTTPException(status_code=501, detail="当前存储不支持存档点")
-        owner = _owner_scope(request)   # 管理员 → None（全局视图）
-        stuck = stuck_awaiting_human(
-            store, cp_store, older_than_seconds=older_than_min * 60.0, owner=owner
-        )
-        return {
-            "older_than_min": older_than_min,
-            "count": len(stuck),
-            "runs": [
-                {
-                    "run_id": s.run_id,
-                    "status": s.status,
-                    "waiting_seconds": s.waiting_seconds,
-                    "detail": s.detail,
-                    # 时长算自哪里：approval=精确（进入等待审批的时刻）；
-                    # last_activity=近似（只会低估）；unknown=拿不到
-                    "source": s.source,
-                }
-                for s in stuck
-            ],
-        }
-
-    # 首页：返回可视化演示控制台（HTML），让服务"看得见"。
-    # T10 起优先返回 React 构建产物（web/dist）；若未构建则回退到旧版静态 index.html。
-    _dist_html: str | None = None
-
-    def _repo_dir() -> str:
-        # server.py 位于 <repo>/src/warden_agent/web/server.py，向上 3 层回到仓库根
-        import os
-
-        here = os.path.dirname(os.path.abspath(__file__))  # .../warden_agent/web
-        return os.path.abspath(os.path.join(here, "..", "..", ".."))  # <repo>
-
-    def _web_dist_dir() -> str:
-        import os
-
-        dist = env_opt("WARDEN_WEB_DIST")
-        if dist:
-            return dist
-        return os.path.join(_repo_dir(), "web", "dist")
-
-    def _find_spa_index() -> str | None:
-        # 顺序找构建产物：环境变量指定的路径 > 仓库内 web/dist
-        p = os.path.join(_web_dist_dir(), "index.html")
-        if os.path.isfile(p):
-            try:
-                with open(p, encoding="utf-8") as f:
-                    return f.read()
-            except OSError:
-                return None
-        return None
-
-    @app.get("/", include_in_schema=False)
-    def index() -> HTMLResponse:
-        html = _find_spa_index()
-        if html is None:  # 未构建 React 前端，回退到旧演示控制台
-            try:
-                from importlib.resources import files
-
-                html = files("warden_agent.web.static").joinpath("index.html").read_text("utf-8")
-            except Exception:  # 找不到模板时给个简单占位，不至于 500
-                html = "<h1>Warden Agent</h1><p>未找到演示页面。</p>"
-        return HTMLResponse(html)
-
-    @app.post("/chat/{run_id}")
-    def chat(
-        run_id: str, body: ChatRequestIn, request: Request, user_id: str = "demo-user"
-    ) -> ChatResponseOut:
-        lease = _acquire_run(run_id)
-        try:
-            sess = registry.get(run_id)
-            if not sess.run.user_id:
-                # 首轮对话建立归属：认证模式下身份来自凭证（user_id 参数被忽略）
-                sess.run.user_id = _identity(request, user_id)
-                # 归属刚定下来 → 把模型同步成"这个用户选的那个"（没选过就是部署默认）
-                registry.apply_owner_model(sess)
-            try:
-                outcome = sess.start(body.text)
-            except Exception as e:  # 工具未注册 / 被 DENY 等
-                logger.exception("chat 失败 run=%s", run_id)
-                bus.publish(run_id, {"event": "error", "message": str(e)})
-                raise HTTPException(status_code=400, detail=str(e)) from e
-
-            if isinstance(outcome, FinalReply):
-                bus.publish(run_id, {"event": "final", "text": outcome.text})
-                return ChatResponseOut(
-                    run_id=run_id,
-                    status=sess.status().name,
-                    kind="final",
-                    text=outcome.text,
-                    messages=_serialize_messages(outcome.messages),
-                )
-            if isinstance(outcome, NeedsApproval):
-                bus.publish(
-                    run_id,
-                    {"event": "needs_approval", "approval": outcome.approval.tool_name},
-                )
-                return ChatResponseOut(
-                    run_id=run_id,
-                    status=sess.status().name,
-                    kind="needs_approval",
-                    approval={
-                        "approval_id": outcome.approval.approval_id,
-                        "tool_name": outcome.approval.tool_name,
-                        "arguments": outcome.approval.arguments,
-                        "reason": outcome.approval.reason,
-                    },
-                )
-            raise HTTPException(status_code=500, detail="未知结果类型")
-        finally:
-            lease.stop()
-
-    @app.get("/status/{run_id}")
-    def status(run_id: str) -> dict[str, Any]:
-        sess = registry.get(run_id)
-        return {"run_id": run_id, "status": sess.status().name}
-
-    @app.get("/runs")
-    def runs(request: Request, user_id: str = "") -> list[dict[str, Any]]:
-        """对话列表：最近活跃的会话。
-
-        认证模式下只返回**调用者自己**的会话（身份来自凭证，`user_id` 参数被忽略）；
-        匿名开发模式下按 `user_id` 过滤，不传则返回全部。
-        """
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        owner = caller.user_id if caller is not None else (user_id or None)
-        return store.list_runs(limit=50, owner=owner)
-
-    @app.post("/runs/{run_id}")
-    def create_run(
-        run_id: str, request: Request, user_id: str = "demo-user"
-    ) -> dict[str, Any]:
-        """预创建会话：归属当前身份，立即可见于该用户的对话列表。幂等。
-
-        已存在的会话不改变归属（归属由已认证凭证锁定，不能被后续请求改写）。
-        """
-        identity = _identity(request, user_id)
-        store.create_user(identity)
-        sess = registry.get(run_id)
-        if store.load_run(run_id) is None:
-            sess.run.user_id = identity
-            store.save_run(sess.run)
-        return {
-            "run_id": run_id,
-            "status": sess.status().name,
-            "user_id": sess.run.user_id,
-        }
-
-    @app.get("/users")
-    def users_view(request: Request) -> list[dict[str, Any]]:
-        """已登记的中控台用户。
-
-        认证模式下只返回调用者自己——否则等于开放了一个"枚举他人账号"的接口。
-        """
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        if caller is not None:
-            return [u for u in store.list_users() if u["user_id"] == caller.user_id]
-        return store.list_users()
-
-    @app.post("/users")
-    def users_create(body: UserCreateIn, request: Request) -> dict[str, Any]:
-        """登记用户（幂等：已存在则不动）。
-
-        认证模式下只能登记调用者自己，不能替别人建档。
-        """
-        uid = body.user_id.strip()
-        if not uid:
-            raise HTTPException(status_code=400, detail="user_id 不能为空")
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        if caller is not None and uid != caller.user_id:
-            raise HTTPException(status_code=403, detail="无权为其他账号建档")
-        store.create_user(uid)
-        return {"ok": True, "user_id": uid}
-
-    @app.delete("/runs/{run_id}")
-    def delete_run(run_id: str) -> dict[str, Any]:
-        """删除会话：数据库（状态/对话/待审批/checkpoint）清空，内存会话下线。"""
-        registry.remove(run_id)
-        store.delete_run(run_id)
-        return {"ok": True, "run_id": run_id}
-
-    @app.get("/messages/{run_id}")
-    def messages(run_id: str) -> list[dict[str, Any]]:
-        """返回某会话的完整对话记录（前端刷新后恢复聊天区用）。"""
-        sess = registry.get(run_id)
-        return _serialize_messages(sess.messages)
-
-    @app.get("/approvals")
-    def approvals(request: Request) -> list[dict[str, Any]]:
-        """列出"等待审批"的会话（审批队列）。
-
-        认证模式下只列**调用者自己**名下的会话——审批队列是人工闸门入口，
-        跨租户可见会让别人看到甚至替你决策高危操作。
-        """
-        caller: TrustedCaller | None = getattr(request.state, "caller", None)
-        result = []
-        for run_id in registry.run_ids():
-            sess = registry.get(run_id)
-            if caller is not None and sess.run.user_id != caller.user_id:
-                continue
-            pending = sess.pending_approval()
-            if pending is not None:
-                result.append(
-                    {
-                        "run_id": run_id,
-                        "approval_id": pending.approval_id,
-                        "tool_name": pending.tool_name,
-                        "arguments": pending.arguments,
-                        "reason": pending.reason,
-                    }
-                )
-        return result
-
-    @app.get("/approvals/history")
-    def approvals_history(request: Request) -> list[dict[str, Any]]:
-        """审批决策历史（已批准 / 已拒绝，最新的在前）。
-
-        认证模式下只返回调用者名下 Run 的决策（审批历史含工具名与参数，属租户数据）；
-        **管理员**看全部（与 /audit 同一口径）。
-        """
-        owner = _owner_scope(request)   # 管理员 → None（全局视图）
-        return store.list_approval_history(limit=20, owner=owner)
-
-    @app.post("/approve/{run_id}")
-    def approve(run_id: str) -> ChatResponseOut:
-        lease = _acquire_run(run_id)
-        try:
-            sess = registry.get(run_id)
-            pending = sess.pending_approval()
-            if pending is None:
-                raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
-            m_approvals.inc(labels=("approve",))
-            outcome = sess.approve()
-            store.record_approval_decision(
-                run_id, pending.approval_id, pending.tool_name,
-                pending.arguments, "approved",
-            )
-            return _outcome_response(run_id, sess, outcome)
-        finally:
-            lease.stop()
-
-    @app.post("/reject/{run_id}")
-    def reject(run_id: str) -> ChatResponseOut:
-        lease = _acquire_run(run_id)
-        try:
-            sess = registry.get(run_id)
-            pending = sess.pending_approval()
-            if pending is None:
-                raise HTTPException(status_code=409, detail="该会话没有等待审批的请求")
-            m_approvals.inc(labels=("reject",))
-            outcome = sess.reject()
-            store.record_approval_decision(
-                run_id, pending.approval_id, pending.tool_name,
-                pending.arguments, "rejected",
-            )
-            return _outcome_response(run_id, sess, outcome)
-        finally:
-            lease.stop()
-
-    def _outcome_response(
-        run_id: str, sess: AgentSession, outcome: FinalReply | NeedsApproval
-    ) -> ChatResponseOut:
-        """把会话结果（最终回答 / 又遇到审批）转成响应。approve 与 reject 共用。"""
-        if isinstance(outcome, FinalReply):
-            bus.publish(run_id, {"event": "final", "text": outcome.text})
-            return ChatResponseOut(
-                run_id=run_id,
-                status=sess.status().name,
-                kind="final",
-                text=outcome.text,
-                messages=_serialize_messages(outcome.messages),
-            )
-        if isinstance(outcome, NeedsApproval):
-            # 与 /chat 路径对齐：又遇到审批也要发事件。此前 approve/reject 这条路
-            # 拿到 NeedsApproval 只回响应、不发事件，/events 订阅方永远等不到它。
-            bus.publish(
-                run_id,
-                {"event": "needs_approval", "approval": outcome.approval.tool_name},
-            )
-            return ChatResponseOut(
-                run_id=run_id,
-                status=sess.status().name,
-                kind="needs_approval",
-                approval={
-                    "approval_id": outcome.approval.approval_id,
-                    "tool_name": outcome.approval.tool_name,
-                    "arguments": outcome.approval.arguments,
-                    "reason": outcome.approval.reason,
-                },
-            )
-        raise HTTPException(status_code=500, detail="未知结果类型")
-
-    @app.post("/chat/stream/{run_id}")
-    async def chat_stream(
-        request: Request, run_id: str, body: ChatRequestIn, user_id: str = "demo-user"
-    ) -> StreamingResponse:
-        """流式对话（SSE 打字机）：模型边生成边把增量推给前端。
-        前端拿到增量直接渲染，就能看到"逐字打出"的效果。"""
-        # 并发闸门：到上限立刻 503，不排队（排队只会让一堆请求一起超时）。
-        if not sse_gate.acquire():
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"SSE 长连接已达并发上限 {sse_max_concurrency}，请稍后重试"
-                    "（WARDEN_SSE_MAX_CONNECTIONS 可调）"
-                ),
-            )
-        # 流式用**手动 start/stop** 的租约：锁在端点里取（抢不到就地 423），
-        # 但必须活到 SSE 流结束——所以释放放在生成器的 finally 里，而不是端点作用域。
-        # 租约自带心跳续租，所以"流很久"也不会中途过期被接管。
-        try:
-            lease = _acquire_run(run_id)
-            try:
-                sess = registry.get(run_id)
-                if not sess.run.user_id:
-                    # 归属只能用 `_identity` 派生（认证模式下来自凭证，忽略查询参数），
-                    # 与非流式 `/chat` 一致——否则客户端能用 `?user_id=alice` 把消息写进别人名下。
-                    sess.run.user_id = _identity(request, user_id)
-                    registry.apply_owner_model(sess)  # 用该用户自己选的模型
-            except Exception:
-                # 建流**之前**出错也必须释放租约：租约带后台心跳续租，漏掉的话这个 run
-                # 会被永久占住（一直回 423），直到进程重启。流内的释放见 generate() 的 finally。
-                lease.stop()
-                raise
-        except Exception:
-            # 建流前任何失败（含上面抢不到 Run 锁的 423）都要把并发名额还回去。
-            sse_gate.release()
-            raise
-
-        def generate() -> Any:
-            try:
-                for event in sess.stream(body.text):
-                    # SSE 格式：每条事件以 "data: <json>\n\n" 结尾
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            except Exception as e:  # DENY / 工具错误等，以 error 事件结束
-                logger.exception("流式 chat 失败 run=%s", run_id)
-                err = {"type": "error", "message": str(e)}
-                yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
-            finally:
-                # 流结束（含客户端断开触发 GeneratorExit）才释放：
-                # 整段流式期间都在驱动这个 run，提前释放等于开门让人并发写。
-                # 并发名额同生共死：与租约一起在这里还回去。
-                lease.stop()
-                sse_gate.release()
-
-        # 关键响应头：no-cache 防止代理缓冲；X-Accel-Buffering 关掉 nginx 缓冲，
-        # 否则增量会被攒住不实时发出（部署必配）。
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            },
-        )
-
-    @app.get("/events/{run_id}")
-    async def events(run_id: str) -> StreamingResponse:
-        """SSE：监听某会话的事件（最终结果 / 审批请求 / 错误）。
-
-        走可插拔事件总线：单副本是进程内实现（条件变量唤醒、无延迟），
-        多副本换成存储实现（多个副本订阅同一张事件表），客户端连任一副本都能收到。
-        """
-        # 与 /chat/stream 共用同一并发闸门：否则只限 /chat/stream 是形同虚设——
-        # 用 /events 一样能无限量开长连接把连接池占满。名额在生成器 finally 里释放
-        # （含客户端断开触发的 GeneratorExit）。
-        if not sse_gate.acquire():
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    f"SSE 长连接已达并发上限 {sse_max_concurrency}，请稍后重试"
-                    "（WARDEN_SSE_MAX_CONNECTIONS 可调）"
-                ),
-            )
-
-        def generate() -> Any:
-            try:
-                seq = 0
-                while True:
-                    items = bus.poll(run_id, seq, timeout=15.0)
-                    if not items:
-                        yield ": keep-alive\n\n"  # 心跳，防中间层掐连接
-                        continue
-                    stop = False
-                    for s, ev in items:
-                        seq = s
-                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
-                        if ev.get("event") in ("final", "error"):
-                            stop = True
-                    if stop:
-                        break
-            finally:
-                # 流结束（含客户端断开）就归还并发名额，防泄漏
-                sse_gate.release()
-
-        return StreamingResponse(generate(), media_type="text/event-stream")
+    _routes_chat.register_streaming(
+        app,
+        _acquire_run=_acquire_run,
+        _identity=_identity,
+        bus=bus,
+        logger=logger,
+        registry=registry,
+        sse_gate=sse_gate,
+        sse_heartbeat_seconds=lambda: SSE_HEARTBEAT_SECONDS,
+        sse_max_concurrency=sse_max_concurrency,
+    )
 
     @app.get("/capabilities")
     def capabilities() -> dict[str, Any]:
@@ -1691,36 +816,37 @@ def build_app(
                 "web_fetch": registry.extra.get("web_fetch"),
                 # 搜索 provider（离线 mock vs 真实联网搜索）——同样要能看到
                 "web_search": registry.extra.get("web_search"),
-                # RAG：报出嵌入器名，避免"词频嵌入被当成语义检索"
+                # 是不是离线演示 provider（None = 该能力没注册），以及“为什么退回 mock”。
+                # 前端要能用它把“搜到了”标成“这是演示数据”，否则用户会以为真的联网搜了。
+                "web_search_mock": registry.extra.get("web_search_mock"),
+                "web_fetch_mock": registry.extra.get("web_fetch_mock"),
+                "web_degraded_reason": registry.extra.get("web_degraded_reason") or "",
+                # RAG：报出嵌入器名，避免“词频嵌入被当成语义检索”
                 "knowledge_embedder": registry.extra.get("knowledge_embedder"),
                 "knowledge_sources": len(knowledge_sources) if knowledge_sources else 0,
                 # Run 锁用的是哪种实现：进程内锁在多副本下等于没锁，运维必须能一眼看到
                 "run_lock": type(_run_lock).__name__,
+                # 模型究竟是真实推理还是**演示脚本**。FakeModel 的回复看起来像真能力，
+                # 不标出来就会被当成系统能力的证据（这是“能力错觉”，不是小事）。
+                "demo_instance": _demo_instance,
+                "model_kind": "fake" if _demo_instance else "real",
+                "model_kind_now": "fake" if registry._default_model_id == "fake" else "real",
+                # 沙箱：shell.run 在 HTTP 路径上**默认没有**（这里跑的是多租户 API，
+                # 没有 per-tenant 文件系统边界，任意 shell 不适合直接开放）。
+                # 万一被显式开启，隔离档必须如实上报——「只是语义层」不许讲成隔离。
+                "sandbox_shell": bool(registry.extra.get("sandbox")),
+                "sandbox_isolation": registry.extra.get("sandbox_isolation_note")
+                or "未启用 shell.run（HTTP 路径默认不注册）",
+                "sandbox_isolation_declared": _declared_isolation,
+                "sandbox_isolation_detected": _detected_isolation,
             },
         }
 
-    @app.get("/memory/{scope}")
-    def memory_view(request: Request, scope: str) -> list[dict[str, Any]]:
-        """查看某作用域（run/session/user/workspace）下**调用者自己**的记忆。
-
-        归属边界：记忆按 `owner`（用户 id）严格隔离——认证模式下只看得到自己写的，
-        否则任一用户就能读到全部署所有人的记忆（跨租户泄露），甚至无从发现被投毒。
-        """
-        mem = registry.extra.get("memory_service")
-        if mem is None:
-            raise HTTPException(status_code=404, detail="未启用记忆(memory=True)")
-        from warden_agent.memory import MemoryScope
-
-        try:
-            enum_scope = MemoryScope[scope.upper()]
-        except KeyError:
-            raise HTTPException(status_code=400, detail=f"未知作用域: {scope}") from None
-        owner = _identity(request, None)   # 身份来自凭证，不接受查询参数自称
-        return [
-            {"scope": i.scope.name, "key": i.key, "text": i.content.text,
-             "status": i.status.name, "owner": i.owner}
-            for i in mem.recall(enum_scope, limit=100, owner=owner)
-        ]
+    _routes_memory.register(
+        app,
+        _identity=_identity,
+        registry=registry,
+    )
 
     # ---- T10：托管 React 构建产物的静态资源（/assets/...）----
     # 若 web/dist 存在，把它的静态文件挂到 /assets，让 SPA 的 JS/CSS 能被同源加载，
@@ -1734,5 +860,11 @@ def build_app(
             app.mount("/assets", StaticFiles(directory=assets_dir), name="warden-assets")
     except Exception:  # noqa: BLE001 - 静态挂载失败不连累 API
         logger.exception("React 静态资源挂载失败，仅 API 可用")
+
+    # ---- 安全响应头（最后挂 = 最外层）----
+    # 必须挂在网关中间件**之后**：Starlette 里后加的在最外层，这样 404 / 401 / 500
+    # 这些**错误响应**也带上 CSP 与防套框——出错的那一页一样能被 iframe 套住、被嗅探。
+    # 只改头不改体（纯 ASGI），所以 SSE 流式输出不受影响。
+    security_headers.install(app)
 
     return app

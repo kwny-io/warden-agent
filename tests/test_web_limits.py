@@ -87,6 +87,45 @@ async def test_chunked请求体无ContentLength也拦截() -> None:
 
 
 @pytest.mark.asyncio
+async def test_DELETE带大body同样413() -> None:
+    """DELETE 按规范也能带 body；旧口径只护 POST/PUT/PATCH，DELETE 能绕过闸门。"""
+    app = _app(max_request_bytes=100)
+    async with _client(app) as client:
+        resp = await client.request(
+            "DELETE", "/runs/whatever", json={"x": "y" * 500}
+        )
+        assert resp.status_code == 413
+        assert resp.json()["errorCode"] == "PAYLOAD_TOO_LARGE"
+
+
+@pytest.mark.asyncio
+async def test_DELETE分块大body也413() -> None:
+    """DELETE + 不声明长度（chunked）：边读边计数这条路也得盖上。"""
+
+    async def _chunks():
+        yield b"x" * 300
+
+    app = _app(max_request_bytes=100)
+    async with _client(app) as client:
+        resp = await client.request(
+            "DELETE",
+            "/runs/whatever",
+            content=_chunks(),
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_GET不会被当成带body的请求() -> None:
+    """闸门不能误伤：GET 既不该被读 body，也不该因为没 Content-Length 被拦。"""
+    app = _app(max_request_bytes=100)
+    async with _client(app) as client:
+        resp = await client.get("/status/get-probe")
+        assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_sse并发超上限立刻返回503() -> None:
     """名额占满时 `/chat/stream` 立刻 503；释放名额后同一端点照常 200。"""
     app = _app(sse_max_concurrency=2)

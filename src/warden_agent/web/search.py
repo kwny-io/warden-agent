@@ -69,9 +69,17 @@ class LocalMockSearchProvider:
 
     # 不联网 → 不占用出站配额（真实 provider 必须置 True，与 LocalMockFetchProvider 同理）
     requires_network = False
+    # **离线演示 provider 的诚实标记**：工具层据此在"给模型看的文本"里加"这是演示数据"前缀。
+    # 为什么非要有这个标记：mock 返回的 title/url/snippet 长得和真结果一样，模型分不出来，
+    # 会把内置样例里的链接当事实引用；而"配了 provider 却缺 key"退回 mock 时如果只写日志，
+    # 日志是运维看的，模型和用户看到的是"搜到了"。能力少不可怕，装作有能力才可怕。
+    is_mock = True
 
-    def __init__(self, entries: list[WebSearchResult] | None = None) -> None:
+    def __init__(self, entries: list[WebSearchResult] | None = None, *,
+                 degraded_reason: str = "") -> None:
         self._entries = list(entries or [])
+        # 非空 = "本该是真实 provider，因配置不全/写错退回 mock"（由 providers_from_env 填）
+        self.degraded_reason = degraded_reason
 
     def search(self, query: str, top_k: int = 5) -> list[WebSearchResult]:
         q = query.lower()
@@ -84,14 +92,22 @@ class LocalMockFetchProvider:
 
     # 不联网 → 不需要 DNS 解析校验（真实 provider 必须置 True，见 WebUrlPolicy）
     requires_network = False
+    is_mock = True   # 见 LocalMockSearchProvider 的说明：演示 provider 必须自报家门
 
-    def __init__(self, pages: dict[str, str] | None = None) -> None:
+    def __init__(self, pages: dict[str, str] | None = None, *,
+                 degraded_reason: str = "") -> None:
         self._pages = dict(pages or {})
+        self.degraded_reason = degraded_reason
 
     def fetch(self, url: str) -> WebFetchResult:
         if url in self._pages:
             return WebFetchResult(url=url, status=200, content=self._pages[url])
-        return WebFetchResult(url=url, status=404, content="", error="页面不存在")
+        # 别只说"页面不存在"：离线 provider 里没预置这条 URL，**不等于真实网络上 404**。
+        # 说成 404，模型会得出"这个链接是死链"的结论——而真相是它根本没联网。
+        return WebFetchResult(
+            url=url, status=404, content="",
+            error="离线演示 provider 未预置该 URL（不是真实网络请求失败，也不是真实的 404）",
+        )
 
 
 # ---- 真实联网：HTTP 抓取 ----
@@ -173,6 +189,7 @@ class HttpFetchProvider:
     """
 
     requires_network = True
+    is_mock = False
 
     def __init__(
         self,
@@ -308,6 +325,7 @@ class HttpSearchProvider:
     """
 
     requires_network = True
+    is_mock = False
 
     def __init__(
         self,
@@ -328,15 +346,24 @@ class HttpSearchProvider:
         self._transport = transport
         # DNS 解析器可注入（host -> list[ip]），便于离线测试端点解析到内网/元数据的场景。
         self._resolver = resolver
+        # 最近一次失败的原因（空 = 没失败）。为什么要单独记："搜到 0 条"与"根本没打通"
+        # 是两件事，工具层必须能把后者如实告诉模型——否则模型会把"服务故障/配置写错"
+        # 读成"世上没有这条信息"，再基于这个"没有"继续往下编。
+        self.last_error = ""
 
     def search(self, query: str, top_k: int = 5) -> list[WebSearchResult]:
+        self.last_error = ""
         if not self.endpoint:
+            self.last_error = (
+                f"provider={self.provider} 没有可用端点（custom 需配 WARDEN_SEARCH_ENDPOINT）"
+            )
             return []
         # 与抓取工具同一条路径：静态检查 + 解析 DNS 并校验每个结果，
         # 否则端点域名解析到内网（DNS rebinding）时静态检查看不出问题，
         # 会把 API key 发向内网地址。
         ok, reason = WebUrlPolicy.check_for_network(self.endpoint, self._resolver)
         if not ok:
+            self.last_error = f"搜索端点被 URL 策略拒绝：{reason}"
             logger.warning("搜索端点被 URL 策略拒绝（%s）：%s", self.endpoint, reason)
             return []
         try:
@@ -344,6 +371,7 @@ class HttpSearchProvider:
             resp.raise_for_status()
             return self._parse(resp.json(), top_k)
         except Exception as e:  # noqa: BLE001 - 搜索失败不该把异常打进会话
+            self.last_error = f"搜索请求失败：{type(e).__name__}: {e}"
             logger.warning("搜索失败（provider=%s）：%s", self.provider, e)
             return []
 
@@ -401,7 +429,11 @@ def providers_from_env(
     - `WARDEN_SEARCH_PROVIDER=tavily|brave|custom`：`web.search` 换成**真实联网搜索**
       （`HttpSearchProvider`）。tavily/brave 需配 `WARDEN_SEARCH_API_KEY`；
       custom 需配 `WARDEN_SEARCH_ENDPOINT`。**配不全就如实退回 mock 并告警**——
-      绝不假装"能搜"（那只会让模型拿着空结果硬编）。
+      绝不假装"能搜"（那只会让模型拿着空结果硬编）。退回时还会把"为什么退回"记在
+      provider 上（`degraded_reason`），工具层会把它印进**给模型看的文本**里：
+      只有日志告警的话，运维看得到、模型和用户看不到，等于撒谎没人负责。
+      provider 名写错（不在预设里且非 custom）同样按"配错"处理，不再造一个
+      永远返回空列表的真 provider——那会让"名字打错"表现为"世上没有这条信息"。
 
     为什么默认不开真实抓取/搜索：Agent 能主动访问外网是一个**应该由运维显式决定**的能力，
     不该悄悄打开。开了之后抓取每一跳仍受 WebUrlPolicy 约束（拒内网/环回/元数据地址）。
@@ -412,21 +444,27 @@ def providers_from_env(
     kind = env_str("WARDEN_SEARCH_PROVIDER", "", env).strip().lower()
     search: WebSearchProvider
     if kind in ("", "off", "0", "false", "mock"):
+        # 显式/默认的离线 mock：这是文档写明的默认档，不算降级
         search = LocalMockSearchProvider()
     else:
         api_key = env_opt("WARDEN_SEARCH_API_KEY", env) or ""
         endpoint = env_opt("WARDEN_SEARCH_ENDPOINT", env) or ""
-        if kind in _SEARCH_PRESETS and not api_key:
-            logger.warning(
-                "WARDEN_SEARCH_PROVIDER=%s 但未配 WARDEN_SEARCH_API_KEY —— 搜索退回离线 mock"
-                "（不会假装能搜）", kind,
-            )
-            search = LocalMockSearchProvider()
+        known = kind in _SEARCH_PRESETS or kind == "custom"
+        if not known:
+            # 名字写错（如 tavliy）不再"造个真 provider 然后永远返回空列表"：
+            # 那会把配置错误伪装成"搜不到"，是最难查的一类 bug。
+            reason = (f"WARDEN_SEARCH_PROVIDER={kind!r} 不是可用取值"
+                      f"（可选：{'/'.join(sorted(_SEARCH_PRESETS))}/custom/mock）")
+            logger.warning("%s —— 搜索退回离线 mock（不会假装能搜）", reason)
+            search = LocalMockSearchProvider(degraded_reason=reason)
+        elif kind in _SEARCH_PRESETS and not api_key:
+            reason = f"WARDEN_SEARCH_PROVIDER={kind} 但未配 WARDEN_SEARCH_API_KEY"
+            logger.warning("%s —— 搜索退回离线 mock（不会假装能搜）", reason)
+            search = LocalMockSearchProvider(degraded_reason=reason)
         elif kind == "custom" and not endpoint:
-            logger.warning(
-                "WARDEN_SEARCH_PROVIDER=custom 但未配 WARDEN_SEARCH_ENDPOINT —— 退回离线 mock"
-            )
-            search = LocalMockSearchProvider()
+            reason = "WARDEN_SEARCH_PROVIDER=custom 但未配 WARDEN_SEARCH_ENDPOINT"
+            logger.warning("%s —— 退回离线 mock", reason)
+            search = LocalMockSearchProvider(degraded_reason=reason)
         else:
             search = HttpSearchProvider(kind, api_key=api_key, endpoint=endpoint)
     return search, fetch
@@ -593,6 +631,26 @@ class WebUrlPolicy:
 
 
 # ---- 工具集 ----
+def _offline_note(provider: object, *, what: str) -> str:
+    """离线演示 provider 的诚实前缀（非 mock 返回空串）。
+
+    为什么必须在**给模型的文本**里写，而不是只打日志：mock 的返回值与真结果
+    长得一模一样，只写日志的话运维看得到、模型和用户看不到——模型会把内置样例
+    当真实信息引用，用户以为“系统真的联网搜了”。所以所见即真实：
+    结果里没这条前缀，才代表真的是联网拿回来的。
+    """
+    if not getattr(provider, "is_mock", False):
+        return ""
+    reason = str(getattr(provider, "degraded_reason", "") or "")
+    note = (
+        f"[离线演示数据] {what}来自内置离线 provider（不联网），"
+        "**不是真实互联网结果**，不要当成事实引用。"
+    )
+    if reason:
+        note += f" 降级原因：{reason}。"
+    return note + "\n"
+
+
 def make_web_tools(
     search_provider: WebSearchProvider | None = None,
     fetch_provider: WebFetchProvider | None = None,
@@ -629,16 +687,21 @@ def make_web_tools(
         pure=True,
     )
     def search_tool(query: str) -> str:
+        note = _offline_note(search, what="以下搜索结果")
         if getattr(search, "requires_network", True):
             with limiter.guard(f"search:{type(search).__name__}") as decision:
                 if decision.denied:
-                    return f"[限流] {decision.reason}"
+                    return note + f"[限流] {decision.reason}"
                 results = search.search(query)
         else:
             results = search.search(query)
         if not results:
-            return "没有搜到相关结果。"
-        return "\n".join(
+            err = str(getattr(search, "last_error", "") or "")
+            if err:
+                # “搜到 0 条”与“根本没打通”必须分开讲：否则模型会把故障读成“世上没有”。
+                return f"{note}[搜索失败] {err}（这不代表“没有结果”，而是这次搜索没打通）"
+            return note + "没有搜到相关结果。"
+        return note + "\n".join(
             f"{i+1}. {r.title}: {r.url}\n   {r.snippet}" for i, r in enumerate(results)
         )
 
@@ -651,6 +714,7 @@ def make_web_tools(
         pure=True,
     )
     def fetch_tool(url: str) -> str:
+        note = _offline_note(fetch, what="以下网页内容")
         # 默认走严格路径（含 DNS 解析校验）；只有显式声明离线的 provider 才跳过。
         # 默认严格 = 新接入的 provider 天然安全，不靠作者记得声明。
         online = bool(getattr(fetch, "requires_network", True))
@@ -659,18 +723,18 @@ def make_web_tools(
         else:
             ok, reason = policy.check(url)
         if not ok:
-            return f"[拒绝] {reason}"
+            return note + f"[拒绝] {reason}"
         if online:
             # 策略已过，这时才占用出站配额（按 host 分桶，对单个站点保持礼貌）
             with limiter.guard(_host_of(url)) as decision:
                 if decision.denied:
-                    return f"[限流] {decision.reason}"
+                    return note + f"[限流] {decision.reason}"
                 result = fetch.fetch(url)
         else:
             result = fetch.fetch(url)
         if result.error:
-            return f"[抓取失败] {result.error}"
-        return result.content
+            return note + f"[抓取失败] {result.error}"
+        return note + result.content
 
     return [search_tool, fetch_tool]
 

@@ -174,7 +174,11 @@ async def test_审批队列只列自己的() -> None:
 
 
 @pytest.mark.asyncio
-async def test_审批历史只返回自己的() -> None:
+async def test_审批历史只返回自己的(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 显式打开单操作员开关：本例测的是"审批历史按归属收敛"，而 bob 正是自己 Run 的
+    # 发起人，默认开启的职责分离会拦掉"自己批自己"（那条规则由
+    # tests/test_approval_separation.py 负责测）。
+    monkeypatch.setenv("WARDEN_APPROVAL_ALLOW_SELF", "1")
     script = [
         ChatResponse(content=None, tool_calls=[
             ToolCall(id="c1", name="weather.get", arguments={"city": "上海"})],
