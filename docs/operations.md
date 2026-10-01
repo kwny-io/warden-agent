@@ -211,6 +211,22 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 - **密钥轮换**：新密钥配 `WARDEN_CREDENTIAL_KEY`、旧密钥进 `WARDEN_CREDENTIAL_OLD_KEYS` →
   `warden rotate-credentials`（幂等）→ 确认无误后**摘掉旧密钥**。直接换主密钥而不跑这一步，
   等于把存量凭证全废掉；轮换有解不开的会以退出码 5 报出来（那些密文原样保留，补回旧密钥还能救）。
+- **客户端访问密钥（`WARDEN_API_KEYS`）的零停机轮换**：多用户模式是 `用户id:密钥` 列表，
+  同一个用户写两次就能让**新旧两把 key 同时有效**：
+
+  ```bash
+  # 第 1 步：新旧并存（新 key 先下发给调用方）
+  WARDEN_API_KEYS="alice:新key,alice:旧key,bob:bob-key"
+  # 第 2 步：确认新 key 能用（旧的还在，切不坏）
+  curl -H "Authorization: Bearer 新key" http://agent:8000/health/ready
+  # 第 3 步：摘掉旧 key 再重启
+  WARDEN_API_KEYS="alice:新key,bob:bob-key"
+  ```
+
+  同一个密钥写给**两个不同用户会被拒绝启动**（否则一个人的调用会以另一个人的身份
+  记账，会话归属与越权拦截同时失效）；同一用户给两个 key 是轮换，合法。
+  单 key 模式（`WARDEN_API_KEY`）**不支持并存**，换 key 必然有一个 401 窗口——
+  要零停机就换到 `WARDEN_API_KEYS` 并给同一用户两把 key。
 
 ---
 
@@ -240,6 +256,8 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | ~~SSRF 的 DNS 二次解析 TOCTOU~~ | **已消除（2026-09-22）**：校验与"要连哪个 IP"出自**同一次解析**，请求被固定到该 IP（`Host` 头 + `sni_hostname` 保留原主机名） | 回归测试：解析器第一次给公网、之后给 `127.0.0.1`，断言连的是公网且**只解析一次** |
 | **并发上升后 p95 明显变差** | 本机实测（离线假模型、单副本 SQLite）：并发 1 时 p50 82ms、并发 8 时 p95 0.86s；旧记录的“并发 8 p95 12.3s”在当前构建不复现 | **不是容量结论**，只是现象；要容量数字请在目标环境跑 `scripts/load_test.py` |
 | **弃用过渡期的通知头未实现** | 客户端无法从响应里得知"你在用的版本已被弃用" | 至今只有 1.0 一个版本、未发生弃用；政策见 `docs/api-versioning.md`（主版本不受支持会明确 400） |
+| **反代后面不配 `WARDEN_TRUSTED_PROXIES`** | `request.client.host` 永远是代理 IP：匿名限流**塔成一个桶**（一个客户端能把别人挤成 429），且同一个 `Idempotency-Key` 会**跳调用者串响应体**（鉴权档用 `user_id`，不串） | 取值是**代理地址/网段，不是客户端网段**；`*`、`0.0.0.0/0` 启动即拒。K8s `configmap.yaml` 里已列为**必填**，理由与实测见 `docs/deployment-boundaries.md` |
+| 外部工具/子进程的输出**不是** UTF-8（中文 Windows 上的老 CLI） | 输出里会出现 `U+FFFD`「」——这是**看得见的损失**，不是丢失 | 两侧编码已钉死（子进程强制 `PYTHONIOENCODING=utf-8`；父进程 `encoding="utf-8", errors="replace"`）。**修之前是静默变成空串**：`exit_code=0` 而 `stdout=''`（实测 2026-10-01，见 CHANGELOG 第四十批） |
 | 覆盖率门槛 **84%**（基线 85.7%） | 门槛贴着当前值会变成噪声门禁，故留 2 个点余量 | 低覆盖区主要是启动装配（`run_server.py`），靠端到端跑而不是单测 |
 
 ---
@@ -267,15 +285,38 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 
 ---
 
-## 十、链路追踪（traceparent）
+## 十、日志与链路追踪（traceparent）
+
+### 日志格式（一行一个 JSON 对象）
+
+**是什么**：`WARDEN_LOG_FORMAT` 决定日志长什么样——`json` 每行一个 JSON 对象、`text` 是人看的单行文本。
+
+```json
+{"ts":"2026-09-24T11:20:03.412Z","level":"INFO","logger":"warden_agent.web.server",
+ "msg":"run 完成","trace_id":"4f2a...","span_id":"9c1b...","session_id":"s-7f"}
+```
+
+- **默认行为（`auto`）**：stdout 是终端 → `text`（开发机不用配）；不是终端（容器/CI/管道）→ `json`。
+  也就是说"上线忘了配"的默认值是适合采集端的那一个。
+- **字段**：`ts`（ISO8601 UTC 毫秒）/ `level` / `logger` / `msg` / `trace_id`+`span_id`（在 span 内时）/ `exc`（异常栈，
+  仍是同一个对象里的一个字符串——不破坏"一行一条"）/ 调用点用 `extra=` 传的自定义字段（如 `session_id`）。
+- **为什么要 `trace_id` 字段**：原来它只被拼进 span 结束那一行的消息里，同一次请求里**其它模块**的日志完全没有它，
+  想捞一次请求的全貌只能靠时间窗猜。现在格式化层直接读 `tracing.current()`，span 内任何一行都自动带上。
+- **脱敏兜底**：消息与异常栈都会过 `core.redaction.redact_text`（含 OpenAI/Anthropic/GitHub/AWS/GCP/Slack/HF 等常见密钥的
+  裸前缀、JWT、`key=...` 形式、URL 里的口令），免得某个调用点忘了。
+- **取值写错会拒绝启动**（不按默认值猜）——否则上线后才发现采集端一无所获。
+- **本地/演练**：`WARDEN_LOG_FORMAT=text ./scripts/run_local.sh` 想人眼看就显式选 text。
+
+### 链路追踪（traceparent）
 
 **是什么**：W3C Trace Context。请求带 `traceparent: 00-<trace-id>-<span-id>-<flags>` 进来，
 本服务**沿用同一个 `trace_id`**、生成自己的 `span_id`，并在调下游时把新的 `traceparent` 透传出去。
 于是"这次请求经过了哪些步骤、我调下游那一次对应下游哪条日志"才连得起来。
 
 - **开关**：`WARDEN_TRACING`（默认开；`0` 关闭，关闭后 `span()` 不碰上下文、开销接近零）。
-- **怎么看**：响应头会回写 `traceparent`；日志里每个 span 一行，含
-  `name= trace_id= span_id= parent_span_id= duration_ms=`。用 `trace_id` 即可串起一次请求的全部步骤。
+- **怎么看**：响应头会回写 `traceparent`；日志里每个 span 结束都会有一行，含
+  `name= trace_id= span_id= parent_span_id= duration_ms=`（在 json 档下这些同时也是结构化字段）。
+  用 `trace_id` 即可串起一次请求的全部步骤。
 - **出站透传**：`web.fetch` 等出站请求会带上当前 `traceparent`（下游若支持 W3C 即可接链）。
 - **不合法的入站头**（版本错/全零 id/长度不对）一律**当作没有**、重新起链——不因上游脏头把链路带崩。
 - **边界**：本项目**不引入 opentelemetry**（保持零重依赖）。这里做的是上下文传播 + 结构化 span 日志；
@@ -359,3 +400,21 @@ WARDEN_ADMIN_PRINCIPALS=ops,oncall      # 逗号分隔的 principal id（= 用�
   不是**用户数据**的全局视图；记忆里是用户内容，保持按 `owner` 隔离。
 - **没有细粒度角色**：现在只有"API Key → principal"这一层身份，没有组织/团队模型；
   真需要租户内角色时再扩（扩的时候要连带把上面这张口径表补全）。
+
+### 运维动作的边界：**破坏性动作只在 CLI，HTTP 面只有只读视图**
+
+这一条以前是**口头前提**（“运维面故意仅本地”），现在写成明文并配了守卫：
+
+| 面 | 包含什么 | 凭证要求 |
+|---|---|---|
+| **仅 CLI**（宿主机 shell） | `warden backup` / `restore` / `backup-prune` / `rotate-credentials` / `audit-verify` / `stuck` | 能上宿主机 shell = **已经拿到数据目录与密钥**，所以不再重复发明一套"运维 API"和它的鉴权 |
+| **HTTP 只读** | `/audit`、`/recovery/plan`、`/alerts/stuck`（按调用者归属收敛）、**`/metrics`（仅管理员）** | Bearer key + 角色 |
+| **HTTP 写** | `/chat/*`、`/approve/*`、`/reject/*`、`/runs/{id}`(POST/DELETE)、`/models/select`(`scope=self`)、`/users` | Bearer key（并受"不能批自己的单"等约束） |
+| **HTTP 管理员才能做** | `/metrics`；`POST /models/select` 的 `scope=deployment`（切**部署默认**，影响所有人） | `WARDEN_ADMIN_PRINCIPALS` 名单内 |
+
+**路由访问级别的唯一权威是清单守卫**：`tests/test_route_surface.py` 的 `ROUTES` 表。
+它做两件事：① 把 `build_app()` 实际暴露的路由与登记表**逐条比对**——新增路由不登记就红；
+② 把登记表**真的跑一遍**——登记为公开的必须免凭证可访问（不然探活/文档静默失效），
+其余未带凭证必须 401，登记为管理员的普通用户必须 403、管理员必须通过。
+写这条守卫时它当场抓出一处真缺口：`/docs` 公开但 `/docs/oauth2-redirect` 却要凭证
+（Swagger 的 Authorize 流程会跳到那个子页），已一并修正。

@@ -5,6 +5,719 @@
 
 ---
 
+## 2026-10-01（第四十批：子进程输出的「静默消失」—— exit_code=0 但 stdout 是空串）
+
+> 起因很小：全量套件在 `PYTHONUTF8=1` 下多出一个失败
+> （`tests/test_child_env.py::test_真实子进程读不到服务端密钥`，`assert '' == '<无> <无>'`）
+> 和一条 teardown ERROR。查下去发现**错的不是测试，是执行层**。
+
+**根因**：`ExecutionBroker.execute` 传了 `text=True` 却**没钉编码**。于是两侧各按自己的
+locale 干活：父进程（容器 `LANG=C.UTF-8` / `PYTHONUTF8=1`）按 UTF-8 **解码**，子进程
+（本地化 Windows、或任何非 UTF-8 locale）按 cp936 **写**。实测：
+
+```text
+Exception in thread Thread-1 (_readerthread):
+  File "...\subprocess.py", line 1599, in _readerthread
+    buffer.append(fh.read())
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xce in position 1: invalid continuation byte
+exit: 0
+stdout: ''
+```
+
+关键在于**这个异常发生在 `communicate()` 的读取线程里，被线程吞掉了**：调用方拿到的是
+`exit_code=0` + `stdout=''`。对模型来说，这和一个「真的没输出」的命令**完全无法区分**——
+比报错难查得多。这不是测试特供：任何一次「命令成功但输出带中文」都可能中招。
+
+做了什么：
+
+- **解码侧钉死**（`execution/broker.py`）：`encoding="utf-8", errors="replace"`。
+  前者让两侧编码确定，后者是兜底——非 Python 子进程（git 之类，输出编码由它自己决定）
+  写了非 UTF-8 字节时，只是出现 U+FFFD，**不允许整段输出消失**：「看不懂」可以查，「没有」查不了。
+- **写入侧钉死**（`execution/child_env.py` 新的 `CHILD_IO_ENCODING`）：最小环境里**强制**写入
+  `PYTHONIOENCODING=utf-8`。注意它是「强制写」而不是「白名单多放行一个键」：从宿主
+  继承来的 `PYTHONIOENCODING=gbk` 正是病因，必须改写。
+- **同类点一并收**（同一类缺陷，同一个修法）：`git/revision.py`（git 只读探测）、
+  `mcp/client.py`（外部 MCP 组件，JSON-RPC 本就规定 UTF-8）、
+  `scripts/mutation_shards.py`（列改动文件时文件名可能非 UTF-8，一个解码异常会把整个分片跑挂）。
+
+锁住它的测试（`tests/test_child_env.py` 新增 3 条）：
+
+- `test_子进程写入编码被强制为utf8` —— 契约：子进程 std 流一律 UTF-8；
+- `test_宿主locale不能把子进程编码带歪` —— 宿主故意带 `PYTHONIOENCODING=gbk`，子进程仍须**字节级**对得上
+  （源码里用 `\u4e2d\u6587` 转义，免得 argv 的编码又成一个变量）；
+- `test_非utf8字节不会被整段丢弃` —— 子进程直接写 GBK 字节，断言 `stdout != ''` 且含 `\ufffd`。
+
+顺手修掉三处**工具自身**的缺陷（都属于“会静默放过去”这一类）：
+
+- `scripts/mutation_shards.py` 的 `git_changed_paths`：git 默认把非 ASCII 路径 **C 引号化**
+  （`"docs/\345\244\215..."`），它**不等于**真实文件名 → “按路径选分片”会**静默选不中**
+  （改了个中文名源文件 → 该分片不跑 → CI 绿着放过去）。两层修：调 git 一律带
+  `-c core.quotepath=false`，并加 `_unquote_git_path()` 兜底（别人的全局 gitconfig
+  或 `GIT_CONFIG_*` 能把它改回来）。测试：`tests/test_mutation_shards.py` 新增 2 条
+  （用字节**现算**一份引号化结果，不手写八进制转义——否则测试自己写错就没人知道）。
+- 同上文件列改动文件处的解码：钉 UTF-8 + `errors="replace"`（文件名可能非 UTF-8，
+  一个解码异常会把整个分片跑挂）。
+- `scripts/_snapshot_routes.py` 把 `--check` **当成了输出目录名**，于是在仓库根建了一个叫
+  `--check/` 的目录（此后每次 `git ls-files --others` 里都跟着它）；而没给参数时它又会
+  默认往仓库根写 `routes_snapshot/`。现在：`-` 开头的参数直接报错退出 2，缺参数也不再默默建目录；
+  已经建出来的那个垃圾目录已删。
+
+另两件与提交环境有关的收尾（都不影响运行时行为）：
+
+- 仓库根新增 `.gitattributes`（`* text=auto eol=lf`）：Windows 上编辑很容易把 CRLF 带进去，
+  由 git 在提交时统一成 LF，而不是靠人记得。
+- `scripts/_fix_line_endings.py`（新，配套检查/修复脚本，用法 `python scripts/_fix_line_endings.py [--check]`）。
+
+验证：`tests/test_child_env.py` 在**带** `PYTHONUTF8=1` 与**不带**两种环境下都 11 passed
+（修复前后者红）；`python scripts/mutant_check.py` 仍 0 失败；`pytest -q` 全绿；**官方四片变异容器复跑
+（`--all-shards`，批 40 改动后的工作区）四片全过：96.4 / 100.0 / 97.9 / 98.6，存活 16 条与裁决表逐条同名**。
+
+---
+
+## 2026-10-01（第三十九批：反向代理后面的「调用者」—— 一条会跨客户端读到别人响应体的配置缺口）
+
+> 起因：把 `request.client.host` 到底是什么从头核一遍。它是 **TCP 对端**，却被当成
+> 「调用者」用在三处：限流分桶（`web/ratelimit.py` 的 `client_key`）、匿名幂等作用域
+> （`web/server.py` 的 `ip:<host>:<Idempotency-Key>`）、审计里的来源 IP。
+> 而本仓的参考部署**就是**入口在代理后面（`deploy/k8s/ingress.yaml`）——于是这三处
+> 看到的全是代理自己。
+
+**实测出来的两个后果**（不是推演，见下面的用例）：
+
+- 两个**不同**的真实客户端从同一个代理进来、限 1 次/分钟时：A=200、B=**429**——
+  共用一个桶，一个客户端能把别人挤掉；
+- 两者用**同一个** `Idempotency-Key` 打 `/chat/{run_id}` 时，B 拿到的是 A 的**缓存响应体**
+  （`回答一`），而不是自己执行得到的 `回答二`。这是**跨调用者读取响应体**，
+  比"限流偏一点"严重得多（鉴权开启时幂等作用域用 `user_id`，所以只在**匿名模式 + 反代**下真的串）。
+
+做了什么：
+
+- **配置面**（`core/settings.py`）：登记 `WARDEN_TRUSTED_PROXIES`（新 kind `proxies`）。
+  启动校验拒绝 `*`、`0.0.0.0/0`、`::/0`、非法 IP/网段、空项——因为 uvicorn 自己的解析器
+  **对格式错是静默的**（非法项会被当成普通字面量），于是"网段写错一位"的表现是
+  "XFF 忽然不生效"（退回塌桶），很难查；写宽则是"谁都能伪造来源 IP"，更危险。
+- **接线**（`web/run_server.py`）：`trusted_proxies_from_env()` → `uvicorn.run(forwarded_allow_ips=...)`，
+  **设了才传**（显式传 `None` 会把 uvicorn 默认的"只信回环"盖掉）；启动日志把当前信任口径打出来。
+- **部署面**：`deploy/k8s/configmap.yaml` 加这项（入口就是 ingress-nginx，所以是**必填**，
+  带 `REPLACE_ME` 与"取值是**代理**的地址、不是客户端网段"的说明）、`deploy/k8s/README.md`
+  的上线步骤与配置表、README 的环境变量段、`docs/deployment-boundaries.md` 新增一节
+  （含实测数字）+ 安全默认值清单加一行。
+
+怎么证明它真修了：
+
+- 新增 `tests/test_proxy_trust.py`（23 条）。**默认那一侧也钉住了**：不配 = 一律不信 XFF，
+  对端不在名单里时它自带的 XFF 也不信——若谁把默认改成信任 XFF、或把"信任**对端**"写成
+  "信任**请求头**"，这些用例会红。配了受信代理后两处都按真实客户端分开，且**同一个**客户端
+  仍然会被限住（只断言"都 200"的话，把限流整个关掉也能过）。
+- `tests/test_run_server_main.py` 加 2 条：设了才出现 `forwarded_allow_ips` 且值等于原字符串；
+  不设时**不存在**这个 kwarg（这条盯的是"顺手传个 None"这种写法）。
+- 配置面守卫（`tests/test_config_surface.py`）照旧绿：新变量已登记，读它的模块在 `consumers` 内。
+
+仍未覆盖（诚实边界）：多级代理链（CDN → ingress → pod）没有实测——uvicorn 取的是
+"XFF 里最右边那个**不可信**地址"，中间的每一跳代理都必须逐个列进 `WARDEN_TRUSTED_PROXIES`；
+另外这只解决"来源 IP 是代理"，**匿名模式本身不是安全边界**（见 `docs/deployment-boundaries.md`）。
+
+## 2026-10-01（第三十八批：变异测试两个分片收口 —— 把「存活」逐条判成「真缺口」或「等价变异」）
+
+> 起因：变异测试接入后只跑了 `concurrency` 与 `patch-guard` 两个分片，存活清单里
+> **真缺口**和**超时**混在一起（`timeout` 与 `survived` 一个口径），看不出哪条是真的没测到。
+
+做了什么：
+
+- `concurrency`：47 → **0** 条存活（206/206 = **100.0%**，门槛 98.0）。
+- `patch-guard`：71.8% → 84.4% → 93.1% → **98.6%**（341/346，门槛 96.6）。
+  分数涨不动的那一轮不是靠"再补几条测试"，而是**逐条裁决**：24 条存活里
+  13 条是真缺口（按变异点补测试）、其余是等价变异，最后连"超时"也归零
+  （`--timeout=30` + mutmut 外层上限抬到 60 倍 → 超时变成 pytest 内部变红）。
+- 判据与清单写进 `docs/mutation.md`（5 条等价变异逐条给理由；等价判定**跟着实现走**，
+  改实现必须重跑裁决）。
+- 顺手修掉一个**测试工具自身的真缺陷**：`scripts/mutation_shards.py show` 在 GBK stdout 下
+  直接崩（`UnicodeEncodeError`，表里有 emoji/中文）——Windows 控制台一跑就炸，
+  现在写文件/管道都强制 UTF-8。
+- `scripts/mutant_check.py` 的守护用例 15 → **32** 条（21 条"必须被杀" + 11 条"等价可存活"）。
+
+怎么证明它真修了：`scripts/mutation_gate.py` 对两个分片都退出 0；
+`python scripts/mutant_check.py` 退出 0；`pytest -q` 全绿。
+
+未覆盖：另两个分片（`core-security` / `ratelimit`）的存活**全是等价变异**、已结清，但没有
+再扩大分片范围（全仓变异仍是夜间任务，见 `docs/mutation.md`）。
+
+---
+
+## 2026-09-30（第三十七批：工具执行结果上屏 —— 用户点名的那个「信息黑洞」）
+
+> 起因：评审时被直接点出来——「工具确实跑了、确实有输出，但界面上只有一行『🔧 调用工具：x』，
+> 用户既看不到输出，也不知道成没成」。这不是体验问题：**工具输出是审计与排查的一等证据**，
+> 只存在库里和模型的上下文里，等于让人在需要看证据的时候看不到证据。
+
+做了什么：
+
+- **后端**：`runtime/session.py` 把原来一职两用的 `_execute` 拆成 `_execute_with_result`
+  （返回 `(error, text)`），**落库与「推给前端」共用同一段文本**（单一来源，避免两边各拼一份慢慢分叉）。
+  流式路径在 `tool` 事件之后补推 `tool_result {name, ok, text}`；非流式路径没有事件，
+  但同一份文本照样落库，所以刷新页面也看得到。
+- **前端**：`web/src/lib/display.ts` 成为「已落库消息 → 气泡」的**唯一**转换实现，
+  两条恢复路径（初次加载 / 断线兜底重载）共用；`ChatView` 处理 `tool_result`——成功显示「工具结果」、
+  失败显示「工具执行失败」（琥珀色，成败只认后端拼的失败前缀），长输出默认折叠 6 行、可「展开全部（共 N 行）」。
+- **顺手修掉一个真实的不一致**：以前「刷新页面」跳过 tool 消息、「断线兜底重载」却渲染它——
+  同一份历史换个方式重载长得不一样（而且断线一次后工具结果会突然冒出来）。两份实现合并后必然一致。
+
+怎么证明它真修了（而不是看起来修了）：
+
+- 后端 `tests/test_session.py` 新增 2 条：`tool_result` 的 `text` **等于**落库 tool 消息正文（防两份拼装分叉）；
+  失败时 `ok=false` 且正文带失败前缀（前端靠这个前缀上色，前缀改了必须红）。
+- 前端 `web/src/lib/display.test.ts` 5 条（新增）+ `web/src/components/ChatView.test.tsx` 4 条（新增）：
+  成败判定契约、调用气泡与结果气泡**都在**、长结果折叠/展开、**刷新后从历史恢复也渲染出工具结果**。
+- **真浏览器**：`web/e2e/approval.spec.ts` 的「批准」用例新增断言——把服务端**落库的那条 tool 消息**读出来，
+  再断言浏览器里能看到**同一段文字**（标题 + 正文首行两道）。「批准」这条路恰好是工具真执行的路径，
+  所以它是工具结果上屏的真实证据链，而不是组件测试的自我循环。
+- **证伪**：把 `display.ts` 退回老行为（tool 消息不上屏）再跑 → **恰好那 2 条红**，其余 35 条绿
+  （证明断言有鉴别力，不是恒真）。
+
+实测（2026-09-30，本机）：后端 **1471 passed / 4 skipped**（共 1475 项，297.8s，0 failed / 0 errors）、
+前端 `vitest` **195 passed / 13 files**、`tsc -b` 与 `eslint src` 干净、`ruff check` 全绿、
+`mypy --strict` 104 个文件零错、真浏览器 e2e **16 passed**（44.9s）。
+
+---
+
+## 2026-09-29（第三十六批：多副本 e2e —— 用真 PG + 真浏览器验「扩到 2 副本」，并补上第三十批「说过修好、其实只修了一半」的建表竞态）
+
+> 起因：`README` 的「已知局限」里写着「多副本仍未覆盖」。而多副本恰恰是**唯一还没在真环境跑过**的
+> 部署形态：此前对它的信心来自单测/集成测试（同一进程内两个 store 实例）与文档，没有一次
+> 「两个**真进程** + 同一个真 PG + 真浏览器打开页面」的验证。这一批补上，并要求三条证据链都真跑。
+> 顺带照出一个老问题：第三十批修好的 `__schema_version___pkey` 并发冲突**只修了版本行写入，
+> 没修建表本身**——真扩到 2 副本时仍然会撞。
+
+- **新增 `web/e2e/multi-replica.spec.ts`（6 条，真 PG + 真浏览器）**：
+  起 6 个真后端进程（共享档 2 + 对照档 2 + 限流档 2），共用一个**每次运行新建的空 PG 库**：
+  ① 会话历史跨副本（A 副本写，B 副本的 `/messages` **与从 B 打开的浏览器页面**都读得到）；
+  ② 事件跨副本（A 上跑完一轮，B 的 `/events/{run_id}` 续读到同一条 final——等价于「浏览器在 A 上断了、
+  重连时被负载均衡分到 B」）；③ 对照：关掉 `WARDEN_SHARED_STATE` 后 B **读不到** A 的事件
+  （证明 ② 不是空跑）；④ 幂等键跨副本（同 key 打到另一个副本不执行第二遍，副作用只发生一次）；
+  ⑤ 对照：关掉共享后同 key 打到另一个副本**会真的执行第二遍**（这正是共享开关存在的理由）；
+  ⑥ 限流计数跨副本共享（额度是全局一份：3/60 下第 4 个请求必被 429 拒，错误体是 RFC7807 `RATE_LIMITED`）。
+  库与进程的生命周期归 spec（`beforeAll`/`afterAll`）——`playwright.config.ts` 的 `webServer` 模型做不到
+  「两个副本指向同一个每次新建的空库」，而脏库会让用例红在原因之外的地方（限流计数 60 秒窗口、幂等表残留）。
+- **新增 `web/e2e/replicas.ts` 与 `scripts/e2e_pg_admin.py`**：起副本的工具箱（探端口 → 建库 → 起进程 →
+  探活 → 收进程 → 删库）与 PG 工具脚本（探活/建库/删库）。本机没有 `psql`，所以脚本走 `docker exec` 到容器里执行。
+  限流档**单独一个空库**：计数按来源 IP 记在共享库里，而所有用例都从 127.0.0.1 发请求——与前面几组共库时，
+  前面用例花掉的额度会把它的第 1 个请求直接变成 429（实测就是这么红的）。
+- **补齐「只修了一半」的建表竞态**（`src/warden_agent/store/pg_schema.py` 的 `serialized_schema_init`，
+  `store/postgres.py` 调用）：第三十批把版本行改成 `INSERT ... ON CONFLICT (version) DO NOTHING`，
+  但 `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE` 序列在并发下仍会撞（两个事务同时建同一张表，
+  后提交的那个在 `pg_type`/`pg_class` 上唯一键冲突）。现在整段迁移用 `pg_advisory_xact_lock`
+  **串行化**（事务级锁，随提交/回滚自动释放，不会因为进程被杀把库锁死），并先
+  `SELECT set_config('lock_timeout', %s, true)` 设锁等待上限 `DEFAULT_LOCK_TIMEOUT = "30s"`——
+  等不到锁就**明确失败**，而不是在启动探针里无限期挂着（K8s 上表现为 `readiness` 一直不通过）。
+  版本号写入同时改成幂等（`ON CONFLICT DO UPDATE`），避免有人绕过锁手工跑迁移时再炸。
+  层级上也归一成唯一入口：memory store 与 audit store 各自又踩过一次同一个坑（见 `pg_schema.py` 顶部注释）。
+  ⚠️ 一个当场照出来的坑：`SET LOCAL lock_timeout = %s` 在 PG 里是**语法错误**（`SET` 不接受占位符，
+  报 `syntax error at or near "$1"`），必须用 `set_config(...)`——第一版就是这么写的，被真库测试抓住。
+- **新增 `tests/test_pg_concurrent_init.py`**：多线程同时用真 PG 连接建库，断言「要么全成、要么全不建」，
+  并覆盖 `lock_timeout` 到点时的可读报错。没有 PG 时按环境跳过（不假装跑过）。
+- **修两处「测试自己的坑」**（不是产品缺陷，但会让结论不可信）：
+  ① SSE 两类流的终态字段名不同——`/chat/stream/{run_id}` 透传会话事件用 `type`，`/events/{run_id}`
+  透传总线消息用 `event`；第一版只按 `event` 找终态，于是 chat/stream 上「永远读不到 final」
+  （而且因为找不到终态，流会一直读到超时）。统一成 `frameName()` 取；
+  ② 会话第一条消息永远是 `system`（系统提示词），断言角色序列时必须过掉它，否则 `rows[0]`
+  拿到的是提示词，看起来像「用户消息被写坏了」。
+- **`README`**：已知局限第 9 条改为「已覆盖七条路（含多副本）」，剩下**工具执行结果渲染**与
+  **超长列表性能**仍未覆盖；工程质量一节写明多副本那 6 条需要真 PG（无 PG 时**跳过**而不是假绿）。
+- 实测：`cd web && npx playwright test` → **16 passed**（1.0 分钟，含多副本 6 条；单跑多副本 34 秒）。
+- **验收**：全量后端 `1469 passed / 4 skipped`（共 **1473** 项，实测 **430 秒**，`0 failed / 0 error`）；
+  `mypy --strict` 零错、`ruff check` 干净；前端 `npx tsc -b` / `eslint` 干净、`vitest run` **186 passed / 12 files**。
+
+---
+
+## 2026-09-29（第三十五批：e2e 再扩两条路 —— 并把“只有单跑才绿”的隐患一起拆了）
+
+> 起因：`README` 的“已知局限”里当时明确写着「工具面板、长会话滚动、多副本仍未覆盖」。
+> 这一批把前两条补上（真缺陷一条：长会话的滚动**从来没人验过**），并在过程中
+> 发现 e2e 自身有一个**“靠时序通过”**的断言：审批用例里那句“队列里消失了”
+> 在把用例数从 7 扩到 10 后**在全量跑里真的红了（单跑却绿）**。
+
+- **新增 `web/e2e/info-panel.spec.ts`（2 条）——能力面板**：
+  - 工具清单默认**只显示前 6 个**、`展开全部 (N)` 能把最后一个工具露出来、`收起` 能收回去（真行为，不是复制一份清单）；
+  - **演示档必须自曝身份**：`模型:演示脚本` 芯片 + “不能当作系统能力或回答质量的证据”那段提示必须在。
+    这不是体验问题：少这句话，写死的脚本回复就会被读成真实推理；
+  - 断言口径：先向后端问 `/capabilities` 真值，再拿它比对页面——**不把“7 个工具”写死在用例里**，
+    但会把前提**显式断言**出来（`tools.length > 6`、`model_kind_now === 'fake'`），
+    免得将来环境一变用例悄悄变成空跑；
+  - 第二条：`page.route` 把第一次 `/capabilities` 打 500 → 面板出现`加载失败`+`重试`，
+    **点重试必须真把面板救回来**（而不是清掉错误、停在“加载中…”）。
+- **新增 `web/e2e/long-conversation.spec.ts`（1 条）——长会话**：播种 12 轮（直接打 `/chat/stream`，
+  假模型确定且瞬间，比在浏览器里真发 12 条稳得多），然后验：历史**全量**加载、打开就**钉在最新一条**、
+  **手动滚到顶再发消息、新回复必须滚回视口内**（否则用户以为“没反应”），
+  最后按假模型的固定回复文案断言**真有 N+1 条助手回复**——关住一个真空白：
+  用户气泡是本地乐观追加的，SSE 整条链断了它也会出现，那样滚动断言会全绿而用户什么也没等到。
+  - 为什么不用 `toBeInViewport()`：它比的是“元素矩形 ∩ 浏览器视口”，而一个被 `overflow-y: auto`
+    容器滚出去的元素，矩形**可能仍然落在浏览器视口里**（容器在页面中部时）→ 断言假绿。
+    所以用容器矩形与元素矩形的**包含关系**来判断（`isFullyInside`）。
+- **拆掉一个“靠时序通过”的旧断言（真隐患）**：`approval.spec.ts` 里
+  `page.locator('li').filter(hasText: runId).toHaveCount(0)` 用来断言“这单从队列里消失了”，
+  但 `ApprovalPanel` 的**待审批**与**最近决策**都渲染成 `li`、都带 run_id——
+  于是这句断言是否通过取决于 **待审批轮询（2s）与历史轮询（5s）谁先落到界面上**。
+  现在用「**该行里有『批准』按钮**」把两者分开（新助手 `pendingRow()` / `historyRow()`），
+  “待审批”与“历史”语义才真正分行。
+- **同类问题：新用例自己跑出的 strict 模式违规**：`getByText('git.apply_patch')` 在**全量跑**里
+  命中 3 个（能力芯片 + 审批队列里的 `工具=` 与历史行），单跑却绿——因为单跑时审批队列是空的。
+  修法是把断言**圈到“能力”那个面板**里（`capsPanel(page)`），而不是解除 strict。
+- **验收**：`cd web && npm run test:e2e` → **10 passed**（连跑 3 次全绿，不再依赖运行顺序）；
+  `npx vitest run` 186 passed、`tsc -b`/`eslint` 干净；后端未动（`pytest` 仍 1462 passed / 4 skipped）。
+
+---
+
+## 2026-09-29（第三十四批：给测试套件加「挂住必现形」兜底 —— 并证明它真的会响）
+
+> 起因：前一天那次事故——一条用裸 `threading.Barrier` 同步的并发用例，某个工作线抛异常后
+> 其余 7 个永久等待，**整个套件静默卡在 45%**，直到外部超时被杀，日志里看不出是哪一条、
+> 卡在哪一行。当时只修了那一条用例（`wait(timeout=30)` + 接住 `BrokenBarrierError`），
+> 但**套件层面仍然没有兜底**：下一条写错的并发用例照样会让整次运行无声无息地挂着。
+> 这一批把那层兜底补上。
+
+- **`pytest-timeout>=2.3` 进 `dev` 依赖**，`[tool.pytest.ini_options]` 配 `timeout = 120` +
+  `timeout_method = "thread"`。
+  - 为什么用 **thread** 而不是默认的 signal：Python 的 `SIGALRM` 在 **Windows 上根本不存在**，
+    用默认值会变成"本地没保护、CI 才有保护"这种最糟糕的组合；thread 法两边行为一致——
+    超时时**打印所有线程的调用栈**（直接指出卡在哪一行）并终止本次运行。
+    代价是它不会"跳过超时用例继续跑后面的"，而是果断终止——这正好是想要的：
+    一条用例真卡住了，后面的结论已经不可信。
+  - 为什么是 120 秒：整个套件空载实跑约 290 秒 / 1466 项（机器忙时实测到过 460 秒），最慢的单条是几十秒级的并发与真库用例，
+    120 秒对现存用例留了足够余量。**门槛的意义不是"跑得快"，而是让卡死与跑得慢长得不一样**。
+- **证明它真的会响**（不是"配了就算"）：临时塞一条 `time.sleep(60)` 的用例并以 `--timeout=5` 跑，
+  pytest 在 5 秒时打印出 `tests/test_zz_hang_probe.py:5 in test_故意挂住 → time.sleep(60)`
+  的线程栈，并以**退出码 1** 结束；探针用完即删。
+- **配置本身也有守卫**：`tests/test_pytest_guardrails.py`（2 条）断言 `timeout > 0`、
+  `timeout_method == thread`、`filterwarnings` 含 `error`。理由是这几条开关**没有任何调用方**，
+  被顺手删掉、或"本地为了跑快一点"改成 0 都无人察觉，直到下一次真的挂住。
+  实现上先把 `getini("timeout")` 转成 `float` 再比，避免"看起来配了其实是 0/空串"。
+- 顺带核实 `uv.lock` 已随 dev 依赖变更重生成（`uv lock` → 89 个包，新增 `pytest-timeout v2.4.0`），
+  CI 的 `uv sync --frozen` 不会因为本批改动而失败。
+- **验收**：全量 `1462 passed / 4 skipped`（共 1466 项，`0 failed / 0 error`）；`ruff check src tests scripts` 干净；
+  `mypy --strict` 103 文件零错。
+
+---
+
+## 2026-09-29（第三十三批：e2e 扩到登录与审批路径 —— 顺手抓出「开了鉴权就白屏」）
+
+> 起因：`web/e2e` 只有 2 条用例（安全头 + 连发两条消息），而**登录**和**审批**是
+> 出错了最要命的两条路——登录错了没人进得来，审批错了要么高危动作被静默放过、
+> 要么任务永远挂着。两条路都只有 pytest 覆盖到 HTTP 层，**没在真浏览器里点过**。
+> 补完之后，两个真缺陷自己浮出来了：一个让「开了鉴权」的部署完全不可用，
+> 一个让「从队列批准」看起来像没生效。
+
+- **真缺陷 1（P0，安全默认值反而锁死了产品）：开了 `WARDEN_API_KEY` 的部署里，控制台整个白屏。**
+  浏览器加载 `<script type="module" src="/assets/index-xxx.js">` **带不上** `Authorization` 头
+  （HTML 规范如此），而 `/assets/*` 当时也在鉴权里 → `GET /` 能返回 `index.html`，
+  它引用的 JS 却 401 → React 从不挂载 → **页面上连「填访问密钥」的输入框都没有，谁也登不进来**。
+  修法：`src/warden_agent/web/server.py:304` 的 `_is_public()` 把"控制台外壳"列为公开——
+  `/`、`/index.html`、以及前缀匹配的 `/assets/*`（文件名带内容哈希，没法穷举）；
+  **数据接口一律照旧要密钥**，`/health/*` 原有白名单不变。外壳里没有任何业务数据，
+  退让的只有"登录入口本身"，不是放松安全。
+  锁住它：`tests/test_web.py:302`（`test_开启鉴权时_spa外壳仍可匿名加载而数据接口照旧401`）
+  + `web/e2e/auth.spec.ts`（真浏览器，真产物）。
+- **真缺陷 2：从**侧栏审批队列**批准之后，聊天区不更新。**
+  队列面板的批准入口不在聊天区，服务端其实已经把这一轮接着跑完了（`POST /approve/{run}` 的响应体里
+  就带着最终回答），但聊天区还停在那句「需要审批」——用户看到的是「我批了，队列少了一格，然后什么都没发生」。
+  修法：`ApprovalPanel` 新增 `onDecided` 回调（**失败时不回调**，否则上层会误以为这一轮已经恢复）→
+  `web/src/App.tsx` 的 `approvalTick` 自增 → `ChatView` 收到 `refreshTick` 变化后重拉会话记录
+  （在途流式请求期间不抢，用 `abortRef` 判断）。
+  锁住它：`web/src/components/ApprovalPanel.test.tsx`（2 条）+ `web/src/components/ChatView.test.tsx`（3 条）
+  + `web/e2e/approval.spec.ts` 的端到端断言。
+- **审批链路的 e2e（`web/e2e/approval.spec.ts`，2 条）**：用消息里点名 `git.apply_patch` 触发
+  （假模型有一条"用户提到哪个工具就假装要调用它"的确定性规则，生产策略 `ask_when_tool_not_pure` 会拦成待审批）。
+  · 批准：队列这一单消失 + 决策历史记成 `approved` + **聊天区真的拿到了最终回答**；
+  · 拒绝：**工具绝不执行**（会话里是 `用户拒绝执行 …` 那条说明，且不含工具成功文案）——
+  这是安全语义，不是体验问题。断言双轨：界面 + `request` 直查 `/approvals`、`/approvals/history`、`/messages/{run}`。
+  `run_id` 带时间戳后缀，保证 e2e **可重复跑**（否则上一次留下的"同 run 还挂着待审批"会波及下一次）。
+- **登录链路的 e2e（`web/e2e/auth.spec.ts`，3 条）**：没密钥时逐条 401 且页面不白屏（原因原样显示）、
+  填对密钥后轮询错误消失且 **SSE 流也真带上了密钥**（不是只有读接口能过）、
+  密钥存储语义（不勾"记住"只进 `sessionStorage`，勾了才进 `localStorage`）。
+- **e2e 基础设施三处加固**（都是"以后不会再踩"的）：
+  1. **双档位后端**：`playwright.config.ts` 的 `webServer` 变数组 —— anon 档 8123 +
+     鉴权档 8124，同一份代码、不同环境变量；端口刻意不用 8000（项目默认端口，本机常被占，
+     否则"跑不过"其实是"端口被占"的假失败）。
+  2. **产物只构建一次**：新增 `web/e2e/global-setup.ts`；两个后端都带 `WARDEN_E2E_PREBUILT=1`，
+     否则两个实例并发 `vite build` 会互相覆盖 `web/dist`。
+  3. **e2e 不再依赖真模型/不花一分钱**：子进程以前继承 shell 环境，`run_server.py:528` 的
+     `load_env()` 会把仓库 `.env` 读进来 —— 一个 API Key 就让 e2e 变成"联网 + 花钱 + 不确定"。
+     现在子进程带 `WARDEN_SKIP_DOTENV=1` 且显式 `WARDEN_MODEL=fake`；
+     并且给每个 e2e 后端一次性 SQLite 状态目录（`warden-e2e-state-*`），跑完即删。
+- **验收数字**：e2e **2 → 7 条**（CSP 2 + 登录 3 + 审批 2，`npm run test:e2e` → `7 passed (40.8s)`）；
+  前端 `vitest` 181 → **186 passed / 12 文件**；`tsc -b` 与 `eslint` 干净；
+  后端全量 **1462 passed / 4 skipped（共 1466 项，实测 285 秒，0 failed / 0 error）**，覆盖率 **89%**（门槛已提到 86%）；
+  `ruff check src tests scripts` 干净；`mypy --strict` **103 个源文件零错**。
+- **顺带复测并收紧了覆盖率门禁**：全量 1462 passed / 4 skipped 下实测 **89%**（含分支覆盖：10381 行语句、
+  漏 903 行 + 348 个分支未走全），比 2026-09-27 的 85.50% 高 3.5 个点。
+  原来的门槛 84% 是贴着当时的 85.7% 基线定的，如今留了 **5 个点余量——太宽了，能默默放过一批回退**，
+  所以提到 **86%**（当前值下留 3 个点；CI 带真 PG 通过项更多、只会更高，以"本地无 PG"这个**最差情况**
+  为基准才不会出现"本地绿、CI 红"）。`pyproject.toml` 的 `[tool.coverage.report]` 与 `ci.yml` 的注释里
+  旧数字也一并改掉（两个地方各写一个阈值就是下一次漂移的根源）。
+- **诚实边界**：① 审批 e2e 用假模型按关键字触发，验的是"审批链路 + 界面"，
+  不是"真模型判断该不该审批"；② `web/e2e` 现在覆盖 **CSP / 对话 / 登录 / 审批** 四条路，
+  **工具面板、长会话滚动仍未覆盖**，所以对外只能说"四条关键路径有真浏览器回归"，
+  不能说"全站 e2e"；③ `ruff format --check` 全仓不干净（202 文件）——**这不是门禁**，
+  CI 只跑 `ruff check`，全仓重排会产生一个与本次改动无关的巨大 diff，故不动。
+
+---
+
+## 2026-09-29（第三十二批：变异测试 —— 用“把代码改坏”来证明测试不是假绿）
+
+> 起因是一个问题：**“测试全绿”到底说明什么？** 行覆盖率只说明代码被执行过，
+> 不说明“它一旦被改错，会有任何一条测试喊出来”。变异测试反过来做：把源码里的比较符、
+> 边界、布尔、返回值逐个改掉再跑测试——测试变红叫“杀死”，仍然全绿叫“存活”。
+> 首次接入就在三个安全关键模块里照出 **22 条“改坏了也没人报警”的代码**。
+
+- **接入范围**：`pyproject.toml` 的 `[tool.mutmut]` 只圈三个“错了就是安全事故”的模块——
+  `src/warden_agent/core/redaction.py`（密钥泄进日志）、`src/warden_agent/policy/policy.py`
+  （该拦没拦 / 审批被绕）、`src/warden_agent/web/security_headers.py`（响应头缺一条）。
+  不圈全仓库是因为突变体是**逐个**跑的，整仓是小时级——那是跑不完的门禁，等于没有门禁。
+- **实测（本机容器内，权威台账 `mutants/mutmut-cicd-stats.json`）**：
+  接入基线 **228/22 → 91.2%**；补完第一批测试 **239/11 → 95.6%**；
+  收尾 **242 killed / 9 survived / total 251 → 96.4%**，其中
+  `timeout=0 no_tests=0 skipped=0`（分母没被环境噪音污染）。
+- **9 条存活全部是等价变异**（改了与没改行为完全一样，杀不掉是正常的，不是缺口）：
+  逐条给了突变体 ID 与理由，见 `docs/mutation.md` 第五节。
+- **照出一个真缺陷（最有价值的一条）**：`policy/policy.py` 里
+  `if os.name == "nt":` 决定路径是否折叠大小写，而原测试写成“看当前平台再决定断言哪一边”
+  ——**Linux CI 上永远只跑 `else` 分支**，“Windows 上路径大小写不敏感”这条安全语义
+  从来没有被任何一次 CI 验证过（在 Windows 开发机上反而会红，假象更稳）。
+  变异测试把它改成 `if os.name == "XXntXX":` 和 `if os.name == "NT":`，两条都存活，
+  盲区就此暴露。改为用 `monkeypatch` 注入平台名、**两个平台的分支都断言**，
+  两条突变体立刻被杀死。
+- **其余 6 处真缺口补的是断言，不是实现**：`redact_text` 的 `head`/`tail` 必须取自
+  `m.group(0)`（丢掉规则前缀或值尾引号就错）、`bytes` 分支的 `_masked`/`redact_text` 分流、
+  字典分支深度递增与 `MAX_DEPTH` 截断、受保护路径的空段/`.` 过滤（`./data/x` 绕过前缀匹配）、
+  规则异常日志必须带 `exc_info=True`、安全头兜底消息缺 `headers` 键时不能 500。
+- **门禁**：`scripts/mutation.sh`（本地/CI 统一入口）+ `scripts/mutation_gate.py`
+  （分数口径：分母扣掉 `skipped`/`no_tests`，**`timeout` 不算杀死**）。
+  门禁自带 5 种退出码，把“分数不够”（1）、“没产出统计文件”（2）、“读不出来”（3）、
+  “配置空转”（4）分得清清楚楚——以前 `load_stats` 直接抛 `FileNotFoundError`，
+  进程退出码也是 1，和“分数不够”长得一样，维护者会去补根本不缺的测试。
+  新增 `tests/test_mutation_gate.py`（15 条，固定全部分支，含“恰好等于门槛算过”）。
+- **CI**：`.github/workflows/ci.yml` 新增 `mutation` job（夜间定时 + 手动触发，
+  不放进每个 PR 的必跑链路——它保护的是“测试质量”，不是“这次改动对不对”，
+  挡住每个 PR 只会逼人绕过门禁），并把存活清单写进 job summary。
+- **修正一处假声明**：`scripts/mutation.sh` 原注释写着“CI：ci.yml 的 mutation job”，
+  但当时**根本没有这个 job**——现在它真的存在了。
+- **工程教训（已修）**：补测试时把 `tests/test_policy.py` 与 `scripts/mutation_gate.py`
+  各写超了一行 100 列，当场把 CI 的 `quality` job 改红——**门禁脚本自己也是被门禁管的代码**。
+- **诚实边界**（写进 `docs/mutation.md` 第七节）：96.4% 只是这三个模块的分数，
+  不等于“全仓库测试有效”；等价变异的判断跟着实现走（改实现要重跑裁决）；
+  Windows 语义是 `monkeypatch` 断言而非真机跑通；没接增量变异，所以它跑夜间全量。
+- **新增文件**：`docs/mutation.md`、`scripts/mutation.sh`、`scripts/mutation_gate.py`、
+  `scripts/mutant_check.py`、`tests/test_mutation_gate.py`。
+
+## 2026-09-29（第三十一批：流式链路的两个真实失败模式 —— 空闲被掐断、断线丢掉整轮回复）
+
+> 这批不是抛光，是补两个**真实网络下必然发生**的洞。上一批的 e2e 只证明“连发两条消息能对话”，
+> 但工具执行期间 `/chat/stream` 会**几十秒零字节**：中间层（nginx / CDN / 浏览器）会当成死连接
+> 掐掉；而一旦断线，**那一整轮回复就白跑了**——后端其实还在跑，但没人把落库后的结果交还给用户。
+> 现在：空闲期主动发心跳；断线后那一轮照常跑完并落库，客户端自动从事件总线续读补齐。
+
+- **空闲心跳**：`/chat/stream` 的搬运循环等不到帧就发一行 SSE 注释（`: keep-alive`），
+  间隔 `SSE_HEARTBEAT_SECONDS`（默认 10 秒，`WARDEN_SSE_HEARTBEAT_SECONDS` 可调，`0` 关心跳）。
+  注释行**不带 data**，任何合规的 SSE 客户端都会忽略它（前端解析器也不例外，有用例钉住）。
+- **断线不掐整轮**：会话驱动从“生成器里直接 `for ... yield`”改成“**后台线程跑 + 队列搬运**”。
+  客户端断开时 Starlette 只关掉搬运生成器，后台那一轮继续跑完、**照常落库**，
+  并把终态同时 `publish` 到事件总线（`/events/{run_id}` 因此能续读到同一份结果）。
+  租约与并发名额仍在这一轮真正结束时归还——不会因为客户端走了而泄漏，也有用例钉住。
+- **前端看得见、能补齐**：`streamChat` 未见终态就收尾时报 `{type:"disconnected"}`（不假装正常结束，
+  也不再让 UI 永远停在 busy）；`ChatView` 据此显示「🔌 连接中断，正在从服务端续读本轮回复…」，
+  并调 `/events/{run_id}` 把 `final` 补回**同一个气泡**（不重复新建消息）。
+  续读通道也不可用时提示改为「本轮回复未能取回」+「重新加载会话」；
+  **用户自己点过「停止」则不自动续读**（不擅自再拉一轮）。
+- **新增回归测试**：`tests/test_web_stream_disconnect.py`（4 条，直接按 ASGI 驱动——
+  `httpx.ASGITransport` 会把响应体缓冲完再返回，走不到“客户端提前断开”这条路径）：
+  断线后落库 + 事件总线可续读、断线后租约与并发名额照样归还、空闲期会发心跳、
+  心跳注释行不会被当成事件解析。前端侧：`api.test.ts` 3 条 + `ChatView.test.tsx` 的
+  `断线续读` 组 4 条。
+- **收益**：用户切网 / 刷新页面 / 代理超时不再“回答了但看不到”；
+  代理层不再把长工具执行当成死连接掐掉。**代价**：客户端断开的那一轮仍占用一个
+  `WARDEN_SSE_MAX_CONNECTIONS` 名额直到该轮结束（已在 `docs/deployment-boundaries.md` 写明）。
+
+## 2026-09-28（第三十批：真浏览器 e2e —— 它顺手抓出两个「只有真跑才看得见」的缺陷）
+
+> 这批起源于一句质疑：“这个前端是不是很拉跨？” 前端门禁（类型检查 / 单测 / 构建）都在，
+> 但**没有任何一条路径证明它在真浏览器 + 真服务器下能跑**。补上这条路径之后，
+> 它立刻抓出两个在此之前全部用例都照不到的缺陷。
+
+- **新增真浏览器 e2e（Playwright）**：`web/playwright.config.ts`、`web/e2e/csp.spec.ts`、
+  `web/e2e/start-e2e-server.mjs`（启动器：先 `npm run build`，再起
+  `.venv/Scripts/python.exe -m warden_agent.web.run_server`）、npm 脚本 `test:e2e`，
+  CI 的 quality job 增加一步（含 `npx playwright install --with-deps chromium`）。
+  顺带把本机踩到的三个坑写进启动器注释：Node 20+ 用 `spawnSync` 跑 `npm.cmd` 必须 `shell:true`；
+  服务器不认识 `WARDEN_HOST` 之外的主机名要靠 `WARDEN_WEB_DIST` 指定已构建的前端目录；
+  匿名开发模式要显式 `WARDEN_ALLOW_ANON=1`（默认 fail-closed 拒绝启动）。
+- **它抓到的缺陷 ①：ContextVar 跨 yield —— 真实服务器上第二条消息必 500**
+  （`src/warden_agent/runtime/session.py`）。`owner_scope(run.user_id)` 原本用 `with` 包住了**整个流式生成器**；
+  Starlette 会把同步生成器丢进线程池逐块 `next()`，每块各持一份 context 副本，
+  于是 `set` 落在一个副本、`reset` 落在另一个副本，`reset` 直接抛
+  `ValueError: <Token var=<ContextVar name='warden_memory_owner'> ...> was created in a different Context`。
+  现象是“第一条消息正常、第二条消息 500”。TestClient 的同步路径不长这样，
+  所以在此之前 1410 条用例全绿也照不到它。
+  修法：归属只在**工具执行那一小段**（`_execute`，不跨 yield）生效，
+  而 ContextVar 的唯一消费者（`memory/tools.py` 的 `current_owner()`，供 remember/recall 推断归属）正好就在那一段里。
+- **它抓到的缺陷 ②：多副本同时启动会撞 `__schema_version___pkey`**
+  （`src/warden_agent/store/postgres.py`）。版本行的写入是裸 `INSERT`，两个副本同时起来时
+  第二个必然 `UniqueViolation` —— 而“把副本从 1 扩到 2”正是 K8s 的常规操作。
+  改为 `INSERT ... ON CONFLICT (version) DO NOTHING`（建表仍留在一个事务里，保持“要么全建要么不建”）。
+- **新增两条回归用例**：
+  ① `tests/test_session.py::test_跨上下文逐块推进流式会话不炸`：用 `contextvars.copy_context()`
+  逐块推进生成器，精确复现上面的时序（修复前会在推完最后一块时报错）；
+  ② `tests/test_memory_persistence.py` 里走**产品路径**的一条：`POST /chat/{run_id}` 中模型调 `memory.remember`，
+  断言候选落在调用者（demo-user）名下、状态为 `PENDING`，且 `?user_id=alice` **不能**冒充身份改写归属。
+- **修一套“看起来像死锁”的测试实现**（`tests/test_postgres_integration.py` 的 run 锁并发抢占用例）：
+  原来用 `threading.Barrier(8)` + 裸 `wait()`——任一 worker 在建连接阶段抛异常，
+  其余 7 个线程就**永久等待**，整套回归停在 45% 一动不动、日志断在半行，看起来像“卡死”。
+  取证：先用 `CreateToolhelp32Snapshot` + `OpenProcess`（本机既无 PowerShell 也无 psutil）
+  确认进程仍在且无输出，再抓线程转储，看到多个 `concurrent.futures` 工作线程停在 `Barrier.wait`。
+  同时确认本机**没装 `pytest-timeout`**（`--timeout` 参数不被识别）→ 没有任何机制会来救人。
+  改为 `wait(timeout=30)`，并把 `BrokenBarrierError` 转成带可读原因的 `AssertionError`。
+- **此前一条“跑不起来”的说明已修正**：`docs/operations.md:306` 教人跑 `./scripts/run_local.sh`，
+  而该脚本在仓库里**不存在**（全仓 `grep -rn "run_local.sh" docs/` 只命中这一处）。现在 `scripts/run_local.sh` 真的存在了（一键：建 venv → 装依赖 → 起服务 → 打印地址），
+  文档里的引用因此变成真的；同时把 `scripts/rollback.sh`、`scripts/run_local.sh` 都记进 `docs/复核索引.md` 的“新增文件”表。
+- **文档对齐**：`docs/复核索引.md` 补齐第二十九/三十批的批次行与文件索引，
+  §0 的“三十秒上手”数字改为当前实测值（全量 **1408 通过 / 4 跳过**（共 1412 项），前端 vitest 105，e2e 2），
+  欠账表里划掉已补齐的 CSP-in-browser 与回滚演练两项。
+- **诚实的边界**：e2e 只覆盖“真浏览器下 CSP/静态资源不违规 + 首屏能渲染 + 两条消息能对话”，
+  不是全站 e2e；CI 里新增的那一步**尚未在真 GH runner 上跑过**（本地绿）。
+
+---
+
+## 2026-09-28（第二十九批：发布面与回滚面 —— 把“存在”变成“能一键真跑一次”）
+
+> 这批针对的是一类特别隐蔽的“名不副实”：**东西都在，但没有任何路径能证明它真的跑得起来**。
+> 更具体的三条旧毛病：签名链路只有“推公开 tag”一个入口（于是它永远没被运行过）；
+> `cosign sign` 签的是 **tag** 而不是注释里写的 **digest**；回滚只有一句文档描述、没有命令。
+
+- **签名链路补上免发布入口**（`.github/workflows/ci.yml`）：`on:` 新增 `workflow_dispatch`，
+  入参 `tag` 声明为 **required**（手动跑也必须显式给出发布版本，不让分支名冒充版本号）；
+  新增“发布 tag 合法性”步（必须 `v<数字>…` 开头，否则 fail-closed）。
+  原来想验证签名就必须先对外发布——等于用“发布”换“验证”，门槛高到没人会去验。
+- **签名对象从 tag 改成 digest**（`ci.yml` 的 `image-signing`）：`docker push` 后用
+  `docker buildx imagetools inspect` 从 **registry**（而不是本地 `RepoDigests`）取回权威 digest，
+  用 `^sha256:[0-9a-f]{64}$` 校验后才 `cosign sign`。
+  **这是修一个真缺陷**：tag 可被移动/覆盖，签 tag 等于“签了一个以后可能指向别的东西的名字”，
+  而原注释自己写着“签名对象是 digest，不是 tag”——代码与注释不一致。
+  同时把不可变引用 `repo@sha256:…` 打进 job summary（部署就直接用这一串）。
+- **签名后**立刻**独立校验**（同 job）：`cosign verify` 带
+  `--certificate-identity-regexp` + `--certificate-oidc-issuer`，把“别人将来能不能验”
+  提前跑一遍（只签名不验证 = “我以为签上了”）；可复跑的验证命令原样写进 summary。
+- **签名对象与部署对象是同一个字符串**：签名后调用仓库自己的
+  `scripts/pin_image_digests.sh --app-image`（fail-closed、解析不出就非 0 退出）把 digest
+  钉进 `deploy/k8s/*.yaml`，并把 `git diff` 打进 summary 供人工落到部署分支。
+- **新增回滚面 `scripts/rollback.sh`**：退出码是契约——`0` 完成且健康检查通过、
+  `2` 没有可回滚历史（**什么都不做**）、`3` 已下发但**没起来（要求人介入）**、`1` 用法/环境错误。
+  细节：revision 会跳号，所以“上一个版本”取“严格小于当前的最大值”而非 `current-1`；
+  `readyReplicas` 在“没有 Pod ready”时字段被省略，必须按 0 处理（否则 `0 == 0` 会误判成功）；
+  结尾明确提示 `rollout undo` **不还原** ConfigMap / Secret / 数据库 schema。
+- **新增 `tests/test_release_scripts.py`（18 条）**：这两个脚本是“出事时才运行”的代码，
+  所以锁的是**失败时的行为**：不可解析 → 退出码 3 **且一个字节都不改**；
+  没有历史 → 退出码 2 **且绝不能下发 undo**；回滚后必须真的去查健康；
+  输出不是合法 digest（只吐了警告）也必须停。
+- **顺手修一个 Windows 陷阱**（`scripts/pin_image_digests.sh`）：Git Bash 里 `timeout` 会解析到
+  **Windows 自带的 `timeout.exe`**（那是“等待 N 秒”的另一个程序，参数是 `/t`），
+  拿它包 docker 会立刻报参数错；改为只接受真正支持 `--version` 的 coreutils `timeout` / `gtimeout`。
+- 测试实现里踩到并记录的两个坑（写下来是为了后人别把它“简化”掉）：
+  `export -f` 注入的替身函数在 Git Bash 下不可靠，改用 `BASH_ENV`；
+  更重要的是**替身必须连 `timeout` 一起替**——`timeout` 是外部命令，它按 PATH 找 docker，
+  **绕过 bash 函数**，只替 docker 会让测试静默地跑真 docker（真打 registry），
+  于是几个用例会“靠错误的原因通过”。
+- **修一处会把整套回归“静默卡死”的测试实现**（`tests/test_mcp.py`）：MCP 真实连接的预热超时
+  原为 **600 秒**，于是冷启动一旦变慢，`pytest` 会停在 `tests/test_mcp.py .....` 后面
+  **十几分钟没有任何输出**——看起来像死锁，实际是在等一个外部进程。两处修改：
+  ① 上限收到 **90 秒**（本机实测冷启动 30.5s / 13 个工具，约 3 倍余量）；
+  ② 预热前后各**主动往终端写一行进度**（`[mcp] 预热真实 server…` / `预热完成：13 个工具，39.6s`），
+  并把耗时带进失败信息。原则：**一个测试能拖住整套回归多久，必须是有界且看得见的。**
+  取证记录：卡死时先用 `CreateToolhelp32Snapshot` + `NtQueryInformationProcess(60)` 拿到各 python
+  进程的**完整命令行**（本机既无 PowerShell 也无 psutil），据此定位到卡在 `test_mcp.py` 第 6 条；
+  另外全仓 grep 确认**没有任何测试会 spawn 嵌套 pytest**（即不存在递归跑套件的隐患）。
+- **诚实的边界**：本批**尚未**在真 GHCR 上跑过一次（需推 `v*` tag 或手动触发）。
+  所以只能说“链路已到一键可验证”，不能说“已验证”。
+
+---
+
+## 2026-09-28（第二十八批：核心运行时「名不副实」收口 —— 把库里的能力真正接进产品路径）
+
+> 这批换了个角度审：不看“有没有写”，只看“产品路径上到底能不能用”。
+> 结果发现六处“读代码像是在的、测试也绿、但跑真路径就没有”的地方。
+> 每一条的处理原则一样：**要么真接线（并带闸门/开关），要么诚实说明边界——不删能力、不假装**。
+
+- **P1-4 `RecoveryController.can_resume` 没有产品入口**（`runtime/recovery.py:107`）：`GET /recovery/plan`
+  只回四组列表（续跑/重试/等人工/已失败），调用方得自己从列表里反推“这一次到底能不能续”。
+  现在端点支持 `?run_id=`：多回 `run_id` / `decision` / `resumable` 三个字段直接答“能不能续”；
+  `resumable` 就是 `can_resume()` 的结论（未判失败、未在等人工）；别人的 Run 一律 **404**（与其它
+  按归属收敛的端点一致）。测试：`tests/test_recovery_wiring.py` 新增两条（含越权）。
+- **P1-5 `memory.remember_text`（原话抽候选）只有单测在调**：`extract_facts` / `propose_from_text`
+  写好了、也有单测，但产品目录里根本没有入口——用户说一句话想让系统自己抽事实，无路可走。
+  现在多了一张 `memory.remember_text` 卡（默认纯规则抽取，抽不到会**如实说抽不到**并提示改用
+  `memory.remember`）；同时把它列入审批豁免集合（`web/run_server.py` 的 `_POLICY_BENIGN_TOOLS`）——
+  理由：它只往候选区写一条**待确认**、不生效也不可绕过回滚；真正生效的 `memory.confirm` 仍必须审批。
+  实现中发现并修掉一个真 bug：`propose_from_text` 没带 `owner`，产品路径上会把用户偏好记成“空归属
+  的公共记忆”（多用户部署下 B 能在确认时直接动到 A 的条目）。测试：`test_memory.py` 新增 5 条。
+- **P1-6 `multiagent/` 整包不在产品路径上**（主管/分派器只被 `demo_e2e.py` 与 `evals/` 调用，
+  README 能力表却已算“已实现”）：新增 `src/warden_agent/multiagent/registry.py` +
+  `augment_catalog(multiagent=..., multiagent_model=...)` + HTTP 路径 `WARDEN_MULTIAGENT=1`，
+  打开后产品 Agent 目录里真的多出 `research` / `write` 两张子 Agent 卡（默认关，因为子 Agent 会多花
+  模型调用；开了却不给模型 → **报错**，不静默装出空壳目录）。
+  子 Agent **只拿 `pure=True` 的只读工具**、且拿不到子 Agent 卡自身：前者是因为带副作用的工具要过
+  人工审批、而子 Agent 跑在一次工具调用内部没有审批对话通道（接线反而开洞），后者是防“主管→子
+  Agent→主管”递归。测试：`test_multiagent.py` 新增 6 条（默认不注册/开关注册/pure=False/工具面
+  只读不递归/缺模型报错/`build_app` 端到端）。
+- **P2-7 `SkillTriggerRouter` 只在 demo/评测生效**：产品路径只注册了 `skill.<alias>.run` 激活卡，
+  “按任务意图选该用哪本 SKILL.md”这件事在产品上不存在，模型得自己猜翻哪本。
+  现在 `augment_catalog` 在装配技能时同步注册 `skill.trigger.pick`（读卡是纯计算、`pure=True`、
+  不花额外模型调用，所以不需要开关）；没装技能则不注册。测试：`test_skill_trigger.py` 新增 3 条。
+- **P2-8 请求体上限口径**：文档写“只对带 body 的方法生效”，实现只护 `POST/PUT/PATCH`——
+  按 HTTP 规范 **`DELETE` 也能带 body**，一个 `DELETE` 就能把任意大的 body 灌进来（同一道闸门、
+  同一份内存）。现在改为：声明了 `Content-Length` 的**任何方法**按声明值判，没声明但方法本身可带
+  body（含 `DELETE`）则边读边计数；`GET` 不被当带 body 处理（不误伤、不白读）。
+  同步修正 `docs/deployment-boundaries.md` 的口径描述。测试：`test_web_limits.py` 新增 3 条。
+- 环境变量登记同步：`core/settings.py` 的 `ENV_SPECS` 新增 `WARDEN_MULTIAGENT`（`consumers`
+  只有 `web/run_server.py`，AST 守卫照旧断言“实际读它的模块 ⊆ consumers”）；
+  `deploy/k8s/README.md` 变量表补一行。
+- **两处已澄清、不做“假修复”**：① `fs.delete` 演示卡**不能真删**（没有工作区兜底时真删任意路径
+  反而是风险），它已收进 `WARDEN_DEMO_TOOLS=1` 且返回值不再谎称“已删除”——保留但不伪装；
+  ② 配置面（env 读取点的模块归属）逐条核对后没有越权读取的洞，不动。
+- 验证：`pytest` **1355 passed / 36 skipped**（全量，4m31s）；`ruff check src tests` 干净；
+  `mypy` 对本次改动的 `agent.py` / `web/server.py` / `multiagent/registry.py` 无新增问题。
+
+## 2026-09-28（第二十七批补：记忆写入改真两阶段候选 + 路由面清单守卫 + 技能 requires 门禁）
+
+> 承接上一批：把总账里剩下那些「看着已经做了、实际上没做」的地方逐条收口。
+> 这三项的共同点是**代码里确实有那段逻辑，但产品路径根本没接上**——
+> 比“根本没写”更难发现：读代码像是有的，测试也绿（测的是“能校验时怎么校验”），只有跑真路径才暴露。
+
+- **P1-13 `memory.remember` 写的是「待确认候选」，实际直接生效**（批次 3 最后一条）：
+  - 工具描述写着“先进入待确认候选”，但两个分支都 `approve(...)` **直接生效**；而且就算真的只入候选，
+    也**没有任何面能看见/确认候选**（`GET /memory/{scope}` 只回已生效项）——“确认环节”纯属文案。
+  - 现在 `memory.remember` 真走 `propose → PENDING`；`memory.confirm` 无候选时给明确提示。
+  - `memory/service.py`：`candidates(scope, owner)` **在服务层就按归属过滤**、`conflict_preview(c)`
+    给出“确认后会替掉什么”；`approve_candidate(uid, scope, owner, replace_existing)` /
+    `reject_candidate(...)` 越权一律 `None`/`False`（**不分化“存在但不归你”与“不存在”**，防 uid 枚举）；拒绝是软删（`TOMBSTONED`）。
+  - `web/server.py` 新增 `GET /memory/{scope}/candidates`、`POST …/candidates/{uid}/confirm`、
+    `POST …/candidates/{uid}/reject`，身份一律取 `_identity(request, None)`（不接受查询参数自称）。
+  - 前端 `InfoPanel.tsx` 新增「待确认 N」区：可确认/可拒绝，冲突项显式写“⚠️ 确认后会替掉现有：…”，
+    失败显式报错，缺 `uid` 的候选按钮禁用并说明原因（拿 key 当 id 用会动到别人的条目）。
+  - 为什么算 P1：记忆会拼进后续每一轮提示词，**写记忆不必审批 = 让模型给别人/未来的自己写系统提示**。
+  - 测试：`test_memory.py` 21 条、`test_memory_persistence.py` HTTP 候选流（越权/重放 404）、
+    `test_route_surface.py` 登记 3 条新路由、前端 `InfoPanel.test.tsx` +7 条；
+    另把 `test_caps_integration.py` / `test_multiagent.py` 里“写就能取回”的旧断言改成
+    `remember → confirm → recall`——**旧测试原本在替假行为作证**。
+- **P1-11 路由面清单守卫 + 运维边界写明**：新增 `tests/test_route_surface.py`（36 条）——
+  `ROUTES` 表登记 27 条路由的访问级别（含藏在请求体分支里的管理员限制），
+  **逐条比对 `build_app()` 实际暴露的路由**（多/少一条都红），并把登记表真跑一遍
+  （登记公开的必须免凭证可访问、其余未带凭证 401、登记管理员的普通用户 403）。
+  写这条守卫当场查出 `/_docs/oauth2-redirect` 要凭证（Swagger 的 Authorize 正好跳它）。
+- **P0 技能 `requires` 依赖门禁从未生效**（`skill/tools.py` 只在传了 `available` 时才校验，
+  而 `skill_activation_tool` / `build_agent`（`agent.py:374`）**从不传**）：
+  新增 `available` 参数（集合或取集合的**可调用**）与 `ToolCatalog.names()`，
+  `build_agent` 传 `available=lambda: catalog.names()`。
+  必须是可调用而非快照：工具是装配过程中陆续注册的（记忆→技能→Web→MCP→Git），
+  拿快照会让“先造技能卡、后注册 `web.fetch`”的技能被误判为缺依赖。
+
+- 全量测试 **1333 passed, 36 skipped / 0 failed**；覆盖率 **85.98%**（含分支，门槛 84%）；
+  `ruff check .` 全绿；`mypy` 102 文件零错；
+  前端 **172 passed / 12 文件**，`tsc --noEmit` 与 `eslint --max-warnings=0` 干净。
+
+---
+
+## 2026-09-28（第二十七批：「形同虚设」清账 P0 + 安全响应头 + 配置面守卫补肓）
+
+> 来源：第二轮三路只读审计（半成品清点 / 前端质量 / 交付运维）+ 一轮「形同虚设」专项扫描。
+> 本轮只修 **P0——那些“声称做了、实际没做”或者“做得很像真的”** 的地方：它们比直接报错危险，
+> 因为评审者/集成方会把它们当成系统真实能力的证据。每项都配了回归测试。
+
+- **P0-1 演示空壳工具不再默认注册**（`web/run_server.py:112-121` 的 `fs.delete` 只 `return f"已删除 {path}"`，
+  却当作高危工具注册给人看）：现收进 `_build_catalog()` 的 `WARDEN_DEMO_TOOLS=1` 开关之后，
+  工具描述与返回值都明写「演示」，**不再谎称已删除**，仍 `pure=False` 走审批，启动打 WARNING。
+- **P0-2 假模型不再静默接管**（`model/fake.py` 在缺 key 时自动变成“大脑”，回复是写死脚本
+  却会选工具、事件流完整）：新增 `ensure_model_is_real()`（`web/run_server.py`）——
+  非回环监听 + 假模型 + 未设 `WARDEN_ALLOW_FAKE_MODEL=1` → **拒绝启动**（fail-closed）；
+  回环地址自动放行（本机怎么跑都行），`/capabilities` 如实标出“这是演示档”。
+- **P0-3 评测 `--mode real` 从“尚未实现”到落地**：新增 `src/warden_agent/evals/real_model.py`，
+  5 条**行为化**真实模型质量用例（工具选择 / 不该调时不调 / 严格 JSON 指令遵循 /
+  **间接提示注入**（注入藏在工具返回内容里，判据是轨迹里有没有执行 `boom.run`）/
+  幻觉抵抗（无资料来源不许编年份））。`runner.run_all(mode, model)` 在 `real` 模式下
+  **必须显式传真模型**（不做“没传就退回脚本模型”）——否则这条门禁就变成自欺；
+  `EvalReport.mode` 写进报告，`quality` 阈值 0.6 且**空类别不参与判定**（不会因 quality 没数据
+  把 `--mode scripted` 判成失败）。CI 新增 `evals-real` job（`.github/workflows/ci.yml:259`）：
+  没配 key 就**显式跳过**（日志写明，不出“质量 100%”），不搞 `continue-on-error` 式的假门禁。
+- **P0-4 教学版恢复不再能冒充恢复入口**（`store/recovery.py` 把历史拼成一条 user 消息重跑，
+  不恢复 Run 状态机也不校验冻结绑定）：文档加 DEPRECATED 标注，构造时发 `DeprecationWarning`
+  ——靠仓库的 `filterwarnings=error` 在 CI 与线上日志里**当场暴露**，并指名去路
+  （`runtime/recovery.py` 的 `RecoveryController`、`runtime/worker.py`、`GET /recovery/plan`）。
+- **P0-5 离线搜索不再装作真搜索**（`web/search.py:646`）：假 provider 的结果文本带
+  `[离线演示数据]` 前缀，`/capabilities` 的 `web_search_mock` 如实上报，前端能力面板摆出来。
+- **配置面守卫补丁肓区**（`tests/test_config_surface.py`）：守卫原先只认调用处的**字面量**，
+  于是 `web/server.py` 里 `ENV_APPROVAL_ALLOW_SELF = "WARDEN_APPROVAL_ALLOW_SELF"` 这种
+  **常量别名**读法能静默绕过“登记 + 越权检查”——一条能静默绕过的守卫比没守卫更坑。
+  新增 `_module_constants()` 解析模块级字符串常量（前缀式常量 `WARDEN_` 刻意不当变量名，避免误报），
+  4 条新测试锁住（含“不传常量表时依旧扫不到”，保证不会悄悄兼容掉）。
+- **安全响应头（浏览器层纵深防御）**：新增 `src/warden_agent/web/security_headers.py`——
+  纯 ASGI 中间件（**只改头不碰 body**，SSE 流式输出不受影响），挂在网关**外层**，
+  所以 404 / 401 / 500 这些错误页也带全套头；同名头先去重再补（重复 CSP 在浏览器里是**取交集**，
+  会让行为无法推理）。CSP 默认全禁再开口：`script-src 'self'`、`object-src 'none'`、
+  `frame-ancestors 'none'`、无 `unsafe-eval`；配 `X-Frame-Options: DENY`、`nosniff`、
+  `no-referrer`、`Permissions-Policy`。**HSTS 故意不设**（应用分不清自己是否在 TLS 后面，该由网关设）。
+  诚实口径：`style-src` 保留 `'unsafe-inline'`（分栏拖拽用行内 style），且本机**未做浏览器 e2e**。
+- **访问密钥默认不再长期驻留**（前端配套）：`web/src/lib/api.ts` 默认只存 `sessionStorage`
+  （本标签页有效），要跨重启保留得在 `web/src/App.tsx` 新加的「记住」勾选框里显式选；
+  取消勾选时同步清掉 localStorage 副本——两处都留会让“到底存在哪”无法推理。
+  为什么当 P0：页面要渲染模型生成的 Markdown，key 落在 localStorage 就是跨重启长期待在 XSS 能读到的地方。
+- **会话可分享/可刷新（URL 深链）**：新增 `web/src/lib/deepLink.ts`——会话 ID 写回 `?run=`（用
+  `replaceState`，否则「后退」要一步步退会话），且 URL 里的 `run` 是**外部输入**，只接受
+  `[A-Za-z0-9._:-]{1,80}` 的字面量：形态不对就当“没有深链”回退到新会话，
+  不拿一个可疑字符串去请求别人的会话（与 `web/src/lib/guards.ts` 同一口径）。
+- **前端健壮性/可访问性**（本轮前半段）：切会话时 abort 在途流、`usePolling` 加代际守卫
+  （防旧响应覆盖新状态）、折叠后的面板不再渲染 DOM（原先宽度 0 的容器里按钮仍可 Tab 聚焦、
+  读屏仍能读到，且 5s 轮询白烧请求）、外壳暴露可访问名。
+- **路由面有了清单守卫（运维边界也不再是口头前提）**：新增 `tests/test_route_surface.py`——
+  `ROUTES` 表逐条登记 27 条路由的访问级别（公开 / 认证 / 管理员）与藏在请求体分支里的
+  管理员限制（`POST /models/select` 的 `scope=deployment`）。它做两件事：
+  ① 把 `build_app()` 实际暴露的路由与登记表**逐条比对**——新增路由不登记就红
+  （与 `test_config_surface.py`、`test_k8s_manifests.py` 同一套“新增必须声明”思路）；
+  ② 把登记表**真的跑一遍**——登记为公开的必须免凭证可访问，其余未带凭证必须 401，
+  登记为管理员的普通用户 403 / 管理员通过。**写这条守卫时当场抓出一处真缺口**：
+  `/docs` 公开但 `/docs/oauth2-redirect` 却要凭证（Swagger 的 Authorize 流程会跳到那个子页），
+  已把整个文档簇收进 `_is_public()`。
+- **运维边界写成明文**（`README.md` 路由节 + `docs/operations.md` 第十三节）：
+  **破坏性运维动作只在 CLI**（`backup` / `restore` / `backup-prune` / `rotate-credentials` /
+  `audit-verify`）——能上宿主机 shell 就已经拿到数据目录与密钥，不再重复造一套“运维 API”及其鉴权；
+  HTTP 面只给**只读**运维视图（`/audit`、`/recovery/plan`、`/alerts/stuck`，按调用者收敛），
+  其中 `/metrics` 仅管理员。同时修掉 README 里 `/audit` 那句过时口径（“按租户隔离”
+  实际是**按调用者收敛、admin 见租户全局**——同租户并不等于同一个人）。
+- **技能 `requires` 依赖门禁真的会拦人了**：审计发现 `build_agent` 调 `skill_activation_tool`
+  时没传 `available`，`skill_to_tool` 里那段校验自然就没跑——**SKILL.md 里声明的前置依赖
+  在生产路径上完全无效**（典型“形同虚设”）。修法：`skill_activation_tool` /
+  `skill_to_tool` 新增 `available` 参数（接受集合**或取集合的可调用**），
+  `build_agent` 传 `lambda: catalog.names()`（新增 `ToolCatalog.names()`）；
+  用可调用而不是快照是必要的：工具在装配过程中陆续注册（记忆 → 技能 → Web → MCP → Git），
+  用快照会把后注册的 `web.fetch` 误判为缺失。缺依赖时抛 `SkillRequirementError` 并列出缺哪些。
+  测试：`test_caps_integration.py` 两条锁产品路径（未开 `web=True` ⇒ 拒绝激活；开了 ⇒ 激活成功），
+  `test_skill.py` 两条锁“每次激活时取值”与向后兼容；README 补上 SKILL.md 三条契约表
+  （`trust` / `requires` / `version` 各自不满足时的后果）。
+- 验证：全量 `pytest` **1325 passed / 36 skipped / 0 failed**；`coverage` **85.91%**（门槛 84%）；
+  `mypy src/warden_agent` **102 文件**零错；`ruff check .` 全绿；前端 `vitest` **165 例 / 12 文件**、
+  `tsc --noEmit` 与 `eslint --max-warnings=0` 均干净。
+
+> 已知（**2026-09-28 按代码重新核对**）：
+> · 仍然开放：`dev` 领先 `master` 且**无 tag / release**，发布与回滚流水线**从未真跑过**（下一批）；
+>   语义档沙箱（`execution/sandbox.py` 的 `_NETWORK_TOKENS` 正则）可绕过，生产应用内核档；
+>   Prometheus 实集群未设 `retention`；真实 PostgreSQL 环境的端到端验收未做；
+>   前端 CSP 未在真实浏览器验证（本机无 e2e）；
+>   **运维路由清单只锁了“当前这 27 条”**：新增路由必须同步登记（否则 CI 红），
+>   但“登记为 AUTHENTICATED 的路由内部是否真的按调用者收敛”仍靠各自的行为测试；
+>   **内存 `memory.remember` 的两处不诚实仍未改**：工具描述里承诺的“冲突检测/即时生效”
+>   与 `auto_approve` 默认值对不上（`memory/tools.py:92-108`，批次 3 第 13 条）。
+> · 本轮已收口（旧清单里的这几条不再是缺口）：评测已接 CI（`evals-real` job，无 key 则显式跳过）；
+>   演示空壳工具、假模型静默接管、教学版恢复、离线搜索“装真”、配置面守卫肓区均已处理；
+>   批次3 第 11 条（运维面越权）已收口：HTTP 面仅 3 条只读运维视图（`/metrics` 仅管理员），
+>   破坏性动作只在 CLI，并由路由清单守卫锁住。
+
+---
+
 ## 2026-09-24（第二十六批：独立审计后的三项安全/类型修复）
 
 > 来源：对 `dev` 工作树的一次独立审计（安全治理 / 交付运维 / 代码质量契约 三路并行，只读审查）。
@@ -28,9 +741,18 @@
 - 验证：全量 `pytest` **1129 passed / 36 skipped**（较上批 1114 增加 15 条守卫）；`coverage` 85%
   （新增 `execution/child_env.py` 100%）；`mypy --strict` **99 文件**零错；`ruff check src tests` 全绿。
 
-> 已知（未修，按优先级）：`dev` 仍领先 `master` 52 个提交且无 tag / release；语义档沙箱
-> （`execution/sandbox.py:44-52` 的 `_NETWORK_TOKENS` 正则）注释自认可绕过，生产应强制内核档；
-> 无备份 CronJob、无迁移 Job；`deploy/` 无 NetworkPolicy；审计账本记原始参数未脱敏；前端仍无测试。
+> 已知（**2026-09-27 按代码重新核对过，旧的“未修”清单已大半过时**）：
+> · 仍然开放：`dev` 领先 `master` 54 个提交且**无 tag / release**，发布与回滚流水线**从未运行**；
+>   语义档沙箱（`execution/sandbox.py` 的 `_NETWORK_TOKENS` 正则）可绕过，生产应强制内核档；
+>   Prometheus 实集群未设 `retention`（SLO 用 `rate(...[30d])`）；评测黄金集未接 CI。
+> · **已完成、旧清单未更新**：备份 CronJob、迁移 Job、NetworkPolicy 均已存在（`deploy/k8s/`）；
+>   审计账本已脱敏（`core/redaction.py`，接线 `store/sqlite.py`、`store/postgres.py`）；
+>   前端已有 11 个测试文件 / 140 例 + 覆盖率门槛（`web/vite.config.ts`）；JSON 结构化日志已落地；
+>   迁移指纹已拍细（列类型/可空/默认/主键 + 索引集合）；ServiceMonitor 的抓取 token 键已改为
+>   专用的 `WARDEN_METRICS_BEARER`；演示空壳工具（`fs.delete` / `weather.get`）已收进
+>   `WARDEN_DEMO_TOOLS=1` 开关之后，返回值不再谎称「已删除」。
+> · 最新一轮三路复审（前端 / 半成品 / 交付运维）的总账与待办批次见
+>   桌面文档 `wardenagent-Python/24-三路复审与前端P0修复（2026-09-27）.md`。
 
 ---
 
@@ -295,6 +1017,12 @@
   **仍未处理**：PG 单连接吞吐上限；
 - ✅（第二十二批）CI 已补 SBOM/镜像签名/migration 检查；
   **仍未处理**：配置守卫对"整包传 Mapping"的读取不可见。
+- ✅（第二十九批）发布面与回滚面收口：`image-signing` 改成签 **digest**（原为 tag，与注释不符）；
+  新增 `workflow_dispatch` 手动入口（“验一次”不必先公开推送）+ 签后立刻 `cosign verify` +
+  把 digest 钉进 `deploy/k8s`（签名对象与部署对象同一字符串）；
+  新增 `scripts/rollback.sh`（退出码契约 0/1/2/3 + “不还原 ConfigMap/Secret/schema”的边界）
+  与 18 条行为测试 `tests/test_release_scripts.py`。
+  **仍未处理**：在真 GHCR 上实际跑一次（需推 `v*` tag 或手动触发）。
 
 ---
 

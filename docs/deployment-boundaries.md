@@ -27,6 +27,34 @@ Warden Agent 是一个**有状态的 Agent 运行时**，支持两种部署形�
 
 审计同样按租户隔离：`/audit` 只返回调用者所在 `tenant_id` 的记录。
 
+## 反向代理后面的来源 IP：`WARDEN_TRUSTED_PROXIES`
+
+`request.client.host` 是 **TCP 对端**，不是“客户端 IP”。它被当成调用者用在三处：
+
+| 用处 | 位置 | 塌成代理 IP 的后果 |
+|---|---|---|
+| 匿名限流分桶 | `web/ratelimit.py` 的 `client_key(user_id, host)` | 所有匿名调用者共用一个配额 → 一个客户端能把别人挤成 429 |
+| 匿名幂等作用域 | `web/server.py` 的 `ip:<host>:<Idempotency-Key>` | 两个客户端用同一个 `Idempotency-Key` 时，**后到的读到前一个的缓存响应体** |
+| 审计来源 IP | 审计账本 | 只记录到代理 |
+
+实测（`tests/test_proxy_trust.py` 就是照这个写的）：两个真实客户端 A/B 从同一个代理进来，限 1 次/分钟时 A=200、B=429；两者用同一个 `Idempotency-Key` 打 `/chat/{run_id}` 时，B 拿到的是 A 的缓存响应体（`回答一`），而不是自己执行得到的 `回答二`。
+
+**这不是 bug，是“没配”**：不信任 `X-Forwarded-For` 是安全的那一侧默认（否则任何客户端
+自填一个 XFF 就能刷新自己的配额、伪造审计来源）。在反代后面必须显式声明信任谁：
+
+```bash
+WARDEN_TRUSTED_PROXIES=10.0.0.0/8,172.17.0.1     # 取值 = 代理自己的地址（集群内网段）
+```
+
+启动时它透传成 uvicorn 的 `forwarded_allow_ips`，由 `ProxyHeadersMiddleware` 把
+`scope["client"]` 改写成 “XFF 里**最右边那个不可信**的地址”（标准做法，防左侧伪造）。
+
+两个易错点：
+
+- **取值是代理地址，不是客户端网段**。写成客户端网段等于不设；写成 `*` / `0.0.0.0/0`
+  等于信任所有人自带的 XFF——这两种在启动时会被 `validate_env` 判错并拒绝启动。
+- **只信对端**：对端不在名单里时，它自带的 XFF 一律忽略（有测试盯着）。
+
 ## 协调状态：单副本 vs 多副本
 
 三样"必须全局一致"的状态被抽成了可插拔实现（`web/coordination.py`）：
@@ -110,10 +138,14 @@ Warden Agent 是一个**有状态的 Agent 运行时**，支持两种部署形�
 | 项 | 默认 | 说明 |
 |---|---|---|
 | 鉴权 | **fail-closed** | 无 key 又无 `WARDEN_ALLOW_ANON=1` → 拒绝启动 |
+| 来源 IP | **不信任 `X-Forwarded-For`**（只信回环对端） | 在 Ingress/反代后面**必须**配 `WARDEN_TRUSTED_PROXIES=<代理地址/网段>`，否则匿名限流会塔成一个桶、幂等缓存会被跨客户端读到（见上一节）；`*`、`/0` 在启动时拒绝 |
 | 对外监听 | 拒绝无鉴权 | `WARDEN_HOST=0.0.0.0` + 无鉴权 → 拒绝启动 |
 | 限流 | **开启**，600 次/60 秒/调用者 | `WARDEN_RATE_LIMIT=0` 关闭；格式 `次数/秒数` |
-| 请求体上限 | **开启**，1 MiB（超限 413） | `WARDEN_MAX_REQUEST_BYTES` 可调；只对带 body 的方法生效（先看 Content-Length，无则边读边计数）；`0` 关 |
+| 请求体上限 | **开启**，1 MiB（超限 413） | `WARDEN_MAX_REQUEST_BYTES` 可调；口径：凡声明了 `Content-Length` 的请求（**任何方法**）按声明值判，没声明但方法可带 body（`POST/PUT/PATCH/DELETE`）则边读边计数；`0` 关 |
 | SSE 并发上限 | **开启**，100 条 `/chat/stream`（超限 503） | `WARDEN_SSE_MAX_CONNECTIONS` 可调；到上限**立刻拒绝不排队**；`0` 关 |
+| SSE 断线后的连接占用 | 客户端断开不会掐掉那一轮：会话在后台线程跑完并落库，期间**继续占用**一个 `/chat/stream` 名额（名额在该轮真正结束时归还） | 心跳间隔 `WARDEN_SSE_HEARTBEAT_SECONDS`（默认 10 秒）；前端用 `/events/{run_id}` 续读补齐 |
+| 断线续读的事件来源 | **进程内**（单副本）：`InProcessEventBus`，每个 run 只保留最近 500 条（`WARDEN_EVENT_KEEP`）→ **进程重启后**同一次断线续读拿不到终态（前端显示「本轮回复未能取回」，但答复**已落库**，刷新页面即可见） | 多副本设 `WARDEN_SHARED_STATE=1` → `SqlEventBus`（`run_events` 表）**跨副本且重启后仍可续读**；要「跨进程无条件可续读」得再接事件日志重放，本轮未做 |
+| 多 Agent 子 Agent 卡 | **默认关**（`WARDEN_MULTIAGENT=1` 开） | 会多花模型调用；子 Agent 只拿 `pure=True` 的只读工具 |
 | 协调状态 | **进程内**（单副本） | 多副本必须 `WARDEN_SHARED_STATE=1` |
 | RAG 知识库 | **关闭** | `WARDEN_KNOWLEDGE=1\|<目录>` 开启；默认**词频嵌入（词面匹配，非语义）**，要语义配 `WARDEN_EMBED_*` |
 | 出网抓取 | **关闭** | `WARDEN_WEB_FETCH=1` 开启真实 HTTP 抓取；每跳重定向都过 URL 策略（拒内网/环回/云元数据） |

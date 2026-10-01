@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-1114%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-1471%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -52,13 +52,13 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1150 项测试（1114 passed / 36 skipped）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1475 项测试（1471 passed / 4 skipped）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
 - **确定性多 Agent 分派**：并行 / 串行由显式依赖决定，不依赖模型自由发挥，结果离线可复现
 - **AST 架构边界测试**：分层依赖的单向性由测试守护，架构不靠自觉
-- **mypy --strict 全量零错误**：98 个源文件在严格模式下通过类型检查
+- **mypy --strict 全量零错误**：**103** 个源文件在严格模式下通过类型检查
 
 ### ⑤ 能力"注册即路由"——自解释的工具与技能
 
@@ -104,6 +104,22 @@
   幂等、事件流、限额**全局一致**；恢复工作进程（`runtime/worker.py`）负责把崩溃的 Run 真正续跑
 - **容器层**：`Dockerfile` 多阶段构建 + **非 root 运行** + `HEALTHCHECK`；
   `docker-compose.yml` 里 `read_only` / `cap_drop: ALL` / `no-new-privileges` / 只发布到回环
+- **浏览器层（安全响应头）**：所有响应（*含 404/401/500 与 SSE*）带
+  `Content-Security-Policy`（默认全禁再逐项开口：`script-src 'self'`、`object-src 'none'`、
+  `frame-ancestors 'none'`，无 `unsafe-eval`）、`X-Frame-Options: DENY`、
+  `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Permissions-Policy`
+  （实现在 `web/security_headers.py`，挂在网关**外层**，所以错误页也跟着带）。
+  CSP 在这里不是"顺手加的头"：控制台要渲染模型生成的 Markdown，一次 XSS 就能把访问密钥读走，
+  所以**默认只把密钥存 `sessionStorage`**（本标签页有效），要跨重启保留得在界面上显式勾"记住"。
+  ⚠️ 诚实口径：`style-src` 保留了 `'unsafe-inline'`（分栏拖拽用行内 style）；
+  CSP **已在真浏览器里验过**（`web/e2e/csp.spec.ts`：真 chromium 加载首页 + 断言**一次策略违规都没有**），
+  但覆盖的是"当前这套页面与交互"——新增字体源/外部图片域仍需同步改 `web/security_headers.py`；
+  HSTS **故意不在这里设**（应用分不清自己是否在 TLS 后面，该由入口网关设）。
+
+> 🔓 **唯一免鉴权的三个前缀**：`/`、`/index.html`、`/assets/*`（见 `web/server.py` 的 `_is_public()`）。
+> 原因不是"忘了加锁"：浏览器加载 `<script src="/assets/…">` 时**带不上** `Authorization` 头（HTML 规范如此），
+> 一旦静态资源也要密钥，开了鉴权的部署就是**白屏**——页面上连"填访问密钥"的输入框都没有。
+> 外壳里没有任何业务数据，**数据接口一律仍要密钥**（由 `web/e2e/auth.spec.ts` 在真浏览器里锁住）。
 
 > 📐 **部署边界与多租户口径**（单副本 vs 多副本的开关、进程内状态清单、缩容/扩容注意项）：
 > 见 [docs/deployment-boundaries.md](./docs/deployment-boundaries.md)。
@@ -184,6 +200,19 @@ flowchart TB
   启动日志会写明当前用的是哪一种，避免"在词频嵌入下宣称语义检索"。
 - **记忆默认落盘**：`build_agent(memory=True)` / HTTP 服务用 `SqliteMemoryStore`，
   `USER` 作用域（跨会话用户级记忆）才真的记得住；不传记忆库时是进程内实现（重启即丢）。
+
+**SKILL.md 契约（三条都会在运行时候真拦人）**：
+
+| frontmatter 字段 | 作用 | 不满足时 |
+|---|---|---|
+| `trust: trusted` | 只有可信技能能被激活（激活 = 把正文当系统指令注入） | 抛 `SkillTrustError` |
+| `requires: [web.fetch, ...]` | 前置依赖：这些**工具名**必须在当前目录里已注册 | 抛 `SkillRequirementError`（列出缺哪些） |
+| `version` | 多版本并存，默认解析最新 | — |
+
+两条容易造错的地方：`requires` 比的是**已注册工具名**（如 `web.fetch`、`memory.remember`），
+不是自然语言描述；而工具是装配过程中陆续注册的（记忆 → 技能 → Web → MCP → Git），
+所以依赖判定用的是**“激活时取当前目录”**而不是造技能卡时的快照
+（否则先注册技能、后注册 Web 工具，就会把 `web.fetch` 误判为缺失）。
   召回按**关键词重叠**匹配，不是向量召回。
 
 ## 为什么需要 Warden
@@ -378,8 +407,23 @@ python -m warden_agent.web.run_server
 | GET | `/models` · POST `/models/select` | 可用模型清单与运行时热切换（支持导入 API Key） |
 | GET | `/capabilities` · `/memory/{scope}` | 能力清单与记忆查询 |
 | GET | `/health/live` · `/health/ready` · `/metrics` | 存活/就绪探针与指标 |
-| GET | `/audit` | 审计轨迹（需认证；**按租户隔离**） |
+| GET | `/audit` | 审计轨迹（需认证；**按调用者收敛**，管理员可见租户全局） |
 | GET | `/recovery/plan` | 跨 Run 恢复计划（resume / retry / await_human / terminal；只读判断） |
+
+**路由访问级别与运维边界**（以前只是口头前提，现已明文 + 守卫）：
+
+| 面 | 内容 |
+|---|---|
+| 无需凭证 | `/health/live`、`/health/ready`、`/`、`/docs`（含 `/docs/oauth2-redirect`）、`/redoc`、`/openapi.json` |
+| 需凭证（数据按调用者收敛） | 上表其余全部 |
+| **仅管理员** | `/metrics`；`POST /models/select` 的 `scope=deployment`（切**部署默认**，影响所有人） |
+| **破坏性运维动作：只在 CLI** | `warden backup` / `restore` / `backup-prune` / `rotate-credentials` / `audit-verify`——能上宿主机 shell 就已拿到数据目录与密钥，不再重复造一套"运维 API"及其鉴权；HTTP 面只给**只读**运维视图 |
+
+三条口径细节：**不配 `WARDEN_ADMIN_PRINCIPALS` ⇒ 没有管理员**（fail-closed，不支持通配符 `*`）；
+只读角色 `WARDEN_VIEWER_PRINCIPALS` 只能读、不能发消息/审批/切模型；
+**登记表的唯一权威是 `tests/test_route_surface.py`**——新增路由不登记就 CI 红，
+且登记为"公开/管理员"的会被**真的跑一遍**（写这条守卫时它当场抓出
+`/docs` 公开但 `/docs/oauth2-redirect` 要凭证的缺口）。详见 `docs/operations.md` 第十三节。
 
 服务契约：统一版本头（`X-Warden-Api-Version`）、`Idempotency-Key` 请求幂等、
 problem+json 统一错误码（限流 429 附 `Retry-After`）。
@@ -388,6 +432,7 @@ problem+json 统一错误码（限流 429 附 `Retry-After`）。
 `WARDEN_TENANT`（租户 id）、`WARDEN_RATE_LIMIT`（限流，默认 `600/60`，`0` 关）、
 `WARDEN_MAX_REQUEST_BYTES`（请求体大小上限，默认 `1048576`=1 MiB，超限 413，`0` 关）、
 `WARDEN_SSE_MAX_CONNECTIONS`（`/chat/stream` 并发上限，默认 `100`，超限 503，`0` 关）、
+- `WARDEN_SSE_HEARTBEAT_SECONDS`：`/chat/stream` 空闲心跳间隔，默认 `10` 秒（`0` 关）。工具执行期间可能几十秒没有数据，心跳用来避免中间的代理 / CDN 把连接当死连接掐掉；客户端断开后那一轮仍会在后台跑完并落库。
 `WARDEN_SHARED_STATE`（多副本共享协调状态，默认关）、
 `WARDEN_KNOWLEDGE`（RAG：`1`=内置离线语料 / 文档目录路径，默认关）、
 `WARDEN_WEB_FETCH`（开启真实联网抓取；默认离线 mock）、
@@ -397,7 +442,11 @@ problem+json 统一错误码（限流 429 附 `Retry-After`）。
 `WARDEN_OUTBOUND_MAX_CONCURRENCY`（出站并发上限，默认 8）、
 `WARDEN_OUTBOUND_DAILY_QUOTA`（日出站配额，默认不限）、
 `WARDEN_CREDENTIAL_KEY`（凭证加密密钥材料；**只从环境变量读取**，不设则用进程内临时密钥并告警）、
-`WARDEN_HOST`（默认 `127.0.0.1` 只本机；容器里设 `0.0.0.0`）、`WARDEN_AUDIT=1`（审计账本）、
+`WARDEN_HOST`（默认 `127.0.0.1` 只本机；容器里设 `0.0.0.0`）、
+`WARDEN_TRUSTED_PROXIES`（前置代理的地址/网段，逗号分隔）；**在 Ingress/反代后面必须配**，
+否则 `request.client.host` 永远是代理 IP——按调用者分桶的限流会塔成一个桶，
+且同一个 `Idempotency-Key` 会被跳调用者串响应（见 `docs/deployment-boundaries.md`）；
+`WARDEN_AUDIT=1`（审计账本）、
 `WARDEN_DB_PATH`（SQLite 路径；rootfs 只读时指向挂载卷）、
 `WARDEN_MODEL_API_KEY` / `WARDEN_BASE_URL` / `WARDEN_MODEL`（`custom` 模型三项，见上文模型接入）、
 `WARDEN_SERVER_URL`（**CLI 要连的服务地址**，默认 `http://127.0.0.1:8000`）、
@@ -470,14 +519,14 @@ python -m warden_agent.demo_e2e                                                 
 | CLI（`cli.py`） | `warden` 命令族：chat / stream / approvals / approve / reject / health / caps / coding | 已实现 |
 | RAG 检索（`rag/`） | 向量库 + `knowledge.search` 工具；**已接线**：`build_agent(knowledge=...)` / `build_app` / `run_server` 的 `WARDEN_KNOWLEDGE`（`1`=内置离线语料，或给文档目录） | 已实现 |
 | RAG 来源引用（`rag/knowledge.py`） | 检索结果携带 SourceHit，回答可溯源；嵌入器可切换（默认**离线词频**，配 `WARDEN_EMBED_*` 走真语义端点），启动日志会写明用的是哪一种 | 已实现 |
-| 多 Agent（`multiagent/`） | 主管模式，子 Agent 封装为工具 | 已实现 |
+| 多 Agent（`multiagent/`） | 主管模式，子 Agent 封装为工具；**已接线**：HTTP 产品路径 `WARDEN_MULTIAGENT=1` 注册 `research`/`write` 子 Agent 卡（默认关：子 Agent 会多花模型调用）；子 Agent **只拿只读工具**（带副作用的工具要过人工审批，而子 Agent 跑在一次工具调用内部、没有审批对话通道），且不拿子 Agent 卡本身（防递归） | 已实现 |
 | 多 Agent 结构化交接 | 专员间以交接单（角色 / 任务 / 结论）传递，结果可复核 | 已实现 |
 | 多 Agent 共享记忆 | 专员共享 WORKSPACE 工作记忆，避免重复检索 | 已实现 |
 | 多 Agent 容错降级 | 子 Agent 失败时重试、切换备用专员或降级 | 已实现 |
 | 多 Agent 并行分派（`multiagent/dispatch.py`） | 确定性分派器：线程池真并行或按依赖串行，行为可离线复现 | 已实现 |
 | 技能系统（`skill/`） | SKILL.md 协议、渐进披露、信任快照 | 已实现 |
 | 技能版本化 | 同一技能多版本并存，默认解析最新版本 | 已实现 |
-| 技能触发 | 按任务意图评分选择技能，信号与意图路由同源 | 已实现 |
+| 技能触发 | 按任务意图评分选择技能，信号与意图路由同源；**已接线**：`build_agent`/`build_app` 装配技能时同步注册 `skill.trigger.pick`（以前只在 demo/评测注册） | 已实现 |
 | 记忆（`memory/`） | 多作用域（RUN / SESSION / USER / WORKSPACE）、候选确认、冲突消解、审计；**已接线**：`build_agent(memory=True)` / HTTP 默认开启，产品入口用 `SqliteMemoryStore` **落盘**（`USER` 作用域跨会话才真的记得住），不传则用进程内实现 | 已实现 |
 | MCP 客户端（`mcp/` + `ts/mcp-client`） | TypeScript SDK 连接 MCP，工具先行审查再导入 | 已实现 |
 | Web 搜索 / 抓取（`web/search.py`） | 多 provider 可插拔，URL 策略管控。`web.fetch` 提供**真实联网抓取**（`HttpFetchProvider`，`WARDEN_WEB_FETCH=1` 开启）：**每一跳重定向都重新过 URL 策略**（拒内网/环回/云元数据，防 SSRF 绕过）、只吃文本类响应、超时/响应体/跳转次数都有界。**出站总量另有闸门**（`web/outbound.py`：全局速率 + 单 host 速率 + 并发上限 + 日配额，默认开；URL 策略先于闸门，被拒的 URL 不占配额）。**搜索也可真实联网**：`WARDEN_SEARCH_PROVIDER=tavily|brave|custom` 走 `HttpSearchProvider`（tavily/brave 配 `WARDEN_SEARCH_API_KEY`、custom 配 `WARDEN_SEARCH_ENDPOINT`）——端点先过 URL 策略（不把 key 发向内网）、并计入出站配额；**配不全就如实退回离线 mock 并告警**（不假装能搜）。不设该变量时默认仍是离线 mock | 已实现 |
@@ -490,8 +539,8 @@ python -m warden_agent.demo_e2e                                                 
 | 架构边界测试（`tests/`） | AST 校验模块依赖单向 | 已实现 |
 | **Run 级分布式锁（`runtime/locking.py`）** | 多副本下同一个 `run_id` 只被一方驱动（否则**后写覆盖前写**且不报错）。**租约式**（带 TTL）：持有者崩了不必人工解锁，到期即可被别的副本接管。取锁是单条原子 UPSERT，SQLite / PostgreSQL 都已验证；真库上做过 **8 个副本并发抢占、恰好一个赢家**的测试。自动恢复（`RecoveryWorker`）与 **HTTP 的对话/审批路径**都已接锁：抢不到回 **423** 让客户端重试，流式请求整段 SSE 走完才释放；`/capabilities` 会报出当前用的是哪种锁。**带后台心跳续租**（每 TTL/3 续一次），所以「单次驱动比 TTL 还长」也不会中途被接管；续租失败会报出来（不假装还持有） | 已实现 |
 | **审计链 / 密钥轮换 / 低延迟事件总线（第 6 项）** | ① **审计链（防篡改）**：每条落盘记录带 HMAC 链哈希（`prev_hash`→`hash`，覆盖内容+前驱+行号）——改字段/删中间行/重排都会断链；`warden audit-verify` 被动过则退出码 4。**必须配 `WARDEN_AUDIT_KEY`**：无密钥时挡不住「改完重算整链」（测试里有对照证明这一点）。② **凭证密钥轮换**：历史密钥只用于解密兜底 + `warden rotate-credentials` 把存量密文重加密（幂等；解不开的原样保留并报出，退出码 5）。③ **低延迟事件总线**：`WARDEN_EVENT_BUS=notify` 用 LISTEN/NOTIFY 唤醒，实测发布→唤醒 **47ms**（同场景轮询 110ms，最坏 250ms）；通知只是提示，丢了不丢事件 | 已实现 |
-| **运维面（`runtime/backup.py` · `runtime/alerting.py` · `docs/operations.md`）** | ① **挂起告警**：找出「等人工处理超时」的 Run（`warden stuck`，**退出码 3** 便于接 cron；`GET /alerts/stuck` 按归属收敛）——此前 Run 进了 `WAITING_APPROVAL` 就一直挂着、没人知道；② **备份/恢复**：`warden backup` / `warden restore`，SQLite 在线备份 API 做一致性快照 + 备份后立刻完整性校验 + 恢复默认拒绝覆盖（破坏性操作），**带恢复演练测试**；③ **运维手册**：巡检清单 / 告警接法 / 恢复顺序 / 升级回滚 / 多副本检查清单 / 已知边界表 | 已实现（**无告警规则库、无 SLO、无灰度发布**） |
-| **配置面单一事实源（`core/settings.py`）** | 全部 **69 个环境变量**登记在一张表里（以 `ENV_SPECS` 为准）（用途 / 归属模块 / **允许读它的模块** / 默认值 / 是否敏感）；启动时**校验格式**（写错拒绝启动）+ **对拼错的 `WARDEN_*` 告警**；`tests/test_config_surface.py` 用 AST 强制「代码读的每个变量都已登记、且没被越权读」——**这条守卫实测能拦住同名两用**（把 `cli.py` 改成读模型的 `WARDEN_BASE_URL`，测试立刻红并指出越权模块） | 已实现（读取仍各自 `env.get`，未统一改走类型化访问器） |
+| **运维面（`runtime/backup.py` · `runtime/alerting.py` · `docs/operations.md`）** | ① **挂起告警**：找出「等人工处理超时」的 Run（`warden stuck`，**退出码 3** 便于接 cron；`GET /alerts/stuck` 按归属收敛）——此前 Run 进了 `WAITING_APPROVAL` 就一直挂着、没人知道；② **备份/恢复**：`warden backup` / `warden restore`，SQLite 在线备份 API 做一致性快照 + 备份后立刻完整性校验 + 恢复默认拒绝覆盖（破坏性操作），**带恢复演练测试**；③ **运维手册**：巡检清单 / 告警接法 / 恢复顺序 / 升级回滚 / 多副本检查清单 / 已知边界表 | 已实现（**告警规则库 `deploy/observability/alerts/warden.rules.yml` + SLO `warden.slo.yml` + 灰度脚本 `scripts/canary_rollout.sh`** 都已存在）。⚠️ 交付面仍缺的是**发布工程本身**：0 tag / 0 release、发布与回滚流水线从未运行过；Prometheus 实集群未设 `retention`（SLO 用 `rate(...[30d])`）。见 `CHANGELOG.md` 「已知」块 |
+| **配置面单一事实源（`core/settings.py`）** | 全部 **81 个环境变量**登记在一张表里（以 `ENV_SPECS` 为准）（用途 / 归属模块 / **允许读它的模块** / 默认值 / 是否敏感）；启动时**校验格式**（写错拒绝启动）+ **对拼错的 `WARDEN_*` 告警**；`tests/test_config_surface.py` 用 AST 强制「代码读的每个变量都已登记、且没被越权读」——**这条守卫实测能拦住同名两用**（把 `cli.py` 改成读模型的 `WARDEN_BASE_URL`，测试立刻红并指出越权模块）。守卫**还会解析模块级字符串常量**（`ENV_X = "WARDEN_X"` 再 `env_bool(ENV_X)`），所以"把变量名写成常量再传"绕不过去：原先的盲区（`web/server.py:627` 的 `env_bool(ENV_APPROVAL_ALLOW_SELF)`）**已封**——读取点随 `server.py` 拆分搬到 `web/http_kit.py`，登记表的 owner + consumers 同步改到新模块；并有回归 `tests/test_config_surface.py::test_本仓实际读到的审批逃生门已登记` 钉住"读取点搬走而登记表没跟着改"（拆分时它确实红过） | 已实现（读取仍各自 `env.get`，未统一改走类型化访问器） |
 | 工具稳定性层（`tool/stability.py`） | 超时护栏 / 指数退避 / 降级兜底 / 熔断；**已接线**：`build_agent` / `build_app` 均可传，产品入口默认开启（`WARDEN_STABILITY=0` 关）。按 `pure` 判定，非纯工具只对瞬时错误重试 | 已实现 |
 | 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏；**已接线且落库**：模型的 API Key 经 `CredentialBroker` 加密后写进 `credentials` 表（重启仍在），租约元数据写进 `credential_leases` 表（过期惰性清理），按调用者身份分作用域；`SecretRedactor` 对网关异常日志脱敏 | 已实现 |
 | Checkpoint / 恢复（`runtime/`） | 会话在 `model_call` / `tool_exec` / `awaiting_approval` / `done` 落存档点；`RecoveryController` 分组为 resume / retry / await_human / terminal；**`RecoveryWorker` 真正执行续跑**（`attempts` 递增、超上限不再试、**等人工的绝不自动续**）；入口 `GET /recovery/plan` 与 `warden recover --apply` | 已实现 |
@@ -500,23 +549,75 @@ python -m warden_agent.demo_e2e                                                 
 | 跨副本协调状态（`web/coordination.py`） | 幂等表 / 事件流 / 限流计数可插拔：单副本进程内，多副本 `WARDEN_SHARED_STATE=1` 走共享存储（幂等与 SSE 跨副本一致） | 已实现 |
 | 受控执行（`execution/`） | 受管子进程、输出 / 超时 / 并发预算，经沙箱工具接入主链 | 已实现 |
 | 执行沙箱（`execution/sandbox.py`） | **两档，必须分清**：语义档（只读副本 + NetworkPolicy 正则，跨平台但要明白**它不是安全边界**）；内核档（Linux + `unshare -rn` 网络命名空间，子进程无网络栈、绕不过）。档位探测是**功能性的**（有 `unshare` 不等于有权用）。**已在 WSL2 与容器实测**：`unshare -rn` 下 `eth0` 消失、连接 `ENETUNREACH`。⚠️ **Windows 已知边界**：venv 里的 `python.exe` 只是**转发器**，被放进 Job Object 后它无法再拉起真解释器（`Unable to create process`，exit 101）——所以 Windows + venv 下沙箱跑"venv 的 python"会失败；真解释器与普通可执行文件不受影响（已实测隔离） | 已实现 |
-| Agent 评测集（`evals/`） | 三类黄金集共 **30 例**：意图路由 12 / 技能触发 8 / **循环能力 10**。第三类断言落在**轨迹与决策**上（失败自愈、防打转、意图门禁、策略 DENY、迭代上限、参数保真、配对不变量），不是"回答非空"；`python -m warden_agent.evals` 出报告，可作 CI 门禁 | 已实现 |
+| Agent 评测集（`evals/`） | 四类黄金集共 **35 例**：意图路由 12 / 技能触发 8 / **循环能力 10**（模型为脚本化，确定性，断言落在**轨迹与决策**上：失败自愈、防打转、意图门禁、策略 DENY、迭代上限、参数保真、配对不变量）+ **真实模型质量 5**（`--mode real`：间接提示注入、指令遵循、幻觉抵抗、工具选择） | 已实现 |
 | 检索质量评测（`rag/eval.py`） | 标注问答集算 **top-1 / recall@k / MRR**，把 RAG 从"看着能用"变成有数字：`python -m warden_agent.rag.eval`（离线词频嵌入实测 **top-1 85.7% / MRR 0.905**；`recall@3` 虽是 100% 但**被小语料抬高**——7 块库返回 3 块已覆盖 43%，报告会主动标注这点）。报告**逐条打印首现排名**，避免"垫底命中"被聚合数字掩盖；语义嵌入端点**强制公网地址**（拒环回/私有/保留，解析后校验防 DNS rebinding） | 已实现 |
 
 > **口径说明**：本表「状态」区分"已实现（且已接入产品路径）"与"独立模块（实现+测试齐备，
 > 但未接入 `build_agent` / HTTP / CLI）"。当前**没有标注为「独立模块」的条目**——凭证与恢复
 > 都已接线。文档与实际行为保持一致：凡列入纵深防御的能力，均在运行路径上真实生效。
 
+**⚠️ 已知例外（2026-09-27 三路独立复审确认，逐条带 `file:line`）**：这条「保持一致」的自我评价
+现在**仅剩下 1 处成立**（待办总账见桌面文档 `24-三路复审与前端P0修复（2026-09-27）.md`）：
+
+1. ~~演示空壳工具当真工具注册~~ **已修（2026-09-27）**：`fs.delete` / `weather.get` 两张演示卡
+   改成 **`WARDEN_DEMO_TOOLS=1` 才注册**（已在 `core/settings.py` 的 `ENV_SPECS` 登记、启动日志 WARNING），
+   且打开后**工具描述与返回值都写明「演示」**——不再回一句「已删除 xxx」就完事（演示卡也仍然非 pure、照走审批）；
+2. ~~假模型会在缺 key 时自动接管~~ **已修（2026-09-27）**：非回环监听要**双重显式声明**
+   （`WARDEN_ALLOW_FAKE_MODEL=1` **且** `WARDEN_DEMO_INSTANCE=1`）；`/chat` 与 `/chat/stream` 的**响应自带**
+   `X-Warden-Model-Kind: fake` + `Warning: 199`；假模型每条回复自带 `[演示模型]` 前缀；控制台写明"这是脚本回复"及怎么换成真模型；
+3. ~~搜索 provider 配不全时静默退回离线 mock~~ **已修（2026-09-27）**：缺 key 仍有可服务的兜底，
+   但**不再静默**——`/capabilities` 上报 `web_search_mock`/`web_degraded_reason`（控制台标「离线演示」并给出修复写法），
+   结果文本自带 `[离线演示数据]` 前缀，模型与抓包的人都无从误认为真联网；
+4. ~~评测 `--mode real` 尚未实现~~ **已修（2026-09-27）**：`python -m warden_agent.evals --mode real`
+   跑真实模型质量类（提示注入/指令遵循/幻觉抵抗/工具选择，阈值默认 0.6）；**无凭据时退出码 2、不退回假模型**；
+   CI 新增 `evals-real` job（配了 `DEEPSEEK_API_KEY` 才真跑，否则显式跳过）；
+5. ~~`store/recovery.py` 是教学版恢复~~ **已修（2026-09-27）**：标为 DEPRECATED 教学版，
+   构造时发 `DeprecationWarning`（`filterwarnings=error` 下 CI 会红），文档指向 `runtime/recovery.py` 的 `RecoveryController`；
+6. **运维能力只有 CLI、没有 HTTP 入口**（备份/审计校验/导出/归档/清理/密钥轮换），无法被 cron/网关编排。
+7. **断线续读的样本窗口有限**：事件总线默认在**进程内**（单副本 `InProcessEventBus`），每个 run 只保留
+   最近 500 条（`WARDEN_EVENT_KEEP`）——**进程重启后**同一次断线续读拿不到终态（前端显示「本轮回复未能取回」，
+   但答复**已落库**，刷新页面即可见）。多副本设 `WARDEN_SHARED_STATE=1` → 走 `run_events` 表，跨副本且重启后仍可续读。
+   要「跨进程无条件可续读」需要持久化事件日志 + 重放，本轮未做。
+8. **变异测试只覆盖三个模块**（`core/redaction.py`、`policy/policy.py`、`web/security_headers.py`），
+   分数 96.4%（242/251）**不等于全仓库测试有效**；整仓变异是小时级，跑不完的门禁等于没有门禁。见 `docs/mutation.md`。
+9. **真浏览器 e2e 覆盖七条路**（CSP / 对话 / 登录 / 审批 / 能力面板 / 长会话 / 多副本，共 **16 条用例**）：
+   **超长列表性能**仍未覆盖，所以只能说"七条关键路径有真浏览器回归"，**不能说"全站 e2e"**；
+   多副本那 6 条需要真 PG（本机容器或 `WARDEN_TEST_PG_*`），没 PG 时**跳过**而不是假绿；而审批用例是用确定性假模型
+   按关键字触发的，验的是"审批链路 + 界面"，**不是**"真模型判断该不该审批"。
+
 ## 工程质量
 
-- **测试**：**1114 项通过、0 项失败**（共 1150 项；本机跳过 36 项，含 win32 无内核隔离档、
-  符号链接权限、缺 pg_dump 时的 PG 备份端到端）。覆盖率门槛 **84%**（`[tool.coverage.report] fail_under = 84`），
-  本机实测 **85.26%**——⚠️ 这是**没有 PostgreSQL** 的本地环境下测的；PG 相关测试本地跳过，
+- **测试**：**1471 项通过、0 项失败**（共 1475 项；本机跳过 4 项，均属环境相关：win32 无内核隔离档、
+  符号链接权限、缺 pg_dump 时的 PG 备份端到端等）。覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`），
+  本机实测 **89.46%**（2026-09-29；10394 语词 / 2612 分支，38 个文件 100% 覆盖）——这一次数值是在**本机容器
+  `warden-pg-test`**上跑出来的（PG 相关用例真跑，只跳过 4 条环境相关项）；
   **CI 起了真 PG service 后测得更高**（见 `.github/workflows/ci.yml`）。
   跳过的测试会在没有 PG 时自动跳过、CI 保持绿；其余按环境跳过的还有：未构建前端时的 SPA、无 node 时的 MCP。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、**多租户越权拦截（含 403 不回显他人身份、审计/模型按调用者收敛）**、**patch 路径边界（防越出工作区）**、**幂等并发原子占位（409 而非重复执行）**、**入站限流**、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**凭证密钥托管（KMS/HSM 信封加密：env 与两条 provider 接入路径）**、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘 + 按 `owner` 归属隔离（换实例读同一库仍在、跨用户不可见）**、**真实联网抓取的 SSRF 防护（含重定向绕过）与出站限速/配额（全局、单 host、并发、日配额，含多副本共享与"策略先于限速"的顺序保证）**、**链路追踪（W3C traceparent 解析/生成/传播）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等
-- **Agent 评测**：内置黄金评测集（30 例，三类），可一键跑并出通过率（**当前未接入 CI**，CI 只跑 ruff/mypy/pytest+覆盖率）
+- **挂住必现形**：`pytest-timeout`（`timeout = 120` / **thread** 法）——卡死的用例会打印**所有线程的调用栈**
+  并让本次运行以非 0 结束，而不是让整次运行无声无息地悬着。⚠️ 真实事故驱动：一条用裸 `threading.Barrier`
+  同步的并发用例曾让套件**静默卡在 45%**，日志里看不出是哪一条、卡在哪一行。选 thread 而不是默认 signal
+  是因为 `SIGALRM` 在 Windows 上根本不存在——用默认值会变成「本地没保护、CI 才有保护」。
+  配置本身也有守卫测试（`tests/test_pytest_guardrails.py`）
+- **变异测试门禁**：`scripts/mutation.sh` + `scripts/mutation_gate.py` 把「测试是不是真管用」也变成可执行门禁——
+  三个“错了就是安全事故”的模块（密钥脱敏 / 策略裁决 / 安全响应头）实测 **242/251 = 96.4%**，
+  阈值 **94.4%**（= 收尾值往下留 2 个点，允许重构浮动；比接入前的 91.2% 高 3.2 个点），
+  **9 条存活经逐条裁决全部是等价变异**（改了行为一样，杀不掉是正常的，不是缺口）。
+  分数口径：分母扣 `skipped` / `no_tests`，且 **`timeout` 不算杀死**（那是环境噪音）；退出码分成 5 种，
+  把「分数不够（真需要补测试）」和「根本没跑起来」分开。CI 里是 **`mutation` job：夜间 + 手动触发**
+  （它保护的是**测试质量**而不是单次改动，塞进每个 PR 只会逗人绕过）。见 `docs/mutation.md`
+- **Agent 评测**：内置黄金评测集（**35 例四类**），两套口径分开跑：`--mode scripted`（默认，确定性，能当硬门禁）
+  与 `--mode real`（真实模型的注入/幻觉/指令遵循，需凭据，阈值可调）。CI 的 `evals-real` job
+  **配了 `DEEPSEEK_API_KEY` 才真跑**，否则日志里显式写「跳过」——不假装跑过，也不让 fork 的 PR 无故变红
 - **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告，并**逐条打印首现排名**（离线词频嵌入实测 **top-1 85.7% / MRR 0.905**）。⚠️ 报告里的 `recall@3 = 100%` **被小语料抬高**——7 块库、k=3 一次返回 43% 的库，命中几乎是必然的，**该数字不代表检索器强**；报告在 k 覆盖率 ≥25% 时会主动提示。换真语义嵌入只需配三个环境变量，同一套标注集可对比相对提升
-- **类型检查**：`mypy --strict` 零错误（98 个源文件）
+- **类型检查**：`mypy --strict` 零错误（**104** 个源文件；裸 `mypy` 也真检查——`py.typed` 已在位）
+- **真浏览器 e2e**：Playwright + 真 chromium，**16 条用例覆盖七条关键路径**——安全策略（CSP 在真浏览器里一次违规都没有）、
+  对话（连发两条）、**登录**（没密钥逐条 401 且不白屏 / 填对密钥后读接口与 SSE 流都恢复 / 密钥只进 `sessionStorage`）、
+  **审批**（批准把这一轮接着跑完 —— **且工具输出真的上屏**（读落库的 tool 消息与界面逐字对账）、拒绝则工具绝不执行）、**能力面板**（工具清单折叠/展开是真行为、
+  加载失败给的是能用的「重试」、演示档必须自曝"这不是真能力"）、**长会话**（12 轮之后历史全量加载、
+  打开就钉在最新一条、从顶部翻完历史再发消息新回复一定滚进视口）、**多副本**（6 条：真 PG + 6 个真后端进程——
+  会话历史 / 事件续读 / 幂等键 / 限流计数跨副本共享，且**关掉共享开关的对照用例**证明前两者不是空跑）。跑的是**发布形态**（真后端托管真打包产物）而不是 dev server；
+  同时起两个档位（无鉴权 + 鉴权），**离线可跑**（确定性假模型 + 不读 `.env` + 一次性状态目录）；
+  多副本那 6 条需要真 PG（本机容器或 `WARDEN_TEST_PG_*`），没有就自动跳过。`cd web && npm run test:e2e`
 - **静态检查**：`ruff` 零告警
 - **架构守护**：架构边界测试以 AST 校验分层依赖单向，防止层级倒挂；
   **配置面守卫**同法——AST 扫描「谁读了哪个环境变量」，超出声明的 `consumers` 即报错
