@@ -164,6 +164,21 @@ class ExecutionBroker:
                 stderr=subprocess.PIPE,
                 cwd=cwd,
                 text=True,
+                # **编码必须两侧对齐**：父进程用哪个编码解码，子进程就得用哪个编码写。
+                # 这里把两侧钉死在 UTF-8，三条理由都是踩过的：
+                # 1) 不写 `encoding=` 时父进程按**自己的 locale** 解码（容器里的
+                #    `LANG=C.UTF-8`、`PYTHONUTF8=1` → UTF-8；本地化 Windows → cp936），
+                #    子进程却按**它自己的 locale** 写。不一致时 `communicate()`
+                #    在读取线程里抛 UnicodeDecodeError，异常被线程吞掉，
+                #    结果是 **exit_code=0 且 stdout=''** —— 命令明明成功了，输出却
+                #    凭空消失，模型完全看不出发生过什么（实测记录见 child_env.py）。
+                # 2) `PYTHONIOENCODING=utf-8`（child_env.py 里强制写入）让 Python
+                #    子进程也写 UTF-8，两侧对齐，中文/emoji 不再乱码。
+                # 3) `errors="replace"`：给非 Python 子进程（git 之类，输出编码由它
+                #    自己决定）留一条命 —— 解不出来的字节变 U+FFFD，但不允许
+                #    **整段输出消失**：“看不懂”可以查，“没有”查不了。
+                encoding="utf-8",
+                errors="replace",
                 # **不传 `env=` 就等于把宿主环境整包交给模型能影响的子进程**：
                 # 一句 `env` / `print(os.environ)` 就能读出 WARDEN_API_KEY 等
                 # 服务端密钥。这里给最小白名单，见 execution/child_env.py。

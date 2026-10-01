@@ -100,6 +100,11 @@ class DirectGitProbe:
                 p = subprocess.run(
                     [self.git, "-c", "credential.interactive=never", *args],
                     cwd=repo.root, capture_output=True, text=True, timeout=timeout,
+                    # 编码两侧对齐（同 execution/broker.py 的注释）：git 的输出编码
+                    # 由 git 自己的 locale 决定，不钉死就可能解出 UnicodeDecodeError；
+                    # `errors="replace"` 保证即便它写了非 UTF-8 字节，也只是出现
+                    # U+FFFD，而不是整个探测因为解码异常而挂掉。
+                    encoding="utf-8", errors="replace",
                     # 同上：只给最小环境（git 只需要 PATH/HOME），不给服务端密钥。
                     # 更关键的是 git hook/别名也拿不到密钥。
                     env=minimal_child_env(),

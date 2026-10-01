@@ -133,6 +133,12 @@ class McpClient:
             try:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=timeout,
+                    # JSON-RPC 规定传输就是 UTF-8，这里把两侧钉死：不写 `encoding=`
+                    # 时父进程按自己的 locale 解码，而外部组件的输出是按它自己的
+                    # locale 写的，两侧不一致就会解出 UnicodeDecodeError；
+                    # `errors="replace"` 保证坏字节只损失自己，不会让整段响应消失
+                    # （同 execution/broker.py）。
+                    encoding="utf-8", errors="replace",
                     # MCP server 是**操作者装配的外部组件**：它可能真需要自己的
                     # 厂商密钥（如它自己的 OPENAI_API_KEY），所以不能一刀切白名单；
                     # 但 `WARDEN_*` 是本服务端自己的密钥/配置，它没有任何正当理由

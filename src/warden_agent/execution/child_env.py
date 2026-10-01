@@ -28,6 +28,7 @@
    给"模型能影响的命令"用：沙箱执行（`ExecutionBroker`）、git 只读探测。
    只放行"进程能起来 + 能把结果写回"所必需的键（PATH、Windows 的
    SystemRoot / PATHEXT / TEMP、语言与时区）。
+   另外**强制**写完 `PYTHONIOENCODING=utf-8`（见下面的 `CHILD_IO_ENCODING`）。
    方向是 **fail-closed**：想让子进程多看一个变量，必须**显式加进白名单并说明理由**；
    而不是"默认都能看见、出事再拉黑名单"（黑名单永远漏）。
    刻意不放行：任何密钥、厂商配置、代理变量。
@@ -66,14 +67,30 @@ MINIMAL_ENV_KEYS: frozenset[str] = frozenset({
 # 本项目自己的变量前缀：任何外部子进程都不需要它。
 PROJECT_ENV_PREFIX = "WARDEN_"
 
+# 子进程 std 流的编码：**强制固定值，不从宿主继承**。
+#
+# 这不是“白名单里多放行一个键”，而是主动写入。原因是一个**实测出来的静默失败**：
+# 本地化 Windows 上宿主进程的 locale 是 cp936，子进程写出来的中文是 GBK 字节；
+# 而服务端一旦跑在 UTF-8 环境里（容器 `LANG=C.UTF-8`、CI 里 `PYTHONUTF8=1`），
+# 父进程按 UTF-8 解码 → `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xce
+# in position 1: invalid continuation byte`，这个异常在 `communicate()` 的
+# 读取线程里被吞掉 → `stdout=''`、`exit_code=0`：**命令成功，输出凭空消失**。
+# 固定值 + 固定解码（`broker.execute` 钉的 `encoding="utf-8"`）= 两侧永远一致，
+# 与宿主 locale、与子进程自己的 locale 都没关系。
+#
+# 想覆盖它（`extra=`）必须同时让解码侧对齐，否则就是拿乱码换乱码。
+CHILD_IO_ENCODING: dict[str, str] = {"PYTHONIOENCODING": "utf-8"}
+
 
 def minimal_child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """构造给子进程的**最小**环境（白名单）。
 
-    `extra`：显式追加的键值（覆盖同名项）。用它来放行"某个工具确实需要的"变量，
+    `extra`：显式追加的键值（覆盖同名项）。用它来放行“某个工具确实需要的”变量，
     并且调用处必须写清楚为什么 —— 这是唯一的放行入口，方便 review。
     """
     env = {k: v for k, v in os.environ.items() if k.upper() in MINIMAL_ENV_KEYS}
+    # 再铺强制项：从宿主继承的 PYTHONIOENCODING 一律被改写成 utf-8（见上）。
+    env.update(CHILD_IO_ENCODING)
     if extra:
         env.update({k: str(v) for k, v in extra.items()})
     return env
