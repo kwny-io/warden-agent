@@ -215,25 +215,13 @@ jobs:
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
             detect --source /repo --config /repo/.gitleaks.toml --no-banner --redact -v
 
-      - name: 秘密扫描反向对照（证明 allowlist 没把扫描器关掉）
-        # allowlist 是“让扫描器闭嘴”的开关，写错方向就是静默失守——那比红灯糟。
-        # 这里丢一个**没被放宽**的高熵假密钥进临时目录：必须仍被报出来。
-        # 对照组现场生成而不是写死字面量：写死的话它自己就会成为 ci.yml 里的一处命中，
-        # 反过来把主扫描搞红。
-        run: |
-          ctl="$(mktemp -d)"; mkdir -p "$ctl/tests"
-          printf 'api_key = "sk-live-%s"\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
-            > "$ctl/tests/control_fixture.py"
-          out="$(mktemp)"
-          docker run --rm -v "$ctl:/ctl:ro" -v "$PWD/.gitleaks.toml:/cfg.toml:ro" \
-            ghcr.io/gitleaks/gitleaks:v8.21.2 \
-            detect --no-git --source /ctl --config /cfg.toml --no-banner --redact >"$out" 2>&1 || true
-          if grep -q "leaks found" "$out"; then
-            echo "反向对照通过：未被放宽的假密钥仍被报出 ✓"
-          else
-            echo "::error::反向对照失败——allowlist 把扫描器关掉了（未放宽的假密钥也没报出来）"
-            cat "$out"; exit 1
-          fi
+      - name: 秘密扫描反向对照（证明扫描器没被关掉、且 allowlist 是按值收窄的）
+        # 逻辑在 scripts/gitleaks_reverse_control.sh 里（本地也能跑，避免“只能在 CI 里验”）。
+        #
+        # 判据是 gitleaks 的**退出码**，不是输出文本：这里第一版写的是
+        # `grep -q "leaks found"`，而 "no leaks found" **也含**这个子串 → 实测两种情形都匹配，
+        # 这条对照**永真**、根本没在验（典型的假绿）。已改成退出码 + 写入负面对照自检。
+        run: bash scripts/gitleaks_reverse_control.sh
 
   mutation:
     name: 变异测试（${{ matrix.shard }}）
