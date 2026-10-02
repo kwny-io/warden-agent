@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-1471%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-1589%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -52,13 +52,13 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1475 项测试（1471 passed / 4 skipped）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1593 项测试（1589 passed / 4 skipped）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
 - **确定性多 Agent 分派**：并行 / 串行由显式依赖决定，不依赖模型自由发挥，结果离线可复现
 - **AST 架构边界测试**：分层依赖的单向性由测试守护，架构不靠自觉
-- **mypy --strict 全量零错误**：**103** 个源文件在严格模式下通过类型检查
+- **mypy --strict 全量零错误**：**115** 个源文件在严格模式下通过类型检查
 
 ### ⑤ 能力"注册即路由"——自解释的工具与技能
 
@@ -587,9 +587,9 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**1471 项通过、0 项失败**（共 1475 项；本机跳过 4 项，均属环境相关：win32 无内核隔离档、
+- **测试**：**1589 项通过、0 项失败**（共 1593 项；本机跳过 4 项，均属环境相关：win32 无内核隔离档、
   符号链接权限、缺 pg_dump 时的 PG 备份端到端等）。覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`），
-  本机实测 **89.46%**（2026-09-29；10394 语词 / 2612 分支，38 个文件 100% 覆盖）——这一次数值是在**本机容器
+  本机实测 **89.92%**（2026-10-02；10576 语词 / 2632 分支，40 个文件 100% 覆盖）——这一次数值是在**本机容器
   `warden-pg-test`**上跑出来的（PG 相关用例真跑，只跳过 4 条环境相关项）；
   **CI 起了真 PG service 后测得更高**（见 `.github/workflows/ci.yml`）。
   跳过的测试会在没有 PG 时自动跳过、CI 保持绿；其余按环境跳过的还有：未构建前端时的 SPA、无 node 时的 MCP。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、**多租户越权拦截（含 403 不回显他人身份、审计/模型按调用者收敛）**、**patch 路径边界（防越出工作区）**、**幂等并发原子占位（409 而非重复执行）**、**入站限流**、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**凭证密钥托管（KMS/HSM 信封加密：env 与两条 provider 接入路径）**、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘 + 按 `owner` 归属隔离（换实例读同一库仍在、跨用户不可见）**、**真实联网抓取的 SSRF 防护（含重定向绕过）与出站限速/配额（全局、单 host、并发、日配额，含多副本共享与"策略先于限速"的顺序保证）**、**链路追踪（W3C traceparent 解析/生成/传播）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等
@@ -609,7 +609,7 @@ python -m warden_agent.demo_e2e                                                 
   与 `--mode real`（真实模型的注入/幻觉/指令遵循，需凭据，阈值可调）。CI 的 `evals-real` job
   **配了 `DEEPSEEK_API_KEY` 才真跑**，否则日志里显式写「跳过」——不假装跑过，也不让 fork 的 PR 无故变红
 - **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告，并**逐条打印首现排名**（离线词频嵌入实测 **top-1 85.7% / MRR 0.905**）。⚠️ 报告里的 `recall@3 = 100%` **被小语料抬高**——7 块库、k=3 一次返回 43% 的库，命中几乎是必然的，**该数字不代表检索器强**；报告在 k 覆盖率 ≥25% 时会主动提示。换真语义嵌入只需配三个环境变量，同一套标注集可对比相对提升
-- **类型检查**：`mypy --strict` 零错误（**104** 个源文件；裸 `mypy` 也真检查——`py.typed` 已在位）
+- **类型检查**：`mypy --strict` 零错误（**115** 个源文件；裸 `mypy` 也真检查——`py.typed` 已在位）
 - **真浏览器 e2e**：Playwright + 真 chromium，**16 条用例覆盖七条关键路径**——安全策略（CSP 在真浏览器里一次违规都没有）、
   对话（连发两条）、**登录**（没密钥逐条 401 且不白屏 / 填对密钥后读接口与 SSE 流都恢复 / 密钥只进 `sessionStorage`）、
   **审批**（批准把这一轮接着跑完 —— **且工具输出真的上屏**（读落库的 tool 消息与界面逐字对账）、拒绝则工具绝不执行）、**能力面板**（工具清单折叠/展开是真行为、

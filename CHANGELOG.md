@@ -30,6 +30,11 @@ mypy 把那个字典推断成 `dict[str, str]`，而 `**` 解包时会拿字典�
 `pytest tests/test_run_server_main.py tests/test_proxy_trust.py` 34 passed；
 前端四条门禁复跑：`eslint src` / `tsc --noEmit` 干净、`vitest` 13 文件 195 passed。
 
+**同批文档同步**：`README.md` 的对外数字（测试徽章 1471→**1589**；`mypy --strict`
+103→**115 个源文件**；覆盖率 89.46%→**89.92%** 并改注实测日期）、`docs/复核索引.md`
+升到第四十二批（新增 §2.11，并把 §6/§7 里 `docs/mutation.md`、`web/server.py` 行数、
+变异分片表的数字全部刷成当前值）。
+
 ---
 
 ## 2026-10-02（第四十一批：`mutant_check.py` 会**真的**改源码——补上崩溃安全网）
