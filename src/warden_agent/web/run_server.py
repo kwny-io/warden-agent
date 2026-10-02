@@ -855,10 +855,21 @@ def main() -> None:
     # `timeout_graceful_shutdown`：收到 SIGTERM 后**最多等 30 秒**把在飞的请求跑完，
     # 然后强制退出（app 的 lifespan 随后关闭存储/事件总线/记忆库）。
     # 不设这个上限的话，一个卡住的请求能让停机无限期挂住——滚动升级时表现为"旧副本不退"。
+    #
+    # 受信代理只在**配了**才交下去：不配时这个 kwarg 必须整个不出现，
+    # 让 uvicorn 自己回退到 `FORWARDED_ALLOW_IPS` 环境变量/默认的"只信回环"
+    # （tests/test_run_server_main.py 把这条钉成了断言）。
+    #
+    # 注解写成 `dict[str, Any]` 不是偷懒：`**` 解包转发 kwargs 时，mypy --strict
+    # 会拿字典的值类型去逐参对 `uvicorn.run` 的整个签名，写 `str` 会直接报 10 个
+    # `Argument 5 … **dict[str, str]` 错——而值本身就是"有就传、没有就没有"。
+    proxy_kwargs: dict[str, Any] = (
+        {"forwarded_allow_ips": trusted_proxies} if trusted_proxies else {}
+    )
     uvicorn.run(
         app, host=host, port=port,
         timeout_graceful_shutdown=env_positive_int("WARDEN_SHUTDOWN_GRACE_S", 30, os.environ),
-        **({"forwarded_allow_ips": trusted_proxies} if trusted_proxies else {}),
+        **proxy_kwargs,
     )
 
 

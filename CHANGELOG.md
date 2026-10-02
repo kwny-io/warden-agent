@@ -5,6 +5,33 @@
 
 ---
 
+## 2026-10-02（第四十二批：`mypy --strict` 这条 CI 门禁，被上一批改动悄悄弄红了）
+
+> 起因：做文档同步时顺手跑了一遍 `mypy --strict src/warden_agent`——**10 个错**，
+> 全在 `src/warden_agent/web/run_server.py:861` 同一行。而 CI 里 `mypy src/warden_agent`
+> （`pyproject.toml` 里 `strict = true`）是硬门禁：第三十九批把 CI 弄红了，而本地当时
+> 只跑了 ruff 与 pytest，**没跑类型检查**——这正是"多重门禁"存在的理由。
+
+**根因**：第三十九批加 `WARDEN_TRUSTED_PROXIES` 时，为了做到"不配置时这个 kwarg 干脆不出现"，
+写成了 `**({"forwarded_allow_ips": trusted_proxies} if trusted_proxies else {})`。
+mypy 把那个字典推断成 `dict[str, str]`，而 `**` 解包时会拿字典的值类型去逐参对
+`uvicorn.run` 的**整个签名**——于是同一个解包炸出 10 条
+`Argument 5 to "run" has incompatible type "**dict[str, str]"`（期望 `int | None`、`bool`、
+`Literal["auto", "on", "off"]`、`Callable[[Config, Callable[[], SSLContext]], SSLContext] | None` …）。
+
+修法（运行时行为**零变化**）：把解包用的字典显式注解成 `dict[str, Any]`，并在注释里写清
+为什么这里只能这么写（"有就传、没有就没有"的值本身没有单一类型）。**没有**图省事改成
+显式传 `forwarded_allow_ips=None`：uvicorn 0.53 的 `Config.__init__` 确实对 `None`
+回退到 `FORWARDED_ALLOW_IPS` / `127.0.0.1,::1`，但"设了才传"是更保守的契约，
+`tests/test_run_server_main.py` 已经把这条钉成了断言（不配置时那个 key **不能**出现）。
+
+验证：`mypy --strict src/warden_agent` → `Success: no issues found in 115 source files`
+（修前 `Found 10 errors in 1 file`）；`ruff check src tests scripts` 全绿；
+`pytest tests/test_run_server_main.py tests/test_proxy_trust.py` 34 passed；
+前端四条门禁复跑：`eslint src` / `tsc --noEmit` 干净、`vitest` 13 文件 195 passed。
+
+---
+
 ## 2026-10-02（第四十一批：`mutant_check.py` 会**真的**改源码——补上崩溃安全网）
 
 > 起因：一次被外层超时强杀（Windows 上是不可捕获的 `TerminateProcess`）之后，工作树里
