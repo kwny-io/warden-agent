@@ -68,3 +68,6 @@ web/.playwright/
 # 变异测试产物：mutants/ 里是「每个突变体一份源码副本」，体积远超仓库本身，
 # 且每次跑都重新生成——绝不提交（scripts/mutation.sh 会在这里写 stats / 日志）
 mutants/
+
+# mutant_check.py 的崩溃残留目录（正常跑完会自动删）
+.mutant_check_backup/

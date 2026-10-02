@@ -11,6 +11,20 @@
 所以本文件是一张「存活突变体裁决表」：跑一遍，退出码非 0 就说明有缺口没堵。
 
 跑法：`./.venv/Scripts/python.exe scripts/mutant_check.py`（约 1~2 分钟）
+
+**崩溃安全**（这条是被真事教出来的）：本脚本会**真的改写仓库源码**，所以：
+
+  · 每次改写前先把原文逐字节备份到 `.mutant_check_backup/`，并把「备份名 + 改写后内容的
+    sha256」写进 `manifest.json`，**先落盘再改源码**；
+  · 正常结束、`Ctrl-C`、`SIGTERM` 都会还原（信号处理器 + `finally` 两道）；
+  · 被**强杀**（TerminateProcess/SIGKILL，进程来不及做任何事）会留下残局：
+    下次启动时 `_settle_previous_run()` 会检查——只有当前内容**逐字节等于我们写坏的那份**
+    （sha 对得上）才自动还原文；对不上（比如你手改过）就**拒绝动手**并让你人工处理，
+    绝不拿旧备份覆盖你的新改动。
+
+写这个的原因：一次运行被外层 60 秒超时**强杀**，恰好在「`200_000` → `200001`」这条上，
+源码被留在改坏状态；而 `git status` 因为 stat 缓存看着是干净的，很容易就这么提交进去。
+所以工具必须自己兜住这件事（并且 `--restore` 可以手动还原）。
 数据来源：
   · 2026-09-29 容器内 mutmut 全量运行（killed=242 / survived=9 / total=251 → 96.4%）。
     表中 9 条 EQUIV 就是那 9 条存活；2 条 KILL 是同一轮里**已经被补的测试杀死**的
@@ -40,8 +54,11 @@
          必须直接钉 kwargs 这个契约（`tests/test_patch_parser.py` 里那条 kwargs 用例）。
 """
 
+import hashlib
+import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 
@@ -195,25 +212,151 @@ CASES += [
 # 上面那条 kwargs 契約用例把编码名当字串行断言，于是这两条也会变红（严格一点，无害）。
 
 
+_BACKUP_DIR = pathlib.Path(".mutant_check_backup")
+_MANIFEST = _BACKUP_DIR / "manifest.json"
+# 手上正在被改写的文件：rel → (路径, 原文)。信号中断时靠它还原。
+_PENDING: dict[str, tuple[pathlib.Path, str]] = {}
+
+
+def _sha_of(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_raw(path: pathlib.Path) -> bytes:
+    return path.read_bytes()
+
+
+def _write_raw(path: pathlib.Path, data: bytes) -> None:
+    path.write_bytes(data)
+
+
+def _source_text(raw: bytes) -> str:
+    """把文件内容翻译成「用于匹配的 LF 文本」。
+
+    必须归一化：本仓库工作树里有 CRLF 文件，而 CASES 里跨行的原文写作 "...\n..."，
+    拿 CRLF 原文去 count() 会一条都对不上（踩过：一条跨行用例莫名变 SKIP）。
+    原有的换行风格另外记下来（_is_crlf），写回时再还原，保持逐字节一致。
+    """
+    return raw.decode("utf-8").replace("\r\n", "\n")
+
+
+def _is_crlf(raw: bytes) -> bool:
+    return b"\r\n" in raw
+
+
+def _encode_like(data: str, crlf: bool) -> bytes:
+    """按原文件的换行风格落盘（新写的行也跟着走）。"""
+    return (data.replace("\n", "\r\n") if crlf else data).encode("utf-8")
+
+
+def _put_back(rel: str) -> None:
+    pending = _PENDING.pop(rel, None)
+    if pending is not None:
+        _write_raw(*pending)
+
+
+def _load_manifest() -> list[dict[str, str]]:
+    if not _MANIFEST.exists():
+        return []
+    try:
+        data = json.loads(_MANIFEST.read_text(encoding="utf-8"))
+    except Exception:
+        return [{"rel": "", "bak": "", "sha": "", "label": "manifest 读不出来"}]
+    return data if isinstance(data, list) else []
+
+
+def _write_manifest(entries: list[dict[str, str]]) -> None:
+    _BACKUP_DIR.mkdir(exist_ok=True)
+    _MANIFEST.write_text(json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _clear_backups() -> None:
+    if _BACKUP_DIR.exists():
+        for item in _BACKUP_DIR.iterdir():
+            item.unlink()
+        _BACKUP_DIR.rmdir()
+
+
+def _on_signal(signum: int, _frame: object) -> None:
+    for rel in list(_PENDING):
+        _put_back(rel)
+    print(f"\n!! 收到信号 {signum}：已把源码还原后再退出", file=sys.stderr)
+    raise SystemExit(130)
+
+
+def _settle_previous_run(entries: list[dict[str, str]]) -> int:
+    """收拾上次被强杀留下的残局。只有「内容确实等于我们写坏的那份」才敢自动还原。"""
+    if not entries:
+        return 0
+    manual: list[str] = []
+    for entry in entries:
+        rel, bak = entry.get("rel", ""), entry.get("bak", "")
+        path, bpath = pathlib.Path(rel), _BACKUP_DIR / bak
+        if not (path.exists() and bpath.exists()):
+            manual.append(f"{rel}（源文件或备份不见了）")
+            continue
+        if entry.get("sha") and _sha_of(_read_raw(path)) == entry["sha"]:
+            _write_raw(path, _read_raw(bpath))
+            bpath.unlink()
+            print(f"还原上次中断残留：{rel}（内容与当初写坏的那份逐字节相同，可以安全还原）")
+        else:
+            manual.append(f"{rel}（当前内容既不是原文也不是我们的变异体 —— 你手改过？）")
+    if manual:
+        print("!! 上次运行被强杀，残局需要人工处理（我不拿旧备份覆盖你的改动）：")
+        for item in manual:
+            print("    -", item)
+        print(f"    备份在 {_BACKUP_DIR}/；看过之后删掉该目录再重跑")
+        return 2
+    _clear_backups()
+    return 0
+
+
 def main() -> int:
+    argv = sys.argv[1:]
+    entries = _load_manifest()
+    if "--restore" in argv:
+        return _settle_previous_run(entries)
+    leftover = _settle_previous_run(entries)
+    if leftover:
+        return leftover
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     rows: list[tuple[str, str, str]] = []
-    for expect, label, rel, old, new, test_file in CASES:
+    suspect: list[str] = []
+    backups: list[dict[str, str]] = []
+    for index, (expect, label, rel, old, new, test_file) in enumerate(CASES):
         path = pathlib.Path(rel)
-        orig = path.read_text(encoding="utf-8")
-        if orig.count(old) != 1:
+        raw = _read_raw(path)
+        crlf = _is_crlf(raw)
+        text = _source_text(raw)
+        if text.count(old) != 1:
             rows.append(("SKIP", expect, label))
+            if text.count(new) == 1 and not text.count(old):
+                suspect.append(label)
             continue
-        path.write_text(orig.replace(old, new, 1), encoding="utf-8")
+        data = _encode_like(text.replace(old, new, 1), crlf)
+        bak = f"{index:03d}__{path.name}"
+        _BACKUP_DIR.mkdir(exist_ok=True)
+        _write_raw(_BACKUP_DIR / bak, raw)
+        backups = [b for b in backups if b["rel"] != rel]
+        backups.append({"rel": rel, "bak": bak, "sha": _sha_of(data), "label": label})
+        _write_manifest(backups)  # 先落盘，再改源码：被强杀也留得下收拾残局的凭据
+        _PENDING[rel] = (path, raw)
         try:
+            _write_raw(path, data)
             proc = subprocess.run(
                 [sys.executable, "-m", "pytest", *test_file.split(), "-x", "-q",
                  "-p", "no:cacheprovider"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
             )
         finally:
-            path.write_text(orig, encoding="utf-8")
+            _put_back(rel)
+            backups = [b for b in backups if b["bak"] != bak]
+            _write_manifest(backups)
         rows.append(("KILLED" if proc.returncode != 0 else "SURVIVED", expect, label))
+    _clear_backups()
 
     print("结果  期望   变异")
     for verdict, expect, label in rows:
@@ -230,6 +373,9 @@ def main() -> int:
         print("  缺口（该补测试或让它可测）：", r[2])
     for r in skipped:
         print("  原文没匹配上（源码变了？）：", r[2])
+    for label in suspect:
+        print("  !! 该处当前内容**正是变异体本身**，源码可能残留着上次被强杀留下的变异：", label)
+        print("     还原：`python scripts/mutant_check.py --restore`，或用 git 恢复那个文件")
     return 1 if (gaps or skipped) else 0
 
 

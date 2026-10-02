@@ -445,6 +445,10 @@ bash scripts/mutation.sh --docker --shard=ratelimit
 #    退出码 0 才算"裁决表没过期"；源码改过而没同步表格时它会以 1 结束
 ./.venv/Scripts/python.exe scripts/mutant_check.py
 
+# 3b. 万一上一步被打断（强杀 / OOM / 拔电源），源码会停在"改坏"的状态：
+#     重跑会自动收拾残局；也可以手动还原（同一件事，退出码 0 = 收拾干净）
+./.venv/Scripts/python.exe scripts/mutant_check.py --restore
+
 # 4. 分片表与 pyproject 是否一致 + 门禁/分片脚本自身的单测
 ./.venv/Scripts/python.exe scripts/mutation_shards.py verify-config
 ./.venv/Scripts/python.exe -m pytest tests/test_mutation_gate.py tests/test_mutation_shards.py -q
@@ -453,4 +457,42 @@ bash scripts/mutation.sh --docker --shard=ratelimit
 容器里跑一片大约 10 分钟（宿主 `docker logs -f warden-mutmut-<片名>` 能看到进度，结束时
 统计落在 `mutants/mutmut-cicd-stats.json`）。`mutants/` 下的清单与 diff 都是**产物**，
 不进版本库。
+
+---
+
+## 九、这个脚本会**真的改源码**，所以它自带安全网
+
+`--mutmut` 是在副本上跑，`scripts/mutant_check.py` 不一样：它把变异体**真写进工作树里的源码**，
+只跑那一条对应的测试文件，然后靠 sha256 核对还原。三条规矩：
+
+1. **改写前先备份、先落清单。** 原文（逐字节）进 `.mutant_check_backup/`，`manifest.json` 里记
+   「备份名 + 改写后内容的 sha256」，而且清单是**先于**源码改写落盘的——被强杀也留得下收拾残局的凭据。
+2. **每条都在 `finally` 里还原。** 测试红/绿/异常都会还回去；正常跑完连备份目录一起删掉。
+   `Ctrl-C`、`SIGTERM` 有信号处理器兜（先还原再退出）。
+3. **不可捕获的强杀（`TerminateProcess`、OOM、断电）救不了当场**，但下次运行会先"收拾残局"：
+   只有当前内容与当初写坏的那份**逐字节相同**（sha256 对得上）才自动还原；对不上——
+   说明这期间你手改过这个文件——它**拒绝动手**、打印备份在哪、以退出码 2 结束，
+   **绝不拿旧备份覆盖你的新改动**。
+
+退出码就是这套契约的对外接口：
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 裁决表与源码同步：该杀的都杀了，等价变异仍是等价 |
+| `1` | 表格过期（原文没匹配上）或出现缺口（该杀却没杀死） |
+| `2` | 上次被强杀的残局需要人工处理（备份在 `.mutant_check_backup/`） |
+
+两条踩过的坑，写在这里省下一次调试：
+
+- **匹配前必须把 `\r\n` 归一成 `\n`。** 本仓库工作树里有 CRLF 文件，而 `CASES` 里的跨行原文是按
+  `\n` 写的：不归一的话，一条跨行用例会静默变成 `SKIP`（看起来只是"表格过期"，其实是读法不对）。
+  归一之后，落盘时按原文件的换行风格还原，逐字节一致。
+- **"上次被强杀"和"表格过期"的症状会互相伪装。** 强杀留下的变异体会让那一条原文匹配不上，
+  于是报出来的是 `SKIP`。所以脚本加了一条旁证：某条 `old` 匹配不上、而**它的 `new` 恰好匹配上**时，
+  说明那处当前内容**正是变异体本身**——直接提示你跑 `--restore`（或 `git` 恢复那个文件）。
+  真正被强杀杀过的那次就是这么认出来的。
+
+这套安全网不是想出来的，是**跑出来发现的**：一次被外层超时强杀后，工作树里静静躺着一个变异体，
+而当时的脚本没有任何痕迹可查。三个验证场景（强杀后重跑自动还原 / `--restore` / 手改过则拒动手）
+都真跑过一遍。
 
