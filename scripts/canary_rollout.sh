@@ -15,7 +15,7 @@
 #     --promote  金丝雀健康后，自动停掉旧容器（真正做到"替换"）。缺省只做门控、不动旧版。
 #
 # 环境变量:
-#   CANARY_PORT/CANARY_CONTAINER/LIVE_CONTAINER/HEALTH_TIMEOUT_S/AUTH_VALUE 等
+#   CANARY_PORT/CANARY_CONTAINER/LIVE_CONTAINER/HEALTH_TIMEOUT_S/CANARY_ALLOW_DEMO 等
 set -euo pipefail
 
 export MSYS_NO_PATHCONV=1
@@ -42,6 +42,31 @@ export "${AUTH_VAR}=${AUTH_VALUE}"
 
 log() { printf '\n[canary] %s\n' "$*"; }
 
+# ---- 模型凭据前置判定（别把「守卫拦住」看成「镜像坏了」）----
+# 金丝雀跑的是**要放量的那个镜像**，容器内必须 WARDEN_HOST=0.0.0.0（否则端口映射进不来）
+# = 对外服务。run_server 的启动守卫把「假模型 + 对外 + 未声明演示」判为**拒绝启动**，
+# 所以没有真实凭据时容器会直接退出——那条 ERROR 要到日志里才看得到，极易被误读成
+# "新镜像起不来"。这里提前把三种情况分开，并把缺什么说清楚：
+#   · 有真实凭据（DEEPSEEK_API_KEY 或 WARDEN_BASE_URL+WARDEN_MODEL_API_KEY）→ 正常放量
+#   · 没有，但操作者**显式** CANARY_ALLOW_DEMO=1 → 允许，但声明为演示实例（日志与
+#     /capabilities 会标明 demo_instance=true，不会把固定脚本的输出当成真实能力）
+#   · 没有也不声明 → 不放量（fail-closed）。放量一个假模型比不放量危险得多。
+DEMO_FLAGS=()
+if [ -n "${DEEPSEEK_API_KEY:-}" ] || { [ -n "${WARDEN_BASE_URL:-}" ] && [ -n "${WARDEN_MODEL_API_KEY:-}" ]; }; then
+  log "检测到真实模型凭据 → 金丝雀按真实模型跑"
+elif [ "${CANARY_ALLOW_DEMO:-0}" = "1" ]; then
+  log "⚠️ 无真实模型凭据，且 CANARY_ALLOW_DEMO=1 → 金丝雀是**演示实例**（假模型：回复是固定脚本）"
+  log "   要验证真实能力，请提供 DEEPSEEK_API_KEY（或 WARDEN_BASE_URL+WARDEN_MODEL_API_KEY）后重跑"
+  DEMO_FLAGS=(-e WARDEN_ALLOW_FAKE_MODEL=1 -e WARDEN_DEMO_INSTANCE=1)
+else
+  log "❌ 没有真实模型凭据 → 不放量（fail-closed）"
+  log "   金丝雀要放量的是对外服务，容器内必须 WARDEN_HOST=0.0.0.0；没凭据就会用假模型（固定脚本），"
+  log "   而假模型的输出看起来像真能力。两种走法："
+  log "     · 放真实版：export DEEPSEEK_API_KEY=... （或 WARDEN_BASE_URL + WARDEN_MODEL_API_KEY）"
+  log "     · 只演练流程：CANARY_ALLOW_DEMO=1 scripts/canary_rollout.sh <镜像>  # 会被标为演示实例"
+  exit 2
+fi
+
 cleanup_canary() { docker rm -fv "$CANARY_CONTAINER" >/dev/null 2>&1 || true; }
 
 log "启动金丝雀：$IMAGE（端口 $CANARY_PORT）"
@@ -50,6 +75,7 @@ docker run -d --name "$CANARY_CONTAINER" \
   -p "127.0.0.1:${CANARY_PORT}:8000" \
   -e PORT=8000 -e WARDEN_HOST=0.0.0.0 -e WARDEN_DB_PATH=/data/warden.db \
   -e "$AUTH_VAR" \
+  ${DEMO_FLAGS[@]+"${DEMO_FLAGS[@]}"} \
   --read-only --tmpfs /tmp --mount type=volume,dst=/data \
   --cap-drop ALL --security-opt no-new-privileges:true \
   "$IMAGE" >/dev/null

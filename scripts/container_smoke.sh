@@ -20,6 +20,8 @@ export MSYS2_ARG_CONV_EXCL="*"
 
 IMAGE="${1:-warden-agent:smoke}"
 CONTAINER="warden-smoke-$$"
+# 负向用例的容器名：同一份镜像、**去掉演示声明**跑一遍，必须起不来（见文末第 6 步）。
+NEG_CONTAINER="${CONTAINER}-nofake"
 PORT="${SMOKE_PORT:-18080}"
 
 # 冒烟用的鉴权 key 在**运行时随机生成**，只为让 run_server 的 fail-closed 校验通过；
@@ -35,6 +37,7 @@ log() { printf '\n[smoke] %s\n' "$*"; }
 cleanup() {
   # -v：一并删掉匿名数据卷，避免每次冒烟都留一个孤儿卷
   docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
+  docker rm -fv "$NEG_CONTAINER" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -59,11 +62,20 @@ docker build $PULL_FLAG -t "$IMAGE" .
 # 继承 /data 的属主（Dockerfile 里 chown 给 warden）。用 tmpfs 的话挂载点是 root 属主、
 # 非 root 应用写不进去，会以 `sqlite3.OperationalError: unable to open database file` 失败——
 # 那是**测试脚手架**的问题，不是镜像的问题，所以这里要和真实部署保持一致。
-log "启动容器（只读 rootfs + cap_drop ALL + no-new-privileges）"
+# 演示声明**必须显式写**：冒烟里没有任何真实模型凭据，而容器内必须
+# `WARDEN_HOST=0.0.0.0`（否则端口映射进不来）= 对外服务。run_server 的启动守卫把
+# 「假模型 + 对外 + 没声明演示」判为拒绝启动（fail-closed，两个变量都得写：
+# 只写一个拦不住"生产配置里残留一句 ALLOW_FAKE_MODEL"这类事故）。
+# 这**不是**为了绕过守卫换绿：第 6 步会把声明去掉再跑一次，验证它**确实**起不来；
+# 第 5b 步验它如实自报 demo（假模型不能装成真能力）。
+# 真实模型凭据在场时（SMOKE_USE_REAL_MODEL 场景）由调用方自行注入，本脚本不加声明。
+log "启动容器（只读 rootfs + cap_drop ALL + no-new-privileges；显式声明演示实例）"
 docker run -d --name "$CONTAINER" \
   -p "127.0.0.1:${PORT}:8000" \
   -e PORT=8000 \
   -e WARDEN_HOST=0.0.0.0 \
+  -e WARDEN_ALLOW_FAKE_MODEL=1 \
+  -e WARDEN_DEMO_INSTANCE=1 \
   -e WARDEN_DB_PATH=/data/warden.db \
   -e "$AUTH_VAR" \
   --read-only \
@@ -115,4 +127,64 @@ case "$unauth" in
      exit 1 ;;
 esac
 
-log "容器冒烟通过：镜像可构建、可启动、健康探针与指标可用、鉴权 fail-closed"
+# ---- 5b. 验演示实例**如实自报**（假模型不许装成真能力）----
+# 上面显式声明了演示。声明之后要能**被外部看到**：/capabilities 必须写清
+# demo_instance=true / model_kind=fake。否则"声明"只是一句给自己的注释，
+# 评审者、集成方照样会把固定脚本的输出当成真实能力。
+log "校验 /capabilities 如实标注 demo_instance=true / model_kind=fake"
+caps="$(curl -s -H "Authorization: Bearer ${AUTH_VALUE}" "http://127.0.0.1:${PORT}/capabilities")"
+echo "$caps" | grep -Eq '"demo_instance"[[:space:]]*:[[:space:]]*true' || {
+  log "/capabilities 没写 demo_instance=true，实际输出："
+  echo "$caps" | head -30
+  exit 1
+}
+echo "$caps" | grep -Eq '"model_kind"[[:space:]]*:[[:space:]]*"fake"' || {
+  log "/capabilities 没写 model_kind=\"fake\"，实际输出："
+  echo "$caps" | head -30
+  exit 1
+}
+log "演示实例如实自报 ✓"
+
+# ---- 6. 验「假模型对外且不声明」在**启动期**就被拒（fail-closed）----
+# 第 2 步是"声明了演示才起来"。这里把两个声明去掉，其余参数**完全一致**，必须起不来。
+# 为什么这条不能省：只验正向的话，脚本会随着"镜像能起来"一路变绿——哪天真有人把
+# 启动守卫删了，冒烟照样全绿。守卫的价值全在"拦得住"，拦不住就等于没有。
+log "校验无演示声明时拒绝启动（假模型对外 = fail-closed）"
+docker run -d --name "$NEG_CONTAINER" \
+  -e PORT=8000 \
+  -e WARDEN_HOST=0.0.0.0 \
+  -e WARDEN_DB_PATH=/data/warden.db \
+  -e "$AUTH_VAR" \
+  --read-only \
+  --tmpfs /tmp \
+  --mount type=volume,dst=/data \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  "$IMAGE" >/dev/null
+neg_exit=""
+for _ in $(seq 1 20); do
+  if ! docker inspect -f '{{.State.Running}}' "$NEG_CONTAINER" 2>/dev/null | grep -q true; then
+    neg_exit="$(docker inspect -f '{{.State.ExitCode}}' "$NEG_CONTAINER" 2>/dev/null || echo '?')"
+    break
+  fi
+  sleep 1
+done
+neg_log="$(docker logs "$NEG_CONTAINER" 2>&1 || true)"
+if [ -z "$neg_exit" ]; then
+  log "❌ 无演示声明的容器**起来并活着**（20s）—— 假模型可以对外服务，启动守卫失效了"
+  echo "$neg_log" | tail -20
+  exit 1
+fi
+if [ "$neg_exit" = "0" ]; then
+  log "❌ 无演示声明时退出码为 0（期望非 0）—— 守卫没拦住。日志："
+  echo "$neg_log" | tail -20
+  exit 1
+fi
+if ! echo "$neg_log" | grep -q 'fail-closed'; then
+  log "❌ 退出码 $neg_exit 非 0（对），但日志里没有 'fail-closed' 说明——退出原因可能不是守卫。日志："
+  echo "$neg_log" | tail -20
+  exit 1
+fi
+log "无演示声明 → 拒绝启动（退出码 $neg_exit，日志含 fail-closed 原因）✓"
+
+log "容器冒烟通过：镜像可构建、可启动、健康探针与指标可用、演示实例如实自报、鉴权与启动守卫均 fail-closed"

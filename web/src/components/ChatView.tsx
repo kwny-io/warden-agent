@@ -3,7 +3,7 @@
 //  - 非流式：POST /chat/{run_id} 等一次性结果
 // 同时展示审批请求（needs_approval）内联的批准/拒绝按钮。
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { StreamEvent } from "../lib/types";
 import { api } from "../lib/api";
 import { toChatMessages } from "../lib/guards";
@@ -13,6 +13,9 @@ import MarkdownText from "./MarkdownText";
 /** 工具结果默认折叠到这么多行 / 字符（展开后看全，不隐藏）。 */
 const COLLAPSED_LINES = 6;
 const COLLAPSED_CHARS = 600;
+
+/** 判定"已经在底部"的容差（px）：亚像素与滚动条宽度会带来 1~2px 误差。 */
+const NEAR_BOTTOM_PX = 8;
 
 const SUGGESTIONS = [
   "查一下上海天气",
@@ -51,6 +54,10 @@ export default function ChatView({
   const [actingId, setActingId] = useState<string | null>(null);
   const activeBubbleRef = useRef<number | null>(null);
   const msgBoxRef = useRef<HTMLDivElement>(null);
+  // 「还在跟随最新一条」：默认跟随。用户把视口往上滚开就停止跟随（别人正在看历史，
+  // 别把他拽下去）；他再发一条消息、或自己滚回底部，就重新跟随。
+  // 用 ref 不用 state：滚动事件里读它不该触发渲染（每帧一次的重渲染只会让滚动更卡）。
+  const followRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // 在途流式请求的取消句柄：卸载时 abort，底层 reader 随之 cancel
   const abortRef = useRef<AbortController | null>(null);
@@ -84,9 +91,43 @@ export default function ChatView({
   const scrollToBottom = useCallback(() => {
     requestAnimationFrame(() => {
       const el = msgBoxRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
+      if (!el) return;
+      if (!followRef.current) return; // 用户已经滚上去看历史了，不要抢他的视口
+      el.scrollTop = el.scrollHeight;
     });
   }, []);
+
+  // 滚动位置 → 跟随开关。
+  // 为什么要有它：没有这个门的时候，每次 delta 都会把视口拽回底部——用户在助手
+  // 长回答的中途想往上翻两句是做不到的（刚滚上去就被拽下来）。
+  useEffect(() => {
+    const el = msgBoxRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      followRef.current =
+        el.scrollTop + el.clientHeight >= el.scrollHeight - NEAR_BOTTOM_PX;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // 消息变了就把视口钉到最新一条——**在提交之后**钉。
+  //
+  // 为什么不能用"在 `.then()` 里 requestAnimationFrame 钉一次"那种写法（原来就是）：
+  // `setMsgs(history)` 之后 React 什么时候把 DOM 提交上去，和 rAF 什么时候跑，**没有**
+  // 先后保证（React 用 MessageChannel/scheduler 调度，rAF 是另一条路径）。rAF 先跑时
+  // 读到的 `scrollHeight` 还是**旧内容**的高度（刚挂载时几乎是 0），于是那条历史被渲染
+  // 出来之后，视口留在顶部——用户看到的是"聊到三十轮的会话一打开停在最上面"。
+  // 本机几乎总是 React 先提交，所以这个竞态只在慢机器/CI 上现形：
+  // 实测 `/runs/36960948354` 的 e2e 就是这么挂的（`isPinnedToBottom` 15s 一直是 false）。
+  // useLayoutEffect 在 DOM 提交后、浏览器绘制前同步执行——读到的必然是**这一份**内容的
+  // 高度，不依赖调度器谁先跑。
+  useLayoutEffect(() => {
+    if (!followRef.current) return;
+    const el = msgBoxRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [msgs]);
 
   // 刷新 / 切 run 后从后端恢复历史对话。
   // system 与 tool 结果消息不入聊天区，保持和流式视图一致的观感。
@@ -106,13 +147,19 @@ export default function ChatView({
     setMsgs([]);
     setError(null);
     activeBubbleRef.current = null;
+    // 换会话 = 新的一段对话：重新打开跟随。不重置的话，在上一个会话里往上翻过历史的人
+    // 切到新会话时会带着"已停止跟随"过去，新会话打开就停在顶部——与 CI 那条失败
+    // 同一个可见症状（"我新开的会话怎么停在最上面"）。
+    followRef.current = true;
     api
       .messages(runId, { signal: ctrl.signal })
       .then((raw) => {
         if (cancelled) return;
         // toChatMessages 先做收窄（服务端可能返回垃圾），toDisplayMsgs 与断线兜底同一份逻辑
         setMsgs(toDisplayMsgs(toChatMessages(raw)));
-        scrollToBottom();
+        // 这里**不再**自己钉一次：上屏后的钉底由下面的 useLayoutEffect 统一负责
+        // （它在 DOM 提交之后、绘制之前执行）。两处各钉一次迟早会分叉，
+        // 而且"在 .then 里 rAF 钉一次"会把顺序押给调度器——正是 CI 挂掉的原因。
       })
       .catch(() => {});
     return () => {
@@ -214,7 +261,11 @@ export default function ChatView({
           text: "",
           approval: ev.approval,
         });
-        scrollToBottom();
+        // 审批是**必须被看见**的事件：这条不清掉，run 就停在等审批上；用户看不到卡片
+        // 就会以为"模型挂了"。所以这里直接**恢复跟随**，让上面那个 useLayoutEffect
+        // （提交后执行）去钉底——不再另起一条 rAF 钉一次：rAF 可能跑在提交之前，
+        // 钉的是"还没有这张卡片"时的高度，同一个时序坑换个地方又出现一次。
+        followRef.current = true;
         break;
       }
       case "disconnected": {
@@ -328,6 +379,10 @@ export default function ChatView({
     if (inputRef.current) inputRef.current.style.height = "auto";
     setError(null);
     setDisconnected(null);
+    // 用户主动发消息 = 明确的"我要看最新"：重新打开跟随开关（他刚才可能正翻历史）。
+    // 不做这一步的话，往上翻过历史的人发完消息只能看到自己的气泡落在视口外，
+    // 页面看起来像"没反应"——那正是长会话用例里第 3 段要抓的东西。
+    followRef.current = true;
     push({ id: nextId(), role: "user", text });
     setBusy(true);
     const ctrl = new AbortController();

@@ -5,6 +5,98 @@
 
 ---
 
+## 2026-10-02（第四十三批：CI 三个 job 红 —— 一条非安全用途的 sha1、一次被守卫正确拦住的启动、一个真实的时序竞态）
+
+> 起因：第四十二批刚把 `mypy --strict` 那条被上一批弄红的门禁修回来，这一批开头先核 CI 现状：
+> run `36960948354` 里 **security / container / quality 三个 job 红**。三个都不是"测试写错了"，
+> 而是三种不同性质的东西——门禁把正当用途的哈希当漏洞、冒烟脚本把**正确的拒绝启动**
+> 当成了镜像坏了、前端一个只在慢调度下现形的时序竞态。三条都在本地复现、修掉、
+> 并且留了能反过来打自己脸的证据。
+
+**① `security`：bandit 抓的是"形状"，而这里不是那个用途**
+
+`bandit -r src/warden_agent --severity-level medium --confidence-level medium` 退出码 1、`High: 1`，
+指 `src/warden_agent/rag/loader.py:53` 的 `hashlib.sha1(...)`（B324 / CWE-327）。它的用途是
+"把来源目录路径压成一段稳定短串"当索引库文件名（`<db>-rag-<hash12>.db`）——没有对手、没有秘密，
+不是安全原语。所以修法是把用途**如实声明**：`hashlib.sha1(path_bytes, usedforsecurity=False)`，
+并在注释里写清为什么不顺手换算法（换了算法，已有的 `*-rag-*.db` 全部变成孤儿，
+重启后要重新嵌入，真嵌入按量计费）。**没有**去调 `--severity-level`、也没有 `# nosec`：
+门禁本身没问题，它抓的是一类形状，这条恰是那类里少见的正当用途。
+验证：同一命令 `Medium: 0 / High: 0`、退出码 0；`hexdigest()` 两种调用实测逐字符相同
+（**摘要不变** → 已有索引库不会被改名）；`ruff check src tests scripts` 全绿。
+
+**② `container`：冒烟脚本把"守卫拒绝启动"读成了"镜像坏了"**
+
+`scripts/container_smoke.sh` 起容器时传的是 `-e WARDEN_HOST=0.0.0.0` + `WARDEN_API_KEY`，
+**没有模型凭据**；而服务在"对外监听 + 要鉴权 + 没有任何真实模型可用"时是 **fail-closed 拒绝启动**的。
+冒烟脚本于是把一次**正确的拒绝**读成了失败。两种修法里没有选"把守卫关掉"：脚本现在**显式声明**
+这是演示实例，并把"守卫还在上班"本身做成冒烟的一部分——新增两条断言：正向必须**如实自报**
+（`/capabilities` 的 `demo_instance=true`、`model_kind="fake"`），负向**去掉声明必须起不来**、
+日志里必须出现 `fail-closed`。同批改 `scripts/canary_rollout.sh`：放量前先判模型凭据，
+缺凭据就 fail-closed 并给出两条去路（配真凭据 / 显式声明演示实例），
+免得把 fail-closed 误判成"新镜像起不来"而回滚一个好镜像。
+
+**③ `quality`：长会话打开停在顶部 —— rAF 与 React 提交之间没有先后保证**
+
+红的是 `web/e2e/long-conversation.spec.ts:90`（`isPinnedToBottom` 15 秒一直 `false`）。
+根因在 `web/src/components/ChatView.tsx`：恢复历史时调 `scrollToBottom()`，
+而它把 `el.scrollTop = el.scrollHeight` 放在 `requestAnimationFrame` 里。
+rAF 和 `setMsgs()` 之后的 DOM 提交**没有先后保证**（React 走 scheduler/MessageChannel，
+rAF 是另一条路径）：rAF 先跑时读到的 `scrollHeight` 还是**旧内容**的高度（刚挂载时几乎是 0），
+历史渲染出来之后视口就停在顶部。本机常态下几乎总是 React 先提交，所以这个竞态**只在慢调度下现形**——但这句话要标清证据等级：
+CI 的 e2e job 里 `:90` 这条断言是**超时（15 秒）**红的，而同一用例本地单跑是绿的；
+我另外写过一个临时的「降速诊断」spec（`web/e2e/diag-scroll-race.spec.ts`，已删）去看
+几何量随时间的取值，它自身也没能给出一个干净的本地复现（EXIT=1）。所以根因的把握来自
+**时序分析 + CI 稳定红 + 同一用例改后转绿**这三条，而不是"我在本地把它稳定跑红了"。
+修法是**把钉底挪到提交之后**，而不是"多钉几次"：新增 `useLayoutEffect` 在 `msgs` 变化后钉
+（提交后、绘制前同步执行，读到的必然是这一份内容的高度），并把 `api.messages().then()` 里
+那次自己钉底的调用删掉——同一件事只留一处实现，两处各钉一次迟早分叉。
+顺带补上一个更常见的体验缺陷：**跟随开关**（`followRef`）。用户把视口往上滚开就停止跟随
+（否则助手长回答中途想往上翻两句是做不到的：刚滚上去就被拽回底部），他再发一条消息、
+或自己滚回底部就恢复跟随；换会话（`runId` 变化）也重置为跟随，否则"在上一个会话里翻过历史"
+会带进新会话，新会话一打开就停在顶部——与 CI 那条失败同一个可见症状。
+唯一刻意例外是**审批请求**：那是"必须被看见"的事件（这条不清掉，run 就停在等审批上，
+用户看不到卡片只会以为模型挂了），所以它直接恢复跟随、仍由同一个 `useLayoutEffect` 去钉，
+不再另起一条 rAF——不然同一个时序坑换个地方又出现一次。
+
+验证：`uv run --frozen pytest --tb=short -rs -p no:cacheprovider --cov=warden_agent`（CI 那条门禁的
+原命令）→ **1593 项 / 1549 passed / 44 skipped / 0 failed / 0 error**（562s，退出码 0；
+数字取自 `--junitxml`，不是数进度条上的点）。
+与 `README.md` 那行“1589 passed / 4 skipped / 共 1593 项”**不矛盾：总数一样**，差别只在跳过数
+——本机没有真 PostgreSQL（docker 拉不到镜像），44 条 PG 相关用例被跳过；CI 的 quality job 带
+PG service（`ci.yml:47-51`）并装了 postgresql-client，所以那边只跳 4 条。
+同一个环境差异也解释覆盖率：本机这次 `Required test coverage of 86.0% reached. Total coverage: 86.67%`（无 PG），
+而 `README.md` 记的 89.92% 是**有真 PG 时**的实测值——两个数都对，口径不同，不是回退。
+`mypy --strict src/warden_agent` → `Success: no issues found in 115 source files`；
+`bandit` 退出码 0；前端四项门禁 `eslint` / `tsc -b` / `vitest` / `npm run build` 全绿，
+`vitest` 14 文件 **199 passed**（新增 `web/src/components/ChatView.scroll.test.tsx` 4 条）；
+真浏览器 `npm run test:e2e` → **10 passed / 6 skipped（49.4s）**——跳过的 6 条就是
+`web/e2e/multi-replica.spec.ts`：它在 `:158` 用 `test.skip(!pg.available, …)` 整体跳过，
+本机 docker 拉不到镜像所以没有真 PG；CI 的 quality job 带 PG service（`ci.yml:47-51` 的
+`WARDEN_TEST_PG_*`），这 6 条在 CI 里会真跑——所以本地这份不是"全站 e2e 绿"。
+**证伪**：① 改之前 `web/e2e/long-conversation.spec.ts:90` 这条断言在 CI 上就是红的
+（先红后绿，不是"一直绿"）；② 用 `git show HEAD:web/src/components/ChatView.tsx` 覆盖回去
+重跑那 4 条滚动用例 → **4 条全红**（包括"关掉 rAF 也必须钉底"那条，证明它们真在盯行为、
+不是盯实现）；换回本批实现 → **4 条全绿**（还原前后 md5 一致：`8b1aa1a420a9866fc6eef1e55f51a7fa`）。
+退旧实现看会不会红的具体跑法见 `docs/复核索引.md` §8。
+
+**诚实边界**：① 容器冒烟这一步**本地验不了**（本机 docker 拉不到镜像：代理 `127.0.0.1:7890` 拒绝连接），
+只能由 CI 复验——所以它的状态是"已修 + 待 CI 复验"，不是"已验证"；
+② 本机后端那 44 条跳过里，大部分是需要真 PostgreSQL 的用例；CI 那边有 PG service，
+且 `scripts/check_pg_tests_ran.py` 会把"该跑的被静默跳过"变成明确失败；
+③ **一个本机特有的假红要记下**：从 cmd/PowerShell 跑 `pytest` 会有 18 条红，全在
+`tests/test_release_scripts.py`——那里的 `BASH = shutil.which("bash")` 会选中
+`C:\Windows\System32\bash.EXE`（WSL relay，本机坏：`execvpe(/bin/bash) failed`），
+换成 git bash 跑同一文件 **18/18 通过**，与本批改动无关；
+④ 审批请求会强行把视口拽到底，这是**有意**的取舍（可见性优先于"别抢我的滚动位置"），
+代价是用户正在抄审批上面那段内容时会被打断；如果这个取舍不对，改回来只是把那一行换成 `scrollToBottom()`；
+⑤ 长列表虚拟化仍未做（几百条消息时滚动性能没保证），与本批的"钉底"是两件事。
+
+**同批文档同步**：`docs/复核索引.md` 升到第四十三批（新增 §2.12，§7 已知欠账表补齐本批三行并把
+"容器冒烟只能由 CI 复验"写成显式欠账）、`README.md` 对外数字刷到本批实测值。
+
+---
+
 ## 2026-10-02（第四十二批：`mypy --strict` 这条 CI 门禁，被上一批改动悄悄弄红了）
 
 > 起因：做文档同步时顺手跑了一遍 `mypy --strict src/warden_agent`——**10 个错**，

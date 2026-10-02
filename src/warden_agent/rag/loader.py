@@ -50,7 +50,14 @@ def default_persist_path(
     db = env_opt("WARDEN_DB_PATH", src_env) or "warden-agent-local.db"
     base = Path(db)
     if isinstance(source, (str, Path)):
-        key = hashlib.sha1(str(Path(source)).encode("utf-8")).hexdigest()[:12]
+        # 这里只需要"把目录路径压成一段稳定短串"当文件名，不做任何完整性/抗碰撞保证
+        # （不是安全用途：没有对手、没有秘密、撞了也只是两个知识目录共用一份索引）。
+        # 因此显式声明 `usedforsecurity=False`：既如实表达用途，也让 SAST 门禁
+        # （bandit B324）不再把这条报成 High——而不是把门禁阈值调松换绿。
+        # 选 sha1 而非换算法是为了**文件名稳定**：换算法会让已有的 `*-rag-<hash>.db`
+        # 全部成为孤儿，重启后重新嵌入（真嵌入按量计费）。
+        path_bytes = str(Path(source)).encode("utf-8")
+        key = hashlib.sha1(path_bytes, usedforsecurity=False).hexdigest()[:12]
         return base.parent / f"{base.stem}-rag-{key}.db"
     return base.parent / f"{base.stem}-rag.db"
 
