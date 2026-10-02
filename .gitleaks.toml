@@ -1,0 +1,38 @@
+# gitleaks 配置：**只放宽测试夹具里那几个写死的假值，不关闭任何规则**。
+#
+# 背景（本地用与 CI 同一版本的镜像 1:1 复现过，不是推测）：security job 红在 7 处命中，
+# 全部落在 tests/test_redaction.py 与 tests/test_approval_separation.py。这两个文件是
+# 「脱敏」与「审批隔离」的用例，夹具**必须**长得像真密钥，否则根本测不出脱敏。
+# 涉及的就 3 个假值：
+#   · sk-live-TOPSECRET123456                                    → generic-api-key / curl-auth-header
+#   · jwt.io 官方示例 JWT 的签名段（SflKxwRJSMeKKF2QT4fwpMeJf…） → jwt
+#   · jwt.io 官方示例 JWT 的 payload 段（eyJzdWIiOiIxMjM0…）     → jwt（源码里跨行写，命中的是片段）
+#
+# 两个都是**实测踩出来的**坑，别踩回去：
+#
+# 1) 只放宽**值**，不放宽**路径**。
+#    v8.21.2 里 paths 与 regexes 是 **OR** 关系（实测：只给 regexes 能压住、只给 paths 也能压住），
+#    所以一旦写上 paths = ["tests/"]，这两个文件就变成**永久扫描盲区**——以后真有人把真密钥
+#    粘进去反而发现不了。按值放宽的代价小得多：被容忍的只是这 3 个写死的字符串，别的值照报。
+#
+# 2) schema 必须用**单数** `[allowlist]`。
+#    `[[allowlists]]`（复数数组，新版本写法）在 v8.21.2 里是**被静默忽略**的：
+#    实测连 catch-all（regexes = [".*"]）都清不掉任何命中——配置被读了，但等于没写。
+#    这类"配置看起来生效、其实没生效"的坑只能靠**主扫描跑一遍**发现，所以下面这条也请保留：
+#
+# 3) [extend] useDefault 必须留着。
+#    自定义配置会**替换**默认规则集；少了 extend，本配置自身没有任何规则，
+#    结果是"扫不出任何东西"——比红灯更糟（扫描器事实上被关掉）。
+#
+# 这份配置有**反向对照**兜着：ci.yml 的「秘密扫描反向对照」步骤会往临时文件里丢一个
+# 未被放宽的高熵假密钥，必须仍被报出来；没报出来就说明扫描器被关掉了，直接红灯。
+[extend]
+useDefault = true
+
+[allowlist]
+description = "脱敏/审批隔离用例里写死的假密钥夹具（3 个固定字符串，非真实凭据）"
+regexes = [
+  '''sk-live-TOPSECRET123456''',
+  '''SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c''',
+  '''eyJzdWIiOiIxMjM0NTY3ODkwIn0''',
+]

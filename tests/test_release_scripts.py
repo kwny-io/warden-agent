@@ -92,7 +92,14 @@ def _run(
         env_file.write_text(prelude, encoding="utf-8", newline="\n")
         env["BASH_ENV"] = env_file.as_posix()
     script_arg = f"scripts/{script}"
-    body = "exec bash " + " ".join([shlex.quote(script_arg), *[shlex.quote(a) for a in args]])
+    # 用 BASH 的**绝对路径**：有的用例把 PATH 收窄到"确定没有 docker/kubectl"，
+    # 若这里靠 PATH 找 bash，`exec bash` 会以 127 挂掉——那测的就不是被测脚本了。
+    body = (
+        "exec "
+        + shlex.quote(BASH)
+        + " "
+        + " ".join([shlex.quote(script_arg), *[shlex.quote(a) for a in args]])
+    )
     return subprocess.run(
         [BASH, "-c", body],
         cwd=str(root),
@@ -110,6 +117,40 @@ def _calls(root: Path) -> list[str]:
     if not log.exists():
         return []
     return [line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+# --------------------------------------------------------------------------- #
+# "这台机器没装 docker/kubectl"怎么造出来才不会骗自己
+#
+# 旧写法是 path="/usr/bin:/bin"，注释写着"只留 Git Bash 自带的工具，确保没有真 docker"。
+# 它在开发机（Windows）上碰巧是对的，在 GitHub runner 上完全不对：那里的 docker 就在
+# /usr/bin、kubectl 也在系统 PATH 里。于是脚本根本没走到"找不到工具"那条分支，用例红了
+# （实测 ci.yml：assert 0 == 2 / assert 2 == 1）。
+# 教训：不要用**宿主 PATH**去表达"这台机器没装 X"——它表达的是"这台机器的 PATH 长这样"，
+# 两者的差别恰好只会在 CI 上暴露。
+# 现在改成：PATH 指向一个**空目录**（确定没有任何可执行文件），脚本真正需要的外部命令
+# 用 bash 函数顶掉（函数在命令查找中优先于 PATH，所以不依赖宿主装了什么）。
+# --------------------------------------------------------------------------- #
+NO_TOOLS_PRELUDE = r"""
+dirname() {
+  local p="${1%/*}"
+  [ "$p" = "$1" ] && p="."
+  [ -z "$p" ] && p="/"
+  printf '%s\n' "$p"
+}
+"""
+
+
+def _no_tools_path(tmp_path: Path) -> str:
+    """返回一个确定找不到 docker/kubectl 的 PATH 值（空目录），并当场自检。"""
+    empty = tmp_path / "path-with-no-tools"
+    empty.mkdir(exist_ok=True)
+    path = str(empty)
+    for tool in ("docker", "kubectl"):
+        assert shutil.which(tool, path=path) is None, (
+            f"脚手架自检失败：这条 PATH 里居然能找到 {tool} —— \"没有工具\"的前提不成立"
+        )
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -259,8 +300,13 @@ def test_pin_app_image_replaces_placeholder(tmp_path: Path) -> None:
 
 def test_pin_needs_docker_and_says_so(tmp_path: Path) -> None:
     root = _make_repo(tmp_path)
-    # 只留 Git Bash 自带的工具，确保 PATH 里没有真 docker
-    proc = _run(root, "pin_image_digests.sh", path="/usr/bin:/bin")
+    # PATH 指向空目录（而不是某个"看起来干净"的宿主路径）→ 必然走到"找不到 docker"分支
+    proc = _run(
+        root,
+        "pin_image_digests.sh",
+        path=_no_tools_path(tmp_path),
+        prelude=NO_TOOLS_PRELUDE,
+    )
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "docker" in proc.stderr
 
@@ -389,7 +435,12 @@ def test_rollback_dry_run_does_not_undo(tmp_path: Path) -> None:
 
 def test_rollback_needs_kubectl_and_says_so(tmp_path: Path) -> None:
     root = _make_repo(tmp_path)
-    proc = _run(root, "rollback.sh", path="/usr/bin:/bin")
+    proc = _run(
+        root,
+        "rollback.sh",
+        path=_no_tools_path(tmp_path),
+        prelude=NO_TOOLS_PRELUDE,
+    )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "kubectl" in proc.stderr
 

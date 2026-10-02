@@ -5,6 +5,60 @@
 
 ---
 
+## 2026-10-02（第四十四批：CI 三个红 job 的真根因 —— 扫描器被靜默关掉、测试把宿主环境当契约、冒烟验的不是部署形状）
+
+**一句话**：这三个红都不是产品缺陷，而是**验证链本身**的三处漏洞，且是同一个根因的三个面 ——
+**本地能跑的东西，和 CI 验的东西，不是同一件事**。
+
+| 会场 | 坐标 | 根因 | 改法 |
+|---|---|---|---|
+| security：`gitleaks` 扫全历史报 7 处 | `.gitleaks.toml`、`.github/workflows/ci.yml` | 仓里那份配置用的是新版本写法 `[[allowlists]]`，而 CI 钉的 v8.21.2 **靜默忽略**它——实测连 catch-all（`regexes=[".*"]`）都清不掉一条命中，等于**密钥扫描器一直是关着的**。另外 gitleaks 只在**进程 cwd** 找 `.gitleaks.toml`，不会去 `--source` 指向的目录找 | 改用单数 `[allowlist]`；CI 显式 `--config /repo/.gitleaks.toml`；只按**值**放宽（`paths` 与 `regexes` 是 **OR**，写上 `paths` 会让两个测试文件变成**永久盲区**）；保留 `[extend] useDefault`（自定义配置会替换默认规则集）；新增**反向对照**步骤：未被放宽的高熵假密钥必须仍被报出 |
+| quality：`tests/test_ci_pg_guard.py`、`tests/test_release_scripts.py` | 同左 | 用**宿主环境**当契约：① 验「非 CI 分支」的用例直接读宿主 env，而 runner 上 `CI=true` 是环境默认值 → 走错分支；② 用 `path="/usr/bin:/bin"` 表达「这台机器没装 docker/kubectl」，在 Windows 开发机上碰巧成立、在 runner 上不成立 | 用例自己管环境（`monkeypatch.delenv("CI")`）；「没装工具」改成 PATH 指向**空目录**并**当场自检** `shutil.which(tool, path=path) is None`；脚本需的外部命令用 bash 函数顶替；`exec bash` 改成绝对路径；再加一条反向用例把「CI 里没 junit 报告必须红」钉住 |
+| container：`scripts/container_smoke.sh` | 同上 | 冒烟用**单 key** 模式起容器（主体名默认 `demo-user`），却去读 **admin-only** 的 `/metrics` → 必然 403。产品没错，是**冒烟脚本的配置不是部署的配置** | 按真实部署配两个身份（`WARDEN_API_KEYS="smoke-admin:<rand>,smoke-viewer:<rand>"` + `WARDEN_ADMIN_PRINCIPALS=smoke-admin`），并补上「**非管理员读 `/metrics` 必须 403**」这条断言——该策略此前**无任何覆盖**，而它正是那个 403 被发现的原因。**不放宽断言** |
+
+**实测**（2026-10-02，本机）：
+
+- `CI=true uv run --frozen python -m pytest tests/test_ci_pg_guard.py tests/test_release_scripts.py` → **30 项全绿**
+  （`CI=true` 正是旧用例被搞红的那个变量）。
+- `gitleaks` 同版本镜像扫全历史 → `no leaks found`；反向对照 → 未被放宽的假密钥**仍被报出** ✓。
+- `bandit -r src/warden_agent --severity-level medium --confidence-level medium` → **退出码 0、0 条 Issue**
+  （`src/warden_agent/rag/loader.py` 的 sha1 已在第四十三批声明 `usedforsecurity=False`）。
+- **容器冒烟本地首次跑通**（第四十三批里只能写「待 CI 复验」的那条，现在不是欠账了）：
+  镜像 `sha256:5e63761b07fb0ce832d05e57232729c0b61c5373f7b284712aba30f94babf7e9` 构建成功并启动，
+  `/health/live` → 200；管理员读 `/metrics` → 含本项目指标 ✓；**非管理员读 `/metrics` → HTTP 403 ✓**；
+  无 key → HTTP 401 ✓；`/capabilities` 自报 `demo_instance=true / model_kind="fake"` ✓；
+  **去掉演示声明 → 拒绝启动（退出码 2，日志含 fail-closed 原因）✓**。
+- 全量本地回归：<!--FILL:suite-numbers-->
+
+```bash
+cd /d/warden-agent && CI=true uv run --frozen python -m pytest tests/test_ci_pg_guard.py tests/test_release_scripts.py -q
+cd /d/warden-agent && uv run --frozen bandit -r src/warden_agent --severity-level medium --confidence-level medium
+docker build -t warden-agent:smoke --build-arg HTTP_PROXY=http://host.docker.internal:7897 .
+cd /d/warden-agent && SMOKE_SKIP_BUILD=1 bash scripts/container_smoke.sh
+```
+
+**与第四十三批的关系（两份诊断不矛盾，别误读）**：CI 一个 job 是**线性步骤表**，
+第 43 批修掉的是各自**第一个**失败步骤（bandit 的假 High、启动被守卫拦住、钉底时序），
+本批修的是**同一三个 job 重新跑之后暴露的下一步**——run `36999273123` 在 `c9a0f47` 上仍然是
+security/quality/container 全红，失败步骤分别是「秘密扫描（gitleaks，扫全历史）」、
+「Pytest（含覆盖率门槛）」、的「校验 /metrics 含本项目指标」。证据：第 43 批那三处修法
+**已在代码里且本地验过**（bandit 退出码 0、冒烟能启动、`ChatView.scroll.test.tsx` 4 条 + e2e 绿），
+但它们不足以让 job 变绿。
+
+→ **因此本批的教训比三条根因本身更重要：修红要修到“job 真绿”，否则只是把红灯往下挪一步。**
+下一批验收这个判断的方法不看数字、看 `gh run view <id> --json jobs` 里那三个 job 的结论。
+
+**本机环境三坑**（都进了桌面排查日志）：① cmd 里裸写 `bash` 会命中坏的 WSL relay（要写 Git Bash 绝对路径）；
+② `.cmd` 文件被 cmd 按 CP936 读，**中文注释会变成命令**（`.cmd` 必须纯 ASCII，逻辑放 `.sh`）；
+③ **容器内的 `127.0.0.1` 是容器自己的回环** —— 构建代理必须写 `host.docker.internal:7897`，
+而容器内**直连** pypi 会 `SSL: UNEXPECTED_EOF_WHILE_READING`（「本机能直连」不等于「容器里能直连」）。
+
+**教训**：三处漏洞的形状一样 —— **用一个「碰巧成立」的东西（宿主 env、宿主 PATH、单 key 的权限、
+新版配置写法）去表达一个本该显式声明的前提**。因此三处都留了**反向对照**：未放宽的假密钥必须被报出、
+CI 里没 junit 报告必须红、非管理员必须 403 —— 让「静默失守」比「红灯」先现形。
+
+---
+
 ## 2026-10-02（第四十三批：CI 三个 job 红 —— 一条非安全用途的 sha1、一次被守卫正确拦住的启动、一个真实的时序竞态）
 
 > 起因：第四十二批刚把 `mypy --strict` 那条被上一批弄红的门禁修回来，这一批开头先核 CI 现状：

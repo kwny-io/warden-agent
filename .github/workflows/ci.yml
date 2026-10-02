@@ -203,10 +203,37 @@ jobs:
       - name: 秘密扫描（gitleaks，扫全历史）
         # 扫 **history** 而不只是工作区：已提交过的凭据也要能发现（就算后来删掉，历史里还在）。
         # 用 CLI 而不是 gitleaks-action：后者对**组织**仓库需要 license；CLI 是 MIT 的，没这个限制。
-        # 本地实测：60 个 commit 扫完，无泄漏。
+        #
+        # --config 必须**显式**给：gitleaks 只在进程 cwd（容器里是 /）找 .gitleaks.toml，
+        # 不会去 --source 指向的目录里找。实测：不传 --config 时仓里的 .gitleaks.toml 完全不生效
+        # （7 处命中照报），等于白写。
+        #
+        # 诚实更正：本步骤原来写着“本地实测 60 个 commit 扫完，无泄漏”——那句话随仓库变长失效了
+        # （108 commits 时 7 处命中，全是脱敏/审批隔离用例的假夹具）。夹具用 allowlist 精确放宽，
+        # 理由与踩过的坑（复数 allowlists 静默失效、paths/regexes 是 OR）都写在 .gitleaks.toml 顶部。
         run: |
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
-            detect --source /repo --no-banner --redact -v
+            detect --source /repo --config /repo/.gitleaks.toml --no-banner --redact -v
+
+      - name: 秘密扫描反向对照（证明 allowlist 没把扫描器关掉）
+        # allowlist 是“让扫描器闭嘴”的开关，写错方向就是静默失守——那比红灯糟。
+        # 这里丢一个**没被放宽**的高熵假密钥进临时目录：必须仍被报出来。
+        # 对照组现场生成而不是写死字面量：写死的话它自己就会成为 ci.yml 里的一处命中，
+        # 反过来把主扫描搞红。
+        run: |
+          ctl="$(mktemp -d)"; mkdir -p "$ctl/tests"
+          printf 'api_key = "sk-live-%s"\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
+            > "$ctl/tests/control_fixture.py"
+          out="$(mktemp)"
+          docker run --rm -v "$ctl:/ctl:ro" -v "$PWD/.gitleaks.toml:/cfg.toml:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            detect --no-git --source /ctl --config /cfg.toml --no-banner --redact >"$out" 2>&1 || true
+          if grep -q "leaks found" "$out"; then
+            echo "反向对照通过：未被放宽的假密钥仍被报出 ✓"
+          else
+            echo "::error::反向对照失败——allowlist 把扫描器关掉了（未放宽的假密钥也没报出来）"
+            cat "$out"; exit 1
+          fi
 
   mutation:
     name: 变异测试（${{ matrix.shard }}）

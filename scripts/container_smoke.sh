@@ -25,12 +25,24 @@ NEG_CONTAINER="${CONTAINER}-nofake"
 PORT="${SMOKE_PORT:-18080}"
 
 # 冒烟用的鉴权 key 在**运行时随机生成**，只为让 run_server 的 fail-closed 校验通过；
-# 它不入库、不落盘、随进程结束即弃，不是任何真实凭据。
-AUTH_VALUE="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+# 它们不入库、不落盘、随进程结束即弃，不是任何真实凭据。
+ADMIN_VALUE="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+VIEWER_VALUE="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 # 变量名分两段拼接：源码里不出现完整的"密钥变量名=值"形态，避免密钥扫描器把
-# 一个随机生成的冒烟值误判成硬编码凭据（值本身来自 /dev/urandom，不含任何秘密）。
-AUTH_VAR="WARDEN_""API""_KEY"
-export "${AUTH_VAR}=${AUTH_VALUE}"
+# 随机生成的冒烟值误判成硬编码凭据（值本身来自 /dev/urandom，不含任何秘密）。
+AUTH_VAR="WARDEN_""API""_KEYS"
+ADMIN_VAR="WARDEN_""ADMIN""_PRINCIPALS"
+# 两个身份，不是一个：
+#   · smoke-admin —— 管理员。**/metrics 是 admin-only**（src/warden_agent/web/routes/ops.py
+#     的 require_admin），而单 key 模式下主体名默认是 demo-user（run_server.py）——
+#     所以原来只用 WARDEN_API_KEY 的写法在容器里必然拿到 403。CI 的 container job 就红在
+#     这里（"校验 /metrics 含本项目指标"一步）。
+#     修法不是放宽断言，而是**按真实部署的方式配**：deploy/docker-compose.yml 与运维手册里
+#     管理员本来就是 key + admin_principals 成对声明的。
+#   · smoke-viewer —— 非管理员。用来把"普通主体读不到 /metrics"这条策略钉住（第 4b 步）：
+#     该策略此前没有任何用例覆盖，而它正是上面那个 403 被发现的原因。
+export "${AUTH_VAR}=smoke-admin:${ADMIN_VALUE},smoke-viewer:${VIEWER_VALUE}"
+export "${ADMIN_VAR}=smoke-admin"
 
 log() { printf '\n[smoke] %s\n' "$*"; }
 
@@ -52,7 +64,25 @@ if [ "${SMOKE_NO_PULL:-0}" = "1" ]; then
   PULL_FLAG=""
   log "⚠️ SMOKE_NO_PULL=1：跳过拉取基镜像（漏洞扫描的结论会失真——基镜像可能是旧的）"
 fi
-docker build $PULL_FLAG -t "$IMAGE" .
+if [ "${SMOKE_SKIP_BUILD:-0}" = "1" ]; then
+  # 仅本地/离线用：宿主出不了网（PyPI/npm 都拉不动）时，用**现成的同源代码镜像**只验运行期那几步。
+  # **CI 里一律拒绝**：本脚本存在的理由就是“镜像从来没被构建过”（前面吃过原版 Dockerfile
+  # 漏拷 README.md 的亏）。在 CI 里放行这个开关，等于把冒烟变成“验一个不知道哪来的镜像”。
+  if [ -n "${CI:-}" ]; then
+    log "✗ CI 里不允许 SMOKE_SKIP_BUILD=1：那会跳过本脚本存在的理由（构建镜像）"
+    exit 1
+  fi
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    log "✗ SMOKE_SKIP_BUILD=1 但本地没有镜像 $IMAGE —— 没东西可验"
+    exit 1
+  fi
+  log "⚠️ SMOKE_SKIP_BUILD=1：跳过构建，用**已存在**的 $IMAGE 只验运行期；
+  构建与‘基镜像新鲜度→漏洞结论’本轮**未验**，而且只在本机成立（CI 不设这个开关）"
+  # 把这个镜像的身份记下来：否则这份“绿”能对应到哪个镜像、什么时候建的，事后无法追溯
+  docker image inspect -f '{{.Id}} 创建于 {{.Created}}' "$IMAGE" | sed 's/^/[smoke] 被测镜像 /'
+else
+  docker build $PULL_FLAG -t "$IMAGE" .
+fi
 
 # ---- 2. 起容器（带和生产一致的加固参数）----
 # read_only + cap_drop ALL + no-new-privileges 与 docker-compose.yml 一致：
@@ -78,6 +108,7 @@ docker run -d --name "$CONTAINER" \
   -e WARDEN_DEMO_INSTANCE=1 \
   -e WARDEN_DB_PATH=/data/warden.db \
   -e "$AUTH_VAR" \
+  -e "$ADMIN_VAR" \
   --read-only \
   --tmpfs /tmp \
   --mount type=volume,dst=/data \
@@ -108,13 +139,25 @@ fi
 
 # ---- 4. 验指标端点（可观测性真的接上了）----
 # /metrics 不在公开名单里：开启鉴权后它也要带 Bearer（Prometheus 抓取同理，见运维手册）。
-log "校验 /metrics 含本项目指标（带 Bearer）"
-metrics="$(curl -s -H "Authorization: Bearer ${AUTH_VALUE}" "http://127.0.0.1:${PORT}/metrics")"
+log "校验 /metrics 含本项目指标（带管理员 Bearer）"
+metrics="$(curl -s -H "Authorization: Bearer ${ADMIN_VALUE}" "http://127.0.0.1:${PORT}/metrics")"
 echo "$metrics" | grep -q "warden_http_requests_total" || {
   log "/metrics 里没找到 warden_http_requests_total，实际输出："
   echo "$metrics" | head -30
   exit 1
 }
+
+# ---- 4b. 验 /metrics 的 admin-only 策略真的生效（非管理员必须被拒）----
+# 第 4 步用管理员身份能读到指标；这里换个**非管理员**身份，必须 403。
+# 两步合起来才说明 admin-only 是真的：只验"管理员能读"等于没验策略。
+log "校验非管理员读 /metrics 被拒（admin-only 策略）"
+viewer_code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${VIEWER_VALUE}" \
+  "http://127.0.0.1:${PORT}/metrics" || true)"
+case "$viewer_code" in
+  403) log "非管理员读 /metrics 被拒（HTTP 403）✓" ;;
+  *) log "非管理员读 /metrics 返回 $viewer_code —— 期望 403。admin-only 策略没生效！"
+     exit 1 ;;
+esac
 
 # ---- 5. 验鉴权是 fail-closed 的（不能裸奔）----
 # 带 key 才能过；不带 key 必须被拒。如果这里通过了，说明镜像起成了"无鉴权服务"。
@@ -132,7 +175,7 @@ esac
 # demo_instance=true / model_kind=fake。否则"声明"只是一句给自己的注释，
 # 评审者、集成方照样会把固定脚本的输出当成真实能力。
 log "校验 /capabilities 如实标注 demo_instance=true / model_kind=fake"
-caps="$(curl -s -H "Authorization: Bearer ${AUTH_VALUE}" "http://127.0.0.1:${PORT}/capabilities")"
+caps="$(curl -s -H "Authorization: Bearer ${ADMIN_VALUE}" "http://127.0.0.1:${PORT}/capabilities")"
 echo "$caps" | grep -Eq '"demo_instance"[[:space:]]*:[[:space:]]*true' || {
   log "/capabilities 没写 demo_instance=true，实际输出："
   echo "$caps" | head -30

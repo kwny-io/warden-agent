@@ -58,10 +58,28 @@ def test_按标记自动发现PG依赖文件() -> None:
     assert "test_postgres_contract.py" not in names
 
 
-def test_非CI环境直接放行() -> None:
-    """本地没有 PG 时测试本就该跳过；守卫不能把本地跑红。"""
+def test_非CI环境直接放行(monkeypatch: pytest.MonkeyPatch) -> None:
+    """本地没有 PG 时测试本就该跳过；守卫不能把本地跑红。
+
+    ⚠️ 这条验的是**非 CI** 分支，所以"非 CI"必须由用例自己保证：GitHub runner 上
+    `CI=true` 是环境默认值，`main([])` 会读到它、判定"在 CI 里"，再因为找不到 junit
+    报告（本地不跑 --junitxml）返回 1。实测 ci.yml 上就是 `assert 1 == 0` 红在这里——
+    不是守卫错了，是用例把宿主环境当成了契约。
+    """
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv(_PG_ENV_KEY, raising=False)
     assert _GUARD.in_ci({}) is False
     assert _GUARD.main([]) == 0
+
+
+def test_CI里没junit报告必须红(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """反向：在 CI 里跑却没有 junit 报告 → 必须判失败，绝不能静默放过。
+
+    这是"防静默跳过"守卫的核心语义：报告缺失 = 无法证明 PG 用例跑过 = 红灯。
+    实测 CI 上它正是靠这条返回 1 的；把方向钉下来，免得以后有人"顺手"改成放行。
+    """
+    monkeypatch.setenv("CI", "true")
+    assert _GUARD.main(["--junitxml", str(tmp_path / "missing-junit.xml")]) == 1
 
 
 def test_junit里PG用例零跳过则通过(tmp_path: Path) -> None:
