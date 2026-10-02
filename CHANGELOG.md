@@ -82,6 +82,32 @@ CI 里没 junit 报告必须红、非管理员必须 403 —— 让「静默失�
   一个永远通过的守卫**比没有守卫更糟**——它把“没人守着”伪装成“守住了”。所以守卫要带自己的负面对照；
   本次也是整个第四十四批里唯一一个“写错了却被当场抓住”的地方，靠的就是去跑一次**本该失败**的输入。
 
+### 续：container job 门禁报的是**真漏洞**（trivy HIGH），不是配置问题
+
+- 第 43 批把 container 的第一个失败（冒烟脚本把“正确的拒绝启动”当成坏）修掉后，重跑暴露了下一步：
+  `镜像漏洞扫描（trivy：HIGH/CRITICAL 且**有修复**才失败）` 红。真实输出
+  （`gh run view 37011197567 --log-failed`，逐字）：
+  ```
+  warden-agent:ci (debian 13.7)
+  Total: 1 (HIGH: 1, CRITICAL: 0)
+  │ libpcre2-8-0 │ CVE-2026-103111 │ HIGH │ fixed │ 10.46-1~deb13u2 │ 10.46-1~deb13u3 │ pcre2: Out-of-bounds write via crafted regular …
+  ```
+- **判据**：`--ignore-unfixed` 只放过“尚无修复”的；这条是 `fixed` 且给出了目标版本 → 门禁**红得对**。
+  所以修法是**升级包**，不是放宽门禁（门禁放宽过一次，就再也拦不住下一个 CVE）。
+- 改法（`Dockerfile` 运行阶段顶部）：显式 `apt-get install --no-install-recommends libpcre2-8-0`。
+  已核实基镜像的 apt 源里 **`trixie-security` 是开着的**（`/etc/apt/sources.list.d/debian.sources`），
+  u3 就在里面；只升这一个包、不用 `apt-get upgrade -y`：镜像内容可复现，其余包跟基镜像更新走。
+- **不信任“apt 会成功升级”这句话本身**：紧跟一句
+  `dpkg --compare-versions "${ver}" ge "10.46-1~deb13u3"`。
+  apt 源里若根本没有安全仓库，`apt-get install` 会“成功地什么也不做”——CVE 就随镜像出海了；
+  这句话让它**当场构建失败**（trivy 那个红发生在“已经构建完”之后，这个是“不让它生成”）。
+- **诚实记一笔：这条修复在本机验不了。** 本机 docker 容器没外网（拉 vulndb 时
+  `mirror.gcr.io … EOF`），所以复现和验证都只能交给 CI。上面那句断言就是为此加的——
+  把“本地验不了”变成“在能联网的地方会自己说话”。
+- 顺手更正 `.github/workflows/ci.yml` 里一句**已经过期的注释**：原文写着“实测：基镜像拉新后 0 命中”，
+  它随基镜像更新失效了（现在就是 1 条 HIGH）。这种“当时的实测”留在注释里最容易被后人当现状引用，
+  所以改成带日期的更正 + 指向 Dockerfile。
+
 ## 2026-10-02（第四十三批：CI 三个 job 红 —— 一条非安全用途的 sha1、一次被守卫正确拦住的启动、一个真实的时序竞态）
 
 > 起因：第四十二批刚把 `mypy --strict` 那条被上一批弄红的门禁修回来，这一批开头先核 CI 现状：

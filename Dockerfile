@@ -38,6 +38,30 @@ FROM python:3.12-slim
 # 构建时可指定 pip 源（默认官方源；国内网络可传 --build-arg PIP_INDEX_URL=<镜像地址>）
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
+# 基镜像里的 OS 包也要**显式升**：python:3.12-slim 当前的 debian 13.7 里
+#   libpcre2-8-0 = 10.46-1~deb13u2，而安全仓库已有 10.46-1~deb13u3
+#   （CVE-2026-103111，pcre2 构造正则导致的越界写，HIGH）。
+#
+# 这是 CI container job 的 trivy 门禁报出来的（`--ignore-unfixed` 挡不住它：
+# 它属于「有修复可用」那一类，所以门禁**应该**红）。修法是升级包，不是放宽门禁。
+#
+# 为什么只升这一个包、而不是 `apt-get upgrade -y`：保持镜像内容可复现；
+# 其余包的安全更新跟着基镜像的更新走（CI 的构建已经带 `--pull`）。
+# 下一个 CVE 来了就再补一条、并把版本与理由写在这里——门禁的作用就是逼我们看一眼。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpcre2-8-0 \
+    && ver="$(dpkg -s libpcre2-8-0 | awk '/^Version:/ {print $2}')" \
+    && echo "[security] libpcre2-8-0 = ${ver}" \
+    && dpkg --compare-versions "${ver}" ge "10.46-1~deb13u3" \
+    && rm -rf /var/lib/apt/lists/*
+# 取版本号故意用 `dpkg -s … | awk` 而不是 `dpkg-query -f='${Version}'`：
+#   后者的 `${Version}` 在 Dockerfile 里写法上容易和 Docker 自己的变量替换撞车
+#   （有概率撞上空串）；而现在这种写法一个 `${}` 都不给 Docker 留。
+# ↑ 这句 `dpkg --compare-versions` 不是装饰，是真的在拦一个失败模式：
+#   apt 源里如果**根本没有**安全仓库（或拉不到），`apt-get install` 会“成功地什么也不做”
+#   ——CVE 就这样随着镜像出海。加一句话让它当场构建失败。
+#   （不依赖它也行：CI 的 trivy 门禁会拦；但那个红是“已经构建完了”，而这个是“根本没让它生成”。）
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     WARDEN_HOST=0.0.0.0 \

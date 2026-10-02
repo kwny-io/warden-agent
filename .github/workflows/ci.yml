@@ -157,8 +157,12 @@ jobs:
       - name: 镜像漏洞扫描（trivy：HIGH/CRITICAL 且**有修复**才失败）
         # `--ignore-unfixed`：只对"有修复可用"的漏洞失败。基镜像里常见"尚无修复"的包
         # （perl / util-linux 等），把它们也算失败会让门禁变成噪声、最后被人关掉。
-        # 实测：**基镜像拉新后 0 命中**；用陈旧缓存则会命中 13 条——所以门禁有意义的前提是
-        # 拉新基镜像（container_smoke.sh 的 build 已加 --pull）。
+        #
+        # 《诚实更正（第四十四批）》这句原来写着"实测：基镜像拉新后 0 命中"——它随基镜像
+        # 更新失效了：2026-10-02 在拉新基镜像（--pull）后仍命中 **1 条 HIGH**：
+        # libpcre2-8-0 CVE-2026-103111（10.46-1~deb13u2 → 已修复 10.46-1~deb13u3）。
+        # 修法是在 Dockerfile 里**显式升级该包**（见 Dockerfile 运行阶段顶部），不是放宽门禁。
+        # （早先"陈旧缓存会命中 13 条"那个数字是当时的实测，不能当成现状引用。）
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:0.57.1 image \
