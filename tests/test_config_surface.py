@@ -225,6 +225,9 @@ _DOC_ONLY_NAMES: dict[str, str] = {
     "WARDEN_X": "README 里 `ENV_X = \"WARDEN_X\"` 的示例常量，故意不对应真变量",
     # 这一条是**反向**用法：文档写它，恰恰是为了记录"它从未存在过"。
     "WARDEN_SKIP_DOTENV": "`docs/复核索引.md` 用它做更正说明（曾被误写成 e2e 的挡法）",
+    # 同上：第四十八批的启动探针**自己发明**了这个名字（服务没凭据时 fail-closed，
+    # 探针拿一个自造变量名去测，于是"没看到日志"成了假象）。文档写它同样是为了记录这个坑。
+    "WARDEN_STORE": "`docs/复核索引.md` 用它记录探针自造变量名的坑（从未存在过）",
 }
 _DOC_GLOBS = ("README.md", "docs/**/*.md")
 _DOC_TOKEN = re.compile(r"WARDEN_[A-Z0-9_]+\*?")

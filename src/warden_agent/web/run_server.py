@@ -559,8 +559,17 @@ def main() -> None:
             logger.error("配置错误：%s", message)
         raise SystemExit(2)
     for suspect in unknown_warden_variables(os.environ):
+        # 指路必须**指得到**：这条告警只在"操作者手上正拿着一个写错的名字"时出现，
+        # 所以它唯一的作用就是把人送到清单那儿。原句点的是"文档 15"，而仓库里
+        # 没有任何编号为 15 的文档（README 的章节是标题式的，无编号）——照它去找
+        # 的人会一无所获，比不告警还坏。两处落点都写成可核对的实名：
+        # `ENV_SPECS`（tests/test_config_surface.py 已把它钉成"唯一事实源"）、
+        # README「运行方式」一节（环境变量清单实际所在处）。
+        # `tests/test_run_server_main.py::test_main_拼错的变量会告警_且告警指的路真能走通`
+        # 会把这条消息里「」里的每个落点拿回 README 里对照——标题改了就会红。
         logger.warning(
-            "环境变量 %s 未被识别——是不是拼错了？它不会生效（清单见 core/settings.py 或文档 15）",
+            "环境变量 %s 未被识别——是不是拼错了？它不会生效"
+            "（清单见 core/settings.py 的 ENV_SPECS，或 README「运行方式」一节）",
             suspect,
         )
     # 生效配置全量清单（敏感值已打码），排查问题时开 DEBUG 即可看到

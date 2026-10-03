@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,8 @@ import warden_agent.runtime.maintenance as maintenance_mod
 from warden_agent.memory.store import SqliteMemoryStore
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.web import run_server
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class _FakeSweeper:
@@ -297,3 +301,44 @@ def test_main_SSE心跳负数拒绝启动(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(SystemExit) as e:
         run_server.main()
     assert e.value.code == 2
+
+
+def test_main_拼错的变量会告警_且告警指的路真能走通(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """拼错的 `WARDEN_*` 要告警，而且告警里点的"清单在哪"必须真的存在。
+
+    这条告警只在"操作者手上正拿着一个写错的变量名"时出现，它唯一的作用就是
+    把人送到清单那儿。原句点的是"文档 15"，而仓库里没有任何编号为 15 的文档
+    （README 的章节是标题式的）——照它去找的人会一无所获，**比不告警还坏**。
+    所以这里不只断言"告警发出去了"，还把 `「」` 里的落点拿回 README 对照：
+    以后谁改了那节标题，这条测试会红，告警不会静静烂掉。
+    """
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_RATELIMIT", "10/60")  # 登记表里没有这个名字
+
+    with caplog.at_level(logging.WARNING, logger="run_server"):
+        run_server.main()
+
+    hits = [
+        record.getMessage()
+        for record in caplog.records
+        if "WARDEN_RATELIMIT" in record.getMessage()
+    ]
+    assert hits, "拼错的 WARDEN_* 没告警——它会静默按默认值跑"
+    msg = hits[0]
+    assert "未被识别" in msg
+
+    pointers = re.findall(r"「([^」]+)」", msg)
+    assert pointers, f"告警没有给出可查的清单位置：{msg}"
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for pointer in pointers:
+        assert pointer in readme, f"告警指向 README「{pointer}」，但 README 里没这个标题"
+    assert "ENV_SPECS" in msg
+    settings = (ROOT / "src" / "warden_agent" / "core" / "settings.py").read_text(
+        encoding="utf-8"
+    )
+    assert "ENV_SPECS" in settings, "告警点了 ENV_SPECS，但 settings.py 里没有它"
+
+    created["store"].close()
+    created["memory_repository"].close()
