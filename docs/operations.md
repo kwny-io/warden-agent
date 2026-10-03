@@ -258,7 +258,7 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | **弃用过渡期的通知头未实现** | 客户端无法从响应里得知"你在用的版本已被弃用" | 至今只有 1.0 一个版本、未发生弃用；政策见 `docs/api-versioning.md`（主版本不受支持会明确 400） |
 | **反代后面不配 `WARDEN_TRUSTED_PROXIES`** | `request.client.host` 永远是代理 IP：匿名限流**塔成一个桶**（一个客户端能把别人挤成 429），且同一个 `Idempotency-Key` 会**跳调用者串响应体**（鉴权档用 `user_id`，不串） | 取值是**代理地址/网段，不是客户端网段**；`*`、`0.0.0.0/0` 启动即拒。K8s `configmap.yaml` 里已列为**必填**，理由与实测见 `docs/deployment-boundaries.md` |
 | 外部工具/子进程的输出**不是** UTF-8（中文 Windows 上的老 CLI） | 输出里会出现 `U+FFFD`「」——这是**看得见的损失**，不是丢失 | 两侧编码已钉死（子进程强制 `PYTHONIOENCODING=utf-8`；父进程 `encoding="utf-8", errors="replace"`）。**修之前是静默变成空串**：`exit_code=0` 而 `stdout=''`（实测 2026-10-01，见 CHANGELOG 第四十批） |
-| 覆盖率门槛 **84%**（基线 85.7%） | 门槛贴着当前值会变成噪声门禁，故留 2 个点余量 | 低覆盖区主要是启动装配（`run_server.py`），靠端到端跑而不是单测 |
+| 覆盖率门槛 **86%**（唯一事实源：`pyproject.toml` 的 `[tool.coverage.report] fail_under`；无真 PG 实测 86.67%~86.93%） | 本行曾写 **84%**，连"留 2 个点余量"的理由一起过期——**漂移了整整一批没人发现**，因为门禁值只被手抄、从来没有东西核对它。现在钉死了：`tests/test_config_surface.py::test_文档里的覆盖率门槛与pyproject一致` | 低覆盖区主要是启动装配（`run_server.py`），靠端到端跑而不是单测 |
 
 ---
 

@@ -15,9 +15,14 @@
        也就是上面「一名两用」的形状）；
     3. 拼错的 `WARDEN_*` 变量要能被识别出来；
     4. **文档里写的 `WARDEN_*` 必须都登记过**（反向：文档不能承诺一个不存在的旋钮），
-       并且 README 自称的那个变量数必须等于登记表条数。
+       并且 README 自称的那个变量数必须等于登记表条数；
+    5. **文档里的覆盖率门槛必须等于 `pyproject.toml` 的 `fail_under`**
+       （`docs/operations.md` 曾写 84% 而事实源是 86%——数字只被手抄，就没东西能让它变红）；
+    6. **e2e 启动脚本不得继承宿主 shell 的 `WARDEN_*`**（`web/e2e/start-e2e-server.mjs`
+       原先把整个 `process.env` 铺进子进程，于是 `WARDEN_SSE_HEARTBEAT_SECONDS=999 node …`
+       能让"确定性档"的后端以 999 秒心跳启动——e2e 断言的东西取决于跑之前 shell 里恰好有什么）。
 
-  没有这四条，注册表就只是文档——而文档是不会自己变红的。
+  没有这六条，注册表（以及文档里的每个数字）就只是文档——而文档是不会自己变红的。
 
 口径说明：扫描规则是「`.get("字面量")` / `["字面量"]` / `env_bool("字面量")`」，
 且字面量形如环境变量名。
@@ -286,6 +291,39 @@ def test_README里的变量计数与注册表一致() -> None:
     )
 
 
+_COVERAGE_GATE_CLAIM = re.compile(r"覆盖率门槛\s*\*\*(\d+)%\*\*")
+
+
+def test_文档里的覆盖率门槛与pyproject一致() -> None:
+    """文档写"覆盖率门槛 N%"——N 必须真是 `pyproject.toml` 里的 `fail_under`。
+
+    这条守卫是**追着一个真缺陷**加上的：`docs/operations.md` 一直写着门槛 84%，
+    而唯一事实源 `pyproject.toml` 里是 86（84% → 86% 是刻意收窄，见 `docs/复核索引.md`）——
+    漂移了整整一批，没人发现，因为这类数字只被手抄、从来没东西核对它。
+    与 `test_README里的变量计数与注册表一致` 同源：单一事实源自己不能自相矛盾。
+    """
+    root = Path(__file__).resolve().parents[1]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    gate = re.search(r"^fail_under\s*=\s*(\d+)", pyproject, re.MULTILINE)
+    assert gate, "`pyproject.toml` 里找不到 `fail_under = N`（改了写法就同步改这条用例）"
+    expected = int(gate.group(1))
+
+    drift: list[str] = []
+    for pattern in _DOC_GLOBS:
+        for path in sorted(root.glob(pattern)):
+            text = path.read_text(encoding="utf-8")
+            for found in _COVERAGE_GATE_CLAIM.finditer(text):
+                if int(found.group(1)) != expected:
+                    line = text[: found.start()].count("\n") + 1
+                    rel = str(path.relative_to(root)).replace("\\", "/")
+                    drift.append(f"  {rel}:{line} 写 {found.group(1)}%，实际 {expected}%")
+    assert not drift, (
+        "覆盖率门槛在文档里被手抄成了别的值"
+        "（门禁只认 `pyproject.toml` 的 `fail_under`，改门槛就顺手改文档）：\n"
+        + "\n".join(drift)
+    )
+
+
 # ---------- 校验与拼写检测 ----------
 
 
@@ -442,3 +480,42 @@ def test_校验口径与运行时解析器一致() -> None:
             f"取值 {value!r}：settings 校验={'接受' if accepted_by_settings else '拒绝'}，"
             f"但运行时解析器={'接受' if accepted_by_runtime else '拒绝'}"
         )
+
+
+# ---------- 口径 6：e2e 的子进程姿态必须自己定，不能吃宿主环境 ----------
+
+_E2E_HARNESS = Path(__file__).resolve().parents[1] / "web" / "e2e" / "start-e2e-server.mjs"
+
+
+def test_e2e启动脚本不吃宿主环境里的WARDEN变量() -> None:
+    """e2e 的子进程姿态必须由脚本自己决定，不能从宿主 shell 继承 `WARDEN_*`。
+
+    这条守卫是**追着一个可复现的真缺陷**加的（本文件口径 6）：
+    脚本里原先写的是把整个 `process.env` 铺进子进程，于是
+
+        WARDEN_SSE_HEARTBEAT_SECONDS=999 node e2e/start-e2e-server.mjs
+
+    会让"确定性档"的后端以 999 秒空闲心跳启动（启动日志里能看到，已实测）。
+    同一行还把开发者的真凭据一并递进子进程，只靠下一行"显式给空串"兜住。
+    失效方式是**静默的**：e2e 要么红在一个和被测代码无关的地方，
+    要么在"以为离线"的情况下打真模型。
+
+    口径是**文本级**的（不是行为级）：真跑一次 e2e 要 vite 构建 + 起后端，代价太大；
+    这里只保证"没有把整个环境铺进去"这个形状不会回来。行为级证据见 CHANGELOG 第四十九批。
+    """
+    text = _E2E_HARNESS.read_text(encoding="utf-8")
+    # 只认行首的铺开写法（注释里会引用这个历史形状，不该被误伤）。
+    assert not re.search(r"^\s*\.\.\.process\.env\b", text, re.MULTILINE), (
+        "`web/e2e/start-e2e-server.mjs` 又把整个 `process.env` 铺进子进程了：\n"
+        "  宿主 shell 里任何一个 `WARDEN_*` 都会改变 e2e 的档位，实测"
+        "`WARDEN_SSE_HEARTBEAT_SECONDS=999 node e2e/start-e2e-server.mjs`"
+        " 能让子进程以 999 秒心跳启动。请只保留非 `WARDEN_*` 的键，再显式设置档位。"
+    )
+    # 摘掉宿主变量的那一步必须在，否则上面那条只是"碰巧没出现那串字"。
+    assert "startsWith('WARDEN_')" in text, (
+        "找不到摘掉宿主 `WARDEN_*` 的过滤（`!key.startsWith('WARDEN_')`）："
+        " 要么被删了，要么改了写法——两种都请同步改这条守卫的判据。"
+    )
+    # 档位与离线姿态必须仍是**显式**的：入参是显式的，不是环境里碰巧有的。
+    for key in ("WARDEN_E2E_API_KEY", "WARDEN_ALLOW_ANON", "WARDEN_API_KEY", "DEEPSEEK_API_KEY"):
+        assert key in text, f"e2e 启动脚本不再显式处理 {key}（档位/离线姿态会失控）"

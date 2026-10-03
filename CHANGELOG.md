@@ -4,7 +4,69 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
-## 2026-10-03（第四十八批：运维告警的指路必须指得到 + 第 46 批的启动可见性首次真启动复核）
+## 2026-10-03（第四十九批：前端四道门禁首次真跑 + e2e 的「确定性档」其实在吃宿主环境）
+
+本批只做两件事：把 CI 里**跑过、但本机从没真跑过**的前端门禁跑一遍，然后跑真浏览器 e2e。
+抓到 2 个真缺陷（一个在 e2e 启动脚本里，一个在运维文档里），都补了**会失败的守卫**。
+
+### 一、前端门禁（本机首次真跑，四件全绿）
+
+| 门禁 | 结果 | 它挡的失败模式 |
+| --- | --- | --- |
+| `npm run lint` | exit 0 | eslint 的 hooks 依赖漏项——类型系统看不见 |
+| `npm run typecheck` | exit 0 | `vite build` **不做**类型检查（只 esbuild 转译） |
+| `npm run test:coverage` | exit 0，实测 **94.67% stmts / 89.66% branch**（阈值 90/90/80/80） | — |
+| `npm run build` | exit 0（js 191KB / css 27KB） | 无 `web/dist` 时 `tests/test_web.py::test_t10` 会**静默跳过** |
+
+### 二、真缺陷：e2e 的「确定性档」把宿主 shell 的环境一起带进子进程
+
+`web/e2e/start-e2e-server.mjs` 原先把整个 `process.env` 铺进子进程（只额外钉了
+`DEEPSEEK_API_KEY=''`）。可复现：
+
+```
+cd web && WARDEN_SSE_HEARTBEAT_SECONDS=999 node e2e/start-e2e-server.mjs
+→ 子进程启动日志：SSE 空闲心跳：999 秒（WARDEN_SSE_HEARTBEAT_SECONDS，0 = 关闭）
+```
+
+失效方式是**静默的**：e2e 断言的心跳/断线行为取决于"跑之前 shell 里恰好 export 了什么"——
+红在一个和被测代码无关的地方；同一行还会把开发者的真凭据递给子进程，只靠"显式给空串"
+那一行兜住，而那行一旦被改，e2e 就在"以为离线"的情况下**打真模型**（非确定、要联网、还花钱）。
+
+修法：先摘掉所有 `WARDEN_*` 再显式定档位（`PATH`/`HOME`/`TEMP` 保留：要能找到 python、跑 git）。
+harness 自己的两个入参 `WARDEN_E2E_API_KEY`、`WARDEN_ALLOW_ANON` 仍显式读取并设置——
+**入参是显式的，不是环境里碰巧有的**。实测同一命令下子进程报默认 `10` 秒，日志里 `999` 出现 0 次。
+
+守卫：`tests/test_config_surface.py::test_e2e启动脚本不吃宿主环境里的WARDEN变量`
+（文本级，docstring 里写明不装成行为级）；并做了**变异验证**：把 `...scrubbedEnv` 改回
+`...process.env` → 守卫变红；改回 → 23 条全绿。
+
+### 三、真缺陷：覆盖率门槛在运维文档里漂了整整一批
+
+`docs/operations.md` 写「覆盖率门槛 **84%**（基线 85.7%）」，而唯一事实源 `pyproject.toml` 的
+`[tool.coverage.report] fail_under` 是 **86**（`README.md` 与 `docs/复核索引.md` 写的也都是 86）。
+与第四十六批「README 自称 81 个环境变量、而登记表有 83 条」同病：
+**门禁数字只被手抄，就没有任何东西能核对它**。已改正，并加守卫
+`test_文档里的覆盖率门槛与pyproject一致`（扫 `README.md` + `docs/**/*.md`，现存 2 处表述，无误伤）。
+
+### 四、e2e 实测（真浏览器 + 打包产物 + 真后端）
+
+`npm run test:e2e` → **10 passed / 6 skipped / 0 failed（51.8s）**。
+6 条 skip 全是 `web/e2e/multi-replica.spec.ts`（多副本一致性要共享状态档，属已登记的 PostgreSQL 门控，
+不是"跳过即通过"）。
+
+修复前那一轮是 9 passed / **1 failed** / 6 skipped（3.7 分钟）：`approval.spec.ts` 的 `page.goto`
+等 `load` 事件 30 秒超时、**teardown 也超时**，而后端日志里那个 `run_id` **一次请求都没到达**——
+是卡住，不是断言错。单独重跑该 spec exit 0（30 秒），修复 harness 后全量也不再复现。
+因此这条「卡住」按**环境问题**记账，不记为被测代码缺陷：判据是"后端一次请求都没收到"。
+
+### 五、已知限制（本批不修，写下来）
+
+`.env` 是另一条进环境的路：子进程由后端自己的 `load_env()` 读仓库根的 `.env`，
+而 `.env` 只在本机存在（gitignore）——e2e 的档位仍可能被本机 `.env` 影响。
+要彻底封掉需要后端加一个"忽略 .env"的**真旋钮**（`WARDEN_SKIP_DOTENV` 从未存在过，
+第三十三批的 CHANGELOG 曾把它写成事实——第四十六批已更正）。本批不扩这个范围。
+
+
 
 ### 一、回头证伪第 46 批：「启动日志里能看到这个旋钮」此前**没有验过**
 

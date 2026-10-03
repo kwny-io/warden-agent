@@ -113,8 +113,22 @@ const authKey = process.env.WARDEN_E2E_API_KEY ?? ''
 //
 // 注意 GIT_WORKDIR 已经在用临时目录了（同一个理由），这里是把它贯彻到存储层。
 const stateDir = mkdtempSync(path.join(os.tmpdir(), 'warden-e2e-state-'))
+// 子进程环境：先**摘掉宿主 shell 里所有 `WARDEN_*`**，再显式决定姿态。
+//
+// 为什么必须摘（真缺陷，可复现）：这里原来是 `...process.env`，于是
+//     WARDEN_SSE_HEARTBEAT_SECONDS=999 node e2e/start-e2e-server.mjs
+// 会让"确定性档"的后端以 999 秒空闲心跳启动（启动日志里能看到，实测过）——
+// 于是 e2e 断言的东西变成了"跑之前 shell 里恰好 export 了什么"，
+// 红在一个和被测代码毫无关系的地方；更糟的是它把开发者的真凭据也一并递进子进程，
+// 只靠下面"显式给空串"那一行兜住（那行一旦被改，就是悄悄打真模型）。
+// 只摘 `WARDEN_*`：PATH/HOME/TEMP 等必须留（要能找到 python、要能跑 git）。
+// harness 自己的两个入参（`WARDEN_E2E_API_KEY`、`WARDEN_ALLOW_ANON`）
+// 仍在上面/下面显式读取后**当成档位**设置——入参是显式的，不是环境里碰巧有的。
+const scrubbedEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.startsWith('WARDEN_')),
+)
 const childEnv = {
-  ...process.env,
+  ...scrubbedEnv,
   PORT: port,
   WARDEN_HOST: host,
   WARDEN_DB_PATH: path.join(stateDir, 'e2e.db'),
