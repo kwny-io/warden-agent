@@ -28,11 +28,88 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PIN_SCRIPT = REPO_ROOT / "scripts" / "pin_image_digests.sh"
 ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "rollback.sh"
 
-BASH = shutil.which("bash")
+# Windows 上 Git Bash 的常见安装位置。
+# 为什么需要这张表：`shutil.which("bash")` 在 Windows 上可能先命中
+# `C:\Windows\System32\bash.exe` —— 那是 **WSL 的转发器**，文件名对、which 找得到，
+# 但只要没装 WSL 发行版，任何调用都会以
+# `execvpe(/bin/bash) failed: No such file or directory` 失败（退出码 1）。
+_WINDOWS_BASH_FALLBACKS = (
+    Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+    Path(r"C:\Program Files\Git\bin\bash.exe"),
+    Path(r"C:\Program Files (x86)\Git\usr\bin\bash.exe"),
+    Path(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+)
+
+
+def _usable_bash(candidate: str | None) -> bool:
+    """这个 bash 是**真的能跑**，还是只"文件存在"？"""
+    if not candidate:
+        return False
+    try:
+        probe = subprocess.run([candidate, "-c", "exit 0"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def _coreutils_dir(bash: str | None) -> str | None:
+    """返回一个确实有 `sed` 的目录（就是那个 bash 自带 coreutils 的地方）。
+
+    Git for Windows 有两层：`Git\\bin\\bash.exe`（包装）与 `Git\\usr\\bin\\`（真身 + coreutils）。
+    两个候选都**查文件**而不是猜路径：猜错了会以「脚本里的 `sed` 是 127」的形式回来。
+    """
+    if not bash:
+        return None
+    parent = Path(bash).resolve().parent
+    for candidate in (parent, parent.parent / "usr" / "bin"):
+        if any((candidate / name).is_file() for name in ("sed", "sed.exe")):
+            return str(candidate)
+    return None
+
+
+def _child_path(narrowed: str | None) -> str:
+    """给子 bash 构造 PATH：**自己把工具链放进去**，不继承宿主的路。
+
+    为什么不能直接继承 `os.environ["PATH"]`：从 cmd.exe / PowerShell 启动 pytest 时，
+    PATH 里通常只有 `Git\\cmd`，没有 `Git\\usr\\bin` —— bash 能跑，脚本里的 `sed`
+    却是 127（command not found）。那种失败看起来像"发布脚本坏了"，
+    实际上只是测试没把工具链给它（而 CI 的 ubuntu 上看不到，因为 `/bin` 本来就在 PATH 里）。
+    """
+    base = narrowed if narrowed is not None else os.environ.get("PATH", "")
+    coreutils = _coreutils_dir(BASH)
+    return f"{coreutils}{os.pathsep}{base}" if coreutils else base
+
+
+def _find_bash() -> str | None:
+    """找一个真能跑的 bash；找不到就返回 None（调用方据此整体 skip）。
+
+    只用 `shutil.which("bash")` 是不够的，那会造出一个
+    **"结论取决于你怎么启动 pytest"** 的测试：同一次提交、同一台机器，
+    从 cmd/PowerShell 启动是 18 failed，从 Git Bash 启动是 18 passed，
+    差别只来自 PATH 里 `System32` 是否排在 Git 前面。
+
+    测试的结论必须是**代码的函数**，不能是"你从哪个 shell 启动"的函数。
+    而且被影响的这 18 个用例正是"只在发布/回滚真出事时才跑到的代码"的用例，
+    无论假红灯还是静默 skip，代价都是让人从此不再信这个文件。
+
+    "能跑"包含两件事：bash 本体能执行、它的 coreutils 能找到（见 `_coreutils_dir`）。
+    """
+    found = shutil.which("bash")
+    candidates = (found, *(str(p) for p in _WINDOWS_BASH_FALLBACKS))
+    for candidate in candidates:
+        if candidate and _usable_bash(candidate) and _coreutils_dir(candidate):
+            return candidate
+    return None
+
+
+BASH = _find_bash()
 
 pytestmark = pytest.mark.skipif(
     BASH is None,
-    reason="需要 bash 才能测这两个脚本（Windows 上装 Git Bash / WSL 即可）",
+    reason=(
+        "需要能跑的 bash（外加它的 coreutils）才能测这两个脚本：Windows 上装 Git Bash / WSL 即可。"
+        "注意 System32\\bash.exe 是 WSL 转发器：没装发行版时它只是「存在」、跑不起来"
+    ),
 )
 
 # 假命令吐出的确定性 digest：sha256:<63 个 0>7 —— 合法（64 位小写十六进制）且好断言。
@@ -83,8 +160,9 @@ def _run(
     env = dict(os.environ)
     # POSIX 形式：这个值会被写进 bash 重定向，反斜杠在 bash 里是转义符
     env["STUB_LOG"] = (tmp_path / "stub.log").as_posix()
-    if path is not None:
-        env["PATH"] = path
+    # 即使某条用例把 PATH 收窄，也先把这个 bash 的 coreutils 放回去：
+    # 收窄 PATH 想表达的是「没有 docker/kubectl」，不是「没有 sed」。
+    env["PATH"] = _child_path(path)
     if env_extra:
         env.update(env_extra)
     if prelude:
@@ -142,13 +220,23 @@ dirname() {
 
 
 def _no_tools_path(tmp_path: Path) -> str:
-    """返回一个确定找不到 docker/kubectl 的 PATH 值（空目录），并当场自检。"""
+    """返回一个确定找不到 docker/kubectl 的 PATH 值（空目录），并当场自检。
+
+    自检要查**子 bash 实际拿到的那个 PATH**（`_child_path` 会在前面塞 coreutils），
+    否则「一个什么都没有的空目录」这句话可能已经不成立了，
+    而症状会是那几个用例「靠错误的原因通过」。
+    """
     empty = tmp_path / "path-with-no-tools"
     empty.mkdir(exist_ok=True)
     path = str(empty)
+    effective = _child_path(path)
     for tool in ("docker", "kubectl"):
         assert shutil.which(tool, path=path) is None, (
             f"脚手架自检失败：这条 PATH 里居然能找到 {tool} —— \"没有工具\"的前提不成立"
+        )
+        assert shutil.which(tool, path=effective) is None, (
+            f"脚手架自检失败：子 bash 实际拿到的 PATH 里能找到 {tool} ——"
+            "coreutils 目录里不该有它，请重选 `_coreutils_dir` 的候选"
         )
     return path
 
@@ -461,3 +549,35 @@ def test_script_syntax_and_line_endings(script: Path) -> None:
         timeout=SESSION_TIMEOUT,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+# =========================================================================== #
+# 元测试：bash 的可用性探测本身不许说谎
+# =========================================================================== #
+def test_wsl转发器不会被当成可用bash() -> None:
+    """回归（第47批）：`System32\bash.exe` 存在但不可用时，探测必须继续往下找 Git Bash，
+    而不是把它当 bash 交给 18 个用例去撞墙。
+
+    这条用例故意**不依赖 BASH**：它要能在"探测写错"的那种机器上照样执行并变红，
+    否则它就只是又一个会被同一个 bug 一起 skip 掉的摆设。
+    """
+    stub = Path(r"C:\Windows\System32\bash.exe")
+    if not stub.is_file():
+        pytest.skip(r"这台机器没有 System32\bash.exe（非 Windows / 无 WSL 转发器）")
+    if _usable_bash(str(stub)):
+        pytest.skip("这台机器的 WSL 转发器真能跑（装了发行版），验证不了这条回归")
+
+    # 注意大小写：`shutil.which("bash")` 返回的是 `...\bash.EXE`，
+    # 直接跟 `...\bash.exe` 比字符串会**比不相等而假装通过**（这正是最早写错的一版）。
+    assert os.path.normcase(BASH or "") != os.path.normcase(str(stub)), (
+        "把不可用的 WSL 转发器当成了 bash —— 本文件 18 个用例会以 "
+        "`execvpe(/bin/bash) failed` 全红，而 CI（ubuntu）上看不到这个现象"
+    )
+
+    usable_fallbacks = [
+        str(p) for p in _WINDOWS_BASH_FALLBACKS if p.is_file() and _usable_bash(str(p))
+    ]
+    assert BASH is not None or not usable_fallbacks, (
+        f"机器上有能跑的 bash（{usable_fallbacks}）却整体 skip 了 —— "
+        "等于把 18 个用例静默丢掉，这比红灯更坏"
+    )

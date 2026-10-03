@@ -4,6 +4,55 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-03（第四十七批：修掉一个"结论取决于你怎么启动 pytest"的测试文件）
+
+第 46 批跑全量复验时才浮出来（第 46 批本身只动配置面）：
+
+`tests/test_release_scripts.py`（测发布/回滚脚本的那 18 个用例）在本机全量跑出 **18 failed**，
+而**同一份提交、同一台机器**，从 Git Bash 启动同样的命令是 **18 passed** —— 差别只在 PATH。
+
+| 触发条件 | 现象 | 根因 |
+| --- | --- | --- |
+| 从 cmd.exe / PowerShell 启动 pytest | `which("bash")` → `C:\Windows\System32\bash.EXE`（WSL 转发器），18 个用例全红：`execvpe(/bin/bash) failed: No such file or directory` | `shutil.which("bash")` 只回答"有这个名字"，不回答"它跑不跑得起来" |
+| 再把 PATH 收窄成 `System32;Windows` | 修掉假 bash 后仍 12 failed：`assert 127 == 0` | `_run()` 的 `env = dict(os.environ)` 把宿主 PATH 原样交给子 bash；从 cmd 启动时 PATH 里通常只有 `Git\cmd`，而 `sed`/`dirname` 在 `Git\usr\bin` |
+
+改法（4 条 + 1 条元测试）：
+
+1. `_usable_bash()`：真的跑一次 `bash -c "exit 0"`，返回码 0 才算"有 bash"。
+2. `_find_bash()`：按 `shutil.which("bash")` → `Git\usr\bin\bash.exe` → `Git\bin\bash.exe` 取第一个**能跑**的。
+3. `_coreutils_dir()`：**查文件**确认 `sed` 在哪（`Git\bin\bash.exe` 旁边的 coreutils 在 `..\usr\bin`），不猜路径。
+4. `_child_path()`：把 coreutils 目录**显式**放进子进程 PATH —— 不再继承宿主环境。
+   即使某条用例故意把 PATH 收窄成空目录（那是为了表达"这台机器没装 docker/kubectl"），`sed` 也仍然在。
+5. 元测试 `test_wsl转发器不会被当成可用bash`：**故意不依赖 `BASH`**，
+   所以在"探测写错"的机器上照样执行并变红 —— 否则它只是又一个会被同一个 bug 一起 skip 掉的摆设。
+
+**实测**：
+
+- 同一个文件，两种启动环境都是 **19 passed**：Git Bash PATH 与 `PATH=System32;Windows`（后者是原失败环境的复现）。
+- 改动前同一环境下分别是 18 passed / 18 failed（`pytest tests/test_release_scripts.py -q`，同一 commit）。
+- 探测在 `PATH=System32;Windows` 下：`shutil.which("bash")` → `C:\Windows\System32\bash.EXE`（rc=1），
+  最终选中 `C:\Program Files\Git\usr\bin\bash.exe`（`_usable_bash` → True）。
+- **全量 `pytest`（CI 同款命令，真实 cmd.exe 环境 = 改动前那 18 个红的环境）：`1615 项收集 / 1571 passed / 44 skipped / 561.8 秒`，退出码 0。**
+  注意别在命令行再补一个 `-q`：`addopts` 已带 `-q`，叠加成 `-qq` 后 pytest **不打印总结行**，
+  只剩退出码可用（本轮为此白跑两遍）；要计数就走 CI 那条命令（带 `-rs` / `--junitxml`）。
+
+**为什么这值得修（而不是"本地环境噪音"）**：被影响的 18 个用例测的是 `scripts/pin_image_digests.sh` 与
+`scripts/rollback.sh` —— 这两个脚本平时不参与任何路径，**只在发布/回滚真出事时才被运行**。
+假红灯会让人学会忽略这个文件；假绿更糟。**结论取决于"你从哪个 shell 启动"的测试，等于没测。**
+
+两个写这条测试时自己踩到的细节：
+
+- `str(BASH) != str(stub)` 会因为 `bash.EXE` / `bash.exe` 的**大小写差异**而"比不相等地通过"
+  → 必须 `os.path.normcase`。这类断言是"看起来在守、其实守不住"的典型。
+- `_no_tools_path()` 那句"一个什么都没有的空目录"在第 4 条改动之后**已经不成立** →
+  它的自检改成查**子进程真正拿到的那个 PATH**，否则 6 个用例会"靠错误的原因通过"。
+
+CI（ubuntu）上看不到这个 bug：`/usr/bin/bash` 与 `/bin/sed` 本来就在 PATH 里 ——
+所以它是一个**只在开发机上出现、只在出事时才被读到的红灯**。
+
+---
+
+
 ## 2026-10-03（第四十六批：#14 文档承诺的旋钮，代码里没人接 —— 配置面守卫只问了一个方向）
 
 **一句话**：这一批还是方向自检问出来的 ——「**文档与代码是不是同源**」。
