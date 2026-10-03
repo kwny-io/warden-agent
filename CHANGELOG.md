@@ -4,6 +4,75 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-03（第五十一批：一个“改了但没生效”的超时预算，和那个**从没被清掉的计时器**）
+
+> 入口是上一批收尾时全量套件的 3 个 setup error（断网）。按当时判据先记成“环境问题”，
+> 但往下查一层发现：真正的主因是**我们自己代码里的缺陷**，且它把整套回归的时间账算错了三批。
+
+### 一、失败模式：三处“机制在、但没接上”，叠在同一个地方
+
+1. **`Promise.race` 的计时器从未被清除**（`ts/mcp-client/mcp-client.mjs`）。
+   `race` 只决定谁赢，不负责给落败的 promise 收尾。后果：`client.connect()` + `listTools()`
+   真实耗时 ~1s，**进程却要等到计时器烧完才退出**，而父进程 `subprocess.run` 等的是
+   **进程退出**。实测同一命令：修复前 **31s**，修复后 **2s**（13 个工具）。
+   附带后果：落败的 timeout 变成未处理的 Promise 拒绝；预算一紧，计时器还会先于真实工作触发，
+   把**成功**变成硬超时错误（变异验证里亲眼见到：删掉 `clearTimeout` 后一个正常的 list
+   直接报 `MCP list 失败: ... 超时`）。
+2. **Python 侧从不把预算传给 node 侧**（`src/warden_agent/mcp/client.py` 的 `McpClient._run`）。
+   它自己读 `WARDEN_MCP_TIMEOUT_S`（默认 120s）去限制 `subprocess.run`，却从没给 mjs 传 `--timeout`——
+   而 mjs 里 `timeoutMs: get("--timeout") ? Number(...) : 30000` 才是**真正生效的那个数**。
+   于是“两个进程共用一个预算”是假的：调用方写的数从头到尾没人读。
+3. **集成测试的服务器靠 `npx -y` 起**（`tests/test_mcp.py`）。npx 每次冷启动都要问 registry，
+   **网络一断就挂**——而 `@modelcontextprotocol/server-everything` 早已是 `ts/mcp-client` 的
+   devDependency（`^2026.8.31`），入口就躺在 `node_modules/@modelcontextprotocol/server-everything/dist/index.js`。
+
+三处叠起来的可见后果：断网时 3 条集成用例从“该跑且能跑”变成 setup error（**假红**）；
+不断网时则每次调用白等 30 秒，并把整个套件的时间账算错（见第四节）。
+
+### 二、改法
+
+- `ts/mcp-client/mcp-client.mjs`：留住计时器句柄，用 `finally { clearTimeout(timer) }` 收尾；
+  文件头用法注释里把 `--timeout`（**毫秒**）和“默认 30000 只是兜底、不是任何一处承诺的上限”写清楚。
+- `src/warden_agent/mcp/client.py`：`cmd += ["--timeout", str(timeout * 1000)]`；
+  新增 `local_everything_server()` 返回本地入口命令，并导出到 `warden_agent.mcp`；
+  重写 `_DEFAULT_TIMEOUT_S` 上方的注释（旧注释把 30s 归因于“npx 冷启动”。错）。
+- `tests/test_mcp.py`：`_SERVER` 改用 `local_everything_server()`；
+  收集期判定改成**两个本地事实**（node + ts 客户端依赖、本地 server 入口），**不含任何网络输入**；
+  新增两条守卫（见下）。
+
+### 三、两条守卫（都做了变异验证）
+
+- `test_超时预算必须传给node客户端`：拦住真 node 进程，只检查**将要执行的命令行**——
+  必须带 `--timeout`，且等于生效秒数 × 1000（无环境变量时是 `120*1000`，设成 90 时是 `90*1000`）。
+  变异：删掉那行传参 → 红；还原 → 绿。
+- `test_成功调用不该白等满超时预算`：真的跑一次 list 并计时，断言 < 15s
+  （真实工作量本机 ~2s，计时器 20s；测试内把预算改为 20s，让回归在 20s 内就红，不拖累整套回归）。
+  变异：删掉 `clearTimeout` → 红（而且是报超时错，不是慢慢通过）；还原 → 绿。
+
+### 四、实测数字
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `node mcp-client.mjs --op list`（13 个工具） | **31s** | **2s** |
+| `tests/test_mcp.py` 预热 | 30.5s（旧记录）/ 断网时 50.8s 后失败 | **1.4s** |
+| 断网时这 3 条用例 | setup error（假红） | 正常通过 |
+| 需网络？ | 是（npx 问 registry） | 否（纯本地事实） |
+
+### 五、这批最值得记的一条
+
+**“上限 90s”这句话曾经同时出现在 fixture 的断言消息、docstring、注释和 CHANGELOG 里，
+而它对应的机制从未生效。** 四处文字彼此一致，于是**没有一处会红**——
+这就是“文档与代码同源”在**同一个仓库里**失效的样子：一致性检查只看了眼“说的话相互一致没”，
+没看“话和机制是不是同一回事”。所以本批的守卫**都钉在机制上**（命令行里有没有那个参数、
+跑一次到底花多少秒），而不是钉在文字上。
+
+### 六、本批的已知限制
+
+- `mcp-client.mjs` 用 `server.split(" ")` 切命令，所以本地入口那个路径**不能带空格**
+  （已写进 `local_everything_server()` 的 docstring）；没有修这个解析器——它不在本批的症状上。
+- 本批**没有**在真 GHCR 上跑发布流水线（仍为已知欠账，需凭据与真 runner）。
+
+---
 ## 2026-10-03（第五十批：把 `.env` 这条静默通道也关掉——第四十九批只堵了一半）
 
 ### 一、上一批的“已知限制”就是这一步该做的事
@@ -59,6 +128,10 @@
 **根本没传到 node 侧** —— `src/warden_agent/mcp/client.py` 从不给 `ts/mcp-client/mcp-client.mjs` 传 `--timeout`，
 而 `ts/mcp-client/mcp-client.mjs:30` 的默认值是 `timeoutMs: 30000`。于是"上限 90s"这句承诺
 （fixture 的断言消息、docstring、注释里都这么写）与真正生效的 30s **不是一回事**。
+【第 51 批追记】这三个 error 的归因要**再往前推一层**：真正的主因是 mjs 里**没被清除的计时器**
+（它让一个 ~1s 的操作拖到 30s+，两个 list 尝试就吃掉 ~50s），不是网络慢；而“npx 要网络”
+这个因素也没必要存在 —— server 早已作为 devDependency 装在本地。三者已在第 51 批一并修掉，
+同一套用例现在**断网下 1.4s 预热完成、全绿**。
 
 44 条跳过逐条有理由：41 条要可用的 PostgreSQL（本机无 PG 二进制、无 PG 服务、Docker daemon 未运行
 → 已登记为**外部资源阻塞**），3 条平台门控（符号链接 ×2、win32 无内核网络命名空间 ×1）。
@@ -1183,6 +1256,12 @@ stdout: ''
   原为 **600 秒**，于是冷启动一旦变慢，`pytest` 会停在 `tests/test_mcp.py .....` 后面
   **十几分钟没有任何输出**——看起来像死锁，实际是在等一个外部进程。两处修改：
   ① 上限收到 **90 秒**（本机实测冷启动 30.5s / 13 个工具，约 3 倍余量）；
+  > **【更正（第 51 批）】这个 30.5s 是误读，而且“收到 90 秒”当时并没生效。**
+  > 那 30s 不是冷启动：`ts/mcp-client/mcp-client.mjs` 里 `Promise.race` 用的计时器**从未被
+  > `clearTimeout`**，一个真实工作量 ~1s 的 `--op list` 要等到计时器烧完才退出 —— 实测 **31s**，
+  > 修完 **2s**。另外 Python 侧从未把预算（`--timeout`）传给 mjs，所以这里写 90、写 30 没区别，
+  > mjs 里硬编码的 `30000ms` 才是真正生效的那个数。详见第五十一批。
+  > （“上限必须有界且看得见”这条原则本身是对的，保留；只是当时定的数治的是症状。）
   ② 预热前后各**主动往终端写一行进度**（`[mcp] 预热真实 server…` / `预热完成：13 个工具，39.6s`），
   并把耗时带进失败信息。原则：**一个测试能拖住整套回归多久，必须是有界且看得见的。**
   取证记录：卡死时先用 `CreateToolhelp32Snapshot` + `NtQueryInformationProcess(60)` 拿到各 python

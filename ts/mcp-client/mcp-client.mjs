@@ -12,6 +12,12 @@
 // 用法：
 //   node mcp-client.mjs --server "npx -y @modelcontextprotocol/server-everything" --op list
 //   node mcp-client.mjs --server "<cmd>" --op call --tool <toolName> --args '{"x":1}'
+//   node mcp-client.mjs --server "<cmd>" --op list --timeout 90000   # 单位**毫秒**
+//
+// `--timeout` 是**调用方给的预算**：Python 侧（src/warden_agent/mcp/client.py 的
+// `WARDEN_MCP_TIMEOUT_S`）必须把它传下来。两个进程各有各的超时，不传下去就不是同一个数
+// （第 50 批踩过：fixture 设 90s、断言消息也写"上限 90s"，真正生效的却是下面那个 30000）。
+// 30000 只是"没人告诉我"时的兜底，不是任何一处承诺的上限。
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -53,10 +59,17 @@ async function run() {
     args: serverArgs,
   });
 
+  // 计时器句柄必须留着：`Promise.race` 只决定**谁赢**，不负责给落败的那个收尾。
+  // 不清掉的话有两个后果，都真实发生过（第 51 批）：
+  //   1) 一个 1 秒就完成的 list，进程要等到计时器烧完才退出 —— 实测 **31s**
+  //      （30s 计时器 + 1s 真实工作量）。父进程 subprocess.run 等的是**进程退出**，
+  //      于是"每次成功调用都白等满整个超时预算"，看起来还像"服务器启动很慢"。
+  //   2) 落败的 timeout 变成**未处理的 Promise 拒绝**。
+  let timer;
   try {
-    const timeout = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error("MCP 连接/操作超时")), timeoutMs)
-    );
+    const timeout = new Promise((_, rej) => {
+      timer = setTimeout(() => rej(new Error("MCP 连接/操作超时")), timeoutMs);
+    });
     const work = (async () => {
       await client.connect(transport);
       if (op === "list" || op === "review") {
@@ -83,6 +96,8 @@ async function run() {
     try { await client.close(); } catch (_) {}
     out({ error: String(e && e.message ? e.message : e) });
     process.exit(1);
+  } finally {
+    clearTimeout(timer);
   }
 }
 

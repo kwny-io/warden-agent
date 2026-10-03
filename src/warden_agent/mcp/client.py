@@ -32,10 +32,35 @@ logger = logging.getLogger("warden.mcp")
 _DANGEROUS_NAME = ("shell", "exec", "system", "delete", "rm", "drop", "write")
 _DANGEROUS_ARG = ("command", "script", "sql")
 
-_DEFAULT_CLI = str(Path(__file__).resolve().parents[3] / "ts" / "mcp-client" / "mcp-client.mjs")
+_MCP_CLIENT_DIR = Path(__file__).resolve().parents[3] / "ts" / "mcp-client"
+_DEFAULT_CLI = str(_MCP_CLIENT_DIR / "mcp-client.mjs")
+# 本地已装的 MCP 演示 server（ts/mcp-client 的 devDependency）。
+_LOCAL_EVERYTHING_SERVER = (_MCP_CLIENT_DIR / "node_modules" / "@modelcontextprotocol"
+                            / "server-everything" / "dist" / "index.js")
 
-# 单次 MCP 操作超时（秒）。冷启动（npx resolve/download + node 启动）在机器负载高时可能
-# 超过 60s，所以默认放宽到 120s，并允许用 WARDEN_MCP_TIMEOUT_S 覆盖。
+
+def local_everything_server() -> str | None:
+    """本机已装的 MCP 演示 server 启动命令；没装则返回 None。
+
+    为什么不用 `npx -y @modelcontextprotocol/server-everything`：npx 每次冷启动都要去
+    registry 确认版本，**网络一断就挂到超时** —— 而包早已作为 devDependency 装在
+    `ts/mcp-client/node_modules` 里。改成直接跑本地入口，"能不能跑"就变成**纯本地事实**，
+    集成测试不需要网络（见 tests/test_mcp.py 的收集期判定与它第 51 批的注释）。
+
+    注意：`ts/mcp-client/mcp-client.mjs` 用 `server.split(" ")` 切命令，所以这条路
+    要求仓库路径里没有空格（路径带空格是 mjs 那个解析器的已知弱点，未在本批修）。
+    """
+    if not _LOCAL_EVERYTHING_SERVER.is_file():
+        return None
+    return f"node {_LOCAL_EVERYTHING_SERVER.as_posix()}"
+
+
+# 单次 MCP 操作超时（秒）。这个值是**两个进程共用的预算**：Python 侧用它限制
+# subprocess.run，并把它（毫秒）通过 `--timeout` 传给 ts/mcp-client/mcp-client.mjs。
+# 第 50 批的教训：只钉住 Python 侧等于没钉 —— 当时 fixture 设 WARDEN_MCP_TIMEOUT_S=90、
+# 断言消息里也写"上限 90s"，而真正生效的是 mjs 里硬编码的 30000ms，两句话说的不是一回事。
+# （另："npx 冷启动要 30.5s"是当时的误读。那 30s 是 mjs 里**没被清除的计时器**，
+#  真实工作量约 1s；已修，见 mjs 里的 clearTimeout。）
 _DEFAULT_TIMEOUT_S = 120
 # 只读的 list 允许尝试两次（就一次重试），应对冷启动抖动；call 只试一次（可能有副作用）。
 _LIST_ATTEMPTS = 2
@@ -125,6 +150,9 @@ class McpClient:
         if args is not None:
             cmd += ["--args", json.dumps(args)]
         timeout = env_positive_int("WARDEN_MCP_TIMEOUT_S", _DEFAULT_TIMEOUT_S)
+        # 把同一个预算**传进 node 侧**：否则两边各用各的默认值（mjs 里是 30000ms），
+        # 调用方以为自己设了 90s，实际生效的是 30s。单位是毫秒（mjs 的约定）。
+        cmd += ["--timeout", str(timeout * 1000)]
         # 有界重试：仅只读的 list 在超时后重试一次；call 绝不重试（工具调用可能有副作用，
         # 重试可能导致重复执行）。
         attempts = _LIST_ATTEMPTS if op == "list" else 1
