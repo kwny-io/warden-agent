@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-1589%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-1585%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -52,7 +52,7 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1593 项测试（带真 PG 时 1589 passed / 4 skipped；本机无 PG 时 1549 passed / 44 skipped）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1629 项测试（2026-10-03 本机无 PG 口径：**1585 passed / 44 skipped / 0 failed / 0 errors**）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -588,9 +588,9 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**0 项失败**（共 1593 项）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
-  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1589 passed / 4 skipped**；
-  无 PG（本机 docker 拉不到镜像时即此）→ **1549 passed / 44 skipped**（多跳的 40 条是需要真库的用例）。
+- **测试**：**0 项失败**（共 1629 项收集）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
+  无 PG（本机 docker 拉不到镜像时即此）→ **1585 passed / 44 skipped**（2026-10-03 第五十一批实测，`--junitxml` 口径，346 秒；多跳的 40 条是需要真库的用例）；
+  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1589 passed / 4 skipped**（2026-10-02 第四十四批时的值，**第五十一批未重测**）。
   其余按环境跳过的还有：win32 无内核隔离档、符号链接权限、缺 pg_dump 时的 PG 备份端到端、未构建前端时的 SPA、无 node 时的 MCP。
   覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：带真 PG 实测 **89.92%**、无 PG 实测 **86.67%**
   （2026-10-02，同为 10576 语词 / 2632 分支）——**两者都过闸，但无 PG 时余量只剩 0.67 个点**；
