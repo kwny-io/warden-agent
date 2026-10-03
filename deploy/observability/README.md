@@ -9,6 +9,7 @@
 | `alerts/warden.slo.yml` | SLO 记录规则（可用性、延迟）+ 多窗口燃烧率告警 |
 | `prometheus.yml` | 抓取配置（**带 Bearer**，因为 `/metrics` 受鉴权保护）+ 规则加载 + 告警转发 |
 | `servicemonitor.yaml` | **Prometheus Operator** 版的抓取声明（装了 Operator 才用；与 `prometheus.yml` 二选一） |
+| `prometheusrule.yaml` | **Prometheus Operator** 版的告警规则（`PrometheusRule` CR；只装 ServiceMonitor 是不够的，见下节） |
 | `alertmanager.yml` | 告警路由（critical 立刻发、warning 打包发） |
 | `docker-compose.yml` | 一键起栈，用于本地演练 |
 
@@ -42,6 +43,32 @@ docker run --rm --entrypoint promtool \
 `warden_*` 指标都真实存在于代码里**、SLO 记录规则被其后的告警引用——防止"改了个指标名、
 规则库悄悄指向一个不存在的指标"这类漂移。
 
+`prometheusrule.yaml`（Operator 版）的规则正文不另做静态校验：
+`tests/test_observability_config.py` 直接把它与上面两个文件**逐条深度比对**——两者不同就红，
+所以 promtool 查过的那份就是它。
+
+## 装了 Prometheus Operator：先把这两处接上（否则规则一条不生效）
+
+静态路径（`prometheus.yml` + `docker-compose.yml`）三件事都齐：抓取、`rule_files` 加载规则、转发
+Alertmanager。**Operator 路径不一样**：它管理的 Prometheus **不读任何 `prometheus.yml`**——
+抓取来自 `ServiceMonitor`，规则来自 `PrometheusRule`，两者都是 CR，且都要被你的 Prometheus
+**按标签选中**。所以 Operator 路径上还差这两件事：
+
+1. **规则**：`kubectl apply -f deploy/observability/prometheusrule.yaml`
+   （只 apply `servicemonitor.yaml` 的结果是：指标抓到了、告警一条不生效，而且**没有任何报错**）。
+   两个 CR 的 `release` 标签必须能被你的 Prometheus 选中：
+   `kubectl get prometheus -A -o jsonpath='{.items[*].spec.ruleSelector}'`；
+   本仓两个文件都写成占位值 `release: prometheus`，换成你的 helm release 名（两处一起换，
+   不一致会出现"一个生效、一个不生效"）。
+2. **保留期**：Operator 路径的保留期在 Prometheus CR 里（**不在本仓**，因为通常由
+   kube-prometheus-stack 的 Helm 生成）。核对：
+   `kubectl get prometheus -A -o jsonpath='{.items[*].spec.retention}'`；
+   要求只有一个：**≥ 规则里最长窗口**（`warden.slo.yml` 的 `rate[30d]`，即 30 天）；
+   本项目口径写成 `spec.retention: 35d`（与本地 compose 的 `--storage.tsdb.retention.time=35d` 同一个数字，留 5d 余量）。
+   太短了会怎样：慢烧告警（1h+30d 双窗口）只能看到保留期内的部分样本 → **比率失真或为空、静静地不生效**。
+
+两条路径**别同时启用**（会重复抓取、告警双发）。
+
 ## 没有 Operator 时怎么用 static_configs 代替
 
 `servicemonitor.yaml` 是 **Prometheus Operator 的 CRD**，只有集群里装了 Operator
@@ -73,6 +100,8 @@ printf '%s' "$WARDEN_API_KEY" > deploy/observability/warden_token   # 已 .gitig
 > ServiceMonitor 路需要额外两件事：(1) Service **必须有带名字的 port**（本仓 `service.yaml` 的
 > `name: http`）；(2) ServiceMonitor 要带 `release: <你的 prometheus release>` 标签
 > 才会被 Operator 选中（见 `servicemonitor.yaml` 注释）。
+> **第三件事**：静态路径的 `rule_files` 在 Operator 路径上等效于 `prometheusrule.yaml`，
+> 漏了它则只有指标、没有告警（见上节）。
 
 ## 备份失败 / 静默失效的告警（代理层，非 warden_* 指标）
 

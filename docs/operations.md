@@ -272,6 +272,10 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
   以及**多窗口燃烧率**告警（快窗口发现快、慢窗口防误报）。
 - **抓取要带 Bearer**：`/metrics` 与其他业务接口一样受鉴权保护；`prometheus.yml` 用
   `bearer_token_file` 从文件读 key（**别把 key 写进配置文件**）。
+- **装了 Prometheus Operator 的话，静态路径那两件事要换成 CR**：抓取用 `servicemonitor.yaml`，
+  规则用 `prometheusrule.yaml`（Operator 的 Prometheus **不读 `prometheus.yml` 的 `rule_files`**，
+  只 apply ServiceMonitor 的结果是"指标抓到了、告警一条不生效且不报错"）；保留期在 Prometheus CR 的
+  `spec.retention`（本仓口径 **35d** ≥ 规则里最长窗口 `rate[30d]`），太短则慢烧告警静静地失真。
 - **本地演练**：`deploy/observability/docker-compose.yml` 一键起 Prometheus+Alertmanager**+Grafana**，
   人为制造错误率/挂起 Run 看告警是否按预期触发。
 - **看板**：`grafana/` 下是 provisioning（数据源 + 仪表盘），挂载即生效；

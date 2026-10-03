@@ -4,6 +4,85 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-03（第五十二批：抓取接上了，**告警从没接线**——Operator 路径上少了一段）
+
+> 入口是 `docs/复核索引.md` §7 自己那条欠账行「Prometheus `retention=35d` 实值」。
+> 查保留期怎么查着查着，撞到更大的一处：**在 Prometheus Operator 路径上，本仓库一条
+> Warden 告警规则都不会生效**，而且没有任何东西会报错。
+
+### 一、失败模式：ServiceMonitor 把“抓”接上了，`PrometheusRule` 从没出现
+
+- 事实：`grep -rn PrometheusRule` 全仓库 **0 处**命中（`.gitignore` 外的所有 yaml/yml/md）；
+  而 `deploy/observability/servicemonitor.yaml` 一直在。**抓取接线有、规则接线没有。**
+- 机制：Operator 管理的 Prometheus **不读 `prometheus.yml` 的 `rule_files`**——它的规则只来自
+  `PrometheusRule` CR，并且要能被 `spec.ruleSelector` 按标签选中。本仓 `prometheus.yml` 里的
+  `rule_files` 只对 compose / 手装 Prometheus 那条路生效。
+- 后果：指标抓到了、规则库也在仓库里，中间那一段从没接上 ⇒ **监控看着是绿的，出事没人知道**，
+  而且不会报错。静态校验也照样全绿：`promtool check rules` 查的是**文件**（本仓文件都对），
+  不是集群里到底加载了什么。
+- 与前三批同源：第45批（机制有测试不等于机制在用）、第50批（`.env` 是第二条路）、
+  第51批（预算改了但没生效）——**同一种坏法：接线处没有守卫，而“文件都在”制造了安全感**。
+
+### 二、改法（三件）
+
+1. 新增 `deploy/observability/prometheusrule.yaml`（`PrometheusRule` CR，7 个 group）：
+   `spec.groups` 与 `alerts/warden.rules.yml` + `alerts/warden.slo.yml` **逐条深度相等**。
+   规则正文的唯一事实源仍是那两个文件（那里有每条“为什么响、先看哪”的注释）。
+2. `metadata.labels.release` 与 ServiceMonitor **取同一个值**（占位 `prometheus`）：Operator 只按标签选，
+   两个文件标签不一致 = 一个生效、一个不生效，而且同样静默。
+3. 保留期从“写死的字面量”改成“**解析出来的窗口**”：原来的
+   `test_prometheus保留期覆盖SLO最长窗口` 把 `30d` 写死在断言里、且只查 docker-compose；
+   现在从所有规则表达式的区间选择器解析出**最长窗口**（30d），再要求 compose 的
+   `--storage.tsdb.retention.time=35d` ≥ 它。同时把 Operator 路径的落点（Prometheus CR 的
+   `spec.retention`）写进 `deploy/observability/README.md` 与 `docs/operations.md`：
+   要求 ≥ 规则里最长窗口，本仓口径 `spec.retention: 35d`（与 compose 同一个数字）。
+
+### 三、守卫（都做过变异验证）
+
+| 守卫 | 钉住的机制 | 变异（改坏什么） | 结果 |
+|---|---|---|---|
+| `test_Operator路径必须有PrometheusRule且与本地规则逐条一致` | CR 的 `spec.groups` 与两个规则文件深度相等 + `release` 标签存在且与 ServiceMonitor 同值 | 偷改 CR 里一条表达式 | 红 ✓ |
+| 同上 | 同上 | 删掉 CR 的 `release` 标签 | 红 ✓ |
+| `test_prometheus保留期覆盖SLO最长窗口` | 保留期 ≥ **解析出的**最长窗口 | 把 `rate(...[30d])` 改成 `[60d]` | 红 ✓ |
+| 同上 | 同上 | 把 compose 的 35d 缩成 7d | 红 ✓ |
+| `test_文档里的保留期与compose实值同源` | 文档里所有 `retention…Nd` 写法都等于 compose 实值 | 把文档里的 35d 改成 30d | 红 ✓ |
+| `test_备份保留份数在文档与脚本里同源` | 文档的份数 = CronJob 脚本里的 `-gt N`；`-mtime` 只允许出现在否定语境 | 文档把 `find -mtime +14 -delete` 写成事实 | 红 ✓ |
+| 同上 | 同上 | CronJob 的 14 改成 30 而文档没跟 | 红 ✓ |
+
+### 四、顺带发现的第四处：备份保留被写成「14 天」，而且教的正是代码**刻意否掉**的写法
+
+- 改动前 `deploy/k8s/README.md` 写的是：**备份卷的保留窗口是 14 天**
+  （`backup-cronjob.yaml` 的 `find ... -mtime +14 -delete`）。
+- 事实（`deploy/k8s/backup-cronjob.yaml`）：脚本按**文件名时间戳** `ls -1 … | sort` 后只保留最新 14 份
+  （与 CLI `warden backup-prune --keep 14` 同口径）；而且该文件里**明确写着为什么不用**
+  `find -mtime +14 -delete`：按 **mtime** 删、没有“最少保留份数”下限，卷里出现被 touch /
+  被 `pg_restore` 写过的文件或节点时钟漂移就可能删掉唯一可用的备份（删备份不可逆）。
+- 两处错叠加：① 语义错——保留的是 **14 份**而不是 14 天（只在“每天恰好成功一份”时才碰巧相等）；
+  ② 更糟的是把被显式否掉的危险写法当成事实教给运维。
+
+### 五、这批最值得记的一条：**守卫的判据本身也要拿变异验**
+
+本批第一版的 `test_文档里的保留期与compose实值同源` 只做了“文档里包含 `35d`”这种子串检查——
+而长文档里别处还有同一个数字（`--storage.tsdb.retention.time=35d`），于是把前面那句
+“本项目取 **35d**”改成 30d，**它照样绿**。第一次变异验证就把这条抓了出来（另一次：把
+`rate[30d]` 改成 `[60d]` 的锚点第一次落在**注释**里，规则解析器读的是 expr，所以那次“变绿”
+是我改错了地方，不是守卫漏了）。改成“只认 `retention…<N>d` 这一种写法，并要求文档里**所有**
+这种写法完全一致且等于 compose 实值”之后才拦住。
+
+⇒ 变异验证不是走形式：**它直接否掉了守卫的第一版**。守卫写完后必须问一句“我刚才到底改了什么、
+那个东西真的被这条断言读到了吗”。
+
+### 六、本批的已知限制
+
+- **没在真集群 / 真 Operator 上 apply 过这两个 CR**（本机没有 k8s 集群）。本批的证据等级是
+  “离线结构守卫 + 手写 CR”，**不是**“真跑过 Operator”。要在真集群验证：`kubectl apply` 两个 CR，
+  然后 `kubectl get prometheusrule -n warden` 与 Prometheus 的 `/config` 页看规则有没有被加载。
+- `release: prometheus` 是**占位值**：真实环境必须换成你的 helm release 名（两个文件一起换，
+  守卫会检查它们一致）。
+- `kubeconform` 的官方 schema 校验需要联网；本批只做了纯离线结构守卫。
+- 发布流水线真跑一次仍是欠账（需真 runner + GHCR/cosign 凭据）。
+
+---
 ## 2026-10-03（第五十一批：一个“改了但没生效”的超时预算，和那个**从没被清掉的计时器**）
 
 > 入口是上一批收尾时全量套件的 3 个 setup error（断网）。按当时判据先记成“环境问题”，

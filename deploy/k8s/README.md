@@ -218,9 +218,15 @@ kubectl -n $NS scale deploy/warden-agent --replicas=2
 kubectl -n $NS rollout status deploy/warden-agent
 ```
 
-> ⚠️ **备份卷的保留窗口是 14 天**（`backup-cronjob.yaml` 的 `find ... -mtime +14 -delete`）：
-> 发现数据损坏越晚，可恢复的窗口越窄。要更久请同步到对象存储（见 `backup-pvc.yaml` 顶部）。
-> 备份失败/静默失效的告警接线见 `deploy/observability/README.md`。
+> ⚠️ **备份卷的保留是「最新 14 份」，不是「14 天」**（`backup-cronjob.yaml` 里按**文件名时间戳**
+> `sort` 后只留最新 14 份，与 CLI `warden backup-prune --keep 14` 同一口径）。
+> 两者只在"每天恰好成功一份"时才碰巧相等；备份批量重跑或失败时就不等。
+> 代码**刻意不用** `find -mtime +14 -delete`：那是按 **mtime** 删、没有"最少保留份数"下限，
+> 卷里出现被 touch / 被 `pg_restore` 写过的文件、或节点时钟漂移，就可能把唯一可用的备份删掉
+> （删备份不可逆，比磁盘满危险得多）。发现数据损坏越晚，可恢复的窗口越窄；要更久请同步到
+> 对象存储（见 `backup-pvc.yaml` 顶部）。
+> 备份失败/静默失效的告警接线、**Operator 路径的告警规则**（`prometheusrule.yaml`）见
+> `deploy/observability/README.md`。
 
 灰度的**自动化门控**在 `scripts/canary_rollout.sh`（它只做"能不能放量"的判定，
 权重切换在你网关侧），可观测性栈见 `deploy/observability/`。

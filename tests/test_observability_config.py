@@ -5,6 +5,10 @@
   - 规则里写 le="1" 而应用渲染的是 le="1.0" → 分子恒 0、燃烧率恒越限；
   - Alertmanager 不加 --config.expand-env → ${ALERT_WEBHOOK_URL} 当字面 URL，告警发不出去；
   - Prometheus 保留期短于 SLO 窗口 → rate[30d] 失真或为空，慢烧告警静默失效；
+  - **Operator 路径只有 ServiceMonitor、没有 PrometheusRule** → 指标抓到了、规则库也在仓库里，
+    但 Operator 管理的 Prometheus 根本不读 prometheus.yml 的 rule_files ⇒ 一条 Warden 告警都
+    不生效（且没有任何报错）；
+  - PrometheusRule 的 `release` 标签不被 ruleSelector 选中 → 同上，且静态校验全绿；
   - inhibit 的 equal 要求聚合告警并不存在的 instance 标签 → 抑制永不命中。
 
 本测试把每一条都变成红灯，避免"配了等于没配"。
@@ -26,6 +30,11 @@ SERVER = REPO / "src" / "warden_agent" / "web" / "server.py"
 
 # 规则表达式里的 le 桶选择器，例如 le="1.0"。
 _LE_RE = re.compile(r'le="([^"]+)"')
+
+# 规则表达式里的区间选择器，例如 [30d] / [5m]。
+_WINDOW_RE = re.compile(r"\[(\d+)([dhms])\]")
+
+_RULE_FILES = ("warden.rules.yml", "warden.slo.yml")
 
 
 def _load(path: Path) -> dict:
@@ -90,8 +99,38 @@ def test_le标签与应用渲染的直方图桶完全匹配() -> None:
     )
 
 
-def test_prometheus保留期覆盖SLO最长窗口() -> None:
-    """保留期 < SLO 窗口时 rate[30d] 只能看到部分样本 → 慢烧告警静静地失真/不触发。"""
+def _all_rules() -> list[dict]:
+    """alerts/ 下两个规则文件的全部规则（与 prometheusrule.yaml 应当逐条一致）。"""
+    out: list[dict] = []
+    for name in _RULE_FILES:
+        out.extend(_rules(_load(ALERT_DIR / name)))
+    return out
+
+
+def _slo_groups() -> list[dict]:
+    out: list[dict] = []
+    for name in _RULE_FILES:
+        out.extend(_load(ALERT_DIR / name)["groups"])
+    return out
+
+
+def _longest_window_days() -> float:
+    """从规则表达式的区间选择器里**解析**最长窗口（天数）。
+
+    为什么不写死 30：写死的话，谁把 rate[30d] 改成 rate[60d]，保留期守卫照样绿——
+    守卫钉在字面量上、没钉在机制上，就退化成"文字承诺"了。
+    """
+    per_unit = {"d": 1.0, "h": 1 / 24, "m": 1 / 1440, "s": 1 / 86400}
+    found = [
+        int(value) * per_unit[unit]
+        for rule in _all_rules()
+        for value, unit in _WINDOW_RE.findall(str(rule.get("expr", "")))
+    ]
+    assert found, "规则表达式里应至少有一个区间选择器（如 [5m] / [30d]）"
+    return max(found)
+
+
+def _compose_retention_days() -> int:
     compose = _load(OBS / "docker-compose.yml")
     command = compose["services"]["prometheus"]["command"]
     days = [
@@ -100,7 +139,74 @@ def test_prometheus保留期覆盖SLO最长窗口() -> None:
         if (m := re.search(r"--storage\.tsdb\.retention\.time=(\d+)d", str(entry)))
     ]
     assert days, "prometheus 命令应显式设置 --storage.tsdb.retention.time"
-    assert max(days) >= 30, f"保留期 {max(days)}d 少于 SLO 最长窗口 30d"
+    return max(days)
+
+
+def test_prometheus保留期覆盖SLO最长窗口() -> None:
+    """保留期 < SLO 窗口时 rate[30d] 只能看到部分样本 → 慢烧告警静静地失真/不触发。"""
+    longest = _longest_window_days()
+    # 自检：本仓的可用性 SLO 就是"30 天预算"（见 warden.slo.yml 顶部），所以最长窗口必然 ≥30d。
+    # 小于它就是解析没找到真窗口（守卫会变成空转），要显式炸出来。
+    assert longest >= 30, f"解析出的最长窗口只有 {longest:g}d，与 SLO 的 30 天承诺不符"
+    retention = _compose_retention_days()
+    assert retention >= longest, (
+        f"prometheus 保留期 {retention}d 少于规则里的最长窗口 {longest:g}d"
+        " → rate 窗口只能看到部分样本，慢烧告警会静静地失真或不触发"
+    )
+
+
+def test_文档里的保留期与compose实值同源() -> None:
+    """运维按文档核对保留期，文档里写出的每个数字都必须就是 compose 里的那个值。
+
+    为什么不能只写「足够长」也不能各写各的：两份数字不一致（或文档根本不给数）= 运维照着核对
+    会得出与事实相反的结论。
+
+    实现上不做「文档里包含 35d」这种子串检查——它在长文档里很容易被别处的同一个数字蒙混过关
+    （本测试自己的变异验证就抓出过这一点）。这里只认 `retention…<N>d` 这一种写法，
+    并要求文档里**所有**这种写法的数字完全一致且等于 compose 实值。
+    """
+    retention = _compose_retention_days()
+    text = (OBS / "README.md").read_text(encoding="utf-8")
+    assert "storage.tsdb.retention.time" in text, (
+        "README 应写明保留期这件事（以及 Operator 路径要自己设）"
+    )
+    stated = {int(m.group(1)) for m in re.finditer(r"retention[^\n]*?(\d+)\s*d", text)}
+    assert stated, "README 没写出具体的保留期数字（只写「足够长」的话运维无法核对）"
+    assert stated == {retention}, (
+        f"README 里的保留期数字 {sorted(stated)} 与本仓实值 {retention}d 不一致"
+        "（文档与代码必须同源：改一处就要改两处）"
+    )
+
+
+def test_Operator路径必须有PrometheusRule且与本地规则逐条一致() -> None:
+    """Operator 的 Prometheus 不读 prometheus.yml 的 rule_files，规则只能来自 PrometheusRule。
+
+    仓库此前只有 servicemonitor.yaml：抓取接上了、规则库也在仓库里，中间那一段从没接上
+    ⇒ 指标有了、告警一条不生效，且没有任何报错。
+
+    这里同时钉住"别抄一份然后分叉"：CR 的 spec.groups 必须与 alerts/*.yml 的 groups 深度相等。
+    """
+    cr = _load(OBS / "prometheusrule.yaml")
+    assert cr["kind"] == "PrometheusRule"
+    assert cr["apiVersion"].startswith("monitoring.coreos.com/")
+    assert cr["metadata"]["name"] == "warden-agent"
+    labels = cr["metadata"].get("labels", {})
+    assert labels.get("app.kubernetes.io/name") == "warden-agent", labels
+    # Operator 只按 ruleSelector 选规则：标签不匹配 = 文件在那儿、运行时一条不生效（=没接线）。
+    assert labels.get("release"), (
+        "PrometheusRule 必须带 release=<你的 prometheus release> 标签，否则 Operator 选不中它"
+    )
+    sm = _load(OBS / "servicemonitor.yaml")
+    sm_release = sm["metadata"].get("labels", {}).get("release")
+    assert sm_release == labels["release"], (
+        f"PrometheusRule 的 release={labels['release']!r} 与 ServiceMonitor 的 "
+        f"{sm_release!r} 不一致：同一个 release 才能被同一个 ruleSelector / "
+        "serviceMonitorSelector 选中（否则一半生效、一半不生效）"
+    )
+    assert cr["spec"]["groups"] == _slo_groups(), (
+        "PrometheusRule 的规则与 alerts/warden.rules.yml + alerts/warden.slo.yml 不一致："
+        "规则正文的唯一事实源是那两个文件，改了一边就要同步另一边"
+    )
 
 
 def test_alertmanager开启环境变量展开() -> None:

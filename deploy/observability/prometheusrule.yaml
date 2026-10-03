@@ -1,0 +1,208 @@
+# PrometheusRule（Prometheus Operator CRD）——把 Warden 的告警规则真正接进 Operator
+#
+# 为什么必须有这个文件（而不是只有 servicemonitor.yaml）：
+#   Operator 管理的 Prometheus **不读 prometheus.yml 的 `rule_files`**——它的规则来自
+#   `PrometheusRule` CR（由 `spec.ruleSelector` 按标签挑选）。本仓库此前只有
+#   `servicemonitor.yaml`（抓取接线），**没有任何 PrometheusRule** ⇒ 在 Operator 路径上
+#   Prometheus 会正常抓取 `warden_*` 指标、但**一条 Warden 告警规则都没有**：
+#   指标有了、规则库也在仓库里，可是中间那一段从没接上。表现是"监控看着是绿的，出事没人知道"，
+#   而且不会有任何报错——这正是本仓库一直在清的那类"机制在、但没接上"。
+#
+# 前提：集群里已装 Prometheus Operator（如 kube-prometheus-stack），否则 apply 会报
+#   `no matches for kind "PrometheusRule"`；**没装就用静态路径**（见同目录 README.md）。
+#   与 `prometheus.yml` 的 `rule_files` 是两条并行路径，**别同时生效**，否则同一告警双份。
+#
+# ⚠️ 规则**正文**的唯一事实源是本目录 `alerts/warden.rules.yml` 与 `alerts/warden.slo.yml`
+#   （那里有每条规则的"为什么响、响了先看哪"注释）。本文件的 `spec.groups` 必须与它们
+#   **逐条一致**——`tests/test_observability_config.py` 会做深度比对，改了一边不改另一边就红。
+#   这里的注释只解释"接线"，不重复抄规则正文的说明。
+#
+# ⚠️ `metadata.labels.release` 必须能让你的 Prometheus 选中它。Operator 默认只选带
+#   `release=<helm release 名>` 标签的 PrometheusRule（看 `kubectl get prometheus -A -o
+#   jsonpath='{.items[*].spec.ruleSelector}'`）。**标签写错 = 规则静态校验全绿、运行时一条不生效**
+#   ——和没接线一模一样，所以这里跟 servicemonitor.yaml 用同一个 `release: prometheus` 占位，
+#   并且有守卫测试盯着这个标签存在。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: warden-agent
+  namespace: warden
+  labels:
+    app.kubernetes.io/name: warden-agent
+    release: prometheus
+spec:
+  groups:
+  - name: warden-availability
+    rules:
+    - alert: WardenServiceDown
+      expr: up{job="warden-agent"} == 0
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: Warden 服务已下线（抓取不到）
+        description: Prometheus 连续 2 分钟抓不到 {{ $labels.instance }}。先看容器/进程是否还活着、端口是否可达。
+        runbook: docs/operations.md
+    - alert: WardenReadinessFailing
+      expr: 'probe_success{job="warden-ready"} == 0
+
+        '
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: Warden 就绪探针失败（依赖可能断了）
+        description: 服务活着但 /health/ready 不通过，多半是数据库连不上。**别只看存活探针**。
+        runbook: docs/operations.md
+  - name: warden-errors
+    rules:
+    - alert: WardenHighErrorRate
+      expr: "sum(rate(warden_http_errors_total[5m]))\n  /\nclamp_min(sum(rate(warden_http_requests_total[5m])),\
+        \ 0.001)\n  > 0.05\n"
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: Warden 5xx 错误率 > 5%
+        description: 近 10 分钟 5xx 占比持续高于 5%。查 /audit 最近失败请求的 correlation_id，再按它捞日志。
+        runbook: docs/operations.md
+  - name: warden-latency
+    rules:
+    - alert: WardenHighLatencyP95
+      expr: "histogram_quantile(\n  0.95,\n  sum by (le) (rate(warden_http_request_duration_seconds_bucket[5m]))\n\
+        ) > 2\n"
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Warden HTTP p95 延迟 > 2s
+        description: 近 10 分钟 p95 超过 2 秒。先看是否模型链路/出站抓取变慢，再看 Run 锁是否存在等待。
+        runbook: docs/operations.md
+  - name: warden-business
+    rules:
+    - alert: WardenStuckRuns
+      expr: warden_stuck_runs{older_than="60m"} > 0
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: 有 {{ $value }} 个 Run 等待人工处理超过 60 分钟
+        description: 高危操作等在审批、或任务等用户回复。见 GET /alerts/stuck 拿明细（含 source 字段判断时长可信度）。
+        runbook: docs/operations.md
+    - alert: WardenRateLimitedSurge
+      expr: increase(warden_rate_limited_total[5m]) > 100
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: 入站限流拒绝量激增
+        description: 近 5 分钟被拒 > 100 次。先区分是「恶意刷」还是「容量不够」：按 path 看分布，再决定收紧还是扩容。
+        runbook: docs/operations.md
+  - name: warden-silent-failures
+    rules:
+    - alert: WardenLockRenewFailures
+      expr: increase(warden_lock_renew_failures_total[10m]) > 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: Run 锁续租失败（可能已被接管）
+        description: 某 Run 的租约续租失败，说明锁被别的副本接管或存储抖动 → 该 Run 可能被并发驱动。查日志「租约续租失败」拿 run/owner，核对是否发生重复执行。
+        runbook: docs/operations.md
+    - alert: WardenEventDropped
+      expr: increase(warden_event_dropped_total[10m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: SSE 事件被丢弃（保留上限被突破）
+        description: 事件总线超出每个 run 的保留条数，慢消费者会看到进度不连续。最终结果不受影响；频繁发生可调大 WARDEN_EVENT_KEEP。
+        runbook: docs/operations.md
+    - alert: WardenAuditWriteFailures
+      expr: increase(warden_audit_write_failures_total[10m]) > 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: 审计写入失败（账本可能缺条）
+        description: 审计落库失败，correlation_id 见日志。先查存储是否不可写/锁冲突，再评估缺失范围（`warden audit-verify` 校验链完整性）。
+        runbook: docs/operations.md
+    - alert: WardenOtlpExportFailing
+      expr: increase(warden_otlp_export_failures_total[10m]) > 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: OTLP 链路导出失败
+        description: span 送不到收集器。检查 OTEL_EXPORTER_OTLP_ENDPOINT 可达性与收集器状态；未配 OTLP 时不会有此指标。
+        runbook: docs/operations.md
+    - alert: WardenOtlpDropping
+      expr: increase(warden_otlp_dropped_total[10m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: OTLP span 因队列满被丢弃
+        description: 导出队列积压，通常是收集器不可达或太慢。链路数据不完整，业务不受影响。
+        runbook: docs/operations.md
+  - name: warden-slo-recording
+    interval: 30s
+    rules:
+    - record: warden:slo_availability:ratio_rate5m
+      expr: "1 - (\n  sum(rate(warden_http_errors_total[5m]))\n    /\n  clamp_min(sum(rate(warden_http_requests_total[5m])),\
+        \ 0.001)\n)\n"
+    - record: warden:slo_availability:ratio_rate1h
+      expr: "1 - (\n  sum(rate(warden_http_errors_total[1h]))\n    /\n  clamp_min(sum(rate(warden_http_requests_total[1h])),\
+        \ 0.001)\n)\n"
+    - record: warden:slo_availability:ratio_rate30d
+      expr: "1 - (\n  sum(rate(warden_http_errors_total[30d]))\n    /\n  clamp_min(sum(rate(warden_http_requests_total[30d])),\
+        \ 0.001)\n)\n"
+    - record: warden:slo_latency_fast:ratio_rate5m
+      expr: "sum(rate(warden_http_request_duration_seconds_bucket{le=\"1.0\"}[5m]))\n  /\nclamp_min(sum(rate(warden_http_request_duration_seconds_count[5m])),\
+        \ 0.001)\n"
+    - record: warden:slo_latency_fast:ratio_rate1h
+      expr: "sum(rate(warden_http_request_duration_seconds_bucket{le=\"1.0\"}[1h]))\n  /\nclamp_min(sum(rate(warden_http_request_duration_seconds_count[1h])),\
+        \ 0.001)\n"
+  - name: warden-slo-burn
+    rules:
+    - alert: WardenAvailabilityBudgetBurnFast
+      expr: "(1 - warden:slo_availability:ratio_rate5m) > (14.4 * 0.005)\n  and\n(1 - warden:slo_availability:ratio_rate1h)\
+        \ > (14.4 * 0.005)\n"
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: 可用性预算快速燃烧（5m+1h 双窗口越限）
+        description: 按当前速率 30 天预算将在数小时内烧穿。先止血（回滚/限流/扩容），再定位。
+        runbook: docs/operations.md
+    - alert: WardenAvailabilityBudgetBurnSlow
+      expr: "(1 - warden:slo_availability:ratio_rate1h) > (6 * 0.005)\n  and\n(1 - warden:slo_availability:ratio_rate30d)\
+        \ > (6 * 0.005)\n"
+      for: 15m
+      labels:
+        severity: warning
+      annotations:
+        summary: 可用性预算持续燃烧（1h+30d 双窗口越限）
+        description: 不是瞬时抖动，是持续性的可靠性退化——排进本周处理，别拖到烧穿。
+        runbook: docs/operations.md
+    - alert: WardenLatencyBudgetBurnSlow
+      expr: '(1 - warden:slo_latency_fast:ratio_rate1h) > 0.05
+
+        '
+      for: 30m
+      labels:
+        severity: warning
+      annotations:
+        summary: 延迟 SLO：>1s 的请求占比持续超过 5%
+        description: 用户可感知的变慢。先看哪条 path / 是否集中在模型调用或出站抓取。
+        runbook: docs/operations.md
+    - alert: WardenLatencyBudgetBurnFast
+      expr: "(1 - warden:slo_latency_fast:ratio_rate5m) > 0.05\n  and\n(1 - warden:slo_latency_fast:ratio_rate1h)\
+        \ > 0.05\n"
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: 延迟预算快速燃烧（5m+1h 双窗口越限）
+        description: 短窗口也越限，说明是**正在发生**的变慢而非统计噪声。先查下游依赖（模型/出站）与 Run 锁等待。
+        runbook: docs/operations.md

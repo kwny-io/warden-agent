@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -225,3 +226,32 @@ def test_备份保留策略不许按mtime删() -> None:
     ]
     assert not dangerous, f"备份保留不许用 find -delete（按 mtime、无最少保留份数）：{dangerous}"
     assert "pruned:" in script or "backup-prune" in script, "保留策略应显式按时间戳保留固定份数"
+
+
+def test_备份保留份数在文档与脚本里同源() -> None:
+    """同一件事在两个文件里被写成两个数（或两种语义）= 运维按文档核对会得出相反结论。
+
+    实际发生过：`deploy/k8s/README.md` 写"保留窗口是 **14 天**（`find ... -mtime +14 -delete`）"
+    ——既把"14 **份**"说成了"14 **天**"，又把代码里**刻意否掉**的危险写法当成事实教给运维。
+    所以这里同时钉两件事：份数同源 + 文档不得再教被否掉的写法。
+    """
+    cj = _by_kind("CronJob")
+    script = "\n".join(_pod_spec(cj)["containers"][0]["args"])
+    match = re.search(r"-gt\s+(\d+)", script)
+    assert match, f"找不到保留份数的判定（形如 `-gt 14`）：{script[:200]}"
+    keep = int(match.group(1))
+    assert f"--keep {keep}" in script, (
+        f"保留份数 {keep} 应与 CLI 口径 `warden backup-prune --keep N` 写明"
+    )
+    readme = (K8S / "README.md").read_text(encoding="utf-8")
+    assert f"{keep} 份" in readme, f"部署文档应写明保留的是「最新 {keep} 份」（不是「{keep} 天」）"
+    # 文档可以把被否掉的写法当**反面例子**讲，但不许把它当事实教给运维：
+    # 提到 `-mtime` 的每一行都必须带否定语境（实测发生过：README 写"保留窗口是 14 天
+    # （find ... -mtime +14 -delete）"，而代码早就不那么做了）。
+    # ⚠️ 这是**文本级**守卫，不装成行为级：它拦的是"再把那个写法写成事实"，不是所有错法。
+    for line in readme.splitlines():
+        if "-mtime" in line:
+            assert any(cue in line for cue in ("不用", "别用", "不是", "禁止", "刻意")), (
+                "部署文档把 `-mtime ... -delete` 当成事实讲"
+                f"（而不是「为什么不用它」）：{line.strip()}"
+            )
