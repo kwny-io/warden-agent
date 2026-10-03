@@ -14,6 +14,7 @@ from warden_agent.agent import InMemoryRunStore
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.runtime.checkpoint import Checkpoint, InMemoryCheckpointStore
 from warden_agent.runtime.notify import (
+    NotifyOutcome,
     NullNotifier,
     WebhookNotifier,
     notifier_from_env,
@@ -82,10 +83,40 @@ def test_notify_stuck投递卡死的run() -> None:
         return httpx.Response(200)
 
     n = WebhookNotifier("https://hook.example/x", transport=httpx.MockTransport(handler))
-    assert notify_stuck(store, cps, n, older_than_seconds=3600) == 1
+    out = notify_stuck(store, cps, n, older_than_seconds=3600)
+    # 命中数是 found；**是否真送出去**是 delivered（两者曾经被混为一谈）
+    assert (out.found, out.delivered, out.channel) == (1, True, "WebhookNotifier")
     body = captured["body"]
     assert body["details"]["count"] == 1
     assert body["details"]["runs"][0]["run_id"] == "run-stuck"
+
+
+def test_notify_stuck投递失败必须如实标未投递() -> None:
+    """webhook 返 500：命中 1 个，但**没送出去**——不能报成已投递。"""
+    store, cps = _stuck_setup()
+    n = WebhookNotifier(
+        "https://hook.example/x",
+        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+    )
+    out = notify_stuck(store, cps, n, older_than_seconds=3600)
+    assert (out.found, out.delivered) == (1, False)
+    assert out.channel == "WebhookNotifier"
+
+
+def test_未配通道时命中也不等于已投递() -> None:
+    """`NullNotifier.send()` 恒 False（不发任何请求）——命中 1 个但 delivered 必须是 False。"""
+    store, cps = _stuck_setup()
+    out = notify_stuck(store, cps, NullNotifier(), older_than_seconds=3600)
+    assert (out.found, out.delivered, out.channel) == (1, False, "NullNotifier")
+
+
+def test_outcome不能有真假值_必须显式看delivered() -> None:
+    """结构约束：`NotifyOutcome` 故意不定义 `__bool__`。
+
+    否则 `if outcome:` 会重新变成“有命中就算成功”——那正是第五十六批修的 bug。
+    """
+    assert "__bool__" not in vars(NotifyOutcome)
+    assert "__len__" not in vars(NotifyOutcome)
 
 
 def test_notify_stuck没有卡死就不投递() -> None:
@@ -98,5 +129,7 @@ def test_notify_stuck没有卡死就不投递() -> None:
         return httpx.Response(200)
 
     n = WebhookNotifier("https://hook.example/x", transport=httpx.MockTransport(handler))
-    assert notify_stuck(store, cps, n, older_than_seconds=3600) == 0
+    out = notify_stuck(store, cps, n, older_than_seconds=3600)
+    assert (out.found, out.delivered) == (0, False)
+    assert out.channel == "WebhookNotifier"
     assert called["n"] == 0, "没有卡死 Run 时不应发出任何请求"

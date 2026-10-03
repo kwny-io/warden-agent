@@ -14,7 +14,8 @@
   warden backup-pg --dbname X       PostgreSQL 备份（pg_dump -Fc + 产物校验）
   warden backup-prune --dir D --keep N  按保留策略清理备份（默认只演练，--yes 才真删）
   warden restore <backup> [--force] 从备份恢复（破坏性，会覆盖目标库）
-  warden stuck [--older-than-min N] 列出等待人工处理超时的 run（接告警用，有则退出码 3）
+  warden stuck [--older-than-min N] 列出等待人工处理超时的 run（接告警用；有则退出码 3，
+                                     --notify 投递失败则是 6）
   warden audit-verify               校验审计链是否完整（被动过则退出码 4）
   warden audit-export               导出审计记录（JSONL/CSV，带链字段，顺带校链）
   warden rotate-credentials         把存量凭证密文重加密到当前密钥（密钥轮换）
@@ -424,18 +425,38 @@ def _cmd_stuck(args: argparse.Namespace) -> None:
         older_than_seconds=args.older_than_min * 60.0,
         owner=args.owner or None,
     )
+    lost_alert = False
     if getattr(args, "notify", False):
-        # 把结论真正投递出去（webhook / Alertmanager 接收端）；未配通道则是空实现
+        # 把结论真正投递出去（webhook / Alertmanager 接收端）；未配通道则是空实现。
+        # 投递的**成败必须说出来**：以前这里只看“命中几个 Run”，于是未配通道（NullNotifier，
+        # send 恒 False）和 webhook 连不上时都照样打印「已投递告警」——值班的人以为有人被叫醒了，
+        # 实际一条都没出去（第五十六批）。
         from warden_agent.runtime.notify import notifier_from_env, notify_stuck
 
         notifier = notifier_from_env()
-        sent = notify_stuck(
+        outcome = notify_stuck(
             store, cp_store, notifier,
             older_than_seconds=args.older_than_min * 60.0,
             owner=args.owner or None,
         )
-        if sent:
-            print(f"已投递告警：{sent} 个 Run（通道 {type(notifier).__name__}）")
+        if outcome.found and outcome.delivered:
+            # `--json` 时 stdout 必须是**纯 JSON**（机器读），所以人话一律走 stderr；
+            # 非 --json 时两边都写（人只看 stdout，cron 两边都能收）
+            msg = f"已投递告警：{outcome.found} 个 Run（通道 {outcome.channel}）"
+            print(msg, file=sys.stderr)
+            if not args.json:
+                print(msg)
+        elif outcome.found:
+            lost_alert = True
+            why = (
+                "未配置告警通道（WARDEN_ALERT_WEBHOOK_URL 为空；空实现不发任何请求）"
+                if outcome.channel == "NullNotifier"
+                else "通道投递失败（webhook 返非 2xx / 连不上 / 超时；原因见日志 warning）"
+            )
+            msg = f"⚠️ 告警未投递：{outcome.found} 个 Run（通道 {outcome.channel}）——{why}"
+            print(msg, file=sys.stderr)
+            if not args.json:
+                print(msg)
     if args.json:
         print(json.dumps(
             [{"run_id": r.run_id, "status": r.status,
@@ -446,7 +467,8 @@ def _cmd_stuck(args: argparse.Namespace) -> None:
         print(describe_stuck(runs))
     # 有需要人工处理的就返回非 0，便于 cron/监控用退出码判断
     if runs:
-        raise SystemExit(3)
+        # 3 = 有人等着处理；6 = 有人等着处理**且**告警没送出去（比 3 更严重：值班不会知道）
+        raise SystemExit(6 if lost_alert else 3)
 
 
 def _cmd_audit_verify(args: argparse.Namespace) -> None:
@@ -824,7 +846,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stuck.add_argument("--db", default="", help="存档库路径（默认取 WARDEN_DB_PATH）")
     p_stuck.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_stuck.add_argument("--notify", action="store_true",
-                         help="同时投递告警到 WARDEN_ALERT_WEBHOOK_URL（未配则不投递）")
+                         help="同时投递告警到 WARDEN_ALERT_WEBHOOK_URL；未配则**明确报未投递**"
+                              "（退出码 6），不再显示成已投递")
     p_stuck.set_defaults(func=_cmd_stuck)
 
     p_audit = sub.add_parser("audit-verify", help="校验审计链是否完整（防篡改巡检）")

@@ -41,9 +41,33 @@ Run 进入 `WAITING_APPROVAL`（高危操作等审批）或 `WAITING_INTERACTION
 
 ### 怎么接告警
 
-```bash
-# 有输出即代表"有人需要处理"；退出码 3 便于 cron/监控判断
+```
 warden stuck --older-than-min 60          # 或 --json 给脚本消费
+warden stuck --older-than-min 60 --notify # 同时把告警投递到 WARDEN_ALERT_WEBHOOK_URL
+```
+
+#### `stuck` 的退出码（cron/监控只能靠它判断）
+
+| 退出码 | 含义 | 该做什么 |
+|---|---|---|
+| 0 | 没有等超时的 Run | 什么都不用做 |
+| 3 | 有 Run 等着人工处理（告警已送达，或本次没要 `--notify`） | 去处理那些 Run |
+| **6** | 有 Run 等着人工处理，**且告警没送出去** | 先修告警通道（通常比 3 更紧急：值班的人还不知情） |
+
+`--notify` 投递失败时**不会**再显示成“已投递”：会打一行
+`⚠️ 告警未投递：N 个 Run（通道 X）——<原因>`（`--json` 时这行只走 stderr，stdout 仍是纯 JSON），
+原因区分「未配通道（`WARDEN_ALERT_WEBHOOK_URL` 为空）」与「通道投递失败（非 2xx / 连不上 / 超时，详见日志 warning）」。
+
+所以惯用的 cron 判断写成：
+
+```bash
+warden stuck --older-than-min 60 --notify
+case $? in
+  0) : ;;                                            # 没有等超时的 Run
+  3) echo "有 Run 等人工处理（告警已送达）" ;;
+  6) echo "有 Run 等人工处理，且告警没送出去——先修通道" ;;
+  1) echo "命令本身失败了" ;;
+esac
 ```
 
 或抓 HTTP（认证模式下按归属收敛）：

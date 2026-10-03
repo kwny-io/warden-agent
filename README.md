@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-1653%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-1662%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -52,7 +52,7 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1657 项测试（2026-10-04 第五十五批实测两个口径：带真 PG **1653 passed / 4 skipped**；无 PG **1613 passed / 44 skipped**；两种口径都是 **0 failed / 0 errors**）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1657 项测试（2026-10-04 第五十六批实测两个口径：带真 PG **1662 passed / 4 skipped**；无 PG **1622 passed / 44 skipped**；两种口径都是 **0 failed / 0 errors**）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -540,7 +540,7 @@ python -m warden_agent.demo_e2e                                                 
 | 架构边界测试（`tests/`） | AST 校验模块依赖单向 | 已实现 |
 | **Run 级分布式锁（`runtime/locking.py`）** | 多副本下同一个 `run_id` 只被一方驱动（否则**后写覆盖前写**且不报错）。**租约式**（带 TTL）：持有者崩了不必人工解锁，到期即可被别的副本接管。取锁是单条原子 UPSERT，SQLite / PostgreSQL 都已验证；真库上做过 **8 个副本并发抢占、恰好一个赢家**的测试。自动恢复（`RecoveryWorker`）与 **HTTP 的对话/审批路径**都已接锁：抢不到回 **423** 让客户端重试，流式请求整段 SSE 走完才释放；`/capabilities` 会报出当前用的是哪种锁。**带后台心跳续租**（每 TTL/3 续一次），所以「单次驱动比 TTL 还长」也不会中途被接管；续租失败会报出来（不假装还持有） | 已实现 |
 | **审计链 / 密钥轮换 / 低延迟事件总线（第 6 项）** | ① **审计链（防篡改）**：每条落盘记录带 HMAC 链哈希（`prev_hash`→`hash`，覆盖内容+前驱+行号）——改字段/删中间行/重排都会断链；`warden audit-verify` 被动过则退出码 4。**必须配 `WARDEN_AUDIT_KEY`**：无密钥时挡不住「改完重算整链」（测试里有对照证明这一点）。② **凭证密钥轮换**：历史密钥只用于解密兜底 + `warden rotate-credentials` 把存量密文重加密（幂等；解不开的原样保留并报出，退出码 5）。③ **低延迟事件总线**：`WARDEN_EVENT_BUS=notify` 用 LISTEN/NOTIFY 唤醒，实测发布→唤醒 **47ms**（同场景轮询 110ms，最坏 250ms）；通知只是提示，丢了不丢事件 | 已实现 |
-| **运维面（`runtime/backup.py` · `runtime/alerting.py` · `docs/operations.md`）** | ① **挂起告警**：找出「等人工处理超时」的 Run（`warden stuck`，**退出码 3** 便于接 cron；`GET /alerts/stuck` 按归属收敛）——此前 Run 进了 `WAITING_APPROVAL` 就一直挂着、没人知道；② **备份/恢复**：`warden backup` / `warden restore`，SQLite 在线备份 API 做一致性快照 + 备份后立刻完整性校验 + 恢复默认拒绝覆盖（破坏性操作），**带恢复演练测试**；③ **运维手册**：巡检清单 / 告警接法 / 恢复顺序 / 升级回滚 / 多副本检查清单 / 已知边界表 | 已实现（**告警规则库 `deploy/observability/alerts/warden.rules.yml` + SLO `warden.slo.yml` + 灰度脚本 `scripts/canary_rollout.sh`** 都已存在）。⚠️ 交付面仍缺的是**发布工程本身**：0 tag / 0 release、发布与回滚流水线从未运行过；Prometheus 实集群未设 `retention`（SLO 用 `rate(...[30d])`）。见 `CHANGELOG.md` 「已知」块 |
+| **运维面（`runtime/backup.py` · `runtime/alerting.py` · `docs/operations.md`）** | ① **挂起告警**：找出「等人工处理超时」的 Run（`warden stuck`，**退出码 3** 便于接 cron，`--notify` 投递到 `WARDEN_ALERT_WEBHOOK_URL`；投递失败时**明说未投递**并给**退出码 6**，不再把“找到了几个 Run”显示成“已投递”；`GET /alerts/stuck` 按归属收敛）——此前 Run 进了 `WAITING_APPROVAL` 就一直挂着、没人知道；② **备份/恢复**：`warden backup` / `warden restore`，SQLite 在线备份 API 做一致性快照 + 备份后立刻完整性校验 + 恢复默认拒绝覆盖（破坏性操作），**带恢复演练测试**；③ **运维手册**：巡检清单 / 告警接法 / 恢复顺序 / 升级回滚 / 多副本检查清单 / 已知边界表 | 已实现（**告警规则库 `deploy/observability/alerts/warden.rules.yml` + SLO `warden.slo.yml` + 灰度脚本 `scripts/canary_rollout.sh`** 都已存在）。⚠️ 交付面仍缺的是**发布工程本身**：0 tag / 0 release、发布与回滚流水线从未运行过；Prometheus 实集群未设 `retention`（SLO 用 `rate(...[30d])`）。见 `CHANGELOG.md` 「已知」块 |
 | **配置面单一事实源（`core/settings.py`）** | 全部 **84 个环境变量**登记在一张表里（以 `ENV_SPECS` 为准）（用途 / 归属模块 / **允许读它的模块** / 默认值 / 是否敏感）；启动时**校验格式**（写错拒绝启动）+ **对拼错的 `WARDEN_*` 告警**；`tests/test_config_surface.py` 用 AST 强制「代码读的每个变量都已登记、且没被越权读」——**这条守卫实测能拦住同名两用**（把 `cli.py` 改成读模型的 `WARDEN_BASE_URL`，测试立刻红并指出越权模块）。守卫**还会解析模块级字符串常量**（`ENV_X = "WARDEN_X"` 再 `env_bool(ENV_X)`），所以"把变量名写成常量再传"绕不过去：原先的盲区（`web/server.py:627` 的 `env_bool(ENV_APPROVAL_ALLOW_SELF)`）**已封**——读取点随 `server.py` 拆分搬到 `web/http_kit.py`，登记表的 owner + consumers 同步改到新模块；并有回归 `tests/test_config_surface.py::test_本仓实际读到的审批逃生门已登记` 钉住"读取点搬走而登记表没跟着改"（拆分时它确实红过） | 已实现（读取仍各自 `env.get`，未统一改走类型化访问器） |
 | 工具稳定性层（`tool/stability.py`） | 超时护栏 / 指数退避 / 降级兜底 / 熔断；**已接线**：`build_agent` / `build_app` 均可传，产品入口默认开启（`WARDEN_STABILITY=0` 关）。按 `pure` 判定，非纯工具只对瞬时错误重试 | 已实现 |
 | 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏；**已接线且落库**：模型的 API Key 经 `CredentialBroker` 加密后写进 `credentials` 表（重启仍在），租约元数据写进 `credential_leases` 表（过期惰性清理），按调用者身份分作用域；`SecretRedactor` 对网关异常日志脱敏 | 已实现 |
@@ -588,13 +588,13 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**0 项失败**（共 1657 项收集，2026-10-04 第五十五批实测，`--junitxml` 口径）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
-  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1653 passed / 4 skipped / 0 failed / 0 errors**（452.3 秒）；
-  无 PG（**真把容器 `docker stop` 掉**即此口径）→ **1613 passed / 44 skipped / 0 failed / 0 errors**（463.7 秒；多跳的 40 条是需要真库的用例）。
+- **测试**：**0 项失败**（共 1666 项收集，2026-10-04 第五十六批实测，`--junitxml` 口径）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
+  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1662 passed / 4 skipped / 0 failed / 0 errors**（454.6 秒）；
+  无 PG（**真把容器 `docker stop` 掉**即此口径）→ **1622 passed / 44 skipped / 0 failed / 0 errors**（462.1 秒；多跳的 40 条是需要真库的用例）。
   ⚠️ 想让本地指标落到「无 PG 口径」有两种做法：`docker stop warden-pg-test`，或把 `WARDEN_TEST_PG_*` 里的端口指到一个没人监听的端口。**但这两种都别只凭“我设了环境变量”下结论——判口径永远看 `skipped` 是 4 还是 44。** 第五十二批在这里栽过：当时门控**不读端口**（只读 host/db/user/password），于是两次“双口径”其实**两次都是 PG 口径**（`skipped` 都是 4）；第五十二批把端口接上并加了守卫 `tests/test_config_surface.py::test_PG门控真的认环境变量里的端口`（子进程真探活，不是读源码文本）。
   时间账：449.8 秒 / 456.3 秒是同机同批实测；第五十三批同口径是 228.8 秒 / 226.3 秒——**这不是性能回归，是两次跑的东西不一样**：本批两次都带了 `--cov=warden_agent`（覆盖率收集把总时间大致翻倍），第五十三批那两次没带。再往前第五十二批是 732 秒 / 578 秒，同一批改动的第一轮 637 秒——**差异全在同期本机在跑别的命令**，所以这里只报实测，**不拿它当性能回归结论**。
   带真 PG 时剩下的 4 条跳过**全是平台/工具链限制、与 PG 无关**：本机 PATH 没 `pg_dump`/`pg_restore`（PG 备份端到端）、win32 建不了符号链接（2 条）、win32 无内核隔离原语；其余按环境跳过的还有未构建前端时的 SPA、无 node 时的 MCP。
-  覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：2026-10-04 第五十五批复测 **带真 PG 90.21% / 无 PG 86.96%**
+  覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：2026-10-04 第五十六批复测 **带真 PG 90.29% / 无 PG 87.05%**
   （语句 10607 / 分支 2646）——**两者都过闸，而无 PG 是最差情况、余量只剩 0.96 个点**；
   这与 `pyproject.toml` 里「门槛贴太近会变成噪声门禁」的取向对照着看：余量大的那边说明门禁还能再抬。
   跳过的测试会在没有 PG 时自动跳过、CI 保持绿；其余按环境跳过的还有：未构建前端时的 SPA、无 node 时的 MCP。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、**多租户越权拦截（含 403 不回显他人身份、审计/模型按调用者收敛）**、**patch 路径边界（防越出工作区）**、**幂等并发原子占位（409 而非重复执行）**、**入站限流**、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**凭证密钥托管（KMS/HSM 信封加密：env 与两条 provider 接入路径）**、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘 + 按 `owner` 归属隔离（换实例读同一库仍在、跨用户不可见）**、**真实联网抓取的 SSRF 防护（含重定向绕过）与出站限速/配额（全局、单 host、并发、日配额，含多副本共享与"策略先于限速"的顺序保证）**、**链路追踪（W3C traceparent 解析/生成/传播）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等

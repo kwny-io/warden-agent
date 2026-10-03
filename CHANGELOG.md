@@ -4,6 +4,91 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-04（第五十六批：`已投递告警` 是一句没有证据的话——未配通道、webhook 连不上，都算“已投递”）
+
+> 入口：继续挖第五十五批记下的「第九种来源」——**契约的执行权在调用方手里，而调用方不看**。
+> 上一批是前端 `usePolling` 的 `error`，这一批是同一件事在**运维侧**的模样：
+> `Notifier.send()` 返回 `bool`，而 `notify_stuck()` 把那个返回值**丢掉了**。
+
+### 一、现象（两次都能复现，判据是 stdout 原文，不是“我觉得”）
+
+```cmd
+warden stuck --db <库里有一个等审批超时的 Run> --older-than-min 0 --notify
+```
+
+| 复现 | 实际发生 | 它说的话 | 退出码 |
+|---|---|---|---|
+| A 未配 `WARDEN_ALERT_WEBHOOK_URL` | `NullNotifier.send()` 恒 `False`，不发任何请求 | `已投递告警：1 个 Run（通道 NullNotifier）` | 3 |
+| B webhook 指向不可达地址 | `httpx.ConnectError: [WinError 10061] 目标计算机积极拒绝` | `已投递告警：1 个 Run（通道 WebhookNotifier）` | 3 |
+
+两次退出码都是 3（文档里写的是「有人等着处理」），于是 cron/监控**无法区分**
+「已经把值班的人叫醒了」与「一条都没出去」。`--notify` 的设计意图（预警的最后一道兜底）
+在配置写错或漏配时**静默失效**，而日志看着一切正常——这是本仓库一直在消灾的那类「形同虚设」。
+
+### 二、根因
+
+1. `runtime/notify.py` 的 `notify_stuck()` 调了 `notifier.send(...)` 但**不用它的返回值**，
+   直接 `return len(runs)`，docstring 还写着“返回投递的 Run 数”——它返回的是**命中数**，那句话是假的。
+2. `cli.py` 的 `_cmd_stuck()` 于是只能写 `if sent:`——`sent` 是命中数，
+   分支名字叫“已投递”，实际语义是“找到了几个”。
+3. 失败信号本身是**齐备的**：`WebhookNotifier.send()` 返非 2xx / 异常都 `return False` 并 `logger.warning`；
+   问题只在**最后一公里**被丢掉（同第五十五批：“机制存在、返回值正确，只是没人看”）。
+
+### 三、改法（让失败响亮且可脚本判断）
+
+- `NotifyOutcome(found, delivered, channel)`（`@dataclass(frozen=True)`）：
+  把“命中多少 / **有没有真送出去** / 走的哪个通道”三个事实一起交回调用方；
+  `notify_stuck()` 改为返回它，docstring 同步改正。
+  **故意不定义 `__bool__`**——`if outcome:` 会立刻退化成“有命中就算成功”，那正是本 bug。
+- `cli.py`：投递成功 → `已投递告警：N 个 Run（通道 X）`；
+  没送出去 → `⚠️ 告警未投递：N 个 Run（通道 X）——<原因>`，且原因区分
+  「未配通道（`WARDEN_ALERT_WEBHOOK_URL` 为空）」与「通道投递失败（非 2xx/连不上/超时，见日志 warning）」。
+- **退出码**：`3` = 有人等着处理（已投递或未要求投递）；**`6` = 有人等着处理且告警没送出去**
+  （比 3 更严重：值班不会知道）。选 6 是因为 1/3/4/5 在 CLI 里各有分工（`_die` / `stuck` /
+  `audit-verify` / `rotate-credentials`），不复用。
+- **`--json` 的 stdout 必须是纯 JSON**：人话（不论成功失败）一律写到 stderr；
+  非 `--json` 时两边都写。这一条是写测试时**当场拦住我的**：
+  第一版只把“原因”挪到 stderr、却仍往 stdout 打一行 ⚠️，`json.loads(stdout)` 直接
+  `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`——两种输出口径打架，正是本批要消掉的那类 bug。
+
+### 四、守卫（每条都做过变异验证）
+
+`tests/test_notify.py`（+3）：`test_notify_stuck投递失败必须如实标未投递`（webhook 返 500）、
+`test_未配通道时命中也不等于已投递`（`NullNotifier`）、
+`test_outcome不能有真假值_必须显式看delivered`（结构约束：`__bool__`/`__len__` 都不许有）。
+
+`tests/test_cli_stuck_notify.py`（新文件，6 条，**真跑 `cli.main([...])`**，断言 stdout/stderr/退出码三件事）：
+未配通道 → 不说已投递 + 退出码 6 + stderr 点明“未配置”；通道返 False → 同上且**确实尝试过投递**；
+**反向控制**：真投递成功 → 必须说已投递 + 退出码 3 + 通道名对得上；
+`--json` 投递失败/成功两种情况下 stdout 都能 `json.loads`；没有命中时既不投递也不提“投递”二字 + 退出码 0。
+
+变异 A/B/C/D：A（`notify_stuck` 又声称已投递）→ **5 条红**；B（CLI 失败时静默）→ **3 条红**；
+C（退出码改回 3）→ **3 条红**；D（给 `NotifyOutcome` 加 `__bool__`）→ **1 条红**。
+每个靶子用完按字节恢复并校验 sha256（断言在脚本里，不靠眼看）。
+
+### 五、本批实测数字（2026-10-04）
+
+| 口径 | 收集 | 通过 | 失败 | 错误 | 跳过 | 耗时 | 覆盖率 |
+|---|---|---|---|---|---|---|---|
+| 真 PG（容器 `warden-pg-test`，与 CI 的 PG service 同口径） | 1666 | **1662** | 0 | 0 | 4 | 454.6s | **90.29%** |
+| 无 PG（**真把容器 `docker stop` 掉**再跑） | 1666 | **1622** | 0 | 0 | 44 | 462.1s | 87.05% |
+
+均 `--junitxml` 口径（`C:\tmp\report56_pg.xml` / `report56_nopg.xml`），两次都带 `--cov=warden_agent`
+（**不显式传 `--cov` 就没有覆盖率数字、也不跑 86% 门禁**——第五十四批被这个坑过）。
+收集数 1657 → **1666**（+9 = `tests/test_notify.py` 的 3 条 + `tests/test_cli_stuck_notify.py` 的 6 条），
+两个口径的通过数各自 +9，说明新守卫在两个口径下都真的跑了；两口径仍差 40 条（需真库那批）。
+覆盖率门槛 **86%**（`pyproject.toml` 的 `fail_under`），两边都过闸（语句 10624 / 分支 2652）。
+耗时仍比第五十一批（346 秒）大：本批两次都带 `--cov`（覆盖率插桩），**不是性能回退**。
+
+### 六、已知限制
+
+- `Notifier.send()` 的**布尔契约**本身没改（仍是“尽力而为、失败返 False、不抛”）——
+  本批只保证那个布尔不再被丢掉。**没有**重试、没有退避、没有告警去重/抑制（那是 Alertmanager 那层的事）。
+- 退出码 6 是**本批新增的契约**：老的 cron 脚本如果只判 `!= 0` 行为不变（6 也是非 0），
+  但只判 `== 3` 的脚本会漏报（那就属于脚本该改的部分，已在 `docs/operations.md` 写明）。
+- 未做：告警通道的**连通性预检**（`warden stuck --notify` 还是只有真投递才知道通道坏没坏）。
+
+---
 ## 2026-10-04（第五十五批：拉取失败时界面说的是「还没有对话」「加载中…」「暂无待审批」——**三句话都是假的，而且都不报错**）
 
 > 入口：翻 `docs/复核索引.md` §7 时先证伪了两个候选（k8s 探针端口名/端口覆盖、`PORT` 环境变量覆盖入口），
