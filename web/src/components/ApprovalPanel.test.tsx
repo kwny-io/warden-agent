@@ -36,6 +36,19 @@ describe("ApprovalPanel", () => {
     expect(screen.getByText(/run-1/)).toBeInTheDocument();
   });
 
+  it("/approvals 拉取失败：报错且**不**说「暂无待审批」（队列里也许有人等着批）", async () => {
+    vi.spyOn(api, "approvals").mockRejectedValue(new Error("503: 服务不可用"));
+    render(<ApprovalPanel />);
+    expect(await screen.findByText(/⚠️ 503: 服务不可用/)).toBeInTheDocument();
+    expect(screen.queryByText("（暂无待审批）")).toBeNull();
+  });
+
+  it("/approvals/history 拉取失败：说出来，而不是当成「从没审批过」", async () => {
+    vi.spyOn(api, "approvalHistory").mockRejectedValue(new Error("500: boom"));
+    render(<ApprovalPanel />);
+    expect(await screen.findByText(/审批历史加载失败：500: boom/)).toBeInTheDocument();
+  });
+
   it("队列为空时给出空态文案", async () => {
     vi.spyOn(api, "approvals").mockResolvedValue([]);
     render(<ApprovalPanel />);
@@ -106,12 +119,14 @@ describe("ApprovalPanel", () => {
     await waitFor(() => expect(window.alert).toHaveBeenCalledWith("409: 没有等待审批的记录"));
   });
 
-  it("轮询失败时在面板内显示错误，而不是整片白屏", async () => {
+  it("轮询失败时在面板内显示错误，而不是整片白屏；且不说「（暂无待审批）」", async () => {
     vi.spyOn(api, "approvals").mockRejectedValue(new Error("503: 服务不可用"));
     render(<ApprovalPanel />);
     expect(await screen.findByText(/503: 服务不可用/)).toBeInTheDocument();
-    // 失败时依然渲染空态骨架
-    expect(screen.getByText("（暂无待审批）")).toBeInTheDocument();
+    // 第五十五批改了这里：原先断言“失败时依然渲染空态骨架”，
+    // 而那句「（暂无待审批）」在拉取失败的那一刻是**假话**（队列里也许有人等着批）。
+    // “不白屏”由上面那条红字负责；空态只能在真的拉到了空列表时才说。
+    expect(screen.queryByText("（暂无待审批）")).toBeNull();
   });
 
   it("畸形审批数据（缺 run_id / reason / arguments）不会崩，仍能渲染", async () => {

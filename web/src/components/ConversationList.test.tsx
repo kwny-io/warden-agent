@@ -99,10 +99,59 @@ describe("ConversationList", () => {
     expect(await screen.findByText("weird")).toBeInTheDocument();
   });
 
-  it("/runs 返回的不是数组（如对象）：退化为空态，不崩在 .map 上", async () => {
+  it("/runs 返回的不是数组（如对象）：不崩在 .map 上，且说「不是数组」而不是「还没有对话」", async () => {
     vi.spyOn(api, "runs").mockResolvedValue({ oops: true } as unknown as RunInfo[]);
     setup();
-    expect(await screen.findByText("还没有对话")).toBeInTheDocument();
+    expect(await screen.findByText(/对话列表不是数组/)).toBeInTheDocument();
+    // 拉到了东西、只是形状不对：那就不是「没有对话」
+    expect(screen.queryByText("还没有对话")).toBeNull();
+  });
+
+  it("/runs 拉取失败：说「加载失败」+ 给重试，绝不说「还没有对话」", async () => {
+    vi.spyOn(api, "runs").mockRejectedValue(new Error("503: 服务不可用"));
+    setup();
+    expect(await screen.findByText(/加载对话列表失败：503: 服务不可用/)).toBeInTheDocument();
+    expect(screen.queryByText("还没有对话")).toBeNull();
+  });
+
+  it("拉取失败后点「重试」会再拉一次，成功就正常显示列表", async () => {
+    vi.spyOn(api, "runs")
+      .mockRejectedValueOnce(new Error("401: 密钥无效"))
+      .mockResolvedValue(runs);
+    setup();
+    await screen.findByText(/加载对话列表失败/);
+    await userEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("最近的对话")).toBeInTheDocument();
+    expect(screen.queryByText(/加载对话列表失败/)).toBeNull();
+  });
+
+  it("创建失败或删除失败时，界面得说出来", async () => {
+    vi.spyOn(api, "createRun").mockRejectedValue(new Error("400: 会话 ID 非法"));
+    const props = setup({ createOpen: true });
+    await screen.findByText("最近的对话");
+    await userEvent.type(screen.getByPlaceholderText("输入 USER_ID…"), "bad id");
+    await userEvent.click(screen.getByRole("button", { name: "创建" }));
+    expect(await screen.findByText(/创建失败：400: 会话 ID 非法/)).toBeInTheDocument();
+    expect(props.onCreateDone).not.toHaveBeenCalled();
+    expect(props.onSwitch).not.toHaveBeenCalled();
+  });
+
+  it("删除会话失败：说出原因，且不谎报已删（onDeleted 不被调）；顺手把「旧列表 + 拉取也挂了」的提示也验了", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    // 第一次拉取成功（先有旧数据），之后的刷新全部失败：这就是“后端挂了”的真实形状
+    vi.spyOn(api, "runs")
+      .mockResolvedValueOnce(runs)
+      .mockRejectedValue(new Error("500: boom"));
+    vi.spyOn(api, "deleteRun").mockRejectedValue(new Error("409: 会话正在运行"));
+    const props = setup();
+    await screen.findByText("最近的对话");
+    await userEvent.click(screen.getAllByTitle("删除对话")[0]!);
+    expect(await screen.findByText(/删除失败：409: 会话正在运行/)).toBeInTheDocument();
+    expect(props.onDeleted).not.toHaveBeenCalled();
+    // 删除失败后那次 refresh 也失败 → 横幅要说清楚“下面看到的是上一次的结果”
+    expect(await screen.findByText(/加载对话列表失败：500: boom/)).toBeInTheDocument();
+    expect(screen.getByText(/下面显示的是上一次的结果/)).toBeInTheDocument();
+    expect(screen.getByText("最近的对话")).toBeInTheDocument(); // 旧数据仍在，没被清掉
   });
 
   it("新建会话输入框有可访问名（不只靠 placeholder）", async () => {

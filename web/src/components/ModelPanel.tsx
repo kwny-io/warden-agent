@@ -8,7 +8,9 @@ import { usePolling } from "../lib/usePolling";
 import { api } from "../lib/api";
 
 export default function ModelPanel() {
-  const { data, refresh } = usePolling<ModelsInfo>((signal) => api.models({ signal }), 5000);
+  // 轮询错误必须接住：不接住时 /models 挂了会一直显示「加载中…」（转圈转到天荒，
+  // 而进度早就断了）——那也是一句假话。
+  const { data, error: loadError, refresh } = usePolling<ModelsInfo>((signal) => api.models({ signal }), 5000);
   const [keyFor, setKeyFor] = useState<string | null>(null); // 正在为哪个模型输入 Key
   const [keyValue, setKeyValue] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -57,8 +59,15 @@ export default function ModelPanel() {
         </p>
       )}
 
+      {loadError && (
+        <p className="text-xs text-warden-danger bg-warden-danger/10 rounded px-2 py-1 mb-2">
+          ⚠️ 加载模型列表失败：{loadError}
+          <button onClick={refresh} className="ml-2 underline">重试</button>
+        </p>
+      )}
+
       <div className="flex flex-col gap-1.5">
-        {models.length === 0 && <p className="text-xs text-warden-fg/40">加载中…</p>}
+        {models.length === 0 && !loadError && <p className="text-xs text-warden-fg/40">加载中…</p>}
         {models.map((m) => {
           const isCurrent = m.id === current;
           const showKeyInput = keyFor === m.id;

@@ -24,6 +24,25 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("ModelPanel", () => {
+  it("/models 拉取失败：说「加载失败」+ 重试，绝不一直显示「加载中…」（转圈也是假话）", async () => {
+    vi.spyOn(api, "models").mockRejectedValue(new Error("503: 网关不可用"));
+    render(<ModelPanel />);
+    expect(await screen.findByText(/加载模型列表失败：503: 网关不可用/)).toBeInTheDocument();
+    expect(screen.queryByText("加载中…")).toBeNull();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+  });
+
+  it("/models 拉取失败后点「重试」能恢复", async () => {
+    vi.spyOn(api, "models")
+      .mockRejectedValueOnce(new Error("500: boom"))
+      .mockResolvedValue(info);
+    render(<ModelPanel />);
+    await screen.findByText(/加载模型列表失败/);
+    await userEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("GPT-4o")).toBeInTheDocument();
+    expect(screen.queryByText(/加载模型列表失败/)).toBeNull();
+  });
+
   it("列出所有模型，当前模型标记「使用中」且不给切换按钮", async () => {
     render(<ModelPanel />);
     expect(await screen.findByText("GPT-4o")).toBeInTheDocument();

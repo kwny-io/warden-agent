@@ -7,6 +7,11 @@ import { toRunInfos } from "../lib/guards";
 import { usePolling } from "../lib/usePolling";
 import { api } from "../lib/api";
 
+/** 错误对象 → 一行能显示给人看的字 */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 const STATUS_DOT: Record<string, string> = {
   COMPLETED: "bg-warden-ok",
   WAITING_APPROVAL: "bg-warden-warn",
@@ -44,27 +49,37 @@ export default function ConversationList({
   onCreateDone: () => void;
   onDeleted: (deletedId: string, remaining: RunInfo[]) => void;
 }) {
-  const { data, refresh } = usePolling<RunInfo[]>(
+  // error 必须接住：拉取失败时 data 是 null（或上一次的旧值）。
+  // 不接住就会把「没拉到」显示成「还没有对话」——那是一句在那一刻为假的话。
+  const { data, error, refresh } = usePolling<RunInfo[]>(
     (signal) => api.runs(userId, { signal }),
     5000,
     userId, // 换账号立刻重拉并清空旧列表
   );
   // 畸形元素（缺 run_id / 非对象）由 toRunInfos 滤掉，不让 `r.run_id` 炸渲染
   const runs = toRunInfos(data);
+  // 拉取成功但形状不对（后端契约变了 / 网关兜底体）：这不是「没有对话」，得说出来
+  const shapeBad = data !== null && !Array.isArray(data);
   const [newId, setNewId] = useState("");
   const [busy, setBusy] = useState(false);
+  // 动作类失败（创建 / 删除）原来是静默的：catch 里 refresh 一下就完了，
+  // 用户点了没反应，只能怀疑自己没点中。
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // 创建会话：用用户输入的 ID 建档（幂等接口），成功后切换过去
   const create = async () => {
     const id = newId.trim();
     if (!id || busy) return;
     setBusy(true);
+    setActionError(null);
     try {
       await api.createRun(id);
       refresh();
       onSwitch(id);
       setNewId("");
       onCreateDone();
+    } catch (e) {
+      setActionError(`创建失败：${errText(e)}`);
     } finally {
       setBusy(false);
     }
@@ -73,12 +88,15 @@ export default function ConversationList({
   const remove = async (e: ReactMouseEvent, r: RunInfo) => {
     e.stopPropagation(); // 别触发切换会话
     if (!window.confirm(`删除对话「${r.title || r.run_id}」？记录不可恢复。`)) return;
+    setActionError(null);
     try {
       await api.deleteRun(r.run_id);
       refresh();
       const remaining = runs.filter((x) => x.run_id !== r.run_id);
       onDeleted(r.run_id, remaining);
-    } catch {
+    } catch (e) {
+      // 删不掉也说一声：原来静默 refresh 会让「删了还在」看起来像界面 bug
+      setActionError(`删除失败：${errText(e)}`);
       refresh();
     }
   };
@@ -102,6 +120,25 @@ export default function ConversationList({
             ⟨
           </button>
         </div>
+
+      {/* 拉取失败：唯一的错误出口（顶部横幅 + 可点的重试）。
+          有旧数据时额外说明“下面看到的不是最新的”，因为屏幕上那几行仍然是真的。 */}
+      {error && (
+        <p className="shrink-0 text-[11px] text-warden-danger bg-warden-danger/10 rounded px-2 py-1 flex items-start gap-1.5">
+          <span className="flex-1">
+            ⚠️ 加载对话列表失败：{error}
+            {runs.length > 0 && "（下面显示的是上一次的结果）"}
+          </span>
+          <button onClick={refresh} className="underline shrink-0">重试</button>
+        </p>
+      )}
+
+      {/* 创建 / 删除失败：不确定的话不能说“成功” */}
+      {actionError && (
+        <p className="shrink-0 text-[11px] text-warden-danger bg-warden-danger/10 rounded px-2 py-1">
+          ⚠️ {actionError}
+        </p>
+      )}
 
       <button
         onClick={onOpenCreate}
@@ -133,9 +170,14 @@ export default function ConversationList({
       )}
 
       <div className="flex-1 min-h-0 overflow-y-auto flex flex-col pr-0.5">
-        {runs.length === 0 && (
-          <p className="text-xs text-warden-fg/35 text-center mt-4">还没有对话</p>
-        )}
+        {runs.length === 0 &&
+          (shapeBad ? (
+            <p className="text-xs text-warden-danger text-center mt-4">
+              ⚠️ 后端返回的对话列表不是数组（契约变了？）
+            </p>
+          ) : error ? null : ( // 拉取失败时上面那条横幅已经说过了：这里绝不再说「还没有对话」
+            <p className="text-xs text-warden-fg/35 text-center mt-4">还没有对话</p>
+          ))}
           {runs.map((r) => {
             const active = r.run_id === activeRunId;
             return (

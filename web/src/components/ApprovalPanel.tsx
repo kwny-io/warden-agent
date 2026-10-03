@@ -13,8 +13,8 @@ export default function ApprovalPanel({ onDecided }: { onDecided?: () => void } 
     (signal) => api.approvals({ signal }),
     2000,
   );
-  // 审批决策历史（已批准/已拒绝），5s 轮询
-  const { data: history } = usePolling<ApprovalHistoryItem[]>(
+  // 审批决策历史（已批准/已拒绝），5s 轮询；error 也要接：拉不到历史不等于“从没审批过”
+  const { data: history, error: historyError } = usePolling<ApprovalHistoryItem[]>(
     (signal) => api.approvalHistory({ signal }),
     5000,
   );
@@ -48,7 +48,8 @@ export default function ApprovalPanel({ onDecided }: { onDecided?: () => void } 
       </h3>
       {error && <p className="text-xs text-warden-danger">⚠️ {error}</p>}
       {list.length === 0 ? (
-        <p className="text-xs text-warden-fg/50">（暂无待审批）</p>
+        // 拉取失败时上方已经有红字：这里不能再说「暂无待审批」（队列里也许有人等着批）
+        error ? null : <p className="text-xs text-warden-fg/50">（暂无待审批）</p>
       ) : (
         <ul className="flex flex-col gap-2">
           {list.map((a) => (
@@ -85,6 +86,9 @@ export default function ApprovalPanel({ onDecided }: { onDecided?: () => void } 
       )}
 
       {/* 决策历史：已批准 / 已拒绝的记录（最新在前，最多显示 5 条） */}
+      {historyError && (
+        <p className="text-xs text-warden-danger">⚠️ 审批历史加载失败：{historyError}</p>
+      )}
       {historyList.length > 0 && (
         <div className="mt-2 pt-2 border-t border-white/[0.06]">
           <p className="text-[11px] text-warden-fg/50 mb-1">最近决策</p>
