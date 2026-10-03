@@ -303,6 +303,27 @@ def test_main_SSE心跳负数拒绝启动(tmp_path: Path, monkeypatch) -> None:
     assert e.value.code == 2
 
 
+def test_main_模板里的占位符_真拒绝启动(tmp_path: Path, monkeypatch) -> None:
+    """端到端（真跑 `main()`）：把 `deploy/k8s/configmap.yaml` 里的**原值**放进环境，
+    进程必须 exit 2——而不是「启动成功、日志里说信任已开」。
+
+    这是第五十三批整批结论的**进程级**证据：占位符不只被 `validate_env` 拦下，
+    它真的会让服务起不来（`web/run_server.py:556-560` 的 `logger.error("配置错误：%s")`
+    + `raise SystemExit(2)`）⇒ 照着 `deploy/k8s/` 的模板值部署，pod 会 CrashLoopBackOff，
+    **不会**静默服务、也不会“看起来是绿的”。
+
+    测试与模板同源：那个字符串就是 `deploy/k8s/configmap.yaml` 里的当前值
+    （`tests/test_k8s_manifests.py::test_模板里的占位符必须过不了启动校验` 盯着它）。
+    """
+    _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_HOST", "127.0.0.1")
+    monkeypatch.setenv("WARDEN_TRUSTED_PROXIES", "REPLACE_ME-pod-cidr")
+
+    with pytest.raises(SystemExit) as e:
+        run_server.main()
+    assert e.value.code == 2
+
+
 def test_main_拼错的变量会告警_且告警指的路真能走通(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:

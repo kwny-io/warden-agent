@@ -4,6 +4,120 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-03（第五十三批：部署模板里的占位符**能穿过启动校验**——「日志说配了、机制没生效」）
+
+> 入口：第五十二批给 `deploy/k8s/` 补文档守卫时，顺手对着参考部署核了一遍取值。
+> `deploy/k8s/configmap.yaml` 里写着 `WARDEN_TRUSTED_PROXIES: "REPLACE_ME-pod-cidr"`——
+> 而它**穿过了启动校验**。占位符不是空值：空值会走「未配置」分支（启动日志会明说
+> 「不采信 X-Forwarded-For」），占位符会被当成**真实取值**一路用下去。
+
+### 一、失败模式：照着参考部署上线，第三十九批的成果会**静默退回**
+
+- 机制（两段合起来才是完整的）：
+  1. `core/settings.py::validate_env()` 只按**登记的类型**查格式，而 `proxies` 那一类
+     **故意**放行字面量（为了兼容 `unix:/path.sock` 这种写法）⇒ `REPLACE_ME-pod-cidr` 合法；
+  2. uvicorn 的 `_TrustedHosts` 对解析不出 IP 的项会当作**字面量**（它自己的注释就写着：
+     因为非法 IP 一律变字面量，「用户无法知道自己写错了」）⇒ 没有任何对端能匹配
+     ⇒ `X-Forwarded-For` 一律丢弃、`scope["client"]` 仍是 TCP 对端。
+- 后果：第三十九批刚修好的两件事（限流按调用者分桶、`Idempotency-Key` 不串响应体）
+  在**照着本仓库参考部署上线**时又退回去了；而启动日志还**声称信任已开**
+  （打印「受信前置代理: REPLACE_ME-pod-cidr（只采信来自它们的 X-Forwarded-For）」）。
+- 行为级证据：`tests/test_proxy_trust.py::test_占位符会让受信代理静默失效_所以必须fail_closed`——
+  真 `ProxyHeadersMiddleware` + 真值 `10.0.0.0/8` 时两个真实客户端各自一个限流桶（200/200）；
+  同一个请求头在占位符下**又塌成一个桶**（200/**429**）。
+- 这是本仓库第五种来源（接线处没有守卫）的又一个实例，但它更基础：
+  **占位符是「配置没填」的一个合法取值**，于是「没填」和「填了但没生效」在代码里长得一样。
+
+### 二、同一批发现的第二对：文档教的键名和 yaml 要的不是一个
+
+- `deploy/observability/servicemonitor.yaml:48` 的 `bearerTokenSecret.key` 要的是
+  `WARDEN_METRICS_BEARER`，而 `deploy/k8s/README.md` 教人写 `WARDEN_METRICS_TOKEN`——
+  **一个不存在于任何文件里的名字**（`secret.example.yaml:37` 里的键名其实是对的）。
+- 为什么没人发现：`tests/test_k8s_manifests.py` 已有「yaml 引用的 Secret 键必须真实存在」
+  （yaml ↔ yaml），但**「文档 ↔ yaml」这一对之前没有**；两边各自都不报错，
+  只有在真集群里才表现为 `/metrics` 401 ⇒ `up==0` ⇒ `WardenServiceDown` 打成长期 critical
+  ⇒ **真告警被淹没**，而且看起来像「服务挂了」而不是「名字写错了」。
+- 顺带查出一个「假告警源」：`WARDEN_METRICS_BEARER` 经 `envFrom: secretRef` 会进 pod 环境，
+  而应用**不读**它（读它的是 Prometheus 抓取端）⇒ `unknown_warden_variables()` 每个 pod 启动
+  都会告警「它不会生效——是不是拼错了？」，运维会去找一个并不存在的拼写错误；
+  而它真正的取值问题（留了占位符）反而没人看。
+
+### 三、改法（三件）
+
+1. **占位符在启动校验里统一判错，且与变量类型无关**：`_PLACEHOLDER_RE =
+   re.compile(r"replace[ _-]?me", re.IGNORECASE)`，命中即报错（不止修正 `proxies` 一个变量——
+   那样只是留下下一个漏的：`WARDEN_ADMIN_PRINCIPALS` 会变成「配了但没有管理员」、
+   `WARDEN_PG_HOST` 连不上库）。报错**说清后果**而不只说「格式不对」，敏感变量**打码**。
+2. **新增 `_EXTERNAL_ENV_KEYS`（已声明、但由部署里别的组件读的键）**：
+   `WARDEN_METRICS_BEARER` → 「由 ServiceMonitor 从同一个 Secret 读取（应用本身不读）」。
+   三条语义写在同一处注释里：① 不再算拼写错误（`unknown_warden_variables`）；
+   ② **仍然**受占位符检查约束（「给别的组件读」不代表留占位符就无所谓）；
+   ③ **不**登记进 `ENV_SPECS`——「登记了却没人读」是本仓库正在消灭的另一个形状。
+   导出 `external_env_names()`，文档守卫据此放行。
+3. **文档改正**：k8s README 的键名改成 `WARDEN_METRICS_BEARER` 并写明「写成别的名字会让抓取 401」；
+   备份保留口径写明是「**最新 14 份**」不是「14 天」（`backup-cronjob.yaml` 显式否掉了 `-mtime`）。
+
+### 四、守卫（全部做过变异验证：删掉机制即红）
+
+| 文件 | 守卫 | 变异（应红） |
+|---|---|---|
+| `tests/test_config_surface.py` | `test_占位符会被启动校验判错`、`test_占位符的各种写法都认`(4 种写法)、`test_占位符判定与变量类型无关`、`test_真值里包含replace字样不会被误伤`、`test_占位符报错不会泄露敏感值` | 去掉 `validate_env` 里的占位符分支 → **红** ✅ |
+| 同上 | `test_部署组件读的变量不算拼写错误`（且真拼错仍被抓）、`test_部署组件读的变量仍然受占位符检查`、`test_部署组件读的变量不登记进ENV_SPECS` | 去掉 `unknown_warden_variables` 的豁免 → **红** ✅；去掉 external 占位符循环 → **红** ✅ |
+| `tests/test_k8s_manifests.py` | `test_模板里的占位符必须过不了启动校验`（真跑 `validate_env`）、`test_占位符键都在部署文档里被点名`、`test_ServiceMonitor要的Secret键必须被部署文档点名`、`test_备份保留份数在文档与脚本里同源`（新增「`N 天` 只允许出现在被否定的语境里」） | 文档写回「14 天保留」→ **红** ✅；文档把键名换成错的 → **红** ✅ |
+| `tests/test_proxy_trust.py` | `test_占位符会让受信代理静默失效_所以必须fail_closed`（真 uvicorn 中间件：真值对照 + 占位符塌成一个桶 + 并断言它现在过不了启动校验） | 占位符判据失效 → 红（同上第一条） |
+| `tests/test_run_server_main.py` | `test_main_模板里的占位符_真拒绝启动`（**进程级**端到端：把 `configmap.yaml` 里的原值放进环境、真跑 `main()`，必须 `SystemExit(2)`）| 去掉占位符分支 → **红** ✅ |
+
+变异脚本：`C:/Users/g1534/AppData/Local/Temp/mut53.py`（6 个变异，6/6 红，跑完自动还原并复核基线全绿）。
+
+进程级证据为什么单独拿出来写：`src/warden_agent/web/run_server.py:556-560` 是 `env_errors = validate_env(os.environ)`
+→ `logger.error("配置错误：%s", message)` → `raise SystemExit(2)`。
+⇒ 照着 `deploy/k8s/` 的模板值部署，pod 是 **CrashLoopBackOff**，不是「静默服务」。
+
+> 顺手被守卫抓到的一条（真失败，不是环境问题）：把扫描范围扩到 `deploy/**/*.md` 后，
+> 我在 `docs/复核索引.md` 里新写的那行「文档曾教人写 `WARDEN_METRICS_TOKEN`」
+> **当场被现有守卫 `test_config_surface.py::test_文档提到的环境变量都已登记` 拦下**——
+> 它扫 `README.md` + `docs/**/*.md`，看到文档里出现一个既未登记、也不在放行名单的名字。
+> 处置：这个反例名字进 `_DOC_ONLY_NAMES` 并写明理由（与 `WARDEN_SKIP_DOTENV` / `WARDEN_STORE`
+> 两条既有先例一致：「文档写它恰恰是为了记录它从未存在过」）；真正拦住
+> 「README 把 Secret 键写成它」的仍是 `test_ServiceMonitor要的Secret键必须被部署文档点名`（变异 M5）。
+
+### 五、已知限制 / 证据等级（别说过头）
+
+- **k8s 清单仍然没有在真集群里 apply 过**（与第五十二批同一处欠账）：本机有一个 kind 节点容器
+  `warden-control-plane`（状态 running，镜像 `kindest/node:v1.31.0`），但 kubeconfig 指的 API 端点
+  `https://127.0.0.1:58583` **拒连**（container 未发布端口/stale），且 `~/.kube/config` 的读取
+  被环境安全策略拦下。⇒ 本批证据等级 = **离线结构守卫 + 一个真中间件的行级行为测试**，
+  不等于「在集群里验证过」。真要 apply 还缺：CRD（`PrometheusRule`/`ServiceMonitor`）是否安装、
+  `release` 标签能否被 `ruleSelector` 选中、镜像从哪来（本地无 `ghcr.io/kwny-io/...` 镜像）。
+- 占位符判据是**模式**而非「含 replace 字样」：真值 `pg-replaces.internal` 不误伤（有用例钉住）。
+- 敏感变量的占位符报错**不带取值**（只说「已打码」），所以线上排查时看不到「占位符长什么样」——
+  这是刻意取舍（日志是泄露渠道）。
+
+### 六、实测数字（两个口径都真跑了一遍）
+
+| 口径 | 收集 | 通过 | 失败 | 错误 | 跳过 | 时间 | junit 产物 |
+|---|---|---|---|---|---|---|---|
+| 带真 PG（容器 `warden-pg-test`，与 CI 的 PG service 同口径） | 1649 | **1645** | 0 | 0 | 4 | 228.8 秒 | `C:\tmp\report53_pg.xml` |
+| 无 PG（**真把容器 `docker stop` 掉**再跑） | 1649 | **1605** | 0 | 0 | 44 | 226.3 秒 | `C:\tmp\report53_nopg.xml` |
+
+- 收集数 1632 → **1649**（+17 条新守卫）；两个口径差 **40 条**（就是需要真库的那一批，无 PG 时跳过）——**不是回退**。
+- 带真 PG 时剩下的 4 条跳过**全是平台/工具链限制**：本机 PATH 没 `pg_dump`/`pg_restore`（PG 备份端到端）、
+  win32 建不了符号链接（2 条）、win32 无内核隔离原语。
+- 时间账：这两次（228.8 秒 / 226.3 秒）比第五十二批同口径（732 秒 / 578 秒）**低**；
+  差异全在“同期本机在跑别的命令” ⇒ **两次都只报实测，不做性能结论**。
+- 静态检查：`uv run --frozen ruff check deploy tests src scripts` 全绿。
+- 判口径永远看 **`skipped` 是 4 还是 44**，不看自己设了什么环境变量（第五十二批的教训）。
+- 两条命令（在任何能跑 `docker` 的机器上可复现）：
+  `docker start warden-pg-test` → 跑套件 = PG 口径；`docker stop warden-pg-test` → 同一命令 = 无 PG 口径。
+
+> 本批跑全量时报过一次 `1 failed, 1644 passed`，**是真失败、不是环境问题**：
+> 把扫描范围扩到 `deploy/**/*.md` 后，我在 `docs/复核索引.md` 里新写的
+> 「文档曾教人写 `WARDEN_METRICS_TOKEN`」那行被现有守卫 `test_文档提到的环境变量都已登记` 拍下。
+> 处置：反例名字进 `_DOC_ONLY_NAMES`（与 `WARDEN_SKIP_DOTENV` / `WARDEN_STORE` 两条先例一致）。
+> 另一条纪律：**全量套件在跑的时候不要改 `docs/**` / `README.md` / `src/` / `tests/`**——
+> 守卫是运行期读文件，中途改会污染那一刻的结论（本批第一轮 1644 passed 的产物就是因此作废重跑的）。
+
+---
 ## 2026-10-03（第五十二批：抓取接上了，**告警从没接线**——Operator 路径上少了一段）
 
 > 入口是 `docs/复核索引.md` §7 自己那条欠账行「Prometheus `retention=35d` 实值」。
@@ -124,6 +238,8 @@
 - 静态检查：`uv run --frozen ruff check deploy tests src scripts` 全绿。
 - 这两个数字是在**端口接线修复之前**跑出来的；那两次都没设那个端口变量，
   所以修复不会改变这两个数字（产物留在 `C:\tmp\report52_pg.xml` / `report52_nopg2.xml` 里可查）。
+- ⚠️ 后续批次已重测：第五十三批同口径为 **1649 收集 / 1645 passed（PG）/ 1605 passed（无 PG）**，
+  见本文件第五十三批 §六。本节的 1632/1628/1588 是**当时**的值，保留做对比，**不要当成现状**。
 
 **本批踩的两个坑（都不是产品缺陷，但会直接把结论搞错）**：
 

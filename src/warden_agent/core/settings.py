@@ -9,6 +9,12 @@
      **服务端的鉴权密钥**发给那个第三方网关。
      `WARDEN_BASE_URL` 同理：CLI 的服务地址 vs custom 模型的端点 → `warden chat` 发错地方。
   2. **拼错静默忽略**：`WARDEN_RATE_LIMIT` 写成 `WARDEN_RATELIMIT` 不报错，悄悄用默认值。
+  3. **占位符静默生效**（第五十三批补）：`deploy/k8s/configmap.yaml` 带着 `REPLACE_ME-pod-cidr`
+     这种占位符上线时，它**不是空值**——空值走默认分支，占位符会被当成真实取值一路用下去。
+     最贵的一例：`WARDEN_TRUSTED_PROXIES=REPLACE_ME-pod-cidr` 会让 uvicorn 把非法 IP
+     当字面量（它自己的源码注释就写着"用户无法知道自己写错了"）⇒ 没有任何对端能匹配
+     ⇒ `X-Forwarded-For` 静默丢弃，而启动日志还在说"受信前置代理: …（只采信来自它们的 XFF）"。
+     所以占位符在启动校验里直接判错（fail-closed，与鉴权同一取向）。
 
   这两类问题的共同根因是"**没有一份声明**"。所以本模块提供：
     - `ENV_SPECS`：每个变量的登记（用途 / 归属模块 / **允许读它的模块** / 默认值 / 是否敏感）；
@@ -32,6 +38,13 @@ from dataclasses import dataclass, field
 
 # 「次数/窗口秒数」形式（限流/速率类配置），例如 600/60、120/60、0
 _RATE_RE = re.compile(r"^\s*\d+\s*/\s*\d+\s*$")
+
+# 部署模板里的占位符（`deploy/k8s/*.yaml`、`secret.example.yaml` 一律用 `REPLACE_ME[-_]…`）。
+# 这是一类**特殊的错值**：看起来"填了"，其实没填。它比空值更危险——空值会走"未配置"分支，
+# 占位符会被当成真实取值一路用下去（最贵的一例见模块 docstring 第 3 条：
+# `WARDEN_TRUSTED_PROXIES=REPLACE_ME-pod-cidr` ⇒ XFF 静默丢弃 + 日志声称已配置）。
+# 变体一起认：`REPLACE_ME` / `replace_me` / `replace-me` / `REPLACEME`。
+_PLACEHOLDER_RE = re.compile(r"replace[ _-]?me", re.IGNORECASE)
 # 布尔型开关的接受取值（其余一律视为"写错了"——避免 silent 忽略）
 _BOOL_ON = frozenset({"1", "true", "yes", "on"})
 _BOOL_OFF = frozenset({"", "0", "false", "no", "off"})
@@ -621,10 +634,15 @@ def _is_truthy(value: str) -> bool:
 
 
 def validate_env(env: Mapping[str, str]) -> list[str]:
-    """启动时校验已登记变量的**格式**。返回错误清单（空 = 通过）。
+    """启动时校验已登记变量的**格式**（返回空 = 通过）。
 
-    只查格式，不查"该不该设"（那是各模块自己的语义，例如鉴权 fail-closed 在 `resolve_auth`）。
-    格式写错就该在启动时暴露，而不是悄悄按默认值跑——这跟"鉴权 fail-closed"是同一个取向。
+    只查格式与"是不是还没填"，不查"该不该设"（那是各模块自己的语义，例如鉴权 fail-closed
+    在 `resolve_auth`）。格式写错就该在启动时暴露，而不是悄悄按默认值跑——这跟"鉴权
+    fail-closed"是同一个取向。
+
+    占位符（`REPLACE_ME…`）在这一层统一判错，且**与变量类型无关**：它是"部署模板忘了
+    替换"这件事的专用判据，只修某一个变量等于留下一个漏的（`WARDEN_TRUSTED_PROXIES` 静默
+    丢 XFF、`WARDEN_ADMIN_PRINCIPALS` 变成"配了但没有管理员"、`WARDEN_PG_HOST` 连不上库）。
     """
     errors: list[str] = []
     for spec in ENV_SPECS:
@@ -632,9 +650,31 @@ def validate_env(env: Mapping[str, str]) -> list[str]:
         if raw is None or raw == "":
             continue
         value = raw.strip()
+        if _PLACEHOLDER_RE.search(value):
+            errors.append(
+                f"{spec.name} 还是部署模板里的占位符：{spec.masked(raw)}。"
+                "占位符**不是空值**：空值会走「未配置」分支，占位符会被当成真实取值用下去，"
+                "于是表现成「日志说配了、机制没生效」。请换成真实取值，或整行删掉。"
+                "（例：WARDEN_TRUSTED_PROXIES 留着占位符时，X-Forwarded-For 会被静默丢弃，"
+                "限流按调用者分桶又塌成一个桶、Idempotency-Key 可跳调用者串响应体。）"
+            )
+            continue
         problem = _format_problem(spec, value, raw)
         if problem:
             errors.append(problem)
+    # 已声明但不登记的键（见 `_EXTERNAL_ENV_KEYS`）：只受占位符检查约束——
+    # 「给别的组件读」不代表留占位符就无所谓：`/metrics` 抓取认证失败会让
+    # `up==0` 把 WardenServiceDown 打成长期 critical，真正该报的告警被淹没。
+    for name in sorted(_EXTERNAL_ENV_KEYS):
+        raw = env.get(name)
+        if raw is None or raw == "":
+            continue
+        if _PLACEHOLDER_RE.search(raw.strip()):
+            errors.append(
+                f"{name} 还是部署模板里的占位符（值已打码）。它{_EXTERNAL_ENV_KEYS[name]}，"
+                "留占位符会让 Prometheus 抓取认证失败（`/metrics` 401 ⇒ `up==0` ⇒ "
+                "WardenServiceDown 打成长期 critical）。请换成真实取值，或整行删掉。"
+            )
     return errors
 
 
@@ -671,6 +711,10 @@ def _format_problem(spec: EnvSpec, value: str, raw: str) -> str | None:
 
 def _proxies_problem(value: str) -> str | None:
     """检查 `WARDEN_TRUSTED_PROXIES` 的每一项，返回第一处问题的描述（None = 通过）。
+
+    ⚠️ 占位符（`REPLACE_ME…`）不在这里判——那是"部署模板没替换"的通用判据，在
+    `validate_env` 里对**所有**变量统一判（见 `_PLACEHOLDER_RE`）。这里的 `_looks_like_ip`
+    只为区分"IP 写错一位"与"刻意写的字面量（unix socket 名）"。
 
     做这层检查是因为 uvicorn 自己的解析器**格式错也静默**（非法 IP 会被当成普通字面量，
     见 `uvicorn/middleware/proxy_headers.py` 里 `_TrustedHosts` 的注释），于是"网段写错一位"
@@ -719,6 +763,26 @@ _K8S_SERVICE_ENV_RE = re.compile(
     r"|PORT|PORT_[0-9]+_TCP(?:_ADDR|_PORT|_PROTO)?)$"
 )
 
+# 已声明、但**应用自己不读**的环境变量（第五十三批）。
+#
+# 它们必须与「拼写错误」区分开：`deploy/k8s/secret.example.yaml` 的 `WARDEN_METRICS_BEARER`
+# 经 `envFrom: secretRef` 会进 pod 环境，而读它的是 **ServiceMonitor**
+# （`deploy/observability/servicemonitor.yaml` 的 `bearerTokenSecret.key`——由 Prometheus
+# 的抓取端从同一个 Secret 里取）。不声明的话，每个 pod 启动都会告警
+# 「它不会生效——是不是拼错了？」，运维会去找一个并不存在的拼写错误；而值本身的问题
+# （留了占位符）反而没人看。声明在这里的键：
+#   ① 不再被当成拼写错误（`unknown_warden_variables`）；
+#   ② **仍然**受启动校验的占位符检查约束（留占位符 = 抓取 401 = `up==0`）；
+#   ③ 不登记进 `ENV_SPECS`——「登记了却没人读」是本仓库正在消灭的另一个形状。
+_EXTERNAL_ENV_KEYS: dict[str, str] = {
+    "WARDEN_METRICS_BEARER": "由 ServiceMonitor 从同一个 Secret 读取（应用本身不读）",
+}
+
+
+def external_env_names() -> frozenset[str]:
+    """已声明、但由**部署里的其它组件**消费的变量名（见 `_EXTERNAL_ENV_KEYS`）。"""
+    return frozenset(_EXTERNAL_ENV_KEYS)
+
 
 def unknown_warden_variables(env: Mapping[str, str]) -> list[str]:
     """找出"看起来是我们家的、但没登记"的变量名——**拼写错误检测**。
@@ -733,6 +797,9 @@ def unknown_warden_variables(env: Mapping[str, str]) -> list[str]:
             continue
         # k8s 注入的服务发现变量不是拼写错误（见 _K8S_SERVICE_ENV_RE）
         if _K8S_SERVICE_ENV_RE.search(name):
+            continue
+        # 已声明、但由部署里别的组件读的变量也不是拼写错误（见 _EXTERNAL_ENV_KEYS）
+        if name in _EXTERNAL_ENV_KEYS:
             continue
         # 未登记的 WARDEN_* 一律可疑（本项目的 WARDEN_ 前缀都被登记完了）
         suspects.append(name)

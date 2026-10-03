@@ -56,6 +56,7 @@ import pytest
 from warden_agent.core.settings import (
     ENV_SPECS,
     describe,
+    external_env_names,
     registered_env_names,
     unknown_warden_variables,
     validate_env,
@@ -243,8 +244,30 @@ _DOC_ONLY_NAMES: dict[str, str] = {
     # 同上：第四十八批的启动探针**自己发明**了这个名字（服务没凭据时 fail-closed，
     # 探针拿一个自造变量名去测，于是"没看到日志"成了假象）。文档写它同样是为了记录这个坑。
     "WARDEN_STORE": "`docs/复核索引.md` 用它记录探针自造变量名的坑（从未存在过）",
+    # 第五十三批补（顺手抓到的回归）：变量本身是真的，但它属于**测试脚手架**——
+    # `tests/test_postgres_integration.py::_pg_params()` 读它，
+    # `src/` 里没有任何地方读 ⇒ 登记进 `ENV_SPECS` 会立刻撞上「登记了没人读」那条守卫。
+    "WARDEN_TEST_PG_PORT": "测试脚手架旋钮（PG 门控端口，只在 tests/ 里读），故意不进产品注册表",
+    # 第五十三批补（同批另一条）：
+    # 本批把扫描范围扩到 `deploy/**/*.md`，**先拍到了我自己刚写下的文档行**——
+    # `docs/复核索引.md` 在记录“文档曾教人写错键名”时，必须把那个错名字写出来。
+    # 它不是变量、也不该被“登记”，但也不等于“可以当真名用”：
+    # 真正拦住“README 把 Secret 键写成它”的是 `tests/test_k8s_manifests.py`
+    # 的 `test_ServiceMonitor要的Secret键必须被部署文档点名`（变异 M5：换成它 → 红）。
+    "WARDEN_METRICS_TOKEN": (
+        "反例名（真名 `WARDEN_METRICS_BEARER`）："
+        "CHANGELOG/复核索引记录“文档曾教人写它”时要写出来"
+    ),
 }
-_DOC_GLOBS = ("README.md", "docs/**/*.md")
+_DOC_GLOBS = ("README.md", "docs/**/*.md", "deploy/**/*.md")
+# 第五十三批把 `deploy/**/*.md` 也纳进来：部署文档同样会点名变量（它甚至比 README 更接近
+# "照者它就能配上"这个场景），而扫描范围漏了它 ⇒ `deploy/k8s/README.md` 里把 Secret 键写成
+# `WARDEN_METRICS_TOKEN`（真实键名是 `WARDEN_METRICS_BEARER`，见 `secret.example.yaml:37`
+# 与 `deploy/observability/servicemonitor.yaml:48`）一直没被拍。
+# 后果不是"名字写错"这么轻：操作者照文档往 Secret 里写 `WARDEN_METRICS_TOKEN`，
+# 而 ServiceMonitor 要的是 `WARDEN_METRICS_BEARER` ⇒ 抓取 401 ⇒ `up{job=…}==0`
+# 把 WardenServiceDown 打成长期 critical，**真正的告警反而被淹没**（就是 D-B4 那个后果，
+# 只不辇 yaml 那对已有守卫、"文档–yaml"这对没有）。
 _DOC_TOKEN = re.compile(r"WARDEN_[A-Z0-9_]+\*?")
 
 
@@ -264,8 +287,13 @@ def _doc_mentions() -> dict[str, set[str]]:
 
 
 def test_文档提到的环境变量都已登记() -> None:
-    """文档说"可调"的旋钮，登记表里必须真有——否则就是一句空承诺。"""
-    registered = registered_env_names()
+    """文档说"可调"的旋钮，登记表里必须真有——否则就是一句空承诺。
+
+    例外（第五十三批）：`external_env_names()` 里的名字是**已声明、但由部署里别的组件读**
+    （`WARDEN_METRICS_BEARER` → ServiceMonitor 的 `bearerTokenSecret`）。它们**必须**出现在
+    部署文档里（不然运维填不完 Secret），但不该进 `ENV_SPECS`——那会变成「登记了却没人读」。
+    """
+    registered = registered_env_names() | external_env_names()
     unknown = {
         name: sorted(where)
         for name, where in _doc_mentions().items()
@@ -363,6 +391,100 @@ def test_合法配置不报错() -> None:
         "PORT": "8000",
     }
     assert validate_env(ok) == []
+
+
+# ---------- 第五十三批：占位符是一类特殊的错值 ----------
+#
+# 为什么不是「小事」：占位符**不是空值**。空值会走「未配置」分支（例如没配
+# `WARDEN_TRUSTED_PROXIES` 就不传 `forwarded_allow_ips`、启动日志也会明说「不采信 XFF」）；
+# 而占位符会被当成**真实取值**一路用下去，于是表现成「日志说配了、机制没生效」。
+# 行为级证据见 `tests/test_proxy_trust.py` 里那条「占位符会让受信代理静默失效」的用例。
+
+
+def test_占位符会被启动校验判错() -> None:
+    """实测过的那一个：`deploy/k8s/configmap.yaml` 就写着这个值。"""
+    errors = validate_env({"WARDEN_TRUSTED_PROXIES": "REPLACE_ME-pod-cidr"})
+    assert len(errors) == 1, errors
+    assert "WARDEN_TRUSTED_PROXIES" in errors[0] and "占位符" in errors[0], errors[0]
+    # 报错要把真实取值展示出来（这个变量不敏感），否则运维不知道是哪个值没用
+    assert "REPLACE_ME-pod-cidr" in errors[0]
+    # 并且要说清后果，而不是只说「格式不对」
+    assert "X-Forwarded-For" in errors[0]
+
+
+@pytest.mark.parametrize("value", ["REPLACE_ME", "replace_me-1", "Replace-Me", "REPLACEME"])
+def test_占位符的各种写法都认(value: str) -> None:
+    """只认一种写法 = 留下一个漏的（模板里的写法本身就有变体）。"""
+    assert validate_env({"WARDEN_PG_HOST": value}), f"{value!r} 没被判错"
+
+
+def test_占位符判定与变量类型无关() -> None:
+    """只修 `proxies` 那一个变量等于留下下一个漏的：
+    `WARDEN_ADMIN_PRINCIPALS` 变成「配了但没有管理员」、`WARDEN_PG_HOST` 连不上库。
+    """
+    for key, value in [
+        ("WARDEN_PG_HOST", "REPLACE_ME-pg-host"),  # str
+        ("WARDEN_ADMIN_PRINCIPALS", "REPLACE_ME-ops-user"),  # str
+        ("WARDEN_TENANT", "REPLACE_ME-tenant"),  # str
+        ("WARDEN_AUDIT", "REPLACE_ME"),  # bool
+        ("WARDEN_RATE_LIMIT", "REPLACE_ME"),  # rate
+    ]:
+        errors = validate_env({key: value})
+        assert errors and "占位符" in errors[0], (key, value, errors)
+
+
+def test_真值里包含replace字样不会被误伤() -> None:
+    """逃生舱：判据是 `replace-me` 这种**占位符形状**，不是「含 replace 就报错」。"""
+    ok = {
+        "WARDEN_PG_HOST": "pg-replaces.internal",
+        "WARDEN_TRUSTED_PROXIES": "10.0.0.0/8",
+        "WARDEN_TENANT": "acme",
+    }
+    assert validate_env(ok) == []
+
+
+def test_占位符报错不会泄露敏感值() -> None:
+    """敏感变量的报错必须打码（与其它格式错误同一口径）——否则日志会多一条泄露渠道。"""
+    errors = validate_env({"WARDEN_CREDENTIAL_KEY": "REPLACE_ME"})
+    assert errors, "敏感变量上的占位符也必须判错"
+    assert "REPLACE_ME" not in errors[0] and "已打码" in errors[0], errors[0]
+
+
+# ---------- 第五十三批：应用不读、但部署里别的组件要读的变量 ----------
+
+
+def test_部署组件读的变量不算拼写错误() -> None:
+    """`envFrom: secretRef` 会把 `WARDEN_METRICS_BEARER` 也放进 pod 环境，而应用不读它
+    （读它的是 ServiceMonitor 的 `bearerTokenSecret`）。不豁免的话，每个 pod 启动都会
+    告警「它不会生效——是不是拼错了？」，运维会去找一个并不存在的拼写错误。
+    """
+    assert "WARDEN_METRICS_BEARER" in external_env_names()
+    assert unknown_warden_variables({"WARDEN_METRICS_BEARER": "sk-x"}) == []
+    # 豁免不能顺便把真的拼写错误放过
+    assert unknown_warden_variables({"WARDEN_METRICS_BEARERR": "sk-x"}) == [
+        "WARDEN_METRICS_BEARERR"
+    ]
+
+
+def test_部署组件读的变量仍然受占位符检查() -> None:
+    """豁免的只是「拼写错误」这一条判断：值本身是占位符照样要拦。
+
+    `deploy/k8s/secret.example.yaml:37` 就写着 `WARDEN_METRICS_BEARER: "REPLACE_ME"`——
+    如果这条不管，抓取会 401、`up==0`，把 WardenServiceDown 打成长期 critical。
+    同时敏感值不得出现在报错里。
+    """
+    errors = validate_env({"WARDEN_METRICS_BEARER": "REPLACE_ME"})
+    assert len(errors) == 1, errors
+    assert "WARDEN_METRICS_BEARER" in errors[0] and "占位符" in errors[0], errors[0]
+    assert "REPLACE_ME" not in errors[0] and "已打码" in errors[0], errors[0]
+
+
+def test_部署组件读的变量不登记进ENV_SPECS() -> None:
+    """它不能进 ENV_SPECS：那会变成「登记了却没人读」——本仓库正在消灭的另一个形状。
+
+    登记表 = 「应用会读的旋钮」；它只受 `_EXTERNAL_ENV_KEYS` 声明（见那里的三条说明）。
+    """
+    assert "WARDEN_METRICS_BEARER" not in registered_env_names()
 
 
 def test_拼错的WARDEN变量会被识别出来() -> None:

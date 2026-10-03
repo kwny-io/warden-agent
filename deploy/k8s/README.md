@@ -25,13 +25,13 @@
 | `serviceaccount.yaml` | ServiceAccount `warden-agent`（**必须 apply**：deployment / migrate-job / backup-cronjob 都写死了这个 SA 名，缺它 Pod 起不来） |
 | `deployment.yaml` | 2 副本、滚动更新先起后停、探针、非 root + rootfs 只读、`/data` 与 `/tmp` 可写卷 |
 | `configmap.yaml` | 非敏感配置：PG 连接、共享状态、事件总线、停机宽限、管理员名单 |
-| `secret.example.yaml` | 密钥**示例**（值全是 `REPLACE_ME`），用前替换或改用外部密钥服务；含 `WARDEN_METRICS_TOKEN`（供 ServiceMonitor 抓 `/metrics`，与用户 API key 分开） |
+| `secret.example.yaml` | 密钥**示例**（值全是 `REPLACE_ME`），用前替换或改用外部密钥服务；含 `WARDEN_METRICS_BEARER`（供 ServiceMonitor 抓 `/metrics`，与用户 API key 分开。⚠️ 名字就是 `…_BEARER`：`deploy/observability/servicemonitor.yaml` 的 `bearerTokenSecret.key` 要的就是这个键，写成别的名字会让抓取 401） |
 | `service.yaml` / `ingress.yaml` | ClusterIP + 入口（SSE 关缓冲、会话粘性） |
 | `hpa.yaml` / `pdb.yaml` | 按 CPU 扩缩（2~6）、维护时至少留 1 个副本 |
 | `networkpolicy.yaml` | **默认拒绝**（ingress+egress 双方向）+ 白名单：ingress-nginx 入站、DNS、PG、OTLP、外网 443；显式排除云元数据 `169.254.169.254/32` |
 | `migrate-job.yaml` | 迁移 Job：复用应用镜像/ConfigMap/Secret，构造 `PostgresStore` 触发幂等 DDL；**必须先于** Deployment 成功 |
 | `backup-pvc.yaml` | 备份落盘卷（`warden-backups`，RWO 20Gi） |
-| `backup-cronjob.yaml` | 每日 `pg_dump -Fc` + 产物校验 + 14 天保留；口令只从 Secret 注入（CronJob 见下） |
+| `backup-cronjob.yaml` | 每日 `pg_dump -Fc` + 产物校验 + 保留**最新 14 份**；口令只从 Secret 注入（CronJob 见下） |
 
 ## 用之前要替换的（环境相关）
 
@@ -58,6 +58,16 @@
 8. **备份**：`backup-pvc.yaml` 的 `storage` 与 `storageClassName` 按库体量和你的存储类改。
 9. **OTLP**：`configmap.yaml` 的 `OTEL_EXPORTER_OTLP_ENDPOINT` → 你的 collector 地址
    （默认指向 `observability` 命名空间的 `otel-collector`；不接后端就删掉这个 key，只打结构化日志）。
+
+> ⚠️ **占位符不是「还没配」，它会让启动直接失败**（第五十三批改的行为）：
+> `configmap.yaml`、`secret.example.yaml` 里所有 `REPLACE_ME…` 值，只要落到**已注册的环境变量**上，
+> 启动校验（`core/settings.py::validate_env`）就判错并**拒绝启动**（不是警告、不是回退默认值）。
+> 这么改是因为占位符是一种**看起来配了、其实没配**的错值：最贵的一例是
+> `WARDEN_TRUSTED_PROXIES=REPLACE_ME-pod-cidr`——应用照常起，日志还打印「受信前置代理:
+> REPLACE_ME-pod-cidr（只采信来自它们的 X-Forwarded-For）」= **声称信任已开**，
+> 而 uvicorn 把非法 IP 当**字面量**、没有任何对端能匹配 ⇒ `X-Forwarded-For` 静默丢弃
+> ⇒ 限流又塔成一个桶、同一个 `Idempotency-Key` 可跳调用者串响应体。
+> 宁可让它起不来，也不让它看着是好的。
 
 ## 校验（不含真实集群）
 

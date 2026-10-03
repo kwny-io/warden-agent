@@ -255,3 +255,87 @@ def test_备份保留份数在文档与脚本里同源() -> None:
                 "部署文档把 `-mtime ... -delete` 当成事实讲"
                 f"（而不是「为什么不用它」）：{line.strip()}"
             )
+    # 第五十三批补：上面那条只查 **带 `-mtime` 的行**，于是**同一句话的另一个写法漏网了**——
+    # 文件表格里还写着 `backup-cronjob.yaml` 是「14 天保留」（真实口径是「最新 14 份」），
+    # 而它既不含 `-mtime`、也含了 `14 份`（在别处）⇒ 旧守卫全绿。
+    # 判据：`N 天` 这种口径**在部署文档里只允许出现在被否定的语境里**。
+    for line in readme.splitlines():
+        if f"{keep} 天" in line:
+            assert any(cue in line for cue in ("不是", "不用", "别用", "禁止", "刻意")), (
+                f"部署文档把保留口径写成「{keep} 天」（真实口径是「最新 {keep} 份」，"
+                f"按文件名时间戳而不是 mtime）：{line.strip()}"
+            )
+
+
+# —— 第五十三批：部署模板里的占位符不是「还没配」 ——
+
+def _placeholder_values(doc: dict) -> dict[str, str]:
+    """模板里所有含占位符的 `键 -> 值`（ConfigMap 用 `data`，Secret 用 `stringData`）。"""
+    data = doc.get("data") or doc.get("stringData") or {}
+    return {
+        k: v
+        for k, v in data.items()
+        if isinstance(v, str) and "replace" in v.lower()
+    }
+
+
+def test_模板里的占位符必须过不了启动校验() -> None:
+    """留占位符是**有意**的（防有人把真值提交上来），但它必须过不去启动校验。
+
+    真实失败模式（第五十三批实测，未改之前）：`configmap.yaml` 的
+    `WARDEN_TRUSTED_PROXIES: "REPLACE_ME-pod-cidr"` **穿过** `validate_env()` ——
+    它只按类型查格式，而 `proxies` 那类**故意**放行字面量（为了兼容 unix socket 名），
+    于是应用照常启动，还打印「受信前置代理: REPLACE_ME-pod-cidr（只采信来自它们的
+    X-Forwarded-For）」= **声称信任已开**；而 uvicorn 的 `_TrustedHosts` 把非法 IP
+    当字面量、没任何对端能匹配 ⇒ `X-Forwarded-For` 静默丢弃 ⇒ 第三十九批刚修好的
+    「限流按调用者分桶 / Idempotency-Key 不串响应体」在**照着本目录部署**时静默退回。
+
+    这条守卫钉的是「**模板 ↔ 门禁**」这对关系：模板里新加一个占位符却没人接住，它会红。
+    """
+    from warden_agent.core.settings import validate_env
+
+    checked = 0
+    for kind in ("ConfigMap", "Secret"):
+        for key, value in sorted(_placeholder_values(_by_kind(kind)).items()):
+            errors = validate_env({key: value})
+            assert errors, (
+                f"{kind} 的 {key}={value!r} 能穿过启动校验："
+                "占位符会被当成真实取值一路用下去（表现是「日志说配了、机制没生效」）"
+            )
+            assert "占位符" in errors[0], f"报错该说清是占位符：{errors[0]}"
+            checked += 1
+    assert checked >= 4, f"占位符守卫看起来是空跑的（只检查到 {checked} 个）"
+
+
+def test_占位符键都在部署文档里被点名() -> None:
+    """占位符必须是「照着文档就能填完」的：部署文档得点名每一个占位符键。
+
+    反面例子（第五十三批实测）：`secret.example.yaml` 里的 `WARDEN_METRICS_BEARER`
+    **在 `deploy/k8s/README.md` 里根本没出现**——README 写的是 `WARDEN_METRICS_TOKEN`
+    （一个不存在于任何文件里的名字），而 `servicemonitor.yaml` 的 `bearerTokenSecret.key`
+    要的是 `…_BEARER` ⇒ 照文档配就抓不到 `/metrics`（401）⇒ `up==0` 把 WardenServiceDown
+    打成长期 critical，**真告警被淹没**。
+    """
+    readme = (K8S / "README.md").read_text(encoding="utf-8")
+    missing: list[str] = []
+    for kind in ("ConfigMap", "Secret"):
+        for key in sorted(_placeholder_values(_by_kind(kind))):
+            if key not in readme:
+                missing.append(f"{kind}/{key}")
+    assert not missing, f"这些占位符键没在 deploy/k8s/README.md 里被点名：{missing}"
+
+
+def test_ServiceMonitor要的Secret键必须被部署文档点名() -> None:
+    """yaml 那对已有守卫（引用的键必须真实存在），**「文档–yaml」这对之前没有**。
+
+    所以 `servicemonitor.yaml:48` 要 `WARDEN_METRICS_BEARER`、而 README 教人写
+    `WARDEN_METRICS_TOKEN` 这个错误名字，两边各自都不报错，只有真集群里才会因为
+    401/`up==0` 表现出来（而且表现成「服务挂了」而不是「名字写错了」）。
+    """
+    sm = yaml.safe_load((_OBS / "servicemonitor.yaml").read_text(encoding="utf-8"))
+    key = sm["spec"]["endpoints"][0]["bearerTokenSecret"]["key"]
+    readme = (K8S / "README.md").read_text(encoding="utf-8")
+    assert key in readme, (
+        f"ServiceMonitor 要的 Secret 键 {key!r} 没在 deploy/k8s/README.md 里出现："
+        "照文档配的人会写另一个名字，抓取 401 却很难看出是名字问题"
+    )

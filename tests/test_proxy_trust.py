@@ -214,3 +214,51 @@ async def test_配了受信代理_幂等键互不串() -> None:
     app = _trusting(_app())
     a_text, b_text = await _same_key_pair(app)
     assert (a_text, b_text) == ("回答一", "回答二")
+
+
+# ---------- 第五十三批：占位符会让这层「静默不成立」 ----------
+
+
+@pytest.mark.asyncio
+async def test_占位符会让受信代理静默失效_所以必须fail_closed() -> None:
+    """`WARDEN_TRUSTED_PROXIES=REPLACE_ME-pod-cidr`（`deploy/k8s/configmap.yaml` 的原值）
+    会让「已配受信代理」这件事**静默不成立**。
+
+    机制（真 uvicorn 实现，本文件用的是 `ProxyHeadersMiddleware` 本身）：`_TrustedHosts`
+    对解析不出 IP 的项会当作**字面量**（它自己的注释就写着：因为非法 IP 一律变字面量，
+    “用户无法知道自己写错了”）；而 "REPLACE_ME-pod-cidr" 永远不会等于任何对端地址
+    ⇒ XFF 一律不采信、`scope["client"]` 仍是 TCP 对端 ⇒ 第三十九批修好的两件事
+    （限流按调用者分桶 / 幂等键不串）在**照着参考部署上线**时又退回去了。
+
+    所以这一层在第五十三批改成 fail-closed：占位符在启动校验里就直接判错
+    （`core/settings.py::_PLACEHOLDER_RE`——与变量类型无关，因为“占位符”是
+    “部署模板忘了替换”的专用判据，只修 proxies 一个变量等于留下一个漏的）。
+
+    两个断言都必须有：
+      1) 对照：同一个 XFF 在**真值** `10.0.0.0/8` 下会被采信（两个客户端各自一个桶）；
+      2) 占位符下又塔成一个桶——即“日志说配了、机制没生效”本身是 rebuttable 的事实，
+         不是描述；若哪天 uvicorn 变成“非法字面量 = 信任所有人”，第 2 条会红
+         （那比今天的 bug 更危险，必须被拦下来）。
+    """
+    placeholder = "REPLACE_ME-pod-cidr"
+
+    # (1) 真值：两个真实客户端各自一个桶
+    good = _trusting(_app(rate_limiter=RateLimiter(1, 60)), trusted=TRUSTED)
+    async with _client(good) as c:
+        a = await c.get("/status/a", headers={"X-Forwarded-For": CLIENT_A})
+        b = await c.get("/status/b", headers={"X-Forwarded-For": CLIENT_B})
+    assert (a.status_code, b.status_code) == (200, 200)
+
+    # (2) 占位符：又变成一个桶（第二个被挤成 429）
+    bad = _trusting(_app(rate_limiter=RateLimiter(1, 60)), trusted=placeholder)
+    async with _client(bad) as c:
+        a = await c.get("/status/a", headers={"X-Forwarded-For": CLIENT_A})
+        b = await c.get("/status/b", headers={"X-Forwarded-For": CLIENT_B})
+    assert (a.status_code, b.status_code) == (200, 429), (
+        "占位符下两个真实客户端又共用一个限流桶：说明「已配受信代理」这句话是假的"
+    )
+
+    # (3) 而它现在过不了启动校验 ⇒ 这句假话下回根本走不到运行期
+    assert validate_env({"WARDEN_TRUSTED_PROXIES": placeholder}), (
+        "占位符能穿过 validate_env 的话，这个测试证明的静默失效就会在生产上重现"
+    )
