@@ -27,6 +27,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PIN_SCRIPT = REPO_ROOT / "scripts" / "pin_image_digests.sh"
 ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "rollback.sh"
+K8S_NAMESPACE_MANIFEST = REPO_ROOT / "deploy" / "k8s" / "namespace.yaml"
 
 # Windows 上 Git Bash 的常见安装位置。
 # 为什么需要这张表：`shutil.which("bash")` 在 Windows 上可能先命中
@@ -118,6 +119,27 @@ FAKE_DIGEST = "sha256:" + ("0" * 63) + "7"
 SESSION_TIMEOUT = 120
 
 
+def _manifest_namespace(path: Path) -> str | None:
+    """从清单里读出 `kind: Namespace` 那个对象的 `name`。
+
+    这里**故意不复用脚本里的 awk**：守卫如果用被测代码自己的解析器去得出"期望值"，
+    解析器写错时会两边一起错，测试照样绿。
+    同一文件里还有 `warden-quota` / `warden-limits`（ResourceQuota / LimitRange），
+    所以不能直接取"第一个 name:"，要先等 `kind: Namespace`。
+    """
+    in_namespace = False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if raw.rstrip() == "kind: Namespace":
+            in_namespace = True
+            continue
+        if in_namespace and raw.strip() == "---":
+            in_namespace = False
+            continue
+        if in_namespace and raw.startswith("  name:"):
+            return raw.split(":", 1)[1].strip().strip("'\"")
+    return None
+
+
 def _make_repo(tmp_path: Path, dockerfile_from: str = "FROM python:3.12-slim AS runtime") -> Path:
     """造一个最小的「仓库布局」。
 
@@ -129,6 +151,9 @@ def _make_repo(tmp_path: Path, dockerfile_from: str = "FROM python:3.12-slim AS 
     (root / "deploy" / "k8s").mkdir(parents=True)
     shutil.copy2(PIN_SCRIPT, root / "scripts" / "pin_image_digests.sh")
     shutil.copy2(ROLLBACK_SCRIPT, root / "scripts" / "rollback.sh")
+    # 清单也搬进副本：第五十四批之后 rollback.sh 的默认命名空间**来自清单**，
+    # 所以一个没有 namespace.yaml 的假仓库测的是一条真实运行时不存在的路径。
+    shutil.copy2(K8S_NAMESPACE_MANIFEST, root / "deploy" / "k8s" / "namespace.yaml")
     (root / "Dockerfile").write_text(dockerfile_from + "\n", encoding="utf-8")
     (root / "deploy" / "k8s" / "deployment.yaml").write_text(
         "spec:\n  template:\n    spec:\n      containers:\n"
@@ -286,12 +311,25 @@ KUBECTL_STUB = r"""
 kubectl() {
   printf 'kubectl %s\n' "$*" >> "${STUB_LOG:?}"
   case "$*" in
+    *"get deployment"*"-o name"*)
+      # 存在性探测（第五十四批新增）。脚本原来从不问"这个 Deployment 在不在"，
+      # 于是把 kubectl 的失败和"确实没有更早的版本"说成了同一句话。
+      rc="${GET_RC-0}"
+      if [ "$rc" != "0" ]; then
+        printf '%s\n' \
+          "${GET_ERR-Error from server (NotFound): deployments.apps \"warden-agent\" not found}" >&2
+        return "$rc"
+      fi
+      printf 'deployment.apps/%s\n' "${DEPLOYMENT-warden-agent}"
+      return 0 ;;
     *"rollout history"*)
       printf '%s\n' "REVISION  CHANGE-CAUSE" "${HISTORY_ROWS:?}"
       return 0 ;;
     *"rollout undo"*)      return "${UNDO_RC:-0}" ;;
     *"rollout status"*)    return "${STATUS_RC:-0}" ;;
-    *revision*)            echo "${CURRENT_REVISION:-3}"; return 0 ;;
+    # 注意用 `${CURRENT_REVISION-3}` 而不是 `${CURRENT_REVISION:-3}`：
+    # "空串"在本用例里是一个**有意义的状态**（存在但注解读不到），`:-` 会把它换成 3。
+    *revision*)            echo "${CURRENT_REVISION-3}"; return 0 ;;
     *"spec.replicas"*)     echo "${SPEC_REPLICAS:-2}"; return 0 ;;
     *"readyReplicas"*)     echo "${READY_REPLICAS-2}"; return 0 ;;
   esac
@@ -531,6 +569,127 @@ def test_rollback_needs_kubectl_and_says_so(tmp_path: Path) -> None:
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "kubectl" in proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# 第五十四批：出事时唯一那条命令，指向了一个不存在的命名空间
+#
+# 事实链：`scripts/rollback.sh` 的默认 NAMESPACE 曾是 `warden-agent`，
+# 而 `deploy/k8s/namespace.yaml` 声明的是 `warden`（发布手册 deploy/k8s/README.md
+# 的 11 条 apply 和手工回滚步骤也通篇是 `-n warden`）。这件事故意不好发现：
+# 它只在"真出事"时被走到，而表现不是"脚本报错"，是**一句假话** ——
+# 「没有可回滚的历史版本」，配上契约里写着"不做任何改动"的退出码 2。
+#
+# 为什么原来的 8 条 rollback 用例全绿都没拦住：它们都用替身 kubectl 并显式
+# 给出 NAMESPACE/REVISION，**从来没人问过"不传 NAMESPACE 时会用哪个"**。
+# 下面四条守的就是这个空白：默认值必须来自清单、清单变了要跟着变、
+# 且三种"看不到"的情形都不能说成"没有历史版本"。
+# --------------------------------------------------------------------------- #
+# 旧版把"连当前版本都没看到"说成的那一句话（退出码 2 + 这句话 = 值班的人会放弃回滚）。
+# 断言"这句话不许出现"而不是断言"某个词不许出现"：现在的错误文案会**引述**这句话
+# 告诉使用者"这不是那个意思"（引述是好事），所以只能钉在旧的肯定句式上。
+_MISLEADING_DIAGNOSIS = "没有可回滚的历史版本（"
+
+
+def test_rollback默认命名空间必须等于清单里声明的那个(tmp_path: Path) -> None:
+    manifest_ns = _manifest_namespace(K8S_NAMESPACE_MANIFEST)
+    assert manifest_ns, "清单里读不出 kind: Namespace 的 name"
+
+    root = _make_repo(tmp_path)
+    proc = _run(
+        root,
+        "rollback.sh",
+        prelude=KUBECTL_STUB,
+        env_extra={"HISTORY_ROWS": "1         <none>\n2         <none>", "CURRENT_REVISION": "2"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    gets = [c for c in _calls(root) if "get deployment" in c]
+    assert gets, _calls(root)
+    wrong = [c for c in gets if f"-n {manifest_ns} " not in c]
+    assert not wrong, (
+        f"不传 NAMESPACE 时脚本没在清单声明的命名空间（{manifest_ns}）里操作：{wrong}\n"
+        f"这就是第五十四批：清单/发布手册是一种事实，脚本里的默认值是另一种，"
+        f"两者不一致时脚本会在出事时说「没有可回滚的历史版本」。"
+    )
+
+
+def test_rollback读清单而不是把命名空间写死(tmp_path: Path) -> None:
+    """只断言"默认值等于 warden"的守卫，遇到"把读清单那段删掉、写死当前值"会照样绿。
+
+    所以这条把副本里的清单改掉，看脚本跟不跟 —— 它才真正锁住"清单是事实源"。
+    """
+    root = _make_repo(tmp_path)
+    manifest = root / "deploy" / "k8s" / "namespace.yaml"
+    text = manifest.read_text(encoding="utf-8")
+    assert "  name: warden\n" in text, "清单的形状变了，这条用例的前提要重新确认"
+    patched = text.replace("  name: warden\n", "  name: staging-ns\n", 1)
+    manifest.write_text(patched, encoding="utf-8")
+
+    proc = _run(
+        root,
+        "rollback.sh",
+        prelude=KUBECTL_STUB,
+        env_extra={"HISTORY_ROWS": "1         <none>\n2         <none>", "CURRENT_REVISION": "2"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert any("-n staging-ns " in c for c in _calls(root)), _calls(root)
+
+
+def test_rollback清单缺失时不再猜一个命名空间(tmp_path: Path) -> None:
+    """读不出事实源时**必须停下要值**，不能回退到一个"大概对"的默认值。
+
+    猜出来的默认值在平时永远是绿的，在出事时才会骗人——这正是上一轮的形状。
+    """
+    root = _make_repo(tmp_path)
+    (root / "deploy" / "k8s" / "namespace.yaml").unlink()
+    proc = _run(root, "rollback.sh", prelude=KUBECTL_STUB)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "NAMESPACE=" in proc.stderr, proc.stderr
+    assert "清单" in proc.stderr, proc.stderr
+    assert not [c for c in _calls(root) if "rollout undo" in c], _calls(root)
+
+
+def test_rollback看不到deployment时不说没有历史版本(tmp_path: Path) -> None:
+    """命名空间/名字/权限任何一种不对 → 说"连当前版本都没看到"，并带上 kubectl 的原话。
+
+    旧行为是统统说成"没有可回滚的历史版本"（退出码 2），而 2 的契约是"不做任何改动"——
+    值班的人会得出"这版回不了、只能往前修"的结论，而历史其实就在隔壁命名空间里。
+    """
+    root = _make_repo(tmp_path)
+    proc = _run(
+        root,
+        "rollback.sh",
+        prelude=KUBECTL_STUB,
+        env_extra={
+            "GET_RC": "1",
+            "GET_ERR": 'Error from server (NotFound): deployments.apps "warden-agent" not found',
+        },
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "拿不到 Deployment" in proc.stderr
+    # 把 kubectl 的原话带上：出事时人需要的是错误原文，不是我的转述
+    assert "NotFound" in proc.stderr
+    # 本人在这条命令里最需要看到的东西：日志里出现过的命名空间
+    assert "namespace=warden" in proc.stderr, proc.stderr
+    assert _MISLEADING_DIAGNOSIS not in proc.stderr, (
+        "看不到 Deployment 时做出了「没有历史版本」这个诊断 —— 这就是把人带偏的那句话"
+    )
+    assert not [c for c in _calls(root) if "rollout undo" in c], _calls(root)
+
+
+def test_rollback读不到revision注解时也不说没有历史版本(tmp_path: Path) -> None:
+    """"存在，但注解读不到"与"确实没有更早的版本"要分开说（退出码 1 vs 2）。"""
+    root = _make_repo(tmp_path)
+    proc = _run(
+        root,
+        "rollback.sh",
+        prelude=KUBECTL_STUB,
+        env_extra={"CURRENT_REVISION": ""},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "revision 注解" in proc.stderr, proc.stderr
+    assert _MISLEADING_DIAGNOSIS not in proc.stderr, proc.stderr
+    assert not [c for c in _calls(root) if "rollout undo" in c], _calls(root)
 
 
 # =========================================================================== #

@@ -21,7 +21,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `namespace.yaml` | 命名空间 `warden` + PSA `restricted` + ResourceQuota + LimitRange（**必须最先 apply**；文件顶部明确禁止 `kubectl create namespace`） |
+| `namespace.yaml` | 命名空间 `warden` + PSA `restricted` + ResourceQuota + LimitRange（**必须最先 apply**；文件顶部明确禁止 `kubectl create namespace`）。⚠️ 命名空间名字是**事实源**：`scripts/rollback.sh` 的默认命名空间从这里读（第五十四批起），改名就两边都改 |
 | `serviceaccount.yaml` | ServiceAccount `warden-agent`（**必须 apply**：deployment / migrate-job / backup-cronjob 都写死了这个 SA 名，缺它 Pod 起不来） |
 | `deployment.yaml` | 2 副本、滚动更新先起后停、探针、非 root + rootfs 只读、`/data` 与 `/tmp` 可写卷 |
 | `configmap.yaml` | 非敏感配置：PG 连接、共享状态、事件总线、停机宽限、管理员名单 |
@@ -148,6 +148,25 @@ kubectl -n warden apply -f deploy/k8s/backup-cronjob.yaml
 kubectl -n warden rollout undo deploy/warden-agent
 kubectl -n warden rollout status deploy/warden-agent
 ```
+
+**一条命令的版本**：`scripts/rollback.sh`（= 上面两条 + 选版本 + 健康检查 + 退出码）。
+它的命名空间**取自本目录的 `namespace.yaml`**，不需要你记：
+
+```bash
+scripts/rollback.sh                     # 回滚到上一个 revision
+REVISION=3 scripts/rollback.sh          # 指定 revision
+DRY_RUN=1 scripts/rollback.sh           # 只打印将要执行的命令
+NAMESPACE=staging scripts/rollback.sh   # 显式覆盖命名空间
+```
+
+退出码就是契约：`0` 回滚完成且全部副本 ready；`2` **确实**没有更早的版本（什么都没做）；
+`1` 用法/环境问题 —— **包括“连当前 Deployment 都没看到”**（这时要查命名空间/名字/context/权限，
+不是“没有历史”）；`3` 已下发但健康检查没过，**需要人介入，不要自动再滚**。
+
+> 为什么把“看不到 Deployment”与“没有更早的版本”分成两句话：第五十四批之前它们是同一句话。
+> 脚本默认的命名空间当时是手抄的 `warden-agent`（清单里是 `warden`），于是脚本把 kubectl 的
+> NotFound 吞掉、报出“没有可回滚的历史版本”—— 那是在出事现场为假的一句话，
+> 而“回滚脚本不可用”的结论会让人放弃回滚。现在默认值来自清单，读不出来就停下来要你显式传值。
 
 ⚠️ **回滚不会回滚数据库结构**：项目迁移是"只增不删"的幂等补列/建表（见 `migrate-job.yaml`），
 旧版本代码遇到新增列会忽略。所以"代码回滚"通常直接可用；

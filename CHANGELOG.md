@@ -4,6 +4,84 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-04（第五十四批：出事时唯一那条命令**指向了不存在的命名空间**——而且它会说一句假话）
+
+> 入口：翻 `docs/复核索引.md` §7「已知欠账」时看到「回滚脚本 ✅ 已存在（未在真集群演练）」，
+> 按方向自检第 3 条去证伪它：**这个脚本的默认命名空间是从哪来的？**
+> 它是全仓唯一一条「出事时才被走到」的路径，所以它的默认值从没被任何人问过。
+
+### 一、失败模式：它的表现不是「报错」，而是一句在那个时间地点为假的话
+
+- `scripts/rollback.sh` 的 `NAMESPACE="${NAMESPACE:-warden-agent}"` 与清单/发布手册不一致：
+  `deploy/k8s/namespace.yaml:14` 声明的是 `warden`，`deploy/k8s/README.md` 的 11 条 apply
+  与手工回滚步骤（`:148`）也通篇是 `-n warden`。全仓 `git grep -- "-n warden-agent"`
+  **0 处命中** —— 只有这个脚本自己这么以为。
+- 链条：`kubectl -n warden-agent get deployment warden-agent` 返回 NotFound →
+  被 `current_revision()` 里的 `2>/dev/null` 吞掉 → 空串 → `choose_revision` 返回 1 →
+  `fail 2 "没有可回滚的历史版本（…）。未做任何改动。"`
+- 为什么这比一般的红更糟：退出码 2 在契约里写的是「确实没有历史版本」。值班的人据此得出的
+  结论是「这版回不了，只能往前修」—— 而历史就在**隔壁命名空间**里。一个 fail-closed 的脚本
+  配上一个假的诊断，等于把人推向更坏的决定。
+- 同一条链的下游还有第二处：Deployment 明明在、只是 revision 注解读不到（被清掉/无权限）时，
+  也会说成「没有历史版本」；而这三种「看不到」要查的东西各不相同。
+
+### 二、改法：把「猜」换成「问事实源」，把两种「看不到」分成两句
+
+1. 命名空间**从清单读**（`namespace_from_manifest()`：等 `kind: Namespace` 再取第一处 `name`，
+   避免抓到同一文件里的 `warden-quota`/`warden-limits`；并按 k8s 命名规则校验字符）
+   ⇒ 清单改名时两边一起走。**读不出来就停下要你显式传**（`NAMESPACE=<ns> scripts/rollback.sh`）——
+   猜一个默认值，等于把同一类事故再留一次。
+2. 「拿不到 Deployment」与「没有更早的版本」拆成两个出口：前者退出码 1，并把 **kubectl 的原话**、
+   当前 context、清单里声明的命名空间一起打出来（`require_deployment_visible()`）；后者才是 2。
+   同时新增 `RC_NO_CURRENT` / `RC_NO_PREVIOUS` 两个内部返回码。
+
+### 三、守卫（5 条新增；`tests/test_release_scripts.py` 由 19 例变 24 例）与变异验证
+
+- `test_rollback默认命名空间必须等于清单里声明的那个` —— 测试**自己**解析 yaml（不复用脚本的 awk：
+  两边一起错的解析器会让守卫永远绿）。
+- `test_rollback读清单而不是把命名空间写死` —— 把副本里的清单改名为 `staging-ns`，脚本必须跟着走。
+  只断言「默认值等于 warden」的守卫，挡不住「删掉解析、写死当前值」这种回退。
+- `test_rollback清单缺失时不再猜一个命名空间`；`test_rollback看不到deployment时不说没有历史版本`；
+  `test_rollback读不到revision注解时也不说没有历史版本`。
+- 变异（`C:/tmp/mut54v2.py`，每条都断言 bash 语法合法 + pytest 真跑起来了）：
+  A 写死 `warden-agent`（原始 bug）→ **3 条红**；B 让「读不到注解」掉进「没有历史版本」出口 →
+  **2 条红**（含既有的 `test_rollback_no_previous_revision_exits_2_and_does_nothing` ——
+  说明这两条路原来就是耦合的）；C 拿掉存在性检查 → **1 条红**（只有对应那条）。
+- 原来的 8 条 rollback 用例全绿也没拦住它，原因值得记：**它们都显式给了 `NAMESPACE`**，
+  从来没人问过「不传 `NAMESPACE` 时会用哪一个」。替身 kubectl 本来就答不出「默认值是不是错的」。
+
+### 四、这一批自己踩的三个坑（全是「假红」，都已写进验证脚本的自检）
+
+1. 变异脚本给子进程传了只剩 `PATH` 的环境 → pytest 根本起不来（`WinError 10106`），
+   返回码非 0 却被当成「守卫抓到了」。→ 继承 `os.environ`，并加「没跑起来=结论作废」自检。
+2. 用 `Path.write_text` 打补丁/恢复 → Windows 上把整个文件的 `\n` 变成 `\r\n`，
+   `test_script_syntax_and_line_endings` 每次都跟着红，连恢复都不干净（工作区被污染）。→ 字节级读写。
+3. 变异探针 `subprocess.run(["bash", "-n", …])` 命中的是 `System32\bash.exe`（WSL 转发器）
+   → `rc=1` 被误读成「脚本被改坏了」。这已是同一台机器上**第三次**栽在它上面
+   （前两次见 `tests/test_release_scripts.py` 顶部注释与第四十七批）。→ 改用 `shutil.which` 的真 Git Bash。
+
+### 五、已知限制（别把它读成「回滚演练过了」）
+
+- 仍然**没有真集群**：证据等级 = 契约级断言 + 假 kubectl 的调用序列与诊断文案，
+  **不是**「在真集群回滚过一次」。`docs/复核索引.md` §7 那一行照旧标着这个边界。
+- `namespace_from_manifest()` 只认裸清单（没有 kustomize/helm 覆盖层）；
+  真环境若用 helm 决定命名空间，请显式 `NAMESPACE=`。
+
+### 六、本批实测数字（2026-10-04，`--junitxml` 口径；两次都带 `--cov=warden_agent`）
+
+| 口径 | 收集 | 通过 | 失败 | 错误 | 跳过 | 耗时 | junit |
+|---|---|---|---|---|---|---|---|
+| 带真 PG（容器 `warden-pg-test`） | 1654 | **1650** | 0 | 0 | 4 | 449.8 秒 | `C:\tmp\report54_pg_cov.xml` |
+| 无 PG（**真把容器 `docker stop` 掉**再跑） | 1654 | **1610** | 0 | 0 | 44 | 456.3 秒 | `C:\tmp\report54_nopg.xml` |
+
+- 收集数 1649 → **1654**（+5 条新守卫）；两个口径差 **40 条**（需要真库的那一批，无 PG 时跳过）——**不是回退**。
+- 覆盖率门槛 **86%**：带真 PG **90.21%**（总语句 10607 / 分支 2646）、无 PG **86.96%**（语句未覆盖 856 → 1224）——两者都过闸。
+- ⚠️ 耗时比第五十三批（228.8 / 226.3 秒）大是**因为本批多带了 `--cov`**（覆盖率收集把总时间大致翻倍），不是性能回退。
+- ⚠️ 顺手验证到的一条：覆盖率**不会**被 `addopts` 带跑（`addopts` 里只有 `-q`）——不显式传 `--cov=warden_agent`，
+  既没有覆盖率数字、也没有 `fail_under` 门禁（第五十四批实撞：跑完 1650 passed 才发现输出里连 `TOTAL` 都没有，
+  而仓库里留着的 `.coverage` 还是上一批的）。CI（`ci.yml:118`）是唯一会自动跑它的地方。
+
+---
 ## 2026-10-03（第五十三批：部署模板里的占位符**能穿过启动校验**——「日志说配了、机制没生效」）
 
 > 入口：第五十二批给 `deploy/k8s/` 补文档守卫时，顺手对着参考部署核了一遍取值。
