@@ -237,3 +237,63 @@ def test_main_对外监听跑演示实例_声明后放行(tmp_path: Path, monkey
     assert created["model_id"] == "fake"      # 而模型确实是演示
     created["store"].close()
     created["memory_repository"].close()
+
+
+# ---------------------------------------------------------------------------
+# SSE 空闲心跳的**取值来源**：文档把它写成可调旋钮，那就必须真的读一次
+#
+# 这一组盯的不是心跳机制（机制在 tests/test_web_stream_disconnect.py 里验），
+# 而是"环境变量 → build_app → 搬运循环"这条链上装配层有没有把它丢掉。
+# 丢掉的表现是：操作者设了 `WARDEN_SSE_HEARTBEAT_SECONDS=30`，启动日志不提，
+# 心跳还是 10 秒——没有报错，只有代理把连接当死连接掐掉时多出来的一批断线。
+# ---------------------------------------------------------------------------
+
+def test_main_SSE心跳从环境变量透传(tmp_path: Path, monkeypatch) -> None:
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_SSE_HEARTBEAT_SECONDS", "30")
+
+    run_server.main()
+
+    assert created["sse_heartbeat_seconds"] == 30.0
+    created["store"].close()
+    created["memory_repository"].close()
+
+
+def test_main_SSE心跳不设时用默认值(tmp_path: Path, monkeypatch) -> None:
+    """不设时必须是 `web/server.py` 那个常量，而不是 0（0 是"关心跳"，反了）。"""
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.delenv("WARDEN_SSE_HEARTBEAT_SECONDS", raising=False)
+
+    run_server.main()
+
+    assert created["sse_heartbeat_seconds"] == run_server.SSE_HEARTBEAT_SECONDS
+    assert created["sse_heartbeat_seconds"] > 0
+    created["store"].close()
+    created["memory_repository"].close()
+
+
+def test_main_SSE心跳为0_透传0而不是被当成未设置(tmp_path: Path, monkeypatch) -> None:
+    """`0` 是有意义的取值（关心跳），不能被"falsy 就跳过"的写法吞掉。"""
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_SSE_HEARTBEAT_SECONDS", "0")
+
+    run_server.main()
+
+    assert created["sse_heartbeat_seconds"] == 0.0
+    created["store"].close()
+    created["memory_repository"].close()
+
+
+def test_main_SSE心跳负数拒绝启动(tmp_path: Path, monkeypatch) -> None:
+    """负数在**启动期**就红（fail-closed），不是被当成"关心跳"悄悄放过去。
+
+    这里验的是既有的 `kind="int"` 格式校验（`str.isdigit()`）对**这个变量**确实生效——
+    所以 `run_server` 里不需要再写一个 `if < 0` 分支（那是永远跑不到的死代码，
+    写了反而会让人以为负数防线是那儿立的）。
+    """
+    _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_SSE_HEARTBEAT_SECONDS", "-5")
+
+    with pytest.raises(SystemExit) as e:
+        run_server.main()
+    assert e.value.code == 2

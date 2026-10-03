@@ -422,6 +422,16 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         note="长连接会一直占着线程/连接，不限并发时少量客户端就能耗尽连接池。"
              "到上限**立刻 503**（不排队，避免请求堆着一起超时）；流结束（含客户端断开）才释放名额",
     ),
+    EnvSpec(
+        "WARDEN_SSE_HEARTBEAT_SECONDS",
+        "【入站】/chat/stream（SSE 长连接）空闲心跳间隔（秒）；默认 10，0 = 关心跳",
+        "web/run_server.py", ("web/run_server.py",),
+        default="10", kind="int",
+        note="工具执行/长模型调用期间可能几十秒一个字节都不吐，中间层（nginx/CDN/浏览器）"
+             "会把手里的连接当死连接掐掉，于是那一整轮回复白跑——心跳就是发一条不带的 data "
+             "注释行保活。负数不需要单独判：kind=int 的格式校验用 `str.isdigit()`，"
+             "`-1` 之类在启动时就被 `validate_env` 拦下（见 `_is_int`）",
+    ),
     # ---- 可观测性 ----
     EnvSpec(
         "WARDEN_LOG_FORMAT",

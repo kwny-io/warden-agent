@@ -103,6 +103,17 @@ def register(
             lease.stop()
 
 
+def _heartbeat_window(seconds: float) -> float | None:
+    """把"心跳间隔"翻译成队列等待窗口：`<= 0` = 关心跳 → 无限等（`None`）。
+
+    **不能把 0 直接交给 `Queue.get(timeout=...)`**：`timeout=0` 的语义是
+    "立刻超时"，于是搬运循环会变成"转一圈就发一条 `: keep-alive`"的自旋——
+    既烧 CPU，又拿垃圾帧把客户端淹没。这恰好与文档承诺的"`0` 关"相反。
+    用心跳就是**不开**超时（`timeout=None`），而不是"每 0 秒超时一次"。
+    """
+    return seconds if seconds > 0 else None
+
+
 def register_streaming(
     app: FastAPI,
     *,
@@ -216,7 +227,7 @@ def register_streaming(
             try:
                 while True:
                     try:
-                        frame = frames.get(timeout=sse_heartbeat_seconds())
+                        frame = frames.get(timeout=_heartbeat_window(sse_heartbeat_seconds()))
                     except queue.Empty:
                         if worker_done.is_set():
                             break

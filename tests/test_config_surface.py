@@ -13,9 +13,11 @@
     1. 代码里读的每个环境变量，都必须在注册表里（否则新增变量会漏登记）；
     2. 读它的模块，不能超出注册表声明的 `consumers`（否则就是"越权读别人的变量"，
        也就是上面「一名两用」的形状）；
-    3. 拼错的 `WARDEN_*` 变量要能被识别出来。
+    3. 拼错的 `WARDEN_*` 变量要能被识别出来；
+    4. **文档里写的 `WARDEN_*` 必须都登记过**（反向：文档不能承诺一个不存在的旋钮），
+       并且 README 自称的那个变量数必须等于登记表条数。
 
-  没有这三条，注册表就只是文档——而文档是不会自己变红的。
+  没有这四条，注册表就只是文档——而文档是不会自己变红的。
 
 口径说明：扫描规则是「`.get("字面量")` / `["字面量"]` / `env_bool("字面量")`」，
 且字面量形如环境变量名。
@@ -196,6 +198,89 @@ def test_注册表无重复且消费者非空() -> None:
     for spec in ENV_SPECS:
         assert spec.consumers, f"{spec.name} 没有声明任何 consumers"
         assert spec.purpose and spec.owner, f"{spec.name} 缺 purpose/owner"
+
+
+# ---------- 第四个方向：文档 ↔ 注册表 ----------
+#
+# 前面三条守卫都是"代码 ↔ 注册表"（代码读的必须已登记 / 不能越权读 / 登记了得有人读），
+# 它们**盖不住**"文档承诺了一个不存在的旋钮"：
+#   · 登记表里没有它 ⇒ 方向一（代码读的必须已登记）不适用；
+#   · 也没人读，所以方向三（登记了没用）同样不适用。
+#
+# 两个真实踩到的例子（都是"照着文档去查、什么也查不到"）：
+#   1. `README.md` 与 `docs/deployment-boundaries.md` 把 `WARDEN_SSE_HEARTBEAT_SECONDS`
+#      写成"可调"，而它在代码里**读都没被读过**（只是 `web/server.py` 的一个模块常量）：
+#      操作者设了不生效、启动日志也不提，代理把长连接当死连接掉的时候只会觉得"偶尔断"。
+#   2. `docs/复核索引.md` 曾把 e2e 的离线保证写成"子进程带 `WARDEN_SKIP_DOTENV=1`"，
+#      而这个变量**在 `src/` 与 `web/` 里从未存在过**（看代码面：`git log -S WARDEN_SKIP_DOTENV`
+#      `-- src/ web/` 为空 —— **必须带路径限定**，不带路径会命中两个只动文档的提交）；
+#      真实保证是 `DEEPSEEK_API_KEY=''` + `load_env()` 不覆盖已存在的键）。
+#
+# 口径：扫 README.md 与 docs/**/*.md 里形如 `WARDEN_XXX` 的记号；
+#   · 以 `*` 结尾的（`WARDEN_OUTBOUND_*` 这类**变量族**写法）放行，它本就不是单个变量名；
+#   · 其余必须在注册表里；文档里刻意举的假名进 `_DOC_ONLY_NAMES` 并写明理由。
+_DOC_ONLY_NAMES: dict[str, str] = {
+    # README 用它演示"把变量名写成模块级常量"的 AST 形状（`ENV_X = "WARDEN_X"`）
+    # 是个**刻意不存在**的名字。
+    "WARDEN_X": "README 里 `ENV_X = \"WARDEN_X\"` 的示例常量，故意不对应真变量",
+    # 这一条是**反向**用法：文档写它，恰恰是为了记录"它从未存在过"。
+    "WARDEN_SKIP_DOTENV": "`docs/复核索引.md` 用它做更正说明（曾被误写成 e2e 的挡法）",
+}
+_DOC_GLOBS = ("README.md", "docs/**/*.md")
+_DOC_TOKEN = re.compile(r"WARDEN_[A-Z0-9_]+\*?")
+
+
+def _doc_mentions() -> dict[str, set[str]]:
+    """文档里提到的 `WARDEN_*` 记号 → 它出现在哪些文档。"""
+    root = Path(__file__).resolve().parents[1]
+    mentions: dict[str, set[str]] = {}
+    for pattern in _DOC_GLOBS:
+        for path in sorted(root.glob(pattern)):
+            for found in _DOC_TOKEN.findall(path.read_text(encoding="utf-8")):
+                if found.endswith("*"):
+                    continue  # 变量族写法
+                mentions.setdefault(found, set()).add(
+                    str(path.relative_to(root)).replace("\\", "/")
+                )
+    return mentions
+
+
+def test_文档提到的环境变量都已登记() -> None:
+    """文档说"可调"的旋钮，登记表里必须真有——否则就是一句空承诺。"""
+    registered = registered_env_names()
+    unknown = {
+        name: sorted(where)
+        for name, where in _doc_mentions().items()
+        if name not in registered and name not in _DOC_ONLY_NAMES
+    }
+    assert not unknown, (
+        "以下名字只出现在文档里、没在 `core/settings.py` 登记"
+        "（要么登记 + 真的接线，要么改文档；文档里刻意举的假名进 `_DOC_ONLY_NAMES` 并写明理由）：\n"
+        + "\n".join(f"  {n}  ← {', '.join(w)}" for n, w in sorted(unknown.items()))
+    )
+
+
+def test_文档放行名单里的名字都不该是真变量() -> None:
+    """逃生舱不能反过来用：放行的名字若哪天真登记了，就该从名单里删掉。"""
+    both = sorted(set(_DOC_ONLY_NAMES) & registered_env_names())
+    assert not both, (
+        f"这些名字既在登记表里、又在 _DOC_ONLY_NAMES 里，删掉名单里的：{both}"
+    )
+
+
+def test_README里的变量计数与注册表一致() -> None:
+    """README 自称"全部 N 个环境变量登记在一张表里"——N 必须真的是登记表条数。
+
+    这条计数本来是**手写**的：加一个变量就悄悄过期（发现时已经差 2 个），
+    而"单一事实源"这句话本身就在那一行，恰恰最不该自相矛盾。
+    """
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "README.md").read_text(encoding="utf-8")
+    found = re.search(r"全部 \*\*(\d+) 个环境变量\*\*", text)
+    assert found, "README 里找不到『全部 **N 个环境变量**』这句话（改了措辞就同步改这条用例）"
+    assert int(found.group(1)) == len(ENV_SPECS), (
+        f"README 写 {found.group(1)} 个，登记表实际 {len(ENV_SPECS)} 个"
+    )
 
 
 # ---------- 校验与拼写检测 ----------

@@ -84,6 +84,7 @@ from warden_agent.web.server import (
     DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_SESSION_CACHE_MAX,
     DEFAULT_SSE_MAX_CONCURRENCY,
+    SSE_HEARTBEAT_SECONDS,
     build_app,
 )
 
@@ -783,6 +784,16 @@ def main() -> None:
     sse_max_concurrency = env_int(
         "WARDEN_SSE_MAX_CONNECTIONS", DEFAULT_SSE_MAX_CONCURRENCY, os.environ
     )
+    # SSE 空闲心跳：README 的旋钮表与 `docs/deployment-boundaries.md` 都把它写成**可调**，
+    # 所以必须在**这里**真的读一次——不读的话它只是个模块常量，操作者设了不生效、
+    # 启动日志也不提，属于"配置看起来生效、其实没生效"里最难发现的一种
+    # （没有报错、没有告警，只有代理把连接当死连接掉的时候多出来的断线）。
+    # 默认值取 `web/server.py` 的那个常量，不在这里另写一个 10（避免世上两个默认值）。
+    # 负数不需要单独判：kind="int" 的格式校验用 `str.isdigit()`，`-1` 之类早在上面的
+    # `validate_env` 就 exit 2 了——在这里再判一次只会得到一段永远跑不到的死代码。
+    sse_heartbeat_s = env_int(
+        "WARDEN_SSE_HEARTBEAT_SECONDS", int(SSE_HEARTBEAT_SECONDS), os.environ
+    )
     session_cache_max = _session_cache_max_from_env(os.environ)
     # 多 Agent（主管 + 子 Agent 卡）：默认关。它不是零成本的装饰——子 Agent 会真的
     # 多花模型调用，所以由部署方显式打开（`WARDEN_MULTIAGENT=1`）。
@@ -797,6 +808,10 @@ def main() -> None:
         "WARDEN_SSE_MAX_CONNECTIONS，0 = 关闭）",
         f"{max_request_bytes} 字节" if max_request_bytes > 0 else "关闭",
         sse_max_concurrency if sse_max_concurrency > 0 else "关闭",
+    )
+    logger.info(
+        "SSE 空闲心跳：%s（WARDEN_SSE_HEARTBEAT_SECONDS，0 = 关闭）",
+        f"{sse_heartbeat_s} 秒" if sse_heartbeat_s > 0 else "关闭",
     )
     app = build_app(
         model=model,
@@ -833,6 +848,7 @@ def main() -> None:
         maintenance=maintenance,
         max_request_bytes=max_request_bytes,
         sse_max_concurrency=sse_max_concurrency,
+        sse_heartbeat_seconds=float(sse_heartbeat_s),
         session_cache_max=session_cache_max,
     )
     port = env_int("PORT", 8000)

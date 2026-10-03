@@ -53,6 +53,7 @@ def _app(
     bus: InProcessEventBus | None = None,
     gate_limit: int | None = None,
     delay: float = 0.0,
+    heartbeat_s: float | None = None,
 ) -> tuple[Any, SqliteStore]:
     store = SqliteStore(Path(tempfile.mkdtemp()) / "t.db")
     model = _SlowModel(script, delay) if delay else ScriptedModel(script)
@@ -61,6 +62,10 @@ def _app(
         kwargs["event_bus"] = bus
     if gate_limit is not None:
         kwargs["sse_max_concurrency"] = gate_limit
+    if heartbeat_s is not None:
+        # 走**部署方的路径**（`build_app` 参数），不是 monkeypatch 模块全局：
+        # 要验的正是"环境变量算出来的值能不能真的到达搬运循环"。
+        kwargs["sse_heartbeat_seconds"] = heartbeat_s
     app = build_app(
         model=model,
         catalog=weather_tool(),
@@ -266,3 +271,72 @@ async def test_心跳注释行不会被当成事件解析() -> None:
     assert types[0] == "start"
     assert "final" in types
     assert len(types) == 2, f"心跳被当成事件解析了：{types}"
+
+
+# ---------------------------------------------------------------------------
+# 心跳间隔的**取值来源**（`WARDEN_SSE_HEARTBEAT_SECONDS`）
+#
+# 上面三条测的是"心跳这套机制对不对"，用的是 monkeypatch 模块全局——所以它们**测不出**
+# 「环境变量到不了搬运循环」这种失效：机制好好的，参数在装配层被丢了。
+# 下面这三条盯的是取值来源本身。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_心跳间隔可以由build_app参数传入() -> None:
+    """部署路径：`build_app(sse_heartbeat_seconds=...)` 必须真的到达搬运循环。
+
+    这条是"构造得出让它失败的输入"：把 `build_app` 里那个 kwarg 删掉（或忘了往
+    `register_streaming` 传），本用例立刻红——因为这里**没有** monkeypatch 全局，
+    用的是部署方走的那条路。
+    """
+    app, _store = _app(
+        [ChatResponse(content="慢", finish_reason="stop")],
+        delay=0.35,
+        heartbeat_s=0.04,
+    )
+
+    code, raw = await _drive(app, "/chat/stream/run-beat-env", {"text": "hi"})
+    assert code == 200
+    assert raw.count(b": keep-alive") > 0, (
+        "build_app 收到的 sse_heartbeat_seconds 没到达搬运循环"
+        "（参数在装配层被丢掉了）"
+    )
+
+
+@pytest.mark.asyncio
+async def test_心跳间隔为0_不发心跳且不空转() -> None:
+    """`0` = 关心跳（文档承诺的语义），而不是"每 0 秒超时一次"。
+
+    这条是防一个很具体的错法：把 0 原样交给 `Queue.get(timeout=0)`。那个 timeout 的
+    语义是**立刻超时**，于是搬运循环会转一圈发一条 `: keep-alive`——CPU 空转 + 拿垃圾帧
+    淹没客户端，恰好与"关心跳"相反。所以断言不是"没有事件"，而是**一个心跳都没有**
+    （真出现自旋，`raw` 里必然刷满 keep-alive，这条立刻红）。
+    """
+    app, _store = _app(
+        [ChatResponse(content="慢", finish_reason="stop")],
+        delay=0.35,
+        heartbeat_s=0,
+    )
+
+    code, raw = await _drive(app, "/chat/stream/run-beat-off", {"text": "hi"})
+    assert code == 200
+    assert raw.count(b": keep-alive") == 0, (
+        "0 被当成\"每 0 秒超时\"了：搬运循环在自旋刷心跳，而不是关心跳"
+    )
+    # 关掉心跳不等于关掉这一轮：终态照常送到。
+    frames = _frames(raw)
+    assert frames[0]["type"] == "start"
+    assert frames[-1]["type"] == "final" and frames[-1]["text"] == "慢"
+
+
+def test_心跳窗口换算_0与负数都是关心跳() -> None:
+    """把"间隔"翻译成"队列等待窗口"这一步单独钉住（纯函数，不用起服务器）。
+
+    `<= 0` → `None`（无限等）是关键：`None` 与 `0` 在 `Queue.get` 里是两件完全不同的事。
+    """
+    from warden_agent.web.routes.chat import _heartbeat_window
+
+    assert _heartbeat_window(10.0) == 10.0
+    assert _heartbeat_window(0.05) == 0.05
+    assert _heartbeat_window(0) is None          # 文档说的"0 关"
+    assert _heartbeat_window(-1) is None         # 防御：负数不该被当成"极小间隔"

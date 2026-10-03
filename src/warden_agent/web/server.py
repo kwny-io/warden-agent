@@ -183,7 +183,11 @@ _BODY_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 DEFAULT_SSE_MAX_CONCURRENCY = 100
 # SSE 心跳间隔（秒）：空闲这么久就发一条注释行。工具执行/长模型调用期间可能几十秒
 # 一个字节都不吐，中间层（nginx/CDN/浏览器）会把"零字节的长连接"当成死连接掐掉。
-# 测试里会 monkeypatch 成极小值，用来验证心跳确实发得出来。
+# 这个常量是**默认值**：真实取值由 `WARDEN_SSE_HEARTBEAT_SECONDS` 决定，在
+# `run_server.main()` 里读并显式传给 `build_app`（不读就只是一句空承诺——
+# README/docs 早就把它写成可调旋钮了）。0 = 关心跳（见 `routes/chat.py` 的 `_heartbeat_window`）。
+# 测试里会 monkeypatch 成极小值，用来验证心跳确实发得出来（不给 `build_app` 传参时
+# 走的就是这个全局）。
 SSE_HEARTBEAT_SECONDS = 10.0
 
 
@@ -223,6 +227,10 @@ def build_app(
     maintenance: Any = None,
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     sse_max_concurrency: int = DEFAULT_SSE_MAX_CONCURRENCY,
+    # None = 每次调用时读本模块的全局 `SSE_HEARTBEAT_SECONDS`（测试 monkeypatch 的就是它）；
+    # run_server 把环境变量的值显式传进来。两种路径都保留，因为二者的用途不同：
+    # 前者让用例能在不起真进程的前提下把间隔压到毫秒级，后者才是部署方的旋钮。
+    sse_heartbeat_seconds: float | None = None,
     session_cache_max: int = DEFAULT_SESSION_CACHE_MAX,
     session_ttl_s: float = 0.0,
     multiagent: bool = False,
@@ -793,7 +801,11 @@ def build_app(
         logger=logger,
         registry=registry,
         sse_gate=sse_gate,
-        sse_heartbeat_seconds=lambda: SSE_HEARTBEAT_SECONDS,
+        sse_heartbeat_seconds=(
+            (lambda: SSE_HEARTBEAT_SECONDS)
+            if sse_heartbeat_seconds is None
+            else (lambda: sse_heartbeat_seconds)
+        ),
         sse_max_concurrency=sse_max_concurrency,
     )
 

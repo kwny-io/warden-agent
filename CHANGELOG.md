@@ -4,6 +4,61 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-03（第四十六批：#14 文档承诺的旋钮，代码里没人接 —— 配置面守卫只问了一个方向）
+
+**一句话**：这一批还是方向自检问出来的 ——「**文档与代码是不是同源**」。
+`docs/复核索引.md` 与 `README.md` 都写着 SSE 空闲心跳「`WARDEN_SSE_HEARTBEAT_SECONDS` 可调，
+`0` 关」，但改动前 `git grep WARDEN_SSE_HEARTBEAT_SECONDS -- src/` 是**空的**：
+真实存在的只有 `src/warden_agent/web/server.py` 的一个模块常量 `SSE_HEARTBEAT_SECONDS = 10.0`。
+操作者照文档设了这个环境变量 —— **不生效、启动日志不提、配置面守卫也不报**，
+表现出来只是「长连接偶尔被代理掐断」。最贵的那种失败：现象离原因三跳远。
+
+**怎么回事**：**判据的方向只有一半**。`tests/test_config_surface.py` 原有的口径全是
+`代码 → 文档`（读到的必须登记 / 读它的模块 ⊆ 声明的 `consumers` / 登记了必须有人读 /
+`_NON_ENV_CONSTANTS` 逃生舱），而 `文档 → 代码` 是空的。偏偏「文档承诺的开关」正好落在
+盲区中间：写了文档、没写代码，**两边都自洽、两边的守卫都绿**。
+危害不是这一根旋钮，而是**这一类**：文档里任何一个 `WARDEN_*` 都可能是"一厢情愿的承诺"，
+而读者没有办法区分。
+
+| 修法 | 落点 | 为什么必须在这 |
+|---|---|---|
+| **真接线**（三跳） | `core/settings.py`（`EnvSpec` 登记，`kind="int"`）→ `web/run_server.py`（读 `WARDEN_SSE_HEARTBEAT_SECONDS`、写**启动日志**、传 `build_app`）→ `web/server.py`（`sse_heartbeat_seconds` 参数 → 取值器）→ `web/routes/chat.py`（`_heartbeat_window()` + `/chat/stream` 搬运循环） | 只登记不读是死配置；只读不记日志则「设了不生效」依然**不可观测**；模块常量降级为"默认值"（注释写明真实取值来自 `run_server.main()`），否则两条取值路径会在测试里互相覆盖 |
+| **类级守卫（新方向）** | `tests/test_config_surface.py::test_文档提到的环境变量都已登记`：扫 `README.md` + `docs/**/*.md` 里每个 `WARDEN_*`，必须在登记表里 | 这是本批真正的产出：把「文档承诺」纳入可失败的判据。写它的**当场**抓出真实违规 |
+| **README 计数守卫** | `::test_README里的变量计数与注册表一致` | README 自称「全部 **81** 个环境变量」，注册表实际 82（本批 83）——又一个**永不失败**的东西：手工数字早已过期且没人回头删 |
+| **逃生舱反向自检** | `::test_文档放行名单里的名字都不该是真变量` | `_DOC_ONLY_NAMES`（README 的 `WARDEN_X` AST 示例假名、`WARDEN_SKIP_DOTENV`）若哪天成了真变量必须删掉，否则逃生舱会变成永久黑洞 |
+
+**当场抓出的那条违规，本身就是一次旧谎言**：
+`WARDEN_SKIP_DOTENV ← docs/复核索引.md` —— 而 `git log -S WARDEN_SKIP_DOTENV -- src/ web/` 在 `src/` 与
+`web/` **都是空的：这个变量从未存在过**。真实挡法是 `web/e2e/start-e2e-server.mjs` 给子进程传
+`DEEPSEEK_API_KEY=''`（`core/config.py` 的 `load_env()` **不覆盖已存在的键**，空串被当成"没配"
+→ 没有真凭据 → 自动落到离线假模型）。**处理方式是更正而不是删除**：
+`CHANGELOG.md` 那条（第三十三批）里的原句改成划掉 + 【2026-10-03 更正】+ 真实机制 + 指向新守卫，
+因为删掉历史只会让「照它去查的人一无所获」再发生一次。
+
+**只有真接线才暴露的两个细节**（都写进了代码注释）：
+① `queue.Queue.get(timeout=0)` 的语义是「**立刻超时**」而不是「不等待」——直接把 `0` 传下去，
+搬运循环每圈都会发一条 `: keep-alive` 的**自旋**，与文档承诺的"`0` 关"**恰好相反**；
+于是有 `_heartbeat_window()`：关心跳（`0`/负数）映射成 `timeout=None`。
+② 负数**不需要**在 `run_server` 里单独判：登记表的 `kind="int"` 格式校验用 `str.isdigit()`，
+`-1` 之类在启动期就 exit 2；再写一个 `if < 0` 只会得到一段永远跑不到的死代码
+（测试验的是①既有机制 + ②透传，不是新写的防线）。
+
+**实测**（全部可复现）：
+- `uv run --frozen pytest tests/test_config_surface.py -q` → **21 passed**（新增 3 条）
+- `tests/test_run_server_main.py`（新增 4 条装配：`30→30.0` / 不设→默认值(>0) / `0→0.0` 不被当作
+  "未设置" / 负数→`SystemExit(2)`）与 `tests/test_web_stream_disconnect.py`（新增 1 条把窗口换算
+  参数化）全绿
+- **反向对照**：守卫加进仓库后**当场红**在 `WARDEN_SKIP_DOTENV ← docs/复核索引.md`；
+  改掉那两处文档才转绿（构造不出失败输入的守卫不算守卫）
+- `uv run --frozen ruff check .` 全绿；`uv run --frozen mypy src/warden_agent` →
+  `Success: no issues found in 115 source files`
+
+**教训**：**配置面守卫只问一个方向，就等于没问**。「文档承诺的旋钮」是这类失效的标准形状：
+文档自洽、代码自洽、守卫全绿，只有照文档操作的人不生效。
+`测试全绿` ≠ `文档说的都对`；`文档写的` ≠ `代码能跑的` —— 两个不等式各自都需要一条**会失败**的守卫。
+
+
+
 ## 2026-10-02（第四十五批：#13 配置面与策略真伪 —— 子进程派生点整包继承宿主环境）
 
 **一句话**：这一批不是「某个 job 为什么红」，而是方向自检问出来的问题 ——
@@ -656,7 +711,10 @@ stdout: ''
      否则两个实例并发 `vite build` 会互相覆盖 `web/dist`。
   3. **e2e 不再依赖真模型/不花一分钱**：子进程以前继承 shell 环境，`run_server.py:528` 的
      `load_env()` 会把仓库 `.env` 读进来 —— 一个 API Key 就让 e2e 变成"联网 + 花钱 + 不确定"。
-     现在子进程带 `WARDEN_SKIP_DOTENV=1` 且显式 `WARDEN_MODEL=fake`；
+     ~~子进程带 `WARDEN_SKIP_DOTENV=1` 且显式 `WARDEN_MODEL=fake`~~——**【2026-10-03 更正】这两句写错了**：`WARDEN_SKIP_DOTENV` 从未在 `src/` 或 `web/` 里存在过（`git log -S WARDEN_SKIP_DOTENV -- src/ web/` 为空），e2e 脚本也从没设过 `WARDEN_MODEL`。
+   真实挡法是 `web/e2e/start-e2e-server.mjs` 给子进程传 `DEEPSEEK_API_KEY=''`：`load_env()`（`core/config.py`）**不覆盖已存在的键**，空串被当成"没配" → 没有真凭据 → 自动落到离线假模型。
+   原句保留划掉而不删："曾经这么写"本身就是教训（照它去查的人会一无所获）。守卫：`tests/test_config_surface.py::test_文档提到的环境变量都已登记`；
+   **这句话是从哪来的（查清了）**：`git log -S WARDEN_SKIP_DOTENV -- src/ web/` 为空，但放开到 `docs/` 就有两条 —— 引入它的是 `57e66e0`（2026-10-02「docs: CHANGELOG / README / 复核索引 / 运维文档同步到第四十批」）：一次**只动文档**的同步提交。写进去的话既没有代码可对照、当时也没有任何守卫会碰它，于是它静静地待了一天，直到本批「文档 → 登记」的那条守卫把它扫出来。教训：**文档同步提交是「不可证伪的句子」最容易进门的地方** —— 它天然不进任何测试路径。
      并且给每个 e2e 后端一次性 SQLite 状态目录（`warden-e2e-state-*`），跑完即删。
 - **验收数字**：e2e **2 → 7 条**（CSP 2 + 登录 3 + 审批 2，`npm run test:e2e` → `7 passed (40.8s)`）；
   前端 `vitest` 181 → **186 passed / 12 文件**；`tsc -b` 与 `eslint` 干净；
