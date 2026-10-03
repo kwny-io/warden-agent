@@ -26,13 +26,14 @@ PostgreSQL：走标准运维工具 `pg_dump -Fc`（自定义格式）+ `pg_resto
 from __future__ import annotations
 
 import datetime as _dt
-import os
 import re
 import shutil
 import sqlite3
 import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+
+from warden_agent.execution.child_env import env_without_warden
 
 
 class BackupError(RuntimeError):
@@ -189,9 +190,13 @@ def verify_pg_dump(path: str | Path, *, pg_restore_bin: str = "pg_restore") -> t
     if binary is None:
         return False, f"找不到 {pg_restore_bin}（校验 dump 需要它；请装 postgresql-client）"
     try:
+        # pg_restore 是"操作者装配的外部组件"：保留它自己的连接/TLS 配置（`PG*`），
+        # 但**不带本项目自己的密钥**（`WARDEN_*`）。
+        # 不传 `env=` 就是整包继承宿主环境——那等于把服务端配置与密钥交给一个只跑
+        # `--list` 的外部工具。
         proc = subprocess.run(
             [binary, "--list", str(target)],
-            capture_output=True, timeout=120, check=False,
+            capture_output=True, env=env_without_warden(), timeout=120, check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"运行 {pg_restore_bin} 失败：{e}"
@@ -240,7 +245,15 @@ def backup_postgres(
         raise BackupError(f"目标已存在，拒绝覆盖：{dest}（换一个名字或先移走它）")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    env = dict(os.environ)
+    # 给 pg_dump 的环境：**继承但摘掉 `WARDEN_*`**。
+    #
+    # 为什么不是 `dict(os.environ)`：那是把服务端配置与密钥（`WARDEN_API_KEY`、审批密钥、
+    # 模型凭据…）整包交给一个外部工具。`execution/child_env.py` 里已经写明
+    # "本项目自己的变量前缀：任何外部子进程都不需要它"，这里原先正好破了这条。
+    # 为什么不是 `minimal_child_env()`：pg_dump 的连接/TLS 配置来自操作者的
+    # `PGSSLMODE`/`PGSSLROOTCERT`/`PGPASSFILE` 等变量，本模块没有对应的命令行参数，
+    # 用最小白名单会把它们一起丢掉（静默改变连哪个库/用哪张证书）。所以用"继承减 `WARDEN_*`"。
+    env = env_without_warden()
     if password is not None and str(password) != "":
         env[password_env] = str(password)
     cmd = [binary, "-Fc"]

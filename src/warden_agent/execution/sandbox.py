@@ -39,6 +39,7 @@ from pathlib import Path
 
 from warden_agent.core.settings import env_bool, env_str
 from warden_agent.execution.broker import ExecutionBroker, ExecutionBudget, ExecutionResult
+from warden_agent.execution.child_env import minimal_child_env
 
 # 常见的"会碰网络"的命令/参数片断（小写匹配）。用于 NetworkPolicy 语义层判断。
 _NETWORK_TOKENS = re.compile(
@@ -112,8 +113,12 @@ def _probe_namespace(prefix: list[str]) -> bool:
     而实际什么都没隔离。宁可少报一档，也不要谎报一档。
     """
     try:
+        # 探测用的子进程也要走最小环境：**不传 `env=` 就是整包继承宿主环境**，
+        # 等于把 `WARDEN_*`（服务端配置与密钥）顺手交给一个只跑 `true` 的子进程。
+        # 探测只关心退出码，最小白名单足够（`PATH`/`SystemRoot` 都在里面）。
         proc = subprocess.run(
-            [*prefix, "true"], capture_output=True, timeout=10, check=False,
+            [*prefix, "true"], capture_output=True, env=minimal_child_env(),
+            timeout=10, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return False

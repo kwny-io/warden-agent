@@ -70,6 +70,26 @@ def test_外部组件保留自己的密钥_只摘WARDEN前缀() -> None:
     assert env["PATH"] == "/bin"
 
 
+def test_摘WARDEN是前缀规则不是手写清单() -> None:
+    """锁的是**规则**，不是「今天有哪几个变量」。
+
+    上面那条只断言了已知名字（`WARDEN_API_KEY`）。如果哪天有人把它改写成「显式列出
+    要摘的变量」（或者有人为了“更明确”而写死一长串），今天的用例**全都还是绿的**，
+    而下一个新命名的 `WARDEN_*` 就会静默泄给操作者装配的外部组件。
+    所以这里用今天**不存在**的名字来测规则本身（含 Windows 上的大小写不敏感）。
+    """
+    base = {
+        "WARDEN_BRAND_NEW_THING": "x",
+        "warden_lower_case": "y",
+        "WARDEN_": "z",
+        "OPENAI_API_KEY": "vendor",
+        "PATH": "/bin",
+    }
+    env = env_without_warden(base)
+    assert [k for k in env if k.upper().startswith("WARDEN_")] == [], env
+    assert env == {"OPENAI_API_KEY": "vendor", "PATH": "/bin"}
+
+
 def test_真实子进程读不到服务端密钥(monkeypatch) -> None:
     """端到端：走 ExecutionBroker（模型能走的那条真实路径）跑一个真实子进程。
 

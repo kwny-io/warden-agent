@@ -4,6 +4,55 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-02（第四十五批：#13 配置面与策略真伪 —— 子进程派生点整包继承宿主环境）
+
+**一句话**：这一批不是「某个 job 为什么红」，而是方向自检问出来的问题 ——
+「**上一批标成完成的东西里，有没有声称修好但没真验的**」。答案是有一条：
+`execution/child_env.py` 那两种环境姿态**有完整测试，但没有任何测试检查派生点有没有真的用它**。
+
+两种姿态早就定义好了（`minimal_child_env()` 最小白名单、`env_without_warden()` 继承但摘掉
+`WARDEN_*`），`tests/test_child_env.py` 也把两个函数逐条验穿了 —— 但判据的**主语选错了**：
+测了「机制对不对」，没测「机制有没有被用」。不传 `env=` 就是整包继承宿主环境，这是
+`subprocess` 的默认值，它在沉默中生效，于是三处长期如此：
+
+| 派生点 | 修前 | 修后 | 为什么是这种姿态 |
+|---|---|---|---|
+| `runtime/backup.py` `backup_postgres` 的 `pg_dump` | `env = dict(os.environ)` | `env = env_without_warden()`（`:256`） | **不能**换最小白名单：pg_dump 的连接/TLS 配置来自操作者的 `PGSSLMODE`/`PGSSLROOTCERT`/`PGPASSFILE`，本模块没有对应的命令行参数，最小白名单会把它们一起丢掉（静默改变连哪个库/用哪张证书） |
+| `runtime/backup.py` `verify_pg_dump` 的 `pg_restore --list` | 不传 `env=`（整包继承） | `env=env_without_warden()`（`:199`） | 同左：操作者装配的外部工具，但它也不需要本项目密钥 |
+| `execution/sandbox.py` `_probe_namespace` 的 `unshare … true` | 不传 `env=`（整包继承） | `env=minimal_child_env()`（`:120`） | 探测只看退出码，最小白名单足够（`PATH`/`SystemRoot` 都在里面），没必要把服务端配置与密钥递给它 |
+
+**类级守卫**（新增 `tests/test_child_env_policy.py`，9 条）：AST 扫 `src/warden_agent/**/*.py`
+的**全部**派生点（`subprocess.*` 与 `os.system/popen/spawn*` 两族），要求每个点的 `env=` 指向
+两种姿态之一；允许**一次局部变量转手**（`env = env_without_warden()` 后 `env=env`）——
+否则守卫会把人逼成「为了过守卫把调用内联」，那是反向激励；
+`MUST_BE_SCANNED` 要求确实扫到 5 个已知含派生点的模块，**守卫悄悄失明必须表现为失败**；
+5 条反向对照 + 2 条真调用点行为验证。
+
+**实测**（2026-10-02，本机）：
+
+- 真树：`audit_tree()` → **真树违规数 0 / 扫到模块数 7**。
+- **构造让它失败的输入**（判据不是永真）：把 `dict(os.environ)` 塞回去 →
+  `runtime/backup.py:5 subprocess.run —— env=env ← `dict(os.environ)`（不是被认可的姿态）`；
+  换成合规写法 → `[]`。
+- **真调用点行为**（`monkeypatch` 拦 `subprocess.run` 看真实环境）：`pg_dump` 与 `pg_restore`
+  **两个**环境里都没有 `WARDEN_API_KEY`/`WARDEN_CREDENTIAL_KEY`，而 `PGSSLMODE=require`
+  与 `PGPASSWORD` 都还在；沙箱探测环境里也没有 `WARDEN_*`。
+- `uv run --frozen ruff check .` 全绿；`uv run --frozen mypy src/warden_agent`（CI 的调法，`ci.yml:110`）
+  → `Success: no issues found in 115 source files`；相关 7 个测试文件全绿（含新增 9 条）。
+- **本轮容器冒烟本机验不了（诚实记一笔）**：docker 拉基镜像要经 `127.0.0.1:7890` 代理，
+  代理没起 → `connectex: No connection could be made because the target machine actively refused it`
+  （连 `node:20-slim`/`python:3.12-slim` 的 metadata 都取不到）。第四十四批那条 trivy 修复同理
+  （本机容器无外网）。这两条只能交给 CI。
+
+**顺手修**：第四十四批在本文件里留了一个**未填的占位符**（「全量本地回归」后面那个标记）——
+已填上真实数字。**没有为它加扫描守卫**：区分「有意留的待办」（`README.md:16` 那条 `TODO(演示图)`
+是有意的）与「忘了填的占位符」是**判断**，不是模式，一条正则会把两者一起杀。
+
+**教训**：**「机制有测试」不等于「机制在用」**。类级守卫要盯的是**调用点与覆盖面**，不是机制本身；
+判据一旦只测机制，就会漏掉「没人调用」这种最安静的失效。以及那条老规矩：
+**构造得出让它失败的输入，才算验过**。
+
+---
 
 ## 2026-10-02（第四十四批：CI 三个红 job 的真根因 —— 扫描器被靜默关掉、测试把宿主环境当契约、冒烟验的不是部署形状）
 
