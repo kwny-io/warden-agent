@@ -21,8 +21,13 @@
     6. **e2e 启动脚本不得继承宿主 shell 的 `WARDEN_*`**（`web/e2e/start-e2e-server.mjs`
        原先把整个 `process.env` 铺进子进程，于是 `WARDEN_SSE_HEARTBEAT_SECONDS=999 node …`
        能让"确定性档"的后端以 999 秒心跳启动——e2e 断言的东西取决于跑之前 shell 里恰好有什么）。
+    7. **门控/夹具 docstring 里承诺的「可用环境变量覆盖」必须真的生效**
+       （第七个方向，`test_PG门控真的认环境变量里的端口`）：PG 门控的 docstring 写着
+       "可用环境变量覆盖（给 CI 用）"，而它当时**不读端口**——后果不是多一条红，
+       而是**静默少跑 40 条**（PG 不在默认端口 ⇒ 40 条一律 skip，整套仍报 "0 failed"，
+       看起来是绿的）。
 
-  没有这六条，注册表（以及文档里的每个数字）就只是文档——而文档是不会自己变红的。
+  没有这七条，注册表（以及文档里的每个数字）就只是文档——而文档是不会自己变红的。
 
 口径说明：扫描规则是「`.get("字面量")` / `["字面量"]` / `env_bool("字面量")`」，
 且字面量形如环境变量名。
@@ -39,8 +44,11 @@
 from __future__ import annotations
 
 import ast
+import os
 import re
 import secrets
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -529,3 +537,52 @@ def test_e2e启动脚本不吃宿主环境里的WARDEN变量() -> None:
         "WARDEN_IGNORE_DOTENV",
     ):
         assert key in text, f"e2e 启动脚本不再显式处理 {key}（档位/离线姿态会失控）"
+
+
+# ---------- 第七个方向：门控自己承诺的「环境变量覆盖」必须真的生效 ----------
+
+
+def test_PG门控真的认环境变量里的端口() -> None:
+    """PG 门控的 docstring 写着「可用环境变量覆盖（给 CI 用）」——那就必须真的能覆盖。
+
+    为什么值得一条守卫：踩到的后果**不是「多一条红」，而是静默少跑 40 条**——
+    PG 不在默认端口时（远端库 / CI 换端口 / 本地把 5432 映射到 5433），门控连不上 ⇒
+    40 条 PG 用例一律 skip，而整套仍然报「0 failed」：**看起来是绿的**。
+
+    第五十二批做「双口径」时就是这么栽的：以为设 `WARDEN_TEST_PG_PORT=5999`
+    就切到了「无 PG 口径」，两次跑却都是 PG 口径（两次 `skipped` 都是 4）——
+    因为当时的 `_pg_params()` 只读 HOST/DB/USER/PASSWORD，**端口写死**。
+    ⇒ 判口径永远看 `skipped` 是 4 还是 44，不看自己设了什么环境变量。
+
+    这里用**子进程探针**（不是读源码文本）：把端口指向一个没人监听的地方，要求
+    (1) 连接参数里真的带上这个端口，(2) 门控据此判定「没有可用的库」——
+    两条都钉在机制上。注意 `WARDEN_TEST_PG_PORT` 是**测试脚手架**的旋钮，
+    不在 `core/settings.py` 的产品注册表里（所以它不属于上面六个方向的登记检查）。
+    """
+    probe = (
+        "import sys;"
+        "sys.path.insert(0, 'tests');"
+        "import test_postgres_integration as m;"
+        "print(m._pg_params().get('port'));"
+        "print(m._pg_available())"
+    )
+    env = {**os.environ, "WARDEN_TEST_PG_PORT": "5999"}
+    done = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        check=True,
+        timeout=120,
+    )
+    lines = done.stdout.split()
+    assert lines and lines[0] == "5999", (
+        f"门控没把 `WARDEN_TEST_PG_PORT` 读进连接参数（拿到 {lines[:1]!r}）："
+        " docstring 承诺「可用环境变量覆盖」，那就必须真的能覆盖——"
+        " 覆盖不了时它会连默认端口，PG 不在那里就静默 skip 掉 40 条，而整套仍然是绿的。"
+    )
+    assert lines[-1] == "False", (
+        f"端口指向没人监听的地方时，门控仍报「有可用的库」（拿到 {lines[-1:]!r}）："
+        " 要么端口被忽略、要么门控根本没在探活。"
+    )

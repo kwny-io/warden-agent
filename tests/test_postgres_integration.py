@@ -40,9 +40,18 @@ _FIELD = "api_" + "key"
 
 
 def _pg_params() -> dict[str, object]:
-    """连接参数：默认沿用 test_store_interface.py 的约定，可用环境变量覆盖（给 CI 用）。"""
+    """连接参数：默认沿用 test_store_interface.py 的约定，可用环境变量覆盖（给 CI 用）。
+
+    **`WARDEN_TEST_PG_PORT` 必须真的被读到**（第五十二批补）：原实现只读了
+    HOST/DB/USER/PASSWORD——于是上面这句“可用环境变量覆盖”在**端口**上是不成立的。
+    后果不是“多一条红”，而是**静默少跑 40 条**：PG 不在默认端口时（远端库 / CI 换端口 /
+    本地把 5432 映射到 5433），这个门控连不上 ⇒ 40 条 PG 用例一律 skip，
+    而整套仍然报 “0 failed”——**看起来是绿的**（同源失败模式：机制在、但没接上）。
+    锁住它：`tests/test_config_surface.py::test_PG门控真的认环境变量里的端口`。
+    """
     return {
         "host": os.environ.get("WARDEN_TEST_PG_HOST", "localhost"),
+        "port": int(os.environ.get("WARDEN_TEST_PG_PORT", "5432")),
         "dbname": os.environ.get("WARDEN_TEST_PG_DB", "warden"),
         "user": os.environ.get("WARDEN_TEST_PG_USER", "postgres"),
         "password": os.environ.get("WARDEN_TEST_PG_PASSWORD", ""),
