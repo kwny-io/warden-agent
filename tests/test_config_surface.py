@@ -219,7 +219,9 @@ def test_注册表无重复且消费者非空() -> None:
 #   2. `docs/复核索引.md` 曾把 e2e 的离线保证写成"子进程带 `WARDEN_SKIP_DOTENV=1`"，
 #      而这个变量**在 `src/` 与 `web/` 里从未存在过**（看代码面：`git log -S WARDEN_SKIP_DOTENV`
 #      `-- src/ web/` 为空 —— **必须带路径限定**，不带路径会命中两个只动文档的提交）；
-#      真实保证是 `DEEPSEEK_API_KEY=''` + `load_env()` 不覆盖已存在的键）。
+#      当时的真实保证只有 `DEEPSEEK_API_KEY=''` + `load_env()` 不覆盖已存在的键；
+#      第五十批补上了第二个真旋钮 `WARDEN_IGNORE_DOTENV=1`（在那之前 `.env` 照读，
+#      于是 e2e 的档位仍会随开发机的本地 `.env` 变——同一个失败模式的另一个入口）。
 #
 # 口径：扫 README.md 与 docs/**/*.md 里形如 `WARDEN_XXX` 的记号；
 #   · 以 `*` 结尾的（`WARDEN_OUTBOUND_*` 这类**变量族**写法）放行，它本就不是单个变量名；
@@ -517,5 +519,13 @@ def test_e2e启动脚本不吃宿主环境里的WARDEN变量() -> None:
         " 要么被删了，要么改了写法——两种都请同步改这条守卫的判据。"
     )
     # 档位与离线姿态必须仍是**显式**的：入参是显式的，不是环境里碰巧有的。
-    for key in ("WARDEN_E2E_API_KEY", "WARDEN_ALLOW_ANON", "WARDEN_API_KEY", "DEEPSEEK_API_KEY"):
+    for key in (
+        "WARDEN_E2E_API_KEY",
+        "WARDEN_ALLOW_ANON",
+        "WARDEN_API_KEY",
+        "DEEPSEEK_API_KEY",
+        # `.env` 是第二条进环境的路（宿主 shell 是第一条）：主机上那个文件
+        # 会静默盖掉没显式设的键，e2e 的档位于是跟着开发机的本地文件变。
+        "WARDEN_IGNORE_DOTENV",
+    ):
         assert key in text, f"e2e 启动脚本不再显式处理 {key}（档位/离线姿态会失控）"

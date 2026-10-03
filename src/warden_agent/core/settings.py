@@ -450,6 +450,17 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         default="1", kind="bool",
         note="关掉后 span() 不碰 contextvar、开销接近零；出站与入站的链路上下文也随之不再生成",
     ),
+    # ---- 配置来源 ----
+    EnvSpec(
+        "WARDEN_IGNORE_DOTENV",
+        "不读 .env 文件，配置只从环境变量来（容器/k8s 与 e2e 用）",
+        "core/config.py", ("core/config.py",),
+        kind="bool",
+        note="不设 = 照旧读 .env（开发默认）；设 1 = `load_env()` 根本不打开文件。"
+             "为什么要它：`.env` 是**静默改行为**的一条路——工作目录里恰好有一个（容器镜像漏进去、"
+             "或开发机本地文件）就会盖掉你没显式设的键，而 e2e 这种「确定性档」最怕这个："
+             "档位会随跑的人的本地文件变。它只管「要不要读文件」，不管覆盖语义（后者永远是「不覆盖」）",
+    ),
     # ---- 演示与开发（默认关，打开要显式声明） ----
     EnvSpec(
         "WARDEN_DEMO_TOOLS",

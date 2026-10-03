@@ -136,6 +136,10 @@ const childEnv = {
   // 那样 e2e 就会**悄悄打真模型**——非确定、要联网、还花钱，而断言不会红。
   // 这里显式给空串：`load_env()` 不覆盖已存在的键，`DEEPSEEK_API_KEY=""` 于是被当成"没配"。
   DEEPSEEK_API_KEY: '',
+  // 并且**根本不读 .env**：`.env` 是另一条进环境的路（只在本机存在、在 gitignore 里），
+  // 不关掉的话 e2e 的档位仍会随"这台机器的 .env 恰好写了什么"变——
+  // 和上面摘掉宿主 `WARDEN_*` 是同一个失败模式的两个入口。
+  WARDEN_IGNORE_DOTENV: '1',
 }
 if (gitDir) childEnv.GIT_WORKDIR = gitDir
 
