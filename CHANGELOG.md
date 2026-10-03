@@ -55,6 +55,14 @@
 **实测**：`tests/test_run_server_main.py` + `tests/test_config_surface.py` 共 **37 项全绿**；
 `ruff check src tests scripts` 通过；`mypy src/warden_agent/web/run_server.py` 通过。
 
+**全量套件（本批推送后在真环境复核）**：`cd /d D:\warden-agent && uv run --frozen pytest` →
+**1616 passed, 0 failed, 0 error, 44 skipped**（457 秒）。计数取自 `--junitxml` 而不是终端输出：
+本机 `pyproject.toml` 的 `addopts` 已含 `-q`，命令行**再加**一个 `-q` 会连总结行都不打印——
+第 47 批就是把这种「什么都没打」误读成了通过数。
+44 条跳过全部是**环境门控**，没有一条是被静默「跳过即通过」的：41 条要求可用的 PostgreSQL
+（本机未部署，起法写在 `tests/test_postgres_integration.py` 顶部注释），3 条是平台门控
+（符号链接 ×2、win32 无内核网络命名空间 ×1）。
+
 ### 四、第 46 批的守卫在本批又抓到一次真东西
 
 写本批文档时，我把"探针自造的错名字"如实写进了 `docs/复核索引.md` —— 结果
