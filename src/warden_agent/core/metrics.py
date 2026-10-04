@@ -153,7 +153,11 @@ class MetricsRegistry:
         return Gauge(self, ("gauge", name) + tuple(labels))
 
     def histogram(self, name: str, help_text: str,
-                  buckets: Iterable[float] = (0.01, 0.05, 0.1, 0.5, 1.0)) -> Histogram:
+                  # 上界要盖住告警/面板要看的最大延迟（见 web/server.py 里的同一条注释）：
+                  # 分位数落进 +Inf 桶时返回的是最高有限桶的上界，桶封顶多少，
+                  # “大于多少秒”的告警就只能看到多少。
+                  buckets: Iterable[float] = (
+                      0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0)) -> Histogram:
         """注册并返回一个直方图调查柄。默认给一组常用的耗时桶。"""
         b = tuple(buckets)
         self._meta[name] = (help_text, "histogram")

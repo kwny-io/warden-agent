@@ -64,6 +64,11 @@ groups:
   - name: warden-latency
     rules:
       - alert: WardenHighLatencyP95
+        # 阈值必须落在直方图**最高有限桶**以内：分位数落进 +Inf 桶时，histogram_quantile 返回的是
+        # 最高有限桶的上界（不是 +Inf）。本仓库旧桶集到 1.0 为止 ⇒ 这条 `> 2` 曾是**永远不会响的告警**
+        # （第五十九批用 promtool 单元测试实测：哪怕 10% 的请求超过 1s，p95 仍返回 1.0）。
+        # 桶集现已扩到 10.0；改动桶集或本阈值时，必须同步跑
+        #   promtool test rules deploy/observability/alerts/warden.rules.test.yml
         expr: |
           histogram_quantile(
             0.95,

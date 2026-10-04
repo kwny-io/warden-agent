@@ -474,10 +474,14 @@ def build_app(
     m = metrics()
     m_http = m.counter("warden_http_requests_total", "HTTP 请求总数", ["method", "path"])
     m_http_errors = m.counter("warden_http_errors_total", "HTTP 5xx 错误数", ["method", "path"])
+    # 桶上界必须盖住告警/面板要看的最大延迟：分位数落在 +Inf 桶时，histogram_quantile
+    # 返回的是**最高有限桶的上界**（不是 +Inf）。旧桶集到 1.0 为止，于是
+    # `histogram_quantile(...) > 2` 不论服务多慢都恒为假（第五十九批：promtool 单元测试实测
+    # 10% 请求超过 1s 时 p95 仍返回 1.0）。加 2.5/5.0/10.0 之后 >2s 才是真能测到的。
     m_http_latency = m.histogram(
         "warden_http_request_duration_seconds",
         "HTTP 请求耗时(秒)",
-        [0.01, 0.05, 0.1, 0.5, 1.0],
+        [0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0],
     )
     m_approvals = m.counter("warden_approvals_total", "审批决策数", ["action"])
     m_rate_limited = m.counter("warden_rate_limited_total", "被限流拒绝的请求数", ["path"])

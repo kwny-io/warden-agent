@@ -1,0 +1,237 @@
+# Warden Agent —— SLO 记录规则与燃烧率告警的**求值测试**（promtool 单元测试）
+#
+# 为什么要有这个文件（第五十九批）：与 warden.rules.test.yml 同一个理由——规则此前
+# 只有静态守卫，没人求值过。这里额外钉住两件静态检查看不见的事：
+#
+#   1) 记录规则的**算术**：可用性/延迟 SLI 在"全好"时必须是 1、在"全坏"时必须是 0。
+#      只差一个 clamp_min 或一个符号，SLI 就会长期偏高或偏低——而它在 Grafana 上、
+#      在燃烧率告警里都以"数字看起来挺正常"的样子活着。
+#   2) 燃烧率告警的**双窗口**语义：必须两个窗口都越限才响（这正是它区别于单窗口的地方）。
+#      这里对每条告警都给"该响"和"不该响"两个用例。
+#
+# 怎么跑（本地无需网络）：
+#   docker run --rm --entrypoint promtool -v "$PWD/deploy/observability:/cfg" \
+#     prom/prometheus:v2.55.0 test rules /cfg/alerts/warden.slo.test.yml
+#
+# 注意：记录规则那组的 interval 是 30s（写在 warden.slo.yml 里），告警组用本文件的
+# evaluation_interval。要让记录出来的序列先存在，燃燃告警的 eval_time 取在了足够晚的位置。
+#
+# 输入序列的标签集做了简化（真实抓取还带 method/path 等标签；这里的 sum 会先聚合掉）。
+# ⚠️ exp_annotations 会被逐字比对——改了规则里的文案就要同步改这里（故意的，见另一个测试文件）。
+
+rule_files:
+  - warden.slo.yml
+evaluation_interval: 1m
+
+tests:
+  # ---------------- 记录规则：可用性 SLI 的算术 ----------------
+  - name: SLI_可用性_全好时恰好为一
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0x50'
+    promql_expr_test:
+      - expr: warden:slo_availability:ratio_rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="warden:slo_availability:ratio_rate5m"}'
+            value: 1
+      - expr: warden:slo_availability:ratio_rate1h
+        eval_time: 40m
+        exp_samples:
+          - labels: '{__name__="warden:slo_availability:ratio_rate1h"}'
+            value: 1
+      - expr: warden:slo_availability:ratio_rate30d
+        eval_time: 40m
+        exp_samples:
+          - labels: '{__name__="warden:slo_availability:ratio_rate30d"}'
+            value: 1
+
+  - name: SLI_可用性_全坏时恰好为零
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+    promql_expr_test:
+      - expr: warden:slo_availability:ratio_rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="warden:slo_availability:ratio_rate5m"}'
+            value: 0
+
+  # ---------------- 记录规则：延迟 SLI 的算术 ----------------
+  # le="1.0" 桶的累计计数 / 总计数 = "≤1s 的比例"。分母是 _count（不是 _sum）。
+  - name: SLI_延迟_全部一秒内完成时恰好为一
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_request_duration_seconds_count{method="GET",path="/runs"}'
+        values: '0+600x50'
+    promql_expr_test:
+      - expr: warden:slo_latency_fast:ratio_rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="warden:slo_latency_fast:ratio_rate5m"}'
+            value: 1
+      - expr: warden:slo_latency_fast:ratio_rate1h
+        eval_time: 40m
+        exp_samples:
+          - labels: '{__name__="warden:slo_latency_fast:ratio_rate1h"}'
+            value: 1
+
+  - name: SLI_延迟_没有请求落在一秒内时恰好为零
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0x50'
+      - series: 'warden_http_request_duration_seconds_count{method="GET",path="/runs"}'
+        values: '0+600x50'
+    promql_expr_test:
+      - expr: warden:slo_latency_fast:ratio_rate5m
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="warden:slo_latency_fast:ratio_rate5m"}'
+            value: 0
+
+  # ---------------- 燃烧率告警：可用性 ----------------
+  # 全部请求失败 ⇒ 两个窗口的"错误率"都是 100% ⇒ 5m+1h 双窗口都越限 ⇒ 该响
+  - name: WardenAvailabilityBudgetBurnFast_全坏时两个窗口都越限_该响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: WardenAvailabilityBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: WardenAvailabilityBudgetBurnFast
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "可用性预算快速燃烧（5m+1h 双窗口越限）"
+              description: "按当前速率 30 天预算将在数小时内烧穿。先止血（回滚/限流/扩容），再定位。"
+              runbook: "docs/operations.md"
+
+    # 一个窗口好、一个窗口坏 ⇒ 单窗口规则会响，双窗口规则**不该响**（这是它存在的意义）
+  - name: WardenAvailabilityBudgetBurnFast_双窗口未同时越限时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0x50'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WardenAvailabilityBudgetBurnFast
+        exp_alerts: []
+
+  # 慢烧用 1h+30d 两个窗口；持续全坏 ⇒ 15 分钟后该响
+  - name: WardenAvailabilityBudgetBurnSlow_持续全坏该响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WardenAvailabilityBudgetBurnSlow
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WardenAvailabilityBudgetBurnSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "可用性预算持续燃烧（1h+30d 双窗口越限）"
+              description: "不是瞬时抖动，是持续性的可靠性退化——排进本周处理，别拖到烧穿。"
+              runbook: "docs/operations.md"
+
+  - name: WardenAvailabilityBudgetBurnSlow_全好时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenAvailabilityBudgetBurnSlow
+        exp_alerts: []
+
+  # ---------------- 燃烧率告警：延迟 ----------------
+  # 一半请求超过 1s ⇒ 两个窗口的"慢比例"都是 50% ⇒ 都越限 ⇒ 该响
+  - name: WardenLatencyBudgetBurnFast_一半请求超过一秒_该响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0+300x50'
+      - series: 'warden_http_request_duration_seconds_count{method="GET",path="/runs"}'
+        values: '0+600x50'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WardenLatencyBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: WardenLatencyBudgetBurnFast
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "延迟预算快速燃烧（5m+1h 双窗口越限）"
+              description: "短窗口也越限，说明是**正在发生**的变慢而非统计噪声。先查下游依赖（模型/出站）与 Run 锁等待。"
+              runbook: "docs/operations.md"
+
+  - name: WardenLatencyBudgetBurnFast_全部一秒内完成时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_request_duration_seconds_count{method="GET",path="/runs"}'
+        values: '0+600x50'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WardenLatencyBudgetBurnFast
+        exp_alerts: []
+
+  - name: WardenLatencyBudgetBurnSlow_慢比例持续超过百分之五_该响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0+300x50'
+      - series: 'warden_http_request_duration_seconds_count{method="GET",path="/runs"}'
+        values: '0+600x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenLatencyBudgetBurnSlow
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: WardenLatencyBudgetBurnSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "延迟 SLO：>1s 的请求占比持续超过 5%"
+              description: "用户可感知的变慢。先看哪条 path / 是否集中在模型调用或出站抓取。"
+              runbook: "docs/operations.md"
+
+  - name: WardenLatencyBudgetBurnSlow_全部一秒内完成时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0+600x50'
+      - series: 'warden_http_request_duration_seconds_count{method="GET",path="/runs"}'
+        values: '0+600x50'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: WardenLatencyBudgetBurnSlow
+        exp_alerts: []

@@ -1,0 +1,438 @@
+# Warden Agent —— 告警规则的**求值测试**（promtool 单元测试）
+#
+# 为什么要有这个文件（第五十九批）：
+#   规则库此前只有**静态**守卫（名字唯一、有 severity/annotations、表达式引用的指标在代码里
+#   真实存在），但从来没有东西**求值过**这些表达式。于是没人发现：
+#
+#     `WardenHighLatencyP95`（注释写"p95 延迟 > 2s"）**永远不会响**。
+#     当时延迟直方图的最高有限桶是 1.0s（web/server.py 的桶列表），而分位数落进 +Inf 桶时
+#     `histogram_quantile` 返回的是**最高有限桶的上界**（1.0，不是 +Inf）⇒ `1.0 > 2` 恒为假。
+#     实测：哪怕 10% 的请求超过 1s、20% 超过 10s，p95 仍返回 1.0。
+#
+#   这一条只有"真求值一次"才看得见。静态检查看不见——它查的是名字和指标名，不是语义。
+#
+# 怎么跑（本机无需网络：用已有的 prometheus 镜像里的 promtool）：
+#   docker run --rm --entrypoint promtool -v "$PWD/deploy/observability:/cfg" \
+#     prom/prometheus:v2.55.0 test rules /cfg/alerts/warden.rules.test.yml
+#   CI 里没有这个镜像时对应测试会跳过（见 tests/test_alert_rules_evaluated.py）。
+#
+# 写法约定（由 tests/test_alert_rules_evaluated.py 静态检查）：
+#   **每条告警至少两个用例：一个「该响」、一个「不该响」**。
+#   只写"该响"挡不住"永远响"的规则；只写"不该响"挡不住"永远不响"的规则（上面那条就是后者）。
+#   「for: Nm」还要有一个"还没到 N 分钟所以不响"的用例——否则 for 写错也没人发现。
+#
+# ⚠️ promtool 会把 `exp_annotations` **逐字**与规则渲染出来的内容比对（省略 = 期望空）。
+#   所以改了规则里的 annotations，就要同步改本文件——**这是故意的**：值班的人看到的就是这些字，
+#   模板（例如 `{{ $value }}`）渲染成什么样，也在这里被钉住。
+#
+# 输入序列的标签集做了简化（静默失败类计数器省略了线上可能有的额外标签、instance 用占位值）。
+# 这里验证的是**表达式语义**：给定输入下该响的响、不该响的不响。
+
+rule_files:
+  - warden.rules.yml
+evaluation_interval: 1m
+
+tests:
+  # ---------------- 可用性 ----------------
+  # up == 0 且 for: 2m —— 锁住"连续 2 分钟才响"，而不是瞬间就响
+  - name: WardenServiceDown_连续两分钟抓不到才响
+    interval: 1m
+    input_series:
+      - series: 'up{job="warden-agent",instance="warden-agent:8000"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: WardenServiceDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: WardenServiceDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: warden-agent
+              instance: warden-agent:8000
+            exp_annotations:
+              summary: "Warden 服务已下线（抓取不到）"
+              description: "Prometheus 连续 2 分钟抓不到 warden-agent:8000。先看容器/进程是否还活着、端口是否可达。"
+              runbook: "docs/operations.md"
+
+  - name: WardenServiceDown_抓得到时不响
+    interval: 1m
+    input_series:
+      - series: 'up{job="warden-agent",instance="warden-agent:8000"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WardenServiceDown
+        exp_alerts: []
+
+  # probe_success == 0 且 for: 5m —— "活着但没就绪"与"抓不到"是两件事，别混成一条
+  - name: WardenReadinessFailing_就绪探针连续失败五分钟才响
+    interval: 1m
+    input_series:
+      - series: 'probe_success{job="warden-ready",instance="warden-agent:8000"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: WardenReadinessFailing
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: WardenReadinessFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: warden-ready
+              instance: warden-agent:8000
+            exp_annotations:
+              summary: "Warden 就绪探针失败（依赖可能断了）"
+              description: "服务活着但 /health/ready 不通过，多半是数据库连不上。**别只看存活探针**。"
+              runbook: "docs/operations.md"
+
+  - name: WardenReadinessFailing_就绪正常时不响
+    interval: 1m
+    input_series:
+      - series: 'probe_success{job="warden-ready",instance="warden-agent:8000"}'
+        values: '1x12'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WardenReadinessFailing
+        exp_alerts: []
+
+  # ---------------- 错误率 ----------------
+  # 5xx 占比 > 5%；rate[5m] 使条件很快为真，真正压住的是 for: 10m
+  - name: WardenHighErrorRate_错误率一成要连续十分钟才响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x25'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0+60x25'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WardenHighErrorRate
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WardenHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Warden 5xx 错误率 > 5%"
+              description: "近 10 分钟 5xx 占比持续高于 5%。查 /audit 最近失败请求的 correlation_id，再按它捞日志。"
+              runbook: "docs/operations.md"
+
+  - name: WardenHighErrorRate_错误率四个百分点不响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0+600x25'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0+24x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenHighErrorRate
+        exp_alerts: []
+
+  # 规则注释声称 "clamp_min 防止零流量时分母为 0 造成的假告警" —— 这条注释此前**从没被验证过**
+  - name: WardenHighErrorRate_零流量不响_clamp_min那条注释的实证
+    interval: 1m
+    input_series:
+      - series: 'warden_http_requests_total{method="GET",path="/runs"}'
+        values: '0x25'
+      - series: 'warden_http_errors_total{method="GET",path="/runs"}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenHighErrorRate
+        exp_alerts: []
+
+  # ---------------- 延迟 ----------------
+  # 全部请求约 4 秒完成（落在 (2.5, 5.0] 桶里）⇒ p95 ≈ 4.9s > 2
+  - name: WardenHighLatencyP95_p95超过两秒要连续十分钟才响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="0.1",method="GET",path="/runs"}'
+        values: '0x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="0.5",method="GET",path="/runs"}'
+        values: '0x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="2.5",method="GET",path="/runs"}'
+        values: '0x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="5.0",method="GET",path="/runs"}'
+        values: '0+600x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="10.0",method="GET",path="/runs"}'
+        values: '0+600x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="+Inf",method="GET",path="/runs"}'
+        values: '0+600x25'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WardenHighLatencyP95
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WardenHighLatencyP95
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Warden HTTP p95 延迟 > 2s"
+              description: "近 10 分钟 p95 超过 2 秒。先看是否模型链路/出站抓取变慢，再看 Run 锁是否存在等待。"
+              runbook: "docs/operations.md"
+
+  - name: WardenHighLatencyP95_秒级以内不响
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="0.1",method="GET",path="/runs"}'
+        values: '0+600x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0+600x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="+Inf",method="GET",path="/runs"}'
+        values: '0+600x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenHighLatencyP95
+        exp_alerts: []
+
+  # 【这条就是第五十九批抓到的缺陷】20% 的请求超过最高有限桶 ⇒ 分位数落进 +Inf 桶。
+  # 桶封顶 1.0s 时 histogram_quantile 返回 1.0（`> 2` 为假，告警永远不响）；
+  # 桶扩到 10.0 之后返回 10.0 ⇒ 该响。谁把桶集改回封顶 1.0，这条会红。
+  - name: WardenHighLatencyP95_超过最高有限桶时仍然会响_不能封顶
+    interval: 1m
+    input_series:
+      - series: 'warden_http_request_duration_seconds_bucket{le="0.1",method="GET",path="/runs"}'
+        values: '0+480x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="0.5",method="GET",path="/runs"}'
+        values: '0+480x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="1.0",method="GET",path="/runs"}'
+        values: '0+480x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="2.5",method="GET",path="/runs"}'
+        values: '0+480x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="5.0",method="GET",path="/runs"}'
+        values: '0+480x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="10.0",method="GET",path="/runs"}'
+        values: '0+480x25'
+      - series: 'warden_http_request_duration_seconds_bucket{le="+Inf",method="GET",path="/runs"}'
+        values: '0+600x25'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WardenHighLatencyP95
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Warden HTTP p95 延迟 > 2s"
+              description: "近 10 分钟 p95 超过 2 秒。先看是否模型链路/出站抓取变慢，再看 Run 锁是否存在等待。"
+              runbook: "docs/operations.md"
+
+  # ---------------- 业务：人工闸门 ----------------
+  # 只认 older_than="60m" 这条序列 —— 另一个标签值的序列不该把它带响
+  - name: WardenStuckRuns_只看older_than60m的序列
+    interval: 1m
+    input_series:
+      - series: 'warden_stuck_runs{older_than="60m"}'
+        values: '1x20'
+      - series: 'warden_stuck_runs{older_than="5m"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: WardenStuckRuns
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WardenStuckRuns
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              older_than: 60m
+            exp_annotations:
+              summary: "有 1 个 Run 等待人工处理超过 60 分钟"
+              description: "高危操作等在审批、或任务等用户回复。见 GET /alerts/stuck 拿明细（含 source 字段判断时长可信度）。"
+              runbook: "docs/operations.md"
+
+  - name: WardenStuckRuns_没有卡死时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_stuck_runs{older_than="60m"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenStuckRuns
+        exp_alerts: []
+
+  # ---------------- 业务：限流 ----------------
+  - name: WardenRateLimitedSurge_五分钟被拒超过一百才响
+    interval: 1m
+    input_series:
+      - series: 'warden_rate_limited_total{path="/runs"}'
+        values: '0+30x22'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: WardenRateLimitedSurge
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WardenRateLimitedSurge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              path: /runs
+            exp_annotations:
+              summary: "入站限流拒绝量激增"
+              description: "近 5 分钟被拒 > 100 次。先区分是「恶意刷」还是「容量不够」：按 path 看分布，再决定收紧还是扩容。"
+              runbook: "docs/operations.md"
+
+  - name: WardenRateLimitedSurge_被拒量正常时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_rate_limited_total{path="/runs"}'
+        values: '0+10x22'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WardenRateLimitedSurge
+        exp_alerts: []
+
+  # ---------------- 静默失败（只有日志、没有指标的错） ----------------
+  # 这几条的表达式都是 increase(...[10m]) > 0，差别只在 for：1m / 5m / 10m。
+  # 每条都给两个用例：计数器不动 ⇒ 不响；动一次 ⇒ 到了 for 才响。
+  - name: WardenLockRenewFailures_续租失败后响
+    interval: 1m
+    input_series:
+      - series: 'warden_lock_renew_failures_total'
+        values: '0+1x22'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: WardenLockRenewFailures
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: WardenLockRenewFailures
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Run 锁续租失败（可能已被接管）"
+              description: "某 Run 的租约续租失败，说明锁被别的副本接管或存储抖动 → 该 Run 可能被并发驱动。查日志「租约续租失败」拿 run/owner，核对是否发生重复执行。"
+              runbook: "docs/operations.md"
+
+  - name: WardenLockRenewFailures_没有失败时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_lock_renew_failures_total'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WardenLockRenewFailures
+        exp_alerts: []
+
+  - name: WardenEventDropped_丢弃事件后响
+    interval: 1m
+    input_series:
+      - series: 'warden_event_dropped_total'
+        values: '0+1x22'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: WardenEventDropped
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: WardenEventDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "SSE 事件被丢弃（保留上限被突破）"
+              description: "事件总线超出每个 run 的保留条数，慢消费者会看到进度不连续。最终结果不受影响；频繁发生可调大 WARDEN_EVENT_KEEP。"
+              runbook: "docs/operations.md"
+
+  - name: WardenEventDropped_没丢事件时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_event_dropped_total'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenEventDropped
+        exp_alerts: []
+
+  - name: WardenAuditWriteFailures_审计写失败后响
+    interval: 1m
+    input_series:
+      - series: 'warden_audit_write_failures_total'
+        values: '0+1x22'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: WardenAuditWriteFailures
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: WardenAuditWriteFailures
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "审计写入失败（账本可能缺条）"
+              description: "审计落库失败，correlation_id 见日志。先查存储是否不可写/锁冲突，再评估缺失范围（`warden audit-verify` 校验链完整性）。"
+              runbook: "docs/operations.md"
+
+  - name: WardenAuditWriteFailures_写成功时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_audit_write_failures_total'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WardenAuditWriteFailures
+        exp_alerts: []
+
+  - name: WardenOtlpExportFailing_导出失败后响
+    interval: 1m
+    input_series:
+      - series: 'warden_otlp_export_failures_total'
+        values: '0+1x22'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WardenOtlpExportFailing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WardenOtlpExportFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "OTLP 链路导出失败"
+              description: "span 送不到收集器。检查 OTEL_EXPORTER_OTLP_ENDPOINT 可达性与收集器状态；未配 OTLP 时不会有此指标。"
+              runbook: "docs/operations.md"
+
+  - name: WardenOtlpExportFailing_没失败时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_otlp_export_failures_total'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenOtlpExportFailing
+        exp_alerts: []
+
+  - name: WardenOtlpDropping_队列丢弃后响
+    interval: 1m
+    input_series:
+      - series: 'warden_otlp_dropped_total'
+        values: '0+1x22'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: WardenOtlpDropping
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: WardenOtlpDropping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "OTLP span 因队列满被丢弃"
+              description: "导出队列积压，通常是收集器不可达或太慢。链路数据不完整，业务不受影响。"
+              runbook: "docs/operations.md"
+
+  - name: WardenOtlpDropping_没丢弃时不响
+    interval: 1m
+    input_series:
+      - series: 'warden_otlp_dropped_total'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WardenOtlpDropping
+        exp_alerts: []

@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-1680%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-1687%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -52,7 +52,7 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1684 项测试（2026-10-04 第五十八批实测两个口径：带真 PG **1680 passed / 4 skipped**；无 PG **1640 passed / 44 skipped**；两种口径都是 **0 failed / 0 errors**）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1691 项测试（2026-10-04 第五十九批实测两个口径：带真 PG **1687 passed / 4 skipped**；无 PG **1647 passed / 44 skipped**；两种口径都是 **0 failed / 0 errors**）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -588,13 +588,13 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**0 项失败**（共 1684 项收集，2026-10-04 第五十八批实测，`--junitxml` 口径）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
-  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1680 passed / 4 skipped / 0 failed / 0 errors**（496.1 秒）；
-  无 PG（**真把容器 `docker stop` 掉**即此口径）→ **1640 passed / 44 skipped / 0 failed / 0 errors**（505.3 秒；多跳的 40 条是需要真库的用例）。
+- **测试**：**0 项失败**（共 1691 项收集，2026-10-04 第五十九批实测，`--junitxml` 口径）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
+  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1687 passed / 4 skipped / 0 failed / 0 errors**（273.3 秒）；
+  无 PG（**真把容器 `docker stop` 掉**即此口径）→ **1647 passed / 44 skipped / 0 failed / 0 errors**（286.8 秒；多跳的 40 条是需要真库的用例）。
   ⚠️ 想让本地指标落到「无 PG 口径」有两种做法：`docker stop warden-pg-test`，或把 `WARDEN_TEST_PG_*` 里的端口指到一个没人监听的端口。**但这两种都别只凭“我设了环境变量”下结论——判口径永远看 `skipped` 是 4 还是 44。** 第五十二批在这里栽过：当时门控**不读端口**（只读 host/db/user/password），于是两次“双口径”其实**两次都是 PG 口径**（`skipped` 都是 4）；第五十二批把端口接上并加了守卫 `tests/test_config_surface.py::test_PG门控真的认环境变量里的端口`（子进程真探活，不是读源码文本）。
   时间账：449.8 秒 / 456.3 秒是同机同批实测；第五十三批同口径是 228.8 秒 / 226.3 秒——**这不是性能回归，是两次跑的东西不一样**：本批两次都带了 `--cov=warden_agent`（覆盖率收集把总时间大致翻倍），第五十三批那两次没带。再往前第五十二批是 732 秒 / 578 秒，同一批改动的第一轮 637 秒——**差异全在同期本机在跑别的命令**，所以这里只报实测，**不拿它当性能回归结论**。
   带真 PG 时剩下的 4 条跳过**全是平台/工具链限制、与 PG 无关**：本机 PATH 没 `pg_dump`/`pg_restore`（PG 备份端到端）、win32 建不了符号链接（2 条）、win32 无内核隔离原语；其余按环境跳过的还有未构建前端时的 SPA、无 node 时的 MCP。
-  覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：2026-10-04 第五十七批复测 **带真 PG 90.31% / 无 PG 87.08%**
+  覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：2026-10-04 第五十九批复测 **带真 PG 90.31% / 无 PG 87.08%**
   （语句 10644 / 分支 2660）——**两者都过闸，而无 PG 是最差情况、余量只剩 1.08 个点**；
   这与 `pyproject.toml` 里「门槛贴太近会变成噪声门禁」的取向对照着看：余量大的那边说明门禁还能再抬。
   跳过的测试会在没有 PG 时自动跳过、CI 保持绿；其余按环境跳过的还有：未构建前端时的 SPA、无 node 时的 MCP。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、**多租户越权拦截（含 403 不回显他人身份、审计/模型按调用者收敛）**、**patch 路径边界（防越出工作区）**、**幂等并发原子占位（409 而非重复执行）**、**入站限流**、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**凭证密钥托管（KMS/HSM 信封加密：env 与两条 provider 接入路径）**、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘 + 按 `owner` 归属隔离（换实例读同一库仍在、跨用户不可见）**、**真实联网抓取的 SSRF 防护（含重定向绕过）与出站限速/配额（全局、单 host、并发、日配额，含多副本共享与"策略先于限速"的顺序保证）**、**链路追踪（W3C traceparent 解析/生成/传播）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等
