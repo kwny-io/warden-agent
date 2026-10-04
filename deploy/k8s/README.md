@@ -364,7 +364,26 @@ MSYS_NO_PATHCONV=1 bash scripts/k8s_rollback_drill.sh   # Git Bash 下需要这�
 | 5 | `DRY_RUN=1`（并核对 revision 未变） | 0 |
 
 可覆盖的变量：`K8S_NODE`（默认 `warden-control-plane`）、`DRILL_NS`（默认 `warden-drill`）、
-`DEPLOYMENT`（默认 `warden-agent`）。
+`DEPLOYMENT`（默认 `warden-agent`）、`DRILL_IMAGE`（默认 = 生产正在跑的那个镜像）。
+
+演练的四个安全约定（**代码里真的有**，不是文档里的承诺）：
+
+- `DRILL_NS` 名字里必须出现 `drill`，且**绝不等于**清单声明的命名空间（传错就拒绕执行）；
+- 节点里那份 `namespace.yaml` 会被改写成演练命名空间——所以「不传 `NAMESPACE` 时从清单读」
+  这条契约仍被测到，但被回滚的是演练自己的 Deployment；
+- 只删**本次自己创建**的命名空间（`CREATED_NS`）；已存在但没带 `warden-drill=true` 标签的，拒绝执行；
+  已存在且带标签的，**复用而不删**（上次演练崩在半路，不至于把下次也堵死）；
+- 清理放 `trap ... EXIT`，而且**清理失败会把结论翻成失败**（否则值班的人会以为环境已经收拾干净）；
+  最后一个用例会在结束前核对生产命名空间的 revision / env **一个字节都没变**。
+
+> 为什么要用生产镜像：本机网络不稳时 `alpine:3.20` 拉不下来，表现为
+> 「回滚已下发但 180s 内没 ready」——用例 1 会以「集群真出事」的样子变红。
+> 用生产正在跑的那个镜像（`IfNotPresent`）就不需要 registry。
+
+转发脚本（`scripts/kind_api_forward.py`）的退出码：`0` 正常转发、`1` 真失败、
+**`3` = `LISTEN_PORT` 上已经有东西在应答**（常见原因：上一次的 `warden-api-forward` 还活着）。
+它先连一次端口再创建容器——否则 docker 只会报一句「创建转发容器失败」，
+把**上一层的事实**说成**这一层的失败**。
 
 > 边界（照实说）：演练只看「Pod ready 且模板已还原」，**不看回滚后业务是否真的恢复**；
 > 它是**手工触发**的，没有 CI 里的 kind 作业；换一套环境要先 `kind create cluster`。

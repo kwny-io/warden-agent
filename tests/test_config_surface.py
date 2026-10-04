@@ -248,6 +248,10 @@ _DOC_ONLY_NAMES: dict[str, str] = {
     # `tests/test_postgres_integration.py::_pg_params()` 读它，
     # `src/` 里没有任何地方读 ⇒ 登记进 `ENV_SPECS` 会立刻撞上「登记了没人读」那条守卫。
     "WARDEN_TEST_PG_PORT": "测试脚手架旋钮（PG 门控端口，只在 tests/ 里读），故意不进产品注册表",
+    # 第六十批补：这个名字是**演练脚本自己**写到演练负载上的标记
+    # （`scripts/k8s_rollback_drill.sh` 用 `kubectl set env` 设它，用来验证「回滚把 Pod 模板
+    # 还原了」）；产品代码从不读它 ⇒ 登记进 `ENV_SPECS` 会立刻撞上「登记了没人读」那条守卫。
+    "WARDEN_DRILL_MARK": "演练脚本写到演练负载上的标记（只在 scripts/ 里设，产品不读）",
     # 第五十三批补（同批另一条）：
     # 本批把扫描范围扩到 `deploy/**/*.md`，**先拍到了我自己刚写下的文档行**——
     # `docs/复核索引.md` 在记录“文档曾教人写错键名”时，必须把那个错名字写出来。

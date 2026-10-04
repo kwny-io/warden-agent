@@ -19,7 +19,9 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -33,7 +35,7 @@ ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "rollback.sh"
 DRILL_SCRIPT = REPO_ROOT / "scripts" / "k8s_rollback_drill.sh"
 
 # `cat <<'EOF'` / `<<EOF` / `<<-EOF` —— 引号 heredoc 里的反引号不会被展开（帮助文本里常写）
-_HEREDOC_RE = re.compile(r"<<-?\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?")
+_HEREDOC_RE = re.compile(r"<<-?[ \t]*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1")
 K8S_NAMESPACE_MANIFEST = REPO_ROOT / "deploy" / "k8s" / "namespace.yaml"
 
 # Windows 上 Git Bash 的常见安装位置。
@@ -158,6 +160,10 @@ def _make_repo(tmp_path: Path, dockerfile_from: str = "FROM python:3.12-slim AS 
     (root / "deploy" / "k8s").mkdir(parents=True)
     shutil.copy2(PIN_SCRIPT, root / "scripts" / "pin_image_digests.sh")
     shutil.copy2(ROLLBACK_SCRIPT, root / "scripts" / "rollback.sh")
+    # 第六十批：演练脚本也要搬进来。它以前只被 `bash -n` 这一类用例用到，
+    # 所以没进过 _make_repo；现在它的安全守卫要用假 docker 跑真脚本，
+    # 漏了这一行会以「No such file or directory」的形式失败（而不是报一条测试逻辑错）。
+    shutil.copy2(DRILL_SCRIPT, root / "scripts" / "k8s_rollback_drill.sh")
     # 清单也搬进副本：第五十四批之后 rollback.sh 的默认命名空间**来自清单**，
     # 所以一个没有 namespace.yaml 的假仓库测的是一条真实运行时不存在的路径。
     shutil.copy2(K8S_NAMESPACE_MANIFEST, root / "deploy" / "k8s" / "namespace.yaml")
@@ -723,7 +729,7 @@ def test_script_syntax_and_line_endings(script: Path) -> None:
 
 
 @pytest.mark.parametrize("script", [PIN_SCRIPT, ROLLBACK_SCRIPT, DRILL_SCRIPT])
-def test_脚本里不许用反引号(script: Path) -> None:
+def _backtick_offenders(name: str, text: str) -> list[str]:
     """**未转义**的反引号在 shell 里是命令替换，不是 Markdown 引号（注释里随便写）。
 
     第五十八批在真集群上跑回滚脚本时，屏幕里冒出一行 `warden: command not found`，
@@ -731,27 +737,338 @@ def test_脚本里不许用反引号(script: Path) -> None:
     提示里最该看到的那个值变成空白。它不会让脚本失败（退出码仍对），
     只是在那句最需要准确的话里把关键信息抹掉——所以它需要一条静态约束。
 
-    三种合法写法（本用例都不管）：注释行（没被执行过）；`\\`` 转义（双引号里故意要一个
-    字面反引号）；**引号 heredoc** 里的帮助文本（`cat <<'EOF'` 不做展开，那里写反引号是给人看的）。
+    三种合法写法（都不算违规）：注释行（没被执行过）；`\\`` 转义（双引号里故意要一个
+    字面反引号）；**带引号的** heredoc（`cat <<'EOF'` 不做展开，那里写反引号是给人看的）。
     仓库里全部用 `$(...)` 做命令替换，所以剩下任何一种裸反引号都是手滑。
+
+    ⚠️ **不带引号的 heredoc 不在此列**：`cat <<EOF` 里的 `` ` `` 照样会被命令替换执行。
+    第六十批才发现：上一版把两种 heredoc 当成一回事（`_HEREDOC_RE` 里引号是可选的），
+    于是下面这段逻辑对 `<<EOF` 的形式**完全聋**——实测那份文件进守卫得 `offenders == []`，
+    而 bash 跑它真的会执行反引号里的东西（退出码还是 0）。
+    现在引号是**必需捕获到**的（`([\"']?)` + 反向引用），无引号 heredoc 里的裸反引号继续受检。
+
+    抽成函数是为了让它**自己也能被测**：守卫的判据如果只长在一条 `parametrize` 里，
+    它聋了也没人知道（见 `test_反引号守卫自己不许聋`）。
     """
     offenders: list[str] = []
     heredoc_end: str | None = None
-    for num, line in enumerate(script.read_text(encoding="utf-8").splitlines(), start=1):
+    heredoc_quoted = True
+    for num, line in enumerate(text.splitlines(), start=1):
         if heredoc_end is not None:
             if line.strip() == heredoc_end:
                 heredoc_end = None
-            continue
-        if not line.lstrip().startswith("#"):
+                continue
+            if heredoc_quoted:
+                continue
+            # 无引号 heredoc：这里面的反引号**会被命令替换**，必须继续往下判
+        elif not line.lstrip().startswith("#"):
             found = _HEREDOC_RE.search(line)
             if found:
-                heredoc_end = found.group(1)
+                heredoc_quoted = bool(found.group(1))
+                heredoc_end = found.group(2)
                 continue
         if not line.lstrip().startswith("#") and "`" in line.replace(chr(92) + "`", ""):
-            offenders.append(f"{script.name}:{num}: {line.strip()}")
+            offenders.append(f"{name}:{num}: {line.strip()}")
+    return offenders
+
+
+@pytest.mark.parametrize("script", [PIN_SCRIPT, ROLLBACK_SCRIPT, DRILL_SCRIPT])
+def test_脚本里不许用反引号(script: Path) -> None:
+    offenders = _backtick_offenders(script.name, script.read_text(encoding="utf-8"))
     assert not offenders, (
         "这些行里的反引号会被 shell 当命令替换执行（要写变量就用 ${var}）:\n" + "\n".join(offenders)
     )
+
+
+def test_反引号守卫自己不许聋() -> None:
+    """守卫的守卫：四种写法里哪些真会被 shell 执行，由 **bash 自己**说了算。
+
+    为什么需要这条：第六十批发现上一版守卫把 `<<EOF`（无引号 heredoc）与 `<<'EOF'`
+    当成一回事，于是对前者完全聋——**而它正是本仓库第五十八批那个缺陷的另一种写法**。
+    静态守卫一旦聋了，它比没有更坏：它给出的是"这条已经守住了"的假结论。
+
+    这条用例的所有期望值都不靠我读代码得出，而是拿 bash 真跑一遍看它有没有执行。
+
+    **四行都必须过同一道「仪器体检」**：如果那次跑法自己就失败了（rc 非 0），
+    「没看到标记」就不能当作「反引号没被执行」的证据。这个区别本批吃过两次：
+      - 第一次：全量套件里前提断言红了，却只报一句「前提不成立」，把责任推给
+        「守卫的必要性」——**一次误诊**；
+      - 第二次：查出它为什么红——从 cmd.exe 启动 pytest 时，子 bash 的 PATH 里
+        没有 coreutils，`cat` 是 127，heredoc 展开出来的标记被丢掉（假红）。
+        单跑文件时反而绢，因为它从 Git Bash 启动。
+    """
+    # ⚠️ bash 里造一个"被反引号执行"的证据：替身函数（**只用 builtin**）+ 真身脚本
+    cases = {
+        "无引号 heredoc": ("cat <<EOF\n值是 `date` 的\nEOF\n", True),
+        "引号 heredoc": ("cat <<'EOF'\n值是 `date` 的\nEOF\n", False),
+        "注释行": ("# 说明：这里写 `date` 是给人看的\n", False),
+        "转义反引号": ('echo "值是 \\`date\\` 的"\n', False),
+    }
+    for name, (body, should_run) in cases.items():
+        ran, why = _bash_backtick_probe(body)
+        assert "跑法自己就失败了" not in why, f"{name}：{why}"
+        detail = (
+            "反引号确实会被执行，而守卫必须抓住它（第五十八批的形状）"
+            if should_run
+            else "并没有被展开，而守卫必须放过它（误报会让人把守卫删掉）"
+        )
+        assert ran is should_run, f"{name}：bash 的实际行为与期望不符：{detail}。诊断：{why}"
+
+    # 守卫的判定必须与 bash 的事实**一一对应**
+    assert _backtick_offenders("x.sh", cases["无引号 heredoc"][0]), (
+        "无引号 heredoc 里的裸反引号被守卫放过了 —— bash 会执行它，而出事时屏幕上会出现"
+        "`...: command not found` 加一句缺值的话（第五十八批的形状）"
+    )
+    for name in ("引号 heredoc", "注释行", "转义反引号"):
+        assert not _backtick_offenders("x.sh", cases[name][0]), (
+            f"{name} 被误报：它不是缺陷，报它会让下一个人把守卫删掉"
+        )
+
+
+def _bash_backtick_probe(body: str) -> tuple[bool, str]:
+    """把这段脚本交给真 bash 跑，看反引号有没有被当命令执行，并附上判定过程。
+
+    三个必须留意的细节（全都是踩过的）：
+      - 判据标记用 ASCII（`printf` 是 builtin）：它是**内部**凭据，没必要走
+        "非 ASCII 经 argv 传给 MSYS bash"那条链——那正是本仓库一路在治的编码坑。
+      - **必须把 coreutils 放回 PATH**（用本文件的 `_child_path`，与其他跑 bash 的
+        辅助函数同一套纪律）：从 cmd.exe 启动 pytest 时 PATH 里没有 `Git\\usr\\bin`，
+        于是 `cat` 是 127、heredoc 展开出来的标记被丢掉，结论变成"反引号没被执行"
+        —— 一个**假**结论（第六十批全量套件就是这么红的）。
+      - 所以除"有没有标记"之外还要看 **rc**：rc 非 0 说明**这次跑法自己就坏了**，
+        那反引号那一行就无证据可言，调用方不能把它当成"没被执行"。
+    """
+    marker = "BACKTICK_RAN"
+    child_path = _child_path(None)
+    script = f"date() {{ printf %s {marker}; }}\n" + body
+    proc = subprocess.run(
+        [BASH, "-c", script],
+        env={**os.environ, "PATH": child_path},
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=SESSION_TIMEOUT,
+    )
+    why = (
+        f"bash={BASH!r} rc={proc.returncode} stdout={proc.stdout!r} "
+        f"stderr={proc.stderr[:200]!r} child_PATH={child_path[:160]!r}"
+    )
+    if proc.returncode != 0:
+        return False, f"这次跑法自己就失败了（rc={proc.returncode}）：{why}"
+    return marker in proc.stdout, why
+
+
+# =========================================================================== #
+# 第六十批：演练脚本自己的安全约定
+#
+# 先有证据，再有这几条用例。把假 docker 放进 PATH 记下 argv（不碰真集群），
+# 用 `DRILL_NS=warden`（清单声明的那个命名空间）跑演练，会看到脚本真的会下发：
+#     kubectl -n warden set env deploy/warden-agent WARDEN_DRILL_MARK=1   ← 改生产负载模板
+#     kubectl delete ns warden --wait=false                             ← 删生产命名空间
+# 而那个命名空间里正跑着 postgres 与它 11 天的数据，而且**用例失败时也会删**
+# （退出码 1 的语义只是"有用例不符合契约"）。演练脚本删掉生产命名空间，
+# 是这套工具能犯的最贵的错。
+#
+# 所以这组用例断言的不是"输出好看"，而是**那几条命令在任何情况下都不许被下发**。
+# =========================================================================== #
+DRILL_DOCKER_STUB = r"""
+docker() {
+  printf 'docker %s\n' "$*" >> "${STUB_LOG:?}"
+  case "$*" in
+    # 命名空间"已存在、但没有 warden-drill=true 标签"这个状态由 LABEL_VALUE 控制
+    *"jsonpath={.metadata.labels.warden-drill}"*) printf '%s' "${LABEL_VALUE-}"; return 0 ;;
+    # "那个命名空间存不存在"由 NS_EXISTS 控制；
+    # 注意模式里那个尾空格：脚本开头那句 `K get ns`（集群通不通）不能被它挡掉
+    *"kubectl "*"get ns "*) [ "${NS_EXISTS-0}" = "1" ] && return 0 || return 1 ;;
+    # 节点里的清单（脚本要核对它真被改写成演练命名空间）
+    *"cat "*"deploy/k8s/namespace.yaml"*)
+      printf 'kind: Namespace\n  name: %s\n' "${DRILL_NS}"
+      return 0
+      ;;
+    # 清理失败（DELETE_FAIL=1 模拟）：“清理没做成”是真失败，不能只打一行日志就报成功
+    *"delete ns"*) [ "${DELETE_FAIL-0}" = "1" ] && return 1 || return 0 ;;
+  esac
+  return 0
+}
+"""
+
+
+def _drill_calls(root: Path) -> list[str]:
+    return [c for c in _calls(root) if c.startswith("docker ")]
+
+
+def test_演练脚本拒绝在清单声明的命名空间上跑(tmp_path: Path) -> None:
+    """DRILL_NS 指向清单声明的那个 → 必须拒绝，且**一条危险命令都不许下发**。
+
+    这条守的是整个演练脚本最贵的一个后果：删掉生产命名空间。
+    """
+    root = _make_repo(tmp_path)
+    # 把副本清单改成与 DRILL_NS 同名，才能真的走到"与清单相同"那道守卫
+    # （否则先被"名字里必须有 drill"拦住，测的就是另一条分支了）。
+    manifest = root / "deploy" / "k8s" / "namespace.yaml"
+    rewritten = manifest.read_text(encoding="utf-8").replace(
+        "  name: warden\n", "  name: warden-drill\n", 1
+    )
+    manifest.write_text(rewritten, encoding="utf-8")
+    proc = _run(
+        root,
+        "k8s_rollback_drill.sh",
+        prelude=DRILL_DOCKER_STUB,
+        env_extra={"DRILL_NS": "warden-drill"},
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "拒绝执行" in proc.stdout, proc.stdout
+    calls = _drill_calls(root)
+
+    dangerous = [c for c in calls if "delete ns" in c or "set env" in c or "rollout undo" in c]
+    assert not dangerous, (
+        "拒绝执行之前/之后都不许下发这几条命令（删除命名空间、改负载模板、回滚）：\n"
+        + "\n".join(dangerous)
+    )
+
+
+def test_演练脚本的名字必须自己说清它是演练(tmp_path: Path) -> None:
+    """名字里没有 `drill` 就拒绝：这个脚本会删掉那个名字指向的命名空间。"""
+    root = _make_repo(tmp_path)
+    proc = _run(
+        root,
+        "k8s_rollback_drill.sh",
+        prelude=DRILL_DOCKER_STUB,
+        env_extra={"DRILL_NS": "staging-ns"},
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "拒绝执行" in proc.stdout and "drill" in proc.stdout, proc.stdout
+    assert not _drill_calls(root), f"名字不合格时不该去碰 docker：{_drill_calls(root)}"
+
+
+def test_演练脚本不删不是自己创建的命名空间(tmp_path: Path) -> None:
+    """已存在、且没有 `warden-drill=true` 标签的命名空间 → 拒绝，且不删。
+
+    现实里这就是"另一个目标任务恰好用了这个名字"的形态：那个命名空间可能是别人
+    正在用的，本演练无权为了自己的方便把它删掉。
+    """
+    root = _make_repo(tmp_path)
+    proc = _run(
+        root,
+        "k8s_rollback_drill.sh",
+        prelude=DRILL_DOCKER_STUB,
+        env_extra={"DRILL_NS": "warden-drill", "NS_EXISTS": "1", "LABEL_VALUE": ""},
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "拒绝执行" in proc.stdout, proc.stdout
+    calls = _drill_calls(root)
+    assert any("get ns" in c for c in calls), f"应当先问过那个命名空间存不存在：{calls}"
+    assert not [c for c in calls if "delete ns" in c or "set env" in c], calls
+
+
+def test_演练脚本自己创建的命名空间带标记(tmp_path: Path) -> None:
+    """补一个反向控制：正常路径上"创建 + 打标签"是必须的。
+
+    没有这条，上面三条用例只需要"什么都不做"就能全绿。
+    """
+    root = _make_repo(tmp_path)
+    _run(
+        root,
+        "k8s_rollback_drill.sh",
+        prelude=DRILL_DOCKER_STUB,
+        env_extra={"DRILL_NS": "warden-drill"},
+    )
+    # 这份替身答不出"节点里的清单现在声明什么"，所以脚本会在核对那一步停下（这是对的）
+    calls = _drill_calls(root)
+    assert any("create ns warden-drill" in c for c in calls), (
+        f"正常路径上应当创建演练命名空间：{calls}"
+    )
+    assert any("label ns warden-drill warden-drill=true" in c for c in calls), (
+        f"创建后必须打上 warden-drill=true 标签（否则下次同名演练会被自己的守卫拦住）：{calls}"
+    )
+
+
+def test_演练脚本复用自己的演练命名空间时不删它(tmp_path: Path) -> None:
+    """已存在、且带 `warden-drill=true` 标签 → **必须放行**，而且是"复用"，不许删。
+
+    这条是变异 C 补出来的缺口：把守卫条件改成"标签必须等于命名空间名"之后，
+    上面那几条用例**都不会红**（它们只覆盖"标签为空 / 不存在"这一种情形），
+    于是"演练崩一次之后就再也跑不起来"（标签是 `true` 却被拒绕）这件事没人看着。
+    复用而不是删除同样重要：这个命名空间不是本次演练创建的。
+    """
+    root = _make_repo(tmp_path)
+    proc = _run(
+        root,
+        "k8s_rollback_drill.sh",
+        prelude=DRILL_DOCKER_STUB,
+        env_extra={"DRILL_NS": "warden-drill", "NS_EXISTS": "1", "LABEL_VALUE": "true"},
+    )
+    assert "拒绝执行" not in proc.stdout, (
+        "带 warden-drill=true 标签的演练命名空间必须能复用"
+        "（否则演练崩一次之后就再也跑不起来）：\n" + proc.stdout
+    )
+    assert "用例 1" in proc.stdout, f"放行后应当继续往下走用例：{proc.stdout}"
+    calls = _drill_calls(root)
+    assert not [c for c in calls if "delete ns" in c], (
+        f"这个命名空间不是本次演练创建的，不许删：{calls}"
+    )
+
+
+def test_演练脚本清理失败时给非零退出码(tmp_path: Path) -> None:
+    """清理没做成却报成功 —— 值班的人会以为演练环境已经收拾干净，而它还在集群里。
+
+    这条是变异 D 补出来的：以前这条路径**没有常驻用例**（我当时的说法是"写不出便宜的用例"，
+    其实是偷懒）。现在用假 docker 就能写：`DELETE_FAIL=1` 让 `kubectl delete ns` 返 1，
+    命名空间由 `NS_EXISTS=0` 决定为"本次演练创建"，于是清理那一段真的会跑。
+    """
+    root = _make_repo(tmp_path)
+    proc = _run(
+        root,
+        "k8s_rollback_drill.sh",
+        prelude=DRILL_DOCKER_STUB,
+        env_extra={"DRILL_NS": "warden-drill", "NS_EXISTS": "0", "DELETE_FAIL": "1"},
+    )
+    assert "没删掉" in proc.stdout, f"清理失败必须说出来：{proc.stdout}"
+    assert proc.returncode != 0, (
+        f"清理没做成时退出码必须非 0（否则脚本在撒谎说收拾干净了）：{proc.returncode}\n"
+        + proc.stdout
+    )
+
+
+# =========================================================================== #
+# 转发脚本：「端口被占」不是「创建容器失败」
+#   `bind()` 失败会让容器立刻退出，而 docker 只报一句「创建转发容器失败」。
+#   值班的人会去翻 docker 日志找「脚本坏在哪」，而真正的事实是上一层：端口已经有人了。
+# =========================================================================== #
+_FORWARD_SCRIPT = REPO_ROOT / "scripts" / "kind_api_forward.py"
+
+
+def test_转发脚本对端口已被占用说清事实() -> None:
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_FORWARD_SCRIPT)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            env={
+                **os.environ,
+                "LISTEN_PORT": str(port),
+                "UPSTREAM": "127.0.0.1:1",
+                # 子进程的中文输出必须固定成 UTF-8：本机控制台默认 cp936，否则这条断言
+                # 比的是乱码（脚本真跑在容器里时是 UTF-8，`docker logs` 读得到）。
+                "PYTHONIOENCODING": "utf-8",
+            },
+        )
+    finally:
+        listener.close()
+    assert proc.returncode == 3, (
+        f"端口被占时退出码应当是 3（既不是 0「正常」，也不是 1「脚本自己坏了」）："
+        f"实际 {proc.returncode}\n{proc.stdout}{proc.stderr}"
+    )
+    assert "已被占用" in proc.stdout, f"必须把事实说出来：{proc.stdout}"
+    assert "docker ps" in proc.stdout, "还要告诉人怎么确认（可能是上一次的转发容器还活着）"
 
 
 # =========================================================================== #
