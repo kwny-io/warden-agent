@@ -4,6 +4,106 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-04（第五十七批：告警消息没有上限——最需要它的时候，它最可能送不出去）
+
+> 入口：继续沿第九种来源往下挖。上一批证明了「『已投递告警』是一句没有证据的话」，
+> 这一批问下一层——**送出去的那句话，大得能自己把路堵死**。
+
+### 一、现象（都有实测数字）
+
+- 造 5000 个 Run 卡在等审批。**修复前**（= 现在显式 `--limit 0` 的口径，`uv run --frozen python C:/tmp/probe57_cli.py` 可复现）：`warden stuck --json` 输出 **30 002 行 / 790 403 字节**，人话报告 **5 001 行 / 496 070 字节**。**修复后默认口径**：`--json` 122 行 / 3 183 字节，人话 22 行 / 3 218 字节。
+- 同一个库走**真投递**（`C:/tmp/probe57_after.py`，回环上的真 `http.server`）：发出去的 body 是 **6 511 字节**（修复前是整份 JSON ≈1.29MB），而 `details.count` 仍是真实的 5000、`listed=20` / `omitted=4980` / `truncated=True`。
+- 投递载荷是**一个 emoji 都没删**的同一份 JSON：`WebhookNotifier` 是**一次性 POST**——没有分页、没有分批、没有截断。
+- 报告里每个 Run 只占约 99 字节（496 070 ÷ 5 000，人话口径）：**先失去的是数量，不是内容**——所以「先列最该看的」成本几乎为零。
+- 告警恰恰发生在故障时：接收端在压力下先丢的就是超大请求（企业微信/钉钉群机器人的 `text` 上限只有 2000~4096 字节；顺序发 5000 次≈500 秒），而且是**最需要这条告警的那一刻**。
+- 全仓 `git grep -n "limit\|max_" -- "*alerting*" "*notify*"` = **0 处**；而其它列表路径全都有界（`/runs`、审计、指标 TTL 缓存）。
+
+### 二、根因（机制齐备，只差一个数字）
+
+`describe_stuck()` 返回**全部** `runs`；命令行、`--json`、投递载荷、`GET /alerts/stuck` 四条消费路径**各自**把整份渲染出去。它不是新人写的，是**从来没人问过「这个报告最多该多长」**。
+
+### 三、改法（一个有界的报告 + 三处消费路径都接上）
+
+- `src/warden_agent/runtime/alerting.py`：新增 `ALERT_LIST_LIMIT = 20`（一个常量，四个口径共用）；`describe_stuck(..., limit=ALERT_LIST_LIMIT)`：**`None` = 不设上限**（那才是「我要全部」），`0` 也当成不设上限；`StuckReport` 新增 `listed` / `omitted` / `truncated`；人话报告首行仍是**真实总数**，末尾加一行 `……另有 N 个未列出（完整清单：warden stuck --all，或 GET /alerts/stuck?limit=0）`。
+- `src/warden_agent/cli.py`：`stuck` 新增 `--all`（显式要全量）与 `--limit N`（`0` = 不设上限）；`--json` 的 stdout **仍是纯列表**（形状不变，监控脚本不受影响），「只列出了 M 个（共 N 个）」走 stderr——与上一批「人话一律走 stderr」同一条规矩。
+- `src/warden_agent/runtime/notify.py`：投递载荷 `details` 新增 `count` / `listed` / `omitted` / `truncated`，`runs` 只放被列出的；**标题里的总数仍是真实的**；摘要末尾同样写「另有 N 个未列出」。
+- `src/warden_agent/web/routes/ops.py`：`GET /alerts/stuck` 新增 `limit`（默认 `ALERT_LIST_LIMIT`、`0` = 全量），响应仍是同一个 `StuckReport` 形状，多出的是新增字段。
+
+### 四、守卫（判据是「有上界」与「少给了要说出来」，不是「函数被调过」）
+
+- `tests/test_cli_stuck_notify.py` +8：100 个 Run → 首行 `共 100 个`、输出行数 ≤ `ALERT_LIST_LIMIT + 2`、字节数 < 4096、末行写明 `另有 80 个未列出`；`--all` 时 **101 行**且不得出现「未列出」；`--json` 时 `len(payload) == ALERT_LIST_LIMIT` 且「只列出了 20 个」在 stderr、stdout 仍是纯 JSON；真投递口径（替身通道捕获 body）`(count, listed, omitted) == (100, 20, 80)`。
+- 逃逸口本身也有守卫（本批踩坑后补的，见第七节）：`--limit 3` 真的只列 3 条、末尾写「另有 97 个未列出」；`--limit 0` 与 `--all` 等价（101 行、不得出现「未列出」）；`--json --limit 3` 时 stdout 仍是纯 JSON、省略个数走 stderr；以及一条**文档↔argparse 表面**守卫 `test_文档里写的_stuck_参数必须真的存在`——把 `docs/operations.md` 里与 `stuck` 同行的每个 `--flag` 逐个要求在子命令的 `option_strings` 里存在。
+- `tests/test_notify.py` +3：100 个 Run 时**发出去的请求** `len(raw) < 8KB`、`summary` < 4096 字节、`details.count == 100` 而 `runs` 只有 `ALERT_LIST_LIMIT` 个、摘要里有「另有 80 个未列出」；反向控制：只有 3 个时 `truncated is False` 且**不得**出现「未列出」；外加一条**真 HTTP 接收端**（回环上的 `http.server`，不是假传输）端到端验投递链——上一批只能写「只往单元层验过」。
+- `tests/test_stuck_alerts.py` +3：默认只给 `ALERT_LIST_LIMIT` 个而 `count` 是真总数（用 `ALERT_LIST_LIMIT + 5` 个 Run → listed 20 / omitted 5 / truncated True）；`limit=0` 给全量、`limit=3` 给 3 条且 omitted=2；反向控制：只有 1 个时 `truncated is False`。
+- 变异验证 **6/6 全红**（`uv run --frozen python C:/tmp/mutate57.py`，靶子按字节恢复并校验 sha256）：A. `describe_stuck` 忽略 `limit` → `AssertionError: 输出没上界：101 行`；B. 投递载荷塞全部 `runs` → `assert 100 == 20`；C. 路由忽略 `limit` → `assert 25 == 20`；D. 不打印「另有 N 个未列出」→ 断言找不到那行；E. CLI 里去掉 `--limit` 参数 → **真守卫（钉在 argparse 表面上）给的是干净断言**：`AssertionError: Extra items in the left set: '--limit'`（`tests/test_cli_stuck_notify.py:206`）；`C:/tmp/mutate57.py` 那一栏当时报的是 `IndexError: list index out of range`，那是**我的探针自己的脆弱**（它把文档里写的 `--limit 3` 直接喂给 CLI，参数不存在时崩在解析输出上），不是守卫的判据——我把 E 单独重做了一次（改字节 → 只跑那条守卫 → 字节级还原 + sha256 复核 `d2e775bd…`），拿到的就是上面这句干净断言；F. `--limit 0` 不再当作「不设上限」→ 断言 `101 == 1`。
+
+### 五、已知限制（照实说）
+
+- 上限是**常量**，不是与接收端协商出来的（没有「接收端告诉我它能吃多大」的机制）；要全量得显式 `--all` / `limit=0`。
+- 没有**去重/抑制**：5000 个 Run 卡住时，每 5 分钟仍各发一条（只是每条现在都小）；也没有分批（每次发送 1 条还是 1 条）。本批顺手查实了这个缺口的起点：`grep -rn alert src/warden_agent/store/*.py` = **0 处**，`grep -rniE "throttle|debounce|dedup|suppress|cooldown" src/warden_agent` 里与告警有关的也是 **0 处**（只有工具熔断的 `circuit_cooldown`）——即**告警状态从未落库**，所以“同一批卡死不要重发”目前无处可记。（边界：Alertmanager 自带去重；但内置 `--notify` 这条路没有，而文档从没说“请配合 Alertmanager 用”。）
+- 排序是「等得越久越靠前」，所以被截掉的**确实是最不紧急的**；但实际会有人只看前 20 条。
+- 「4096 字节」是群机器人**文档里的上限**，不是协商来的；真接群机器人**本批没有实测**（只在回环上验了真 HTTP）。
+
+### 六、这一步改变了什么失败模式
+
+改前：告警在最需要它的时候（大规模卡死）**送不出去，而报告里根本看不出少给了多少**（因为不存在「少给」这个概念）。
+改后：报告有界、总数真实、少给就说出来，看的人有明确动作（`--all` / `limit=0`）。
+
+### 七、本批自己踩的坑：文档写了 `--limit N`，CLI 里从来没有这个参数
+
+写完代码、跑完守卫都绿之后，我才拿真 CLI 去量“修复前后的体积”，结果撞上：
+
+```
+$ warden stuck --db <库> --limit 3
+usage: warden [-h] {chat,stream,approvals,...}
+warden: error: unrecognized arguments: --limit 3        # 退出码 2
+```
+
+而 CHANGELOG 第三节与 `docs/operations.md` 都写了 `--limit N`（`0` = 不设上限）——
+也就是：**唯一能拿到完整清单的那条命令，根本不存在**。本批的主题是“少给了要能看出来”，
+而“要全量”的逃逸口自己就是句空话。
+
+- 为什么守卫没拦住：这批的守卫只钉在三件事上——默认口径有上界、`--all` 能给全量、`--json` 少给说了话。
+  **没有一条问过「文档承诺的那个参数真的存在吗」**。
+- 修法：`cli.py` 加 `--limit N`（`0` = 不设上限，与 `--all` 同义；`--all` 优先），
+  并把「限几条」的计算收到 `_stuck_limit()` 一处；新守卫
+  `test_文档里写的_stuck_参数必须真的存在` 从 `docs/operations.md` 里抓与 `stuck` 同行的 `--flag`，
+  逐个要求在 `stuck` 子命令的 `option_strings` 里存在。
+- 教训：**逃逸口也得有守卫，而且要钉在 argparse 表面上，不能钉在文档上**——
+  钉在文档上等于把文档当实现（这正是前几批反复出现的坑）。
+
+**同一个坑的第二个实例（同一个批次内自己撞上第二次）**：`docs/复核索引.md` 的批次总表里，从第五十四批起就**残留一行**
+`| 第五十四批 | … | **已提交** \`<待填>\` | …`——我当时先插了一行“待填 sha”的占位，后来另写了一行真的（`c924908`），
+而**占位那一行忘了删**：它连着三个批次挂在表头下面，里面写着 `\`<待填>\``。
+这正是本批主题的同一形状：**写了“待填”，就一定会有人以为它会被人填**。处置：删掉残留行（已做），
+并把本批的真行在代码提交后补上带 sha 的那一行——**不留任何“待填”**。
+
+### 八、本批实测数字（2026-10-04）
+
+**全量套件**（`--junitxml` + `--cov=warden_agent`，第57批最终树）：
+
+| 口径 | 收集 | 通过 | 失败 | 错误 | 跳过 | 耗时 | 覆盖率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 真 PG（容器 `warden-pg-test`，与 CI 的 PG service 同口径） | 1680 | **1676** | 0 | 0 | 4 | 489.2s | **90.31%** |
+| 无 PG（**真把容器 `docker stop` 掉**再跑） | 1680 | **1636** | 0 | 0 | 44 | 505.6s | 87.08% |
+
+收集数 1666 → **1680**（+14 = 8 条 `stuck` CLI 契约 + 3 条投递载荷 + 3 条路由），**两个口径的通过数各自 +14**，
+说明新守卫在两种环境下都真跑了（不是只在有 PG 时跑）。语句 10644 / 分支 2660。
+
+同一个 5000-Run 库，走真 CLI（`uv run --frozen python C:/tmp/probe57_cli.py`）：
+
+| 命令 | stdout 字节 | stdout 行 | stderr 字节 | 退出码 |
+| --- | ---: | ---: | ---: | ---: |
+| `stuck --older-than-min 0`（默认，修复后） | 3 218 | 22 | 0 | 3 |
+| `stuck --limit 3` | 634 | 5 | 0 | 3 |
+| `stuck --limit 0`（= 修复前的行为） | **496 070** | **5 001** | 0 | 3 |
+| `stuck --all` | 496 070 | 5 001 | 0 | 3 |
+| `stuck --json`（默认） | 3 183 | 122 | 66 | 3 |
+| `stuck --json --limit 0`（= 修复前） | **790 403** | **30 002** | 0 | 3 |
+
+真投递（`C:/tmp/probe57_after.py`）：出网 body **6 511 字节**、`details.count=5000` / `listed=20` / `omitted=4980` / `truncated=True`、`NotifyOutcome(found=5000, delivered=True, channel='WebhookNotifier')`。
+
+---
 ## 2026-10-04（第五十六批：`已投递告警` 是一句没有证据的话——未配通道、webhook 连不上，都算“已投递”）
 
 > 入口：继续挖第五十五批记下的「第九种来源」——**契约的执行权在调用方手里，而调用方不看**。

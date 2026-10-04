@@ -14,7 +14,9 @@
   warden backup-pg --dbname X       PostgreSQL 备份（pg_dump -Fc + 产物校验）
   warden backup-prune --dir D --keep N  按保留策略清理备份（默认只演练，--yes 才真删）
   warden restore <backup> [--force] 从备份恢复（破坏性，会覆盖目标库）
-  warden stuck [--older-than-min N] 列出等待人工处理超时的 run（接告警用；有则退出码 3，
+  warden stuck [--older-than-min N] [--all | --limit N]
+                      列出等待人工处理超时的 run（接告警用；有则退出码 3，
+                      告警也没送出去则 6；默认只列 20 条）
                                      --notify 投递失败则是 6）
   warden audit-verify               校验审计链是否完整（被动过则退出码 4）
   warden audit-export               导出审计记录（JSONL/CSV，带链字段，顺带校链）
@@ -404,11 +406,34 @@ def _cmd_restore(args: argparse.Namespace) -> None:
     print("  ⚠️ 请确认该库当前没有别的进程在用（服务应已停止）")
 
 
+def _stuck_limit(args: argparse.Namespace) -> int | None:
+    """`stuck` 的列数上界：`--all` / `--limit 0` = 不设上限，`--limit N` = 最多 N 条。
+
+    什么都不给时用默认的 `ALERT_LIST_LIMIT`（20）。
+
+    第五十七批：`--limit` 曾经**只写在文档里**（CHANGELOG 与 `docs/operations.md` 都写了
+    `--limit N`），而 argparse 里从来没有这个参数——`warden stuck --limit 3` 直接
+    `unrecognized arguments`（退出码 2）。所以逃逸口本身也得有守卫（见
+    `tests/test_cli_stuck_notify.py::test_文档里写的_stuck_参数必须真的存在`）。
+    """
+    if getattr(args, "all", False):
+        return None
+    given = getattr(args, "limit", None)
+    if given is None:
+        from warden_agent.runtime.alerting import ALERT_LIST_LIMIT
+
+        return ALERT_LIST_LIMIT
+    return None if given <= 0 else given
+
+
 def _cmd_stuck(args: argparse.Namespace) -> None:
     """列出"等待人工处理超时"的 run —— 可直接接 cron 告警（有输出就该有人看）。"""
     import json
 
-    from warden_agent.runtime.alerting import describe_stuck, stuck_awaiting_human
+    from warden_agent.runtime.alerting import (
+        describe_stuck,
+        stuck_awaiting_human,
+    )
     from warden_agent.runtime.checkpoint import checkpoint_store_for
     from warden_agent.store.sqlite import SqliteStore
 
@@ -457,14 +482,25 @@ def _cmd_stuck(args: argparse.Namespace) -> None:
             print(msg, file=sys.stderr)
             if not args.json:
                 print(msg)
+    # 输出有上界（第五十七批）：默认只列最该先看的 ALERT_LIST_LIMIT 个，`--all` 才全量。
+    # 首行始终是真实总数、末尾写明省略了多少——「少给了」必须说出来。
+    limit = _stuck_limit(args)
+    shown = runs if limit is None else runs[:limit]
     if args.json:
+        # 形状保持是**列表**（改形状会打破消费方），但同样有上界；
+        # 被省略的个数走 stderr（同「--json 时人话只走 stderr」的约定）
         print(json.dumps(
             [{"run_id": r.run_id, "status": r.status,
-              "waiting_seconds": r.waiting_seconds, "detail": r.detail} for r in runs],
+              "waiting_seconds": r.waiting_seconds, "detail": r.detail} for r in shown],
             ensure_ascii=False, indent=2,
         ))
+        if len(shown) < len(runs):
+            print(
+                f"⚠️ 只列出了 {len(shown)} 个（共 {len(runs)} 个）；要全量加 --all",
+                file=sys.stderr,
+            )
     else:
-        print(describe_stuck(runs))
+        print(describe_stuck(runs, limit=limit))
     # 有需要人工处理的就返回非 0，便于 cron/监控用退出码判断
     if runs:
         # 3 = 有人等着处理；6 = 有人等着处理**且**告警没送出去（比 3 更严重：值班不会知道）
@@ -848,6 +884,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stuck.add_argument("--notify", action="store_true",
                          help="同时投递告警到 WARDEN_ALERT_WEBHOOK_URL；未配则**明确报未投递**"
                               "（退出码 6），不再显示成已投递")
+    p_stuck.add_argument("--all", action="store_true",
+                         help="列出全部命中（默认只列最该先看的 20 个：告警消息有体积上限，"
+                              "5000 个 Run 会渲染出 1.29MB，接收端会拒绝，恰好在最需要告警时）")
+    p_stuck.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="最多列几条（默认 20；0 = 不设上限，与 --all 等价）",
+    )
     p_stuck.set_defaults(func=_cmd_stuck)
 
     p_audit = sub.add_parser("audit-verify", help="校验审计链是否完整（防篡改巡检）")

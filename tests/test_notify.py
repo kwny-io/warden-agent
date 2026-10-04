@@ -12,6 +12,7 @@ import httpx
 
 from warden_agent.agent import InMemoryRunStore
 from warden_agent.core.run.status import AgentRun, RunStatus
+from warden_agent.runtime.alerting import ALERT_LIST_LIMIT
 from warden_agent.runtime.checkpoint import Checkpoint, InMemoryCheckpointStore
 from warden_agent.runtime.notify import (
     NotifyOutcome,
@@ -133,3 +134,116 @@ def test_notify_stuck没有卡死就不投递() -> None:
     assert (out.found, out.delivered) == (0, False)
     assert out.channel == "WebhookNotifier"
     assert called["n"] == 0, "没有卡死 Run 时不应发出任何请求"
+
+
+# ---------------------------------------------------------------------------
+# 第五十七批：告警载荷的**体积上界**（消息太大就送不出去，而那正是最需要它的时候）
+# ---------------------------------------------------------------------------
+def _many_stuck(n: int) -> tuple[InMemoryRunStore, InMemoryCheckpointStore]:
+    """n 个卡在等审批的 Run（内存库，不进磁盘）。"""
+    store = InMemoryRunStore()
+    cps = InMemoryCheckpointStore()
+    for i in range(n):
+        rid = f"run-{i:04d}"
+        store.save_run(AgentRun(rid))
+        cps.save(Checkpoint(
+            run_id=rid, status=RunStatus.WAITING_APPROVAL,
+            iteration=1, step="awaiting_approval",
+        ))
+    return store, cps
+
+
+def test_载荷有上界_且少给了必须说出来() -> None:
+    """100 个卡死的 Run：载荷不能跟着长（完整载荷 31KB，5000 个时 1.29MB 会被 413），
+    但**真实总数与省略个数都要写出来**——不能让人以为就这么多。
+    """
+    store, cps = _many_stuck(100)
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["raw"] = request.content
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200)
+
+    n = WebhookNotifier("https://hook.example/x", transport=httpx.MockTransport(handler))
+    out = notify_stuck(store, cps, n, older_than_seconds=3600)
+    assert out.delivered is True
+
+    body = captured["body"]
+    details = body["details"]
+    assert details["count"] == 100, "真实总数不能被截断掉（值班的人要看的就是它）"
+    assert details["listed"] == ALERT_LIST_LIMIT
+    assert details["omitted"] == 100 - ALERT_LIST_LIMIT
+    assert details["truncated"] is True
+    assert len(details["runs"]) == ALERT_LIST_LIMIT
+
+    # 体积：未截断时这条请求是 31KB（实测），截断后应在个位数 KB
+    raw = captured["raw"]
+    assert isinstance(raw, bytes)
+    assert len(raw) < 8 * 1024, f"载荷仍可能撑爆接收端：{len(raw)} 字节"
+    # 群机器人（企业微信/钉钉）的 text 上限只有 2000~4096 字节
+    assert len(body["summary"].encode("utf-8")) < 4096, "文本消息要能进群机器人"
+    assert "另有 80 个未列出" in body["summary"], f"少给了要说出来：{body['summary'][-80:]!r}"
+    assert body["title"].startswith("[warden] 100 个 Run"), "标题里的总数也要是真实的"
+
+
+def test_命中数小于上限时不截断_反向控制() -> None:
+    """反向控制：只有 3 个时不该出现「另有 N 个未列出」，也不能虚报 truncated。"""
+    store, cps = _many_stuck(3)
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200)
+
+    n = WebhookNotifier("https://hook.example/x", transport=httpx.MockTransport(handler))
+    out = notify_stuck(store, cps, n, older_than_seconds=3600)
+    assert out.delivered is True
+    details = captured["body"]["details"]
+    assert (details["count"], details["listed"], details["omitted"]) == (3, 3, 0)
+    assert details["truncated"] is False
+    assert "未列出" not in captured["body"]["summary"]
+
+
+def test_真HTTP接收端_投递链端到端() -> None:
+    """真浏览器/真网络之前，先把**真 HTTP** 这一段验了：起一个本地接收端，真发、真收。
+
+    第五十六批只能写「只往单元层验过（假传输）」；这里用回环上的真 `http.server`
+    把链路跑通（不联网、不依赖外部服务）：断言请求真的到了、JSON 能解、状态 200 被当成投递成功。
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received: list[dict[str, object]] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            n = int(self.headers.get("Content-Length", "0"))
+            received.append({
+                "path": self.path,
+                "content_type": self.headers.get("Content-Type"),
+                "body": json.loads(self.rfile.read(n)),
+            })
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:  # 不往 stderr 吐行
+            return
+
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        store, cps = _stuck_setup()
+        n = notifier_from_env({"WARDEN_ALERT_WEBHOOK_URL": f"http://127.0.0.1:{port}/hook"})
+        out = notify_stuck(store, cps, n, older_than_seconds=3600)
+        assert (out.found, out.delivered) == (1, True), f"真投递失败：{out}"
+        assert len(received) == 1, "接收端没收到请求"
+        got = received[0]
+        assert got["path"] == "/hook"
+        assert got["content_type"] == "application/json"
+        assert got["body"]["source"] == "warden-agent"
+        assert got["body"]["details"]["runs"][0]["run_id"] == "run-stuck"
+    finally:
+        srv.shutdown()
+        srv.server_close()

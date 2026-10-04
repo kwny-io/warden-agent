@@ -23,7 +23,7 @@ from warden_agent import cli
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.model.model import ChatResponse
 from warden_agent.policy.policy import PolicyEngine
-from warden_agent.runtime.alerting import describe_stuck, stuck_awaiting_human
+from warden_agent.runtime.alerting import ALERT_LIST_LIMIT, describe_stuck, stuck_awaiting_human
 from warden_agent.runtime.checkpoint import Checkpoint, SqliteCheckpointStore
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.web.auth import TrustedCaller
@@ -198,6 +198,62 @@ def _app(store: SqliteStore, **kw):  # noqa: ANN202
         store=store,
         **kw,
     )
+
+
+# ---------------------------------------------------------------------------
+# 第五十七批：HTTP 响应也有上界（监控每几分钟抓一次，5000 个 Run = 1.29MB）
+# ---------------------------------------------------------------------------
+async def _get_stuck(store: SqliteStore, query: str) -> dict:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app(store)), base_url="http://test"
+    ) as c:
+        return (await c.get(f"/alerts/stuck?{query}")).json()
+
+
+@pytest.mark.asyncio
+async def test_HTTP告警默认有上界_但总数与省略个数都说清(tmp_path: Path) -> None:
+    """默认只给最该先看的 `ALERT_LIST_LIMIT` 个；`count` 仍是真实总数，并带 omitted/truncated。
+
+    为什么不能默默少给：第五十二批就在这里栽过——“静默少跑 40 条”而整套仍报绿。
+    """
+    store = _store(tmp_path)
+    total = ALERT_LIST_LIMIT + 5
+    for i in range(total):
+        _make_run(store, f"run-{i:03d}", RunStatus.WAITING_APPROVAL, updated_at=OLD_ISO)
+
+    body = await _get_stuck(store, "older_than_min=0")
+    assert body["count"] == total, "总数必须是真实的（否则值班的人会以为就这么多）"
+    assert body["listed"] == ALERT_LIST_LIMIT
+    assert body["omitted"] == 5
+    assert body["truncated"] is True
+    assert len(body["runs"]) == ALERT_LIST_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_HTTP告警可以显式要全量或指定条数(tmp_path: Path) -> None:
+    """`limit=0` = 不设上限（显式要全量）；`limit=3` = 只要 3 条且说清省了 2 条。"""
+    store = _store(tmp_path)
+    for i in range(5):
+        _make_run(store, f"run-{i:03d}", RunStatus.WAITING_APPROVAL, updated_at=OLD_ISO)
+
+    full = await _get_stuck(store, "older_than_min=0&limit=0")
+    assert (full["count"], full["listed"], full["omitted"], full["truncated"]) == (5, 5, 0, False)
+    assert len(full["runs"]) == 5
+
+    few = await _get_stuck(store, "older_than_min=0&limit=3")
+    assert (few["count"], few["listed"], few["omitted"], few["truncated"]) == (5, 3, 2, True)
+    assert len(few["runs"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_HTTP告警数量少时不截断_反向控制(tmp_path: Path) -> None:
+    """反向控制：只有 1-2 个时不能报 truncated，也不能丢掉那一条。"""
+    store = _store(tmp_path)
+    _make_run(store, "run-only", RunStatus.WAITING_APPROVAL, updated_at=OLD_ISO)
+
+    body = await _get_stuck(store, "older_than_min=0")
+    assert (body["count"], body["listed"], body["omitted"], body["truncated"]) == (1, 1, 0, False)
+    assert body["runs"][0]["run_id"] == "run-only"
 
 
 @pytest.mark.asyncio

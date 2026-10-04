@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from warden_agent.core.metrics import metrics
+from warden_agent.runtime.alerting import ALERT_LIST_LIMIT, stuck_awaiting_human
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.web.audit import AuditLogger, AuditStore
 from warden_agent.web.auth import ApiKeyAuthenticator, TrustedCaller
@@ -161,19 +162,25 @@ def register(
         return payload
 
     @app.get("/alerts/stuck")
-    def alerts_stuck(request: Request, older_than_min: float = 60.0) -> dict[str, Any]:
+    def alerts_stuck(
+        request: Request, older_than_min: float = 60.0, limit: int = ALERT_LIST_LIMIT
+    ) -> dict[str, Any]:
         """**等待人工处理超时**的 Run —— 给监控/告警用。
 
         为什么需要它：Run 进入 `WAITING_APPROVAL` 之后不会有任何动静（没有超时、没有重试、
         没有通知），线上没人盯就一直挂着。这个端点把"挂太久了"变成可被定时抓取的事实：
         返回非空列表就该有人去看。认证模式下只暴露调用者自己名下的 Run。
 
+        体积有上界（第五十七批实测：5000 个 Run 的完整响应是 1.29MB，
+        而监控每几分钟抓一次）：`limit` 默认只返回最该先看的 `ALERT_LIST_LIMIT` 个，
+        `limit=0` = 不设上限（要全量就明说）。`count` 始终是**真实总数**，
+        另外给出 `listed` / `omitted` / `truncated`——**少给了必须能看出来**，
+        不能像第五十二批那样"静默少跑 40 条"还以为全绿。
+
         ⚠️ 口径："等了多久"用 Run 的最后活动时间近似（不是"进入等待那一刻"），所以只会**低估**、
         不会虚报——"报了警"是可信的；"没报警"不等于一定没挂久。
         **管理员**看全部（值班人要知道"整个系统有没有人卡着"）。
         """
-        from warden_agent.runtime.alerting import stuck_awaiting_human
-
         cp_store = _checkpoint_store_for(store)
         if cp_store is None:
             raise HTTPException(status_code=501, detail="当前存储不支持存档点")
@@ -181,9 +188,13 @@ def register(
         stuck = stuck_awaiting_human(
             store, cp_store, older_than_seconds=older_than_min * 60.0, owner=owner
         )
+        shown = stuck if limit <= 0 else stuck[:limit]
         return {
             "older_than_min": older_than_min,
             "count": len(stuck),
+            "listed": len(shown),
+            "omitted": len(stuck) - len(shown),
+            "truncated": len(shown) < len(stuck),
             "runs": [
                 {
                     "run_id": s.run_id,
@@ -194,6 +205,6 @@ def register(
                     # last_activity=近似（只会低估）；unknown=拿不到
                     "source": s.source,
                 }
-                for s in stuck
+                for s in shown
             ],
         }

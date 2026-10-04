@@ -140,7 +140,11 @@ def notify_stuck(
     返回值曾经是 `int`（命中数）且文档写着“投递的 Run 数”——那句话是假的：
     `notifier.send(...)` 的结果被丢掉了，未配通道和投递失败都返回同一个数。
     """
-    from warden_agent.runtime.alerting import describe_stuck, stuck_awaiting_human
+    from warden_agent.runtime.alerting import (
+        ALERT_LIST_LIMIT,
+        describe_stuck,
+        stuck_awaiting_human,
+    )
 
     runs = stuck_awaiting_human(
         store, checkpoints, older_than_seconds=older_than_seconds, owner=owner
@@ -148,11 +152,22 @@ def notify_stuck(
     channel = type(notifier).__name__
     if not runs:
         return NotifyOutcome(found=0, delivered=False, channel=channel)
+    listed = runs[:ALERT_LIST_LIMIT]
     delivered = bool(
         notifier.send(
             title=f"[warden] {len(runs)} 个 Run 等待人工处理超时",
             summary=describe_stuck(runs),
-            details={"count": len(runs), "runs": [asdict(r) for r in runs]},
+            # 载荷必须有上界，且**少给了要说出来**：`count` 是真实总数（值班的人要看的就是它），
+            # 详细清单只列最该先看的 `ALERT_LIST_LIMIT` 个，个数写在 `listed`/`omitted` 里。
+            # 实测：5000 个 Run 时完整载荷是 1.29MB，超 nginx 默认 client_max_body_size=1MB
+            # 会被 413 拒绝，且恰好发生在最需要告警的群体性事故里（第五十七批）。
+            details={
+                "count": len(runs),
+                "listed": len(listed),
+                "omitted": len(runs) - len(listed),
+                "truncated": len(runs) > len(listed),
+                "runs": [asdict(r) for r in listed],
+            },
         )
     )
     return NotifyOutcome(found=len(runs), delivered=delivered, channel=channel)

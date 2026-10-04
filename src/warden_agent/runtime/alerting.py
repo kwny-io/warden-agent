@@ -25,6 +25,19 @@ from dataclasses import dataclass
 
 DEFAULT_STUCK_SECONDS = 3600.0
 
+# 单条告警 / 一次输出里**最多列几个 Run**（唯一事实源：CLI、告警投递、HTTP 都从这里取）。
+#
+# 为什么必须有上界（第五十七批**实测**，不是拍脑袋）：消息体积随命中数线性增长——
+#   1 个 = 218 字节文本 / 514 字节 body；100 个 = 15KB / 31KB；
+#   1000 个 = 108KB / 267KB；5000 个 = 496KB / 1.29MB。
+# 而接收端普遍有上限：nginx 默认 `client_max_body_size` = 1MB（超了直接 413），
+# 企业微信/钉钉群机器人的 text 上限只有 2000~4096 字节。
+# 群体性事故（一个审批环节卡住 → 成百上千个 Run 排队等人工）正是**最需要告警的时刻**，
+# 那一刻消息最大、最可能被拒绝或截断；投递失败只记一条 warning，于是“没有告警”看起来像“没事”。
+# 20 行 × ~100 字节 ≈ 2KB，落在群机器人上限内，同时按等待时长倒序保留了最该先看的那些；
+# 被省略的个数**写在消息里**（不能悄悄少给——同第五十二批“静默少跑 40 条”那类错）。
+ALERT_LIST_LIMIT = 20
+
 
 @dataclass(frozen=True)
 class StuckRun:
@@ -119,12 +132,18 @@ def stuck_awaiting_human(
     return out
 
 
-def describe_stuck(runs: list[StuckRun]) -> str:
-    """把告警结果渲染成一行行文本（CLI 用；有输出即代表"需要人管"）。"""
+def describe_stuck(runs: list[StuckRun], *, limit: int | None = ALERT_LIST_LIMIT) -> str:
+    """把告警结果渲染成一行行文本（CLI 用；有输出即代表“需要人管”）。
+
+    `limit`：最多列几个（`None` = 不限）。**头一行始终是真实总数**，
+    被省略的个数写在末尾——「少给了」必须说出来，不能让人以为就这么多（第五十七批）。
+    不设上界时，5000 个 Run 会渲染出 496KB 文本：既作为告警发不出去，也不适合当 cron 邮件。
+    """
     if not runs:
         return "没有等待人工超时的 run。"
+    shown = runs if limit is None else runs[: max(0, limit)]
     lines = [f"等待人工处理超时，共 {len(runs)} 个（越靠前等得越久）："]
-    for item in runs:
+    for item in shown:
         if item.waiting_seconds is None:
             waited = "等待时长未知"
         else:
@@ -134,4 +153,9 @@ def describe_stuck(runs: list[StuckRun]) -> str:
                 waited += "（近似：按最后活动时间算，实际可能更久）"
         step = f"｜{item.detail}" if item.detail else ""
         lines.append(f"  {item.run_id:<28} {item.status:<20} {waited}{step}")
+    if len(shown) < len(runs):
+        lines.append(
+            f"  ……另有 {len(runs) - len(shown)} 个未列出（完整清单：`warden stuck --all`，"
+            f"或 `GET /alerts/stuck?limit=0`）"
+        )
     return "\n".join(lines)

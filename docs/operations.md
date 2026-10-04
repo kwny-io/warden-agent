@@ -73,8 +73,15 @@ esac
 或抓 HTTP（认证模式下按归属收敛）：
 
 ```
-GET /alerts/stuck?older_than_min=60   →  {"count": N, "runs": [...]}
+GET /alerts/stuck?older_than_min=60&limit=20
+  → {"count": N, "listed": M, "omitted": K, "truncated": bool, "runs": [...]}
 ```
+
+`count` 是**真实总数**，`runs` 默认最多 `limit` 条（默认 20，`limit=0` = 全量），
+`omitted` / `truncated` 告诉你「还有多少没列出来」——**少给了会说出来**，不会让你以为就这么多。
+命令行同理：默认只列 20 条（够值班的先动起来），要看全量用 `warden stuck --all`（或 `--limit 0`），
+`--limit N` 可指定条数。**为什么要设上界**：告警恰恰发生在故障时，而接收端在压力下第一个丢掉的就是超大请求
+（5000 个 Run 卡住时，未截断的报告是 1.29MB，群机器人的 `text` 上限只有 2000~4096 字节）。
 
 **建议**：每 5 分钟跑一次，`count > 0` 就通知值班人。阈值按业务定（审批慢的业务别设 10 分钟）。
 

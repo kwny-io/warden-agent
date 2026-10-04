@@ -17,7 +17,9 @@ CLI 曾经在**一条告警都没送出去**时照样打印「已投递告警：
 
 from __future__ import annotations
 
+import argparse
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,7 @@ import pytest
 from warden_agent import cli
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.runtime import notify as notify_mod
+from warden_agent.runtime.alerting import ALERT_LIST_LIMIT
 from warden_agent.runtime.checkpoint import Checkpoint, checkpoint_store_for
 from warden_agent.store.sqlite import SqliteStore
 
@@ -108,6 +111,168 @@ def test_投递成功才说已投递_退出码3(tmp_path, capsys, monkeypatch) -
     assert "已投递告警：1 个 Run" in out and "_FakeNotifier" in out
     assert "告警未投递" not in out and "告警未投递" not in err
     assert good.calls and good.calls[0]["title"].startswith("[warden] 1 个 Run")
+
+
+def test_命中很多时输出有上界_且首行是真实总数(tmp_path, capsys) -> None:
+    """100 个卡死的 Run：默认只列最该先看的 ALERT_LIST_LIMIT 个。
+
+    首行必须是真实总数（100），末尾必须写出省略多少个——「少给了」得能看出来。
+    """
+    db = _many_stuck_db(tmp_path, 100)
+
+    with pytest.raises(SystemExit) as ei:
+        cli.main(["stuck", "--db", db, "--older-than-min", "0"])
+
+    out, _ = capsys.readouterr()
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert ei.value.code == 3
+    assert lines[0].startswith("等待人工处理超时，共 100 个")
+    assert len(lines) <= ALERT_LIST_LIMIT + 2, f"输出没上界：{len(lines)} 行"
+    assert "另有 80 个未列出" in lines[-1]
+    assert len(out.encode("utf-8")) < 4096, "cron 邮件/群机器人也要能承住"
+
+
+def test_all才是全量_反向控制(tmp_path, capsys) -> None:
+    """`--all` 是拿到完整清单的唯一方式：100 行，不许出现「未列出」。"""
+    db = _many_stuck_db(tmp_path, 100)
+
+    with pytest.raises(SystemExit):
+        cli.main(["stuck", "--db", db, "--older-than-min", "0", "--all"])
+
+    out, _ = capsys.readouterr()
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 101, f"--all 应列出全部：{len(lines)} 行"
+    assert "未列出" not in out
+
+
+def test_limit参数能真的指定条数(tmp_path, capsys) -> None:
+    """`--limit N` 必须真的存在且能指定条数。
+
+    第五十七批自己踩的坑：CHANGELOG 与 `docs/operations.md` 都写了 `--limit N`，
+    而 argparse 里从来没有这个参数——`warden stuck --limit 3` 直接
+    `unrecognized arguments`（退出码 2）。逃逸口本身也得有守卫。
+    """
+    db = _many_stuck_db(tmp_path, 100)
+
+    with pytest.raises(SystemExit):
+        cli.main(["stuck", "--db", db, "--older-than-min", "0", "--limit", "3"])
+
+    out, _ = capsys.readouterr()
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines[0].startswith("等待人工处理超时，共 100 个"), lines[0]
+    assert len(lines) == 5, f"--limit 3 应只列 3 条（+首行+末行）：{len(lines)} 行"
+    assert "另有 97 个未列出" in lines[-1]
+
+
+def test_limit_0_与_all_等价(tmp_path, capsys) -> None:
+    """`--limit 0` = 不设上限（与 `--all` 同义）：101 行，不许出现「未列出」。"""
+    db = _many_stuck_db(tmp_path, 100)
+
+    with pytest.raises(SystemExit):
+        cli.main(["stuck", "--db", db, "--older-than-min", "0", "--limit", "0"])
+
+    out, _ = capsys.readouterr()
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 101, f"--limit 0 应给全量：{len(lines)} 行"
+    assert "未列出" not in out
+
+
+def test_limit与json一起用时省略个数走stderr(tmp_path, capsys) -> None:
+    """`--json --limit 3`：stdout 仍是纯 JSON 且只 3 条，省略个数走 stderr。"""
+    db = _many_stuck_db(tmp_path, 100)
+
+    with pytest.raises(SystemExit):
+        cli.main(["stuck", "--db", db, "--older-than-min", "0", "--json", "--limit", "3"])
+
+    out, err = capsys.readouterr()
+    assert len(json.loads(out)) == 3
+    assert "只列出了 3 个（共 100 个）" in err
+    assert "只列出了" not in out
+
+
+def test_文档里写的_stuck_参数必须真的存在() -> None:
+    """文档与 CLI 的**表面**必须同源——守卫要钉在 argparse 上，不能钉在文档上。
+
+    （第五十七批：文档写了 `--limit N`，而 CLI 没这个参数，退出码 2。
+    这条守卫就是那次遗漏的补丁：`docs/operations.md` 里跟 `stuck` 同一行出现的
+    每个 `--flag` 都必须在 `stuck` 子命令的 option_strings 里。）
+    """
+    parser = cli._build_parser()  # noqa: SLF001
+    sub = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)  # noqa: SLF001
+    )
+    stuck = sub.choices["stuck"]
+    opts = {s for a in stuck._actions for s in a.option_strings}  # noqa: SLF001
+    assert {"--all", "--limit", "--json", "--notify", "--older-than-min"} <= opts
+
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "operations.md").read_text(
+        encoding="utf-8"
+    )
+    mentioned: set[str] = set()
+    for line in doc.splitlines():
+        if "stuck" in line:
+            mentioned |= set(re.findall(r"--[a-z][a-z0-9-]+", line))
+    missing = sorted(m for m in mentioned if m not in opts)
+    assert not missing, f"docs/operations.md 提到的 stuck 参数在 CLI 里不存在：{missing}"
+
+
+def test_json也有上界_且省略个数走stderr(tmp_path, capsys) -> None:
+    """`--json` 的形状仍是列表（不打破消费方），但同样有上界；少给了走 stderr。"""
+    db = _many_stuck_db(tmp_path, 100)
+
+    with pytest.raises(SystemExit):
+        cli.main(["stuck", "--db", db, "--older-than-min", "0", "--json"])
+
+    out, err = capsys.readouterr()
+    payload = json.loads(out)
+    assert len(payload) == ALERT_LIST_LIMIT
+    assert "只列出了 20 个（共 100 个）" in err
+    assert "只列出了" not in out, "--json 的 stdout 必须仍是纯 JSON"
+
+
+def test_命中很多时投递的载荷也不跟着长(tmp_path, monkeypatch) -> None:
+    """真投递口径：100 个 Run 时，发出去的 body 有上界，但 count 是真实总数。"""
+    captured: dict[str, object] = {}
+
+    class _Capture:
+        requires_network = True
+
+        def send(self, *, title: str, summary: str, details: dict[str, object]) -> bool:
+            captured.update({"title": title, "summary": summary, "details": details})
+            return True
+
+    fake = _Capture()
+    monkeypatch.setattr(notify_mod, "notifier_from_env", lambda env=None: fake)
+    db = _many_stuck_db(tmp_path, 100)
+
+    with pytest.raises(SystemExit) as ei:
+        cli.main(["stuck", "--db", db, "--older-than-min", "0", "--notify"])
+
+    assert ei.value.code == 3
+    details = captured["details"]
+    assert (details["count"], details["listed"], details["omitted"]) == (100, 20, 80)
+    assert captured["title"].startswith("[warden] 100 个 Run")
+    assert "另有 80 个未列出" in captured["summary"]
+
+
+def _many_stuck_db(tmp_path: Path, n: int) -> str:
+    """造 n 个卡在等审批的 Run（真 SQLite）。"""
+    path = str(tmp_path / f"many-{n}.db")
+    store = SqliteStore(path)
+    cps = checkpoint_store_for(store)
+    assert cps is not None
+    for i in range(n):
+        rid = f"run-{i:04d}"
+        store.save_run(AgentRun(rid))
+        cps.save(
+            Checkpoint(
+                run_id=rid,
+                status=RunStatus.WAITING_APPROVAL,
+                iteration=1,
+                step="awaiting_approval",
+            )
+        )
+    return path
 
 
 def test_json输出时投递成败都不污染stdout(tmp_path, capsys, monkeypatch) -> None:
