@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -27,6 +28,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PIN_SCRIPT = REPO_ROOT / "scripts" / "pin_image_digests.sh"
 ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "rollback.sh"
+# 真集群演练脚本（第五十八批）：它自己不是被测对象，但必须能过 `bash -n` 且不许有 CRLF，
+# 也不许用反引号（见 test_脚本里不许用反引号）。
+DRILL_SCRIPT = REPO_ROOT / "scripts" / "k8s_rollback_drill.sh"
+
+# `cat <<'EOF'` / `<<EOF` / `<<-EOF` —— 引号 heredoc 里的反引号不会被展开（帮助文本里常写）
+_HEREDOC_RE = re.compile(r"<<-?\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?")
 K8S_NAMESPACE_MANIFEST = REPO_ROOT / "deploy" / "k8s" / "namespace.yaml"
 
 # Windows 上 Git Bash 的常见安装位置。
@@ -671,6 +678,11 @@ def test_rollback看不到deployment时不说没有历史版本(tmp_path: Path) 
     assert "NotFound" in proc.stderr
     # 本人在这条命令里最需要看到的东西：日志里出现过的命名空间
     assert "namespace=warden" in proc.stderr, proc.stderr
+    # 第五十八批真集群演练抳到的那条：错误路径里写了文档式的 `$manifest_ns`，
+    # 反引号在 shell 里是**命令替换** → 屏幕上多一行 `warden: command not found`，
+    # 而「清单里声明的是 ___」后面是空的 —— 出事时最该看到的值消失了。
+    assert "清单里声明的是 warden" in proc.stderr, proc.stderr
+    assert "command not found" not in proc.stderr, proc.stderr
     assert _MISLEADING_DIAGNOSIS not in proc.stderr, (
         "看不到 Deployment 时做出了「没有历史版本」这个诊断 —— 这就是把人带偏的那句话"
     )
@@ -695,7 +707,7 @@ def test_rollback读不到revision注解时也不说没有历史版本(tmp_path:
 # =========================================================================== #
 # 静态约束：两个脚本都要能过 `bash -n`，且不许有 CRLF 行尾
 # =========================================================================== #
-@pytest.mark.parametrize("script", [PIN_SCRIPT, ROLLBACK_SCRIPT])
+@pytest.mark.parametrize("script", [PIN_SCRIPT, ROLLBACK_SCRIPT, DRILL_SCRIPT])
 def test_script_syntax_and_line_endings(script: Path) -> None:
     assert script.exists(), f"脚本不存在: {script}"
     raw = script.read_bytes()
@@ -708,6 +720,38 @@ def test_script_syntax_and_line_endings(script: Path) -> None:
         timeout=SESSION_TIMEOUT,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("script", [PIN_SCRIPT, ROLLBACK_SCRIPT, DRILL_SCRIPT])
+def test_脚本里不许用反引号(script: Path) -> None:
+    """**未转义**的反引号在 shell 里是命令替换，不是 Markdown 引号（注释里随便写）。
+
+    第五十八批在真集群上跑回滚脚本时，屏幕里冒出一行 `warden: command not found`，
+    根因就是一条给值班人看的提示写了 `` `$manifest_ns` ``：变量被当成命令执行，
+    提示里最该看到的那个值变成空白。它不会让脚本失败（退出码仍对），
+    只是在那句最需要准确的话里把关键信息抹掉——所以它需要一条静态约束。
+
+    三种合法写法（本用例都不管）：注释行（没被执行过）；`\\`` 转义（双引号里故意要一个
+    字面反引号）；**引号 heredoc** 里的帮助文本（`cat <<'EOF'` 不做展开，那里写反引号是给人看的）。
+    仓库里全部用 `$(...)` 做命令替换，所以剩下任何一种裸反引号都是手滑。
+    """
+    offenders: list[str] = []
+    heredoc_end: str | None = None
+    for num, line in enumerate(script.read_text(encoding="utf-8").splitlines(), start=1):
+        if heredoc_end is not None:
+            if line.strip() == heredoc_end:
+                heredoc_end = None
+            continue
+        if not line.lstrip().startswith("#"):
+            found = _HEREDOC_RE.search(line)
+            if found:
+                heredoc_end = found.group(1)
+                continue
+        if not line.lstrip().startswith("#") and "`" in line.replace(chr(92) + "`", ""):
+            offenders.append(f"{script.name}:{num}: {line.strip()}")
+    assert not offenders, (
+        "这些行里的反引号会被 shell 当命令替换执行（要写变量就用 ${var}）:\n" + "\n".join(offenders)
+    )
 
 
 # =========================================================================== #

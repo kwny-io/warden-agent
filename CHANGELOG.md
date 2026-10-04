@@ -4,6 +4,70 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-04（第五十八批：集群已经在跑了，账本却写着「从未部署」——第一次真集群演练抓到脚本说的一句假话）
+
+> 入口：自检第 3 条（「已标完成的项先用可复现命令验一遍」）这次不是走过场。
+> `docs/复核索引.md` §7 有两行 ❌ 挂了很久：「集群从未部署过」「发布流水线从未真跑」。
+> 拿 `docker` / `kubectl` 直接问，两行都已经**不成立**——错账也是账，
+> 而且比事实更悲观的那种错账会让下一个人重做已经做过的事。
+
+### 一、现象（三条，都有命令）
+
+- `docker ps` 里有 `warden-control-plane`（node v1.31.0）；`docker exec warden-control-plane kubectl --kubeconfig=/etc/kubernetes/admin.conf get deploy -A` 回：`kube-system/coredns 2/2 11d`、`warden/postgres 1/1 11d`、`warden/warden-agent 2/2 11d`——**`deploy/k8s` 的清单早就 apply 过、而且一直在跑**，而 §7 写「k8s 清单仍未在真集群 apply（kind 容器在，但 API 端点拒连）」。
+  （镜像要说准：跑的是**本机构建**的 `warden-agent:k8s`，**不是**流水线产物 —— 所以这一条不能拿来证明「发布流水线真跑过」。）
+- `git tag | wc -l` = **1**，`git tag` = `probe-nonrelease-tag`（我自己查探流水线时留下的），而 §7 写「`0` 个 tag」、`0` 个 release——**不是发布 tag，但账本里的数字也得跟事实对得上**。
+- 拿真集群跑 `scripts/rollback.sh`（第五十四批刚「修好」的那个），用例 3 的屏幕上多出一行 `warden: command not found`，而「清单里声明的是 ___」后面**是空的**。退出码仍是对的（1），所以任何只看退出码的检查都不会发现。
+- 而第五十四批那 8 条假-kubectl 用例**全绿**地跑过这条路径：它们只断言子串（`NotFound`、`namespace=warden`），没断言那一行**说了什么**。
+
+### 二、根因
+
+- 账本是**人写的结论**，没有任何命令能自己把它证伪，而它读起来像事实来源。
+- 假 kubectl 只能回答「你问的那个抽屉里有什么」，答不出「脚本自己会去哪个抽屉」；它也不会解释反引号、`set -e` 与管道的交互。**替身的表达能力就是那批测试的上界**（第八种来源）。
+- 反引号那条：shell 里 `…` 是**命令替换**而不是引用。写提示时想的是 Markdown，shell 看到的是「把 `$manifest_ns` 当命令跑」。
+
+### 三、改法
+
+- `scripts/rollback.sh`：提示里的 `${manifest_ns}` 去掉反引号——现在真的写出清单里声明的命名空间。
+- 新增 `scripts/k8s_rollback_drill.sh`：在**真**集群上按契约逐个走一遍（不传 `NAMESPACE` 回滚 / 确实没历史 / 命名空间打错 / 清单读不到 / `DRY_RUN=1`），每一步同时断言退出码、关键输出与**集群状态**，结束时把工作负载恢复原样并清理演练命名空间。默认节点 `warden-control-plane`（`K8S_NODE=` 可覆盖），用**节点里的** kubectl 与 `/etc/kubernetes/admin.conf`，所以宿主机 kubeconfig 通不通、6443 映射在不在都不影响演练。
+- 新增 `scripts/kind_api_forward.py`：宿主机 → 节点的 API 转发容器（这个集群容器**没有发布端口**，`~/.kube/config` 里的 58583 早就断了）。TLS 不受影响：kind 的 apiserver 证书本就包含 `127.0.0.1`。
+- `deploy/k8s/README.md`：写清「怎么在这台机器上真的用上这个集群」（转发容器 + 演练脚本两条命令）。
+- 守卫：`tests/test_release_scripts.py` 新增 `test_脚本里不许用反引号`——它得区分三种合法写法（注释行、`\`` 转义、**引号 heredoc 里的帮助文本**），所以实现里跟了 heredoc 状态；既有的「看不到 Deployment」用例补两条断言：必须出现 `清单里声明的是 warden`、不得出现 `command not found`；`k8s_rollback_drill.sh` 也进 `bash -n` / CRLF 那个参数化用例。
+- 账本改正：§7 把这两行从 ❌ 改成当前事实（发布 tag / release 仍是 0，探针 tag 明确标注为探针；集群**已部署**，并附上「怎么亲自看」的命令）。
+
+### 四、实测（真集群，2026-10-04）
+
+`MSYS_NO_PATHCONV=1 bash scripts/k8s_rollback_drill.sh` → **全部用例符合契约**：
+
+| 用例 | 做了什么 | 期望 | 实际 |
+|---|---|---|---|
+| 1 | 造 revision 8，**不传 `NAMESPACE`** 回滚 | 0 | 0（`deployment.apps/warden-agent rolled back`；演练用 env 已还原） |
+| 2 | 只有 1 个 revision | 2 | 2（`::error::没有可回滚的历史版本…未做任何改动`） |
+| 3 | 命名空间打错 | 1 | 1（带 `NotFound` 原话 + `清单里声明的是 warden` + 当前 context） |
+| 4 | 脚本被挪到没有清单的地方 | 1 | 1（`不回退到任何默认值…请显式传 NAMESPACE=`） |
+| 5 | `DRY_RUN=1` | 0 | 0（打出将执行的命令；revision 未变） |
+
+- `kubectl rollout undo --to-revision=7` 会把 revision 记成**新号**（8→9）：消息里「回滚到 revision 7」说的是**模板来源**，结果 revision 是 9。
+- `ruff check src tests scripts` 这次**抓到我自己新加的 `scripts/kind_api_forward.py`**（3 条 `E501` + 2 条 `SIM105`）：上一批我只跑了 `src tests`，而仓库/CI 的命令含 `scripts`。门禁比我的习惯严，这次是它对。
+
+### 五、实测数字（全量，两个口径，2026-10-04）
+
+| 口径 | 收集 | 通过 | 失败 | 错误 | 跳过 | 耗时 | 覆盖率 |
+|---|---|---|---|---|---|---|---|
+| 真 PG（沿用 `warden-pg-test`，与 CI 的 PG service 同口径） | 1684 | **1680** | 0 | 0 | 4 | 496.1s | **90.31%** |
+| 无 PG（**真的把 `docker stop` 掉**，两口径切换真跑） | 1684 | **1640** | 0 | 0 | 44 | 505.3s | 87.08% |
+
+- 收集数 1680 → **1684**（+4）：`test_脚本里不许用反引号` 的 3 个参数化用例 + `k8s_rollback_drill.sh` 进 `bash -n` / CRLF 那个参数化用例。**两个口径的通过数各自 +4**——说明新守卫在两个口径下都真跑了，不是「跳过去的那 4 条」。
+- 覆盖率与上一批同值（90.31% / 87.08%）：新守卫断言的是**既有脚本**的行，不新增被测语句；语句总数仍 10644、分支 2660。
+- 新守卫是**真的网**（先验证「它会红」再说「它绿」）：把 `scripts/rollback.sh:127` 的 `${manifest_ns}` 改回反引号形式 → `test_脚本里不许用反引号[script1]` **红**，报出 `rollback.sh:127: 1) 命名空间 / 名字对不对：清单里声明的是 $manifest_ns（deploy/k8s/namespace.yaml）`（原文里的反引号已被守卫点名）；按字节还原后 `sha256(scripts/rollback.sh) = 48af33ce12117b368ef59b2cea1eb199a87aee3be0b885cfe5d35613d2f5ab2e` 与变异前一致，3 个参数化用例转绿。
+
+### 六、已知限制（照实说）
+
+- 演练是**手工触发**的，没有 CI 里的 kind 作业；它只看「Pod ready 且模板还原」，**不看回滚后业务是否真的恢复**。
+- 转发容器与集群都在本机；换环境要先 `kind create cluster`。演练脚本的节点名/命名空间可覆盖但**不会自动探测**。
+- §7 的账本仍是人工维护的：本批只把它改成当前事实并附上复核命令，**没有**把它自动化。
+- 演练命名空间 `warden-drill` 用的是 `docker.m.daocloud.io` 镜像（本机可达），换环境要换 registry。
+
+---
 ## 2026-10-04（第五十七批：告警消息没有上限——最需要它的时候，它最可能送不出去）
 
 > 入口：继续沿第九种来源往下挖。上一批证明了「『已投递告警』是一句没有证据的话」，

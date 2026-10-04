@@ -319,3 +319,52 @@ kubectl -n $NS rollout status deploy/warden-agent
 > 拼错的 `WARDEN_*` 变量不会被静默忽略：应用启动时会比对 `ENV_SPECS` 并**告警**
 > （`unknown_warden_variables()`），格式错误直接拒绝启动（`validate_env()`）。
 > 所以"清单里写错一个名字"会在 Pod 日志里露出来，不会悄悄用默认值跑。
+
+## 在本机的 kind 集群上真的用一遍（含回滚演练）
+
+> 第五十八批的经验：**离线结构断言与假 kubectl 都有它们答不出的问题**。
+> 假 kubectl 只能回答「你问的那个抽屉里有什么」，答不出「脚本自己会去哪个抽屉」——
+> 第五十四批的 8 条回滚用例全绿，却漏掉了「默认命名空间写死 `warden-agent`、而清单里是 `warden`」。
+> 所以下面两条命令值得真的跑一次（本机已经跑过，见 `CHANGELOG.md` 第五十八批）。
+
+### 1) 先把 API 端点接回宿主机（如果你的集群容器没有发布 6443）
+
+kind 容器一旦被重建/恢复，`docker port <node>` 可能就是空的，`~/.kube/config` 里写的
+`https://127.0.0.1:58583` 会 `connection refused`。用转发容器把这条链路接回来：
+
+```bash
+# NODE_IP：节点的 docker 内网 IP
+NODE_IP=$(docker inspect -f \
+    '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' warden-control-plane)
+docker run -d --name warden-api-forward --restart unless-stopped \
+    -p 58583:58583 -e UPSTREAM=$NODE_IP:6443 \
+    -v "$PWD/scripts/kind_api_forward.py:/fwd.py:ro" python:3.12-slim python /fwd.py
+kubectl get nodes        # 应当直接通了
+```
+
+> 为什么不用 `--network container:<node>`：docker 不允许「发布端口 + 共享网络命名空间」同时用；
+> 而且 6443 在节点里已被 kube-apiserver 占用。TLS 不受影响：kind 生成的 apiserver 证书
+> 本就包含 `127.0.0.1` 这个 SAN。
+
+### 2) 在真集群上按契约走一遍回滚（不是假 kubectl）
+
+```bash
+MSYS_NO_PATHCONV=1 bash scripts/k8s_rollback_drill.sh   # Git Bash 下需要这个环境变量
+```
+
+它把仓库里的 `deploy/k8s/` 与 `scripts/rollback.sh` 拷进节点，然后逐个用例断言
+**退出码 + 关键输出 + 集群状态**，结束把工作负载恢复原样并清理演练命名空间：
+
+| 用例 | 做什么 | 期望退出码 |
+| --- | --- | --- |
+| 1 | 造一个新 revision，**不传 `NAMESPACE`** 回滚（命名空间必须从清单读） | 0 |
+| 2 | 只有 1 个 revision 的 Deployment | 2（确实没有历史） |
+| 3 | 命名空间打错（同时检查输出里有没有 `NotFound` 原话） | 1 |
+| 4 | 脚本被挪到没有清单的地方（不猜默认值） | 1 |
+| 5 | `DRY_RUN=1`（并核对 revision 未变） | 0 |
+
+可覆盖的变量：`K8S_NODE`（默认 `warden-control-plane`）、`DRILL_NS`（默认 `warden-drill`）、
+`DEPLOYMENT`（默认 `warden-agent`）。
+
+> 边界（照实说）：演练只看「Pod ready 且模板已还原」，**不看回滚后业务是否真的恢复**；
+> 它是**手工触发**的，没有 CI 里的 kind 作业；换一套环境要先 `kind create cluster`。

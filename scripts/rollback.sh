@@ -124,7 +124,7 @@ require_deployment_visible() {
     manifest_ns="$(namespace_from_manifest 2>/dev/null || printf '（读不到清单）')"
     fail "$EXIT_USAGE" "拿不到 Deployment $DEPLOYMENT（namespace=$NAMESPACE）。kubectl 的原话：${err:-（无输出）}
 这不是「没有可回滚的历史版本」，而是**连当前版本都没看到**，两者要查的地方不一样。先确认三件事：
-  1) 命名空间 / 名字对不对：清单里声明的是 `$manifest_ns`（deploy/k8s/namespace.yaml）
+  1) 命名空间 / 名字对不对：清单里声明的是 ${manifest_ns}（deploy/k8s/namespace.yaml）
   2) 当前 context 指向的集群对不对：${ctx:-（读不到）}
   3) 手上这份 kubeconfig 有没有对 deployment 的 get 权限
 未做任何改动。要覆盖默认值：NAMESPACE=<ns> DEPLOYMENT=<name> scripts/rollback.sh"
