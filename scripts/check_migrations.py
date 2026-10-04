@@ -355,9 +355,14 @@ def load_snapshot() -> dict[str, Any]:
 
 def write_snapshot(version: int, tables: dict[str, Any]) -> None:
     payload = {"version": version, "tables": tables}
+    # 必须 newline="\n"：这是**签入仓库**的文件（scripts/schema_snapshot.json），
+    # 而 Windows 上文本模式写入会把 \n 翻成 \r\n；`.gitattributes` 是 `* text=auto eol=lf`，
+    # 所以工作区会变成 CRLF，而 `git diff`（git 归一化）与 `load_snapshot()`
+    # （read_text 归一化）**都看不出来**。字节级守卫见 tests/test_migration_check.py。
     SNAPSHOT.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
+        newline="\n",
     )
     print(f"已重写快照：{SNAPSHOT}")
 

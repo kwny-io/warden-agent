@@ -4,6 +4,82 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-04（第六十一批：门禁挂了哪个目录，就是它的全部职责范围——少一个 `s` 的 `matchName`，`deploy/` 的 72 个用例全绿）
+
+> 入口：自检要求「证伪前面标成已完成的项」。我原定的题「k8s 清单从未被静态真校验」**当场被证伪**
+> —— `kubeconform` 早就在 CI 里跑（`-strict`）。但同一句证伪里藏着真的空白：
+> **它只挂了 `deploy/k8s` 一个目录**，而 `deploy/observability` 的两个 CR 从来不在任何门禁的职责范围内。
+
+### 现象
+
+1. **CR 的字段合法性从没被校验过。** `deploy/observability/servicemonitor.yaml` 把
+   `spec.namespaceSelector.matchNames` 写成 `matchName`（**少一个 s**）→ 读 `deploy/` 的
+   **72 个用例全绿**。那些守卫查的是「我们的要求」（标签在不在、`bearerTokenSecret` 指向的
+   Secret 键真不真实、规则正文与 `alerts/*.yml` 是否逐条一致），**没有一条查字段合法性**。
+2. **而 CRD 偏偏是结构化 schema：未知字段会被静默剪掉。** 提交上去不报错、字段没了、
+   行为退回默认值——`kubectl apply` 成功 ≠ 配置生效。同一处写错，普通代码是「立刻报错」，
+   CR 里是「监控看着是绿的」。
+3. **反检自己的产物时又抓到两条同类。** `scripts/mutation_shards.py` 会**改写仓库里的
+   `pyproject.toml`**（把 `[tool.mutmut]` 换成当前分片），但它：
+   ① 把「段落」定义成「到下一个顶层表头为止」，于是 `[tool.mutmut]` 与下一个表头之间的
+   **空行会被一次渲染静默删掉**；② 用 `write_text()` 写文件 ⇒ Windows 上把 `\n` 翻成 `\r\n`，
+   而本仓 `.gitattributes` 是 `* text=auto eol=lf` ⇒ **工作区副本变成 CRLF**。
+   两者都**看不见**：`git diff` 会替我们归一化，`read_text()` 也会把 CRLF 归一化成 `\n`
+   —— 连声称「逐字节还原」的那条守卫当时比的也是**文本**（守卫自己撒谎）。
+
+### 根因
+
+**判据的精度/范围，就是它实际能守住的东西**：挂哪个目录 = 守哪个目录；比字符串 = 只守字符串；
+比文本 = 看不见换行符。三处都**不是**「没人写校验」而是「校验的范围与意图不同源」
+（同 §9 第九/十一种来源）。
+
+### 改法
+
+| # | 改动 | 文件 |
+| --- | --- | --- |
+| 1 | 按 commit 固定上游 schema（含 `sha256` 与来源 commit）：不联网、不需要集群、不需要 Docker | `deploy/observability/schemas/{prometheusrule,servicemonitor}_v1.json`(新) |
+| 2 | 新增 CR schema 守卫 4 条：两个 CR 必须过官方 schema（失败时打印**哪个字段**、为什么比看起来严重）+ **范围的守卫**（盘上任何 `monitoring.coreos.com` 的 CR 清单没进校验名单就红）+ **守卫的守卫**（schema 必须 `additionalProperties: false`；塞假字段、把真字段改名都必须被拒） | `tests/test_crd_schemas.py`(新) |
+| 3 | 文档同源：文件表加 `schemas/*.json` 一行；静态校验一节写清「为什么不在本地跑 kubeconform」（本机 Docker 守护进程的代理指向死端口 `127.0.0.1:7890`）与「schema 怎么更新」 | `deploy/observability/README.md` |
+| 4 | 渲染不再吃空行（段落与下一个表头之间的空行留在 `after` 里）+ `write_shard` 显式 `newline="\n"` | `scripts/mutation_shards.py` |
+| 5 | 往返守卫从**文本**级升到**字节**级（并断言不引入 CRLF）+ 新增「空行不被吃掉」用例；`_copy_pyproject` 改为字节拷贝（否则它自己会把副本写成 CRLF，制造假红） | `tests/test_mutation_shards.py` |
+| 6 | 同族第二处：`write_snapshot` 同样显式 `newline="\n"`（它改写的也是**签入仓库**的文件 `scripts/schema_snapshot.json`）+ 字节级守卫（幂等、无 CRLF、结尾单个换行） | `scripts/check_migrations.py`、`tests/test_migration_check.py` |
+| 7 | 新增 dev 依赖 `jsonschema>=4.26.0`（`uv.lock` 同步；`--frozen` 下跑得起来） | `pyproject.toml`、`uv.lock` |
+
+### 实测
+
+- **变异 7 条全部被拦，且每条都字节级还原（sha256 复核）**：
+  M1 `matchNames→matchName`（**就是那个真实缺陷的形状**）/ M2 `spec` 下塞不存在的字段 /
+  M3 只给 schema 文件**多一个空格**（字节 sha256 那道闸）/ M4 盘上新增第三个 CR（`Probe`：
+  **只有范围的守卫能抓**，而「逐个文件校验」那条保持绿——正说明它补的是真空白）/
+  M5 `write_shard` 去掉 `newline="\n"` / M6 段落重新把尾部空行吞进来 / M7 `write_snapshot` 去掉 `newline="\n"`。
+- 全量复测（两口径，`--junitxml` 口径）：
+  **1705 项收集**；带真 PG **1701 passed / 4 skipped / 0 failed / 0 errors**（271.0 秒）；
+  无 PG（**真把容器 `docker stop` 掉**）**1661 passed / 44 skipped / 0 failed / 0 errors**（294.5 秒）；
+  覆盖率带真 PG **90.31%** / 无 PG **87.08%**（门槛 86%，语句 10644 / 分支 2660）。
+
+### 本批我自己也错过（记下来，别只记成功）
+
+- **子集是按「主题」选的，不是按「改动的文件」选的**：我先跑的子集是
+  `test_crd_schemas / test_k8s_manifests / test_observability_config / test_alert_rules / test_config_surface`，
+  而本批同时改了 `pyproject.toml` ⇒ 真改到的是 `tests/test_mutation_shards.py` 的 3 条配置漂移守卫，
+  **只有全量才红**（第六十批同族教训的第二次犯）。
+- 我两次把要改的文件名写成**不存在**的路径（`tests/test_docs_consistency.py`、
+  `tests/test_observability.py`）——写进文档之前必须 `ls`/`grep` 核一遍。
+- 我在文档里预写「文档已同步」，而 CHANGELOG 这一节当时**还没写**（写完才发现）——
+  「打算做」与「已经做」在文字里长得一样，正是本仓库一直在消灭的那种失真。
+
+### 已知限制
+
+- 校验用的是上游某个 commit 的 schema **快照**：你集群里装的 Operator 版本若不同，schema 可能不同；
+  更新步骤在 `tests/test_crd_schemas.py` 顶部注释里。
+- CI 那条 `kubeconform -strict` 的**目录没动**（只挂 `deploy/k8s`）。这是刻意的：给 CI 加一条
+  「运行时去网上取最新 schema」的校验会引入**第二个不确定的判据**，它可能在**与本次改动无关的提交**上
+  变红，而假警报会让人开始忽略门禁。宁可一条**确定**的判据 + 一条**范围**的守卫。
+- 只覆盖这两个 CR；`deploy/k8s` 之外的其余 YAML（`docker-compose.yml`、`alertmanager.yml` 等）
+  仍只有字符串级检查。
+- 本机跑不了 kubeconform（Docker 守护进程的代理指向死端口），所以这条判据**只在 CI 与装了工具的环境**里跑。
+
+---
 ## 2026-10-04（第六十批：守卫和入口自己会撒谎——演练脚本能删掉*生产*命名空间，「端口被占」被报成「创建容器失败」，还有一条守卫自己是聋的）
 
 > 入口：自检要求「证伪前面标成已完成的项」。三条声称全部当场被证伪，其中第一条是灾难级的：

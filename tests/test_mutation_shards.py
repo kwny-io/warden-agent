@@ -105,11 +105,15 @@ def test_未实测门槛的分片必须在文档里写明() -> None:
 
 
 def _copy_pyproject(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
-    """把真 pyproject 拷到 tmp 并把模块的路径指向副本：测试不许改仓库里的真文件。"""
+    """把真 pyproject 拷到 tmp 并把模块的路径指向副本：测试不许改仓库里的真文件。
+
+    拷贝必须走**字节**：`write_text()` 在 Windows 上会把 `\n` 翻成 `\r\n`，
+    于是"往返后字节还原"这类断言会先被这个拷贝本身弄红（假红）。
+    """
     real = shards.PYPROJECT
     original = real.read_text(encoding="utf-8")
     copy = tmp_path / "pyproject.toml"
-    copy.write_text(original, encoding="utf-8")
+    copy.write_bytes(real.read_bytes())
     monkeypatch.setattr(shards, "PYPROJECT", copy)
     return copy, original
 
@@ -125,11 +129,18 @@ def test_渲染一片之后配置就是那一片(tmp_path: Path, monkeypatch: py
 
 
 def test_渲染可以逐字节还原(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """这是"跑完一定还原"的语义保证：还原后文件与原始字节完全相同。"""
+    """这是"跑完一定还原"的语义保证：还原后文件与原始**字节**完全相同。
+
+    必须比字节而不是只比文本：`read_text()` 会把 CRLF 归一化成 `\n`，所以"文本相等"
+    对**换行符被改写**完全看不见——而 `write-shard` 改的是仓库里的真文件。
+    """
     copy, original = _copy_pyproject(tmp_path, monkeypatch)
+    original_bytes = copy.read_bytes()
     shards.write_shard(shards.BY_NAME["concurrency"])
     shards.write_shard(shards.BY_NAME[shards.DEFAULT_SHARD])
+    assert copy.read_bytes() == original_bytes, "往返后字节不等（换行符或空行被改？）"
     assert copy.read_text(encoding="utf-8") == original
+    assert b"\r\n" not in copy.read_bytes(), "写入引入了 CRLF"
 
 
 def test_同一片重复渲染不写文件(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -137,6 +148,23 @@ def test_同一片重复渲染不写文件(tmp_path: Path, monkeypatch: pytest.M
     assert shards.write_shard(shards.BY_NAME[shards.DEFAULT_SHARD]) is False
     assert shards.current_block() == shards.render_block(shards.BY_NAME[shards.DEFAULT_SHARD])
     assert copy.exists()
+
+
+def test_段落后面那行空行不会被重写吃掉(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`[tool.mutmut]` 后面还有别的表头时，中间那行空行必须原样留着。
+
+    为什么值得单测：`write-shard` 会**改写仓库里的 pyproject.toml**，而它把"段落"
+    定义成"到下一个顶层表头为止"——空行若被算进段落，一次渲染就会把那个空行
+    **静默删掉**（症状不是崩，是文件已经被改过一轮、`test_渲染可以逐字节还原` 才变红；
+    而 `write_shard` 会误以为“每次都需要写”，把那个空行反复吃一遍）。
+    """
+    copy, original = _copy_pyproject(tmp_path, monkeypatch)
+    text = original.rstrip("\n") + "\n\n[probe.blank_line_guard]\nx = 1\n"
+    copy.write_text(text, encoding="utf-8")
+    shards.write_shard(shards.BY_NAME["concurrency"])
+    shards.write_shard(shards.BY_NAME[shards.DEFAULT_SHARD])
+    assert copy.read_text(encoding="utf-8") == text, "那行空行被吃掉了"
+    assert not shards.current_block().endswith("\n\n"), "空行不该被算进 mutmut 段落"
 
 
 def test_render_check_能发现漂移(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,13 +205,19 @@ def test_改动路径能映射到分片() -> None:
 
 def test_split_pyproject_段落定位正确(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _, _ = _copy_pyproject(tmp_path, monkeypatch)
-    before, block, after = shards.split_pyproject(shards.PYPROJECT.read_text(encoding="utf-8"))
+    text = shards.PYPROJECT.read_text(encoding="utf-8")
+    before, block, after = shards.split_pyproject(text)
     assert block.startswith("[tool.mutmut]\n")
     assert block.endswith("\n")
+    # 段落自己不得以空行结尾：否则一次 write-shard 会把那行空行从 pyproject.toml 里删掉
+    # （“到下一个表头为止”的朴素实现就是这么静默改文件的，见 test_段落后面那行空行不会被重写吃掉）
+    assert not block.endswith("\n\n"), "空行被算进段落了"
     # 前面不能还有一个独立的 [tool.mutmut] 表头（注释里提到这个名字是允许的）
     assert not [ln for ln in before.splitlines() if ln.strip() == "[tool.mutmut]"]
     # 段落必须止于下一个顶层表头（不能把后面的配置吞进来）
-    assert after == "" or after.startswith("[")
+    assert after.lstrip("\n") == "" or after.lstrip("\n").startswith("[")
+    # 三段拼回去必须逐字节等于原文——整个工具（改写 pyproject）就靠这条性质
+    assert before + block + after == text
 
 
 def test_split_pyproject_缺段落会抛错(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

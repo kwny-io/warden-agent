@@ -97,6 +97,30 @@ def test_快照版本等于两个后端的目标常量() -> None:
 # ---------------------------------------------------------------------------
 # 漂移类别：每种真实漂移都必须能被报出（旧指纹在这些场景全是哑的）
 # ---------------------------------------------------------------------------
+def test_重写快照在字节级别可还原且不引入CRLF(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`write_snapshot` 改写的是**签入仓库**的 `scripts/schema_snapshot.json`。
+
+    两条性质必须在**字节**级别成立：
+      * 用同一份内容重写两次，字节完全一致（幂等）；
+      * 不引入 `\r\n`——Windows 上文本模式写入会把 `\n` 翻成 `\r\n`，而本仓的
+        `.gitattributes` 是 `* text=auto eol=lf`：工作区会变成 CRLF，而
+        `git diff`（git 归一化）与 `load_snapshot()`（`read_text` 归一化）
+        **都看不出来**——只能用字节守。
+    """
+    module = _load_check_module()
+    payload = module.load_snapshot()  # 先读真快照（此时 SNAPSHOT 还是真路径）
+    copy = tmp_path / "schema_snapshot.json"
+    monkeypatch.setattr(module, "SNAPSHOT", copy)
+    module.write_snapshot(payload["version"], payload["tables"])
+    first = copy.read_bytes()
+    module.write_snapshot(payload["version"], payload["tables"])
+    assert copy.read_bytes() == first, "同一内容重写两次，字节却变了"
+    assert b"\r\n" not in first, "重写引入了 CRLF（newline='\\n' 掉了？）"
+    assert first.endswith(b"}\n"), "结尾不是单个换行"
+
+
 def test_改列类型会被指纹报出() -> None:
     module = _load_check_module()
     diff = _drift(

@@ -284,7 +284,17 @@ def split_pyproject(text: str) -> tuple[str, str, str]:
         if re.match(r"^\[[^\]]+\]", lines[i]):
             end = i
             break
-    return "".join(lines[:start]), "".join(lines[start:end]), "".join(lines[end:])
+    # 段落与下一个表头之间的空行**不属于**这一段，留在 after 里。
+    # 否则对后面还有别的表头的 pyproject 来说，一次 write-shard 就会把那个空行
+    # **静默删掉**：症状不是崩，而是文件已经被改过一轮、"逐字节还原"那条守卫才变红。
+    block_end = end
+    while block_end > start and not lines[block_end - 1].strip():
+        block_end -= 1
+    return (
+        "".join(lines[:start]),
+        "".join(lines[start:block_end]),
+        "".join(lines[block_end:]),
+    )
 
 
 def current_block() -> str:
@@ -293,13 +303,20 @@ def current_block() -> str:
 
 
 def write_shard(shard: Shard) -> bool:
-    """把 pyproject 的 mutmut 段重写为该分片。返回是否真的改了内容。"""
+    """把 pyproject 的 mutmut 段重写为该分片。返回是否真的改了内容。
+
+    必须 `newline="\n"`：Windows 上文本模式写入会把 `\n` 翻成 `\r\n`，
+    而这个仓库的 `.gitattributes` 是 `* text=auto eol=lf`——工作区会变成 CRLF
+    （git diff 看不出来，因为 git 替我们归一化了；测试也看不出来，因为
+    `read_text()` 会把 CRLF 归一化成 `\n`）。所以这里显式写 LF，并由
+    `test_换片往返在字节级别还原` 按住。
+    """
     text = PYPROJECT.read_text(encoding="utf-8")
     before, block, after = split_pyproject(text)
     wanted = render_block(shard)
     if block == wanted:
         return False
-    PYPROJECT.write_text(before + wanted + after, encoding="utf-8")
+    PYPROJECT.write_text(before + wanted + after, encoding="utf-8", newline="\n")
     return True
 
 

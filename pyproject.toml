@@ -155,3 +155,8 @@ max_children = 4
 # 代价是**选窄了不会报错**，只会静默不再守着那些行——所以上面的 test_selection
 # 必须盖住本片模块“被任何测试覆盖过”的所有行（scripts/mutation_shards.py 的 check-tests 按住这点）。
 mutate_only_covered_lines = true
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.26.0",
+]

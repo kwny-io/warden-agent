@@ -12,6 +12,7 @@
 | `prometheusrule.yaml` | **Prometheus Operator** 版的告警规则（`PrometheusRule` CR；只装 ServiceMonitor 是不够的，见下节） |
 | `alertmanager.yml` | 告警路由（critical 立刻发、warning 打包发） |
 | `docker-compose.yml` | 一键起栈，用于本地演练 |
+| `schemas/*.json` | 上面两个 CR 的**上游 schema**（按 commit 固定，带 sha256）：供 `tests/test_crd_schemas.py` 校验字段合法性 |
 
 ## 快速演练
 
@@ -46,6 +47,28 @@ docker run --rm --entrypoint promtool \
 `prometheusrule.yaml`（Operator 版）的规则正文不另做静态校验：
 `tests/test_observability_config.py` 直接把它与上面两个文件**逐条深度比对**——两者不同就红，
 所以 promtool 查过的那份就是它。
+
+### 两个 CR 的**字段合法性**（`servicemonitor.yaml` / `prometheusrule.yaml`）
+
+上面那些测试查的是"我们的要求"（标签、Secret 键、规则正文逐条一致），**不查字段合法性**。
+而 K8s 的 CRD 是结构化 schema：**未知字段会被静默剪掉**，`kubectl apply` 照样成功、
+也没有任何告警——配置悄悄退回默认值。第六十一批实测：把 `namespaceSelector.matchNames`
+写成 `matchName`（少一个 s），读 `deploy/` 的 **72 个用例全绿**。
+
+所以这两个 CR 各配一份**按 commit 固定**的上游 schema（`schemas/*.json`，含 sha256 与来源），
+由 `tests/test_crd_schemas.py` 校验：
+
+- 不联网、不需要集群、不需要 Docker ⇒ CI 与本地是同一条判据；
+- schema 的**字节**被换掉就红（要换必须同时更新 sha256 与来源，不给"悄悄放松标准"留后门）；
+- 还有一条**范围的守卫**：以后新加任何 `monitoring.coreos.com` 的 CR 清单，
+  没进校验名单就直接红——否则"新文件没人管"会重演；
+- "校验器不是安慰剂"本身也被测：schema 必须 `additionalProperties: false`，
+  往里塞假字段、把真字段改名都必须被拒。
+
+为什么不在本地也跑 kubeconform：CI 那条 `kubeconform -strict`
+（`.github/workflows/ci.yml`）**只挂了 `deploy/k8s` 一个目录**，本目录从不在它的职责范围内；
+本机 Docker 守护进程的代理又指向一个死端口（`127.0.0.1:7890`，`docker pull` 直接
+`connection refused`）。更新 schema 的步骤写在 `tests/test_crd_schemas.py` 顶部注释里。
 
 ## 装了 Prometheus Operator：先把这两处接上（否则规则一条不生效）
 
