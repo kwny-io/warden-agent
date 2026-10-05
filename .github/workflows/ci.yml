@@ -31,9 +31,13 @@ jobs:
     # 起一个真实 PostgreSQL：让"存储可换 PostgreSQL"从**声称支持**变成**在 CI 里被验证**。
     # 此前 PG 集成测试是 skipif 跳过的、CI 里也没有库 —— 等于那段代码从未在自动化环境跑过。
     # 用 trust 认证免密，与本仓库测试的连接约定（用户 postgres、空密码、库 warden）一致。
+    #
+    # 第六十三批起**钉住 digest**：这是门禁自己执行的容器（被测代码连它跑集成测试），
+    # 浮动 tag 被上游重推就会换成另一个程序，而这件事在 CI 输出里看不出来。
+    # 台账、取法与验证方式（含反面对照）见 tests/test_ci_tool_pinning.py 顶部。
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: warden
@@ -122,7 +126,9 @@ jobs:
         # terminationGracePeriodSeconds、非 root + rootfs 只读、不用 :latest、多副本必配 PG…）
         # 由 tests/test_k8s_manifests.py 离线守着——那条在 Pytest 里已经跑了。
         run: |
-          docker run --rm -v "$PWD/deploy/k8s:/m:ro" ghcr.io/yannh/kubeconform:v0.6.7 \
+          # 第六十三批起钉住 digest：门禁执行体的身份必须可复现（台账见 tests/test_ci_tool_pinning.py）。
+          docker run --rm -v "$PWD/deploy/k8s:/m:ro" \
+            ghcr.io/yannh/kubeconform:v0.6.7@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c \
             -summary -strict /m
       - name: 断言 PostgreSQL 集成测试真的执行了（防静默跳过）
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
@@ -216,7 +222,11 @@ jobs:
         # （108 commits 时 7 处命中，全是脱敏/审批隔离用例的假夹具）。夹具用 allowlist 精确放宽，
         # 理由与踩过的坑（复数 allowlists 静默失效、paths/regexes 是 OR）都写在 .gitleaks.toml 顶部。
         run: |
-          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+          # 第六十三批起钉住 digest，而且必须与 scripts/gitleaks_reverse_control.sh 里那个
+          # **同一个** digest——反向对照的全部意义就是"证明扫描器没被关掉"，两个程序不同就
+          # 什么都证明不了。台账与取法见 tests/test_ci_tool_pinning.py 顶部。
+          docker run --rm -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks:v8.21.2@sha256:0e99e8821643ea5b235718642b93bb32486af9c8162c8b8731f7cbdc951a7f46 \
             detect --source /repo --config /repo/.gitleaks.toml --no-banner --redact -v
 
       - name: 秘密扫描反向对照（证明扫描器没被关掉、且 allowlist 是按值收窄的）
@@ -284,9 +294,10 @@ jobs:
     # 把这个分叉变成红灯（结构变了而版本没升 = 明确失败）。
     # 和 quality 一样起**真 PG**：两个后端的目标版本与结构必须一致，
     # 只查 SQLite 会漏掉 PG 侧漂移（"可换存储"是本仓库的明确承诺）。
+    # 镜像同样钉 digest（理由与台账见 tests/test_ci_tool_pinning.py 顶部）。
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: warden

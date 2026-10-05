@@ -29,7 +29,10 @@ export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${1:-$REPO_ROOT/.gitleaks.toml}"
-IMG="ghcr.io/gitleaks/gitleaks:v8.21.2"
+# 第六十三批起钉住 digest，且**必须与 .github/workflows/ci.yml 里门禁那一步完全一致**：
+# 反向对照的全部意义就是证明“扫描器没被关掉”，两个程序不是同一个就什么都证明不了。
+# 台账、取法与验证方式见 tests/test_ci_tool_pinning.py 顶部。
+IMG="ghcr.io/gitleaks/gitleaks:v8.21.2@sha256:0e99e8821643ea5b235718642b93bb32486af9c8162c8b8731f7cbdc951a7f46"
 CONTROL_VALUE='sk-live-TOPSECRET123457'
 
 CTL_DIR="$(mktemp -d)"
