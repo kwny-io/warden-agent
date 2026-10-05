@@ -4,6 +4,169 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-04（第六十二批：「选不中」不是错误，是一个合法的空集——一个少写字母的选择器，K8s 连警告都不会给）
+
+> 入口：自检要求「先证伪前面标成已完成的项」。上一批刚把 `deploy/observability` 的**字段合法性**
+> 补上门禁，这一批检查的是**清单与清单之间的对接点**——而它们的共同点是：**对不上不是错误**。
+> 选择器的作用是「选中谁」，选不中就是**空集**，而空集完全合法（K8s 允许「先建策略、后建负载」
+> 这种部署顺序）。于是这些字符串**没有一处会报错**。
+
+### 现象
+
+1. **清单之间的对接点全是字符串，而全仓没有一条断言读过它们。** `Service.spec.selector`
+   要选中 Pod 的标签、`Service.ports[].targetPort` 指向容器端口的**名字**、`Ingress` 的 backend
+   用 Service 的**名字 + 端口名**指过去、`PDB.spec.selector` / `NetworkPolicy.spec.podSelector` /
+   `ServiceMonitor.spec.selector` 各自一份选择器、`ServiceMonitor.endpoints[].port` 又指向
+   Service 的端口名、`HPA.spec.scaleTargetRef` 指向 Deployment 的**名字**、`envFrom` 指向
+   ConfigMap/Secret 的名字、备份 CronJob 的 `claimName` 指向 PVC 的名字。
+   本次改动前，全仓**没有一条断言**读过 `spec.selector` / `ports[].targetPort` /
+   `scaleTargetRef` 这些字符串。（另有两处 grep 命中都在别的层面：
+   `tests/test_observability_config.py` 查的是 Operator 的 **release 标签选择**层
+   （`ruleSelector` / `serviceMonitorSelector`），`tests/test_crd_schemas.py` 只在注释里提过一次。）
+2. **真集群的现场（写文档前在本机 kind 集群又复现了一次）。** 一个把 `app.kubernetes.io/name`
+   写成 `app.kubernetes.io/names` 的 PDB 被 `kubectl apply` **成功接受**（`... created`，
+   连 warning 都没有），而 `kubectl get pdb -o wide` 只把 `ALLOWED DISRUPTIONS` 显示成 **0**
+   （真正选得中的那个是 **1**）——没有 warning、没有事件、没有任何「我没选中任何 Pod」的提示。
+   **这个 0 很毒**：一个**健康**的集群在滚动更新/副本重建期间同样是 0，所以它读不出「配置错了」。
+   （复核：该对象已删，`kubectl get pdb -A` 只剩 `warden/warden-agent`；本机 kind 集群
+   （演练用集群，**不是线上**）里那个 PDB 全程没动。现场原文见「本批我自己也错过」第 4 条。）
+3. **手工变异矩阵：这一类错，旧守卫 0/10 拦住**（见「实测」表）。
+
+### 根因
+
+K8s 的选择器是**集合运算**，不是外键：它不校验被选中的对象是否存在。而三样东西的失效
+表现得**恰好都像「正常」**：
+
+- `PDB` 选不中 ⇒ `kubectl drain` 照删（你以为节点维护有保护，其实没有）；
+- `NetworkPolicy` 选不中 ⇒ 你以为「默认全拒 + 白名单」在生效，实际**没有任何约束**
+  ——比「没有策略」更危险，因为看文件的人以为它在生效；
+- `ServiceMonitor` 选不中 ⇒ `up{job=...} == 0`，看起来像「服务挂了」，于是真实告警被淹没。
+
+同一族里还有一类**语义**错（不是字符串错）：`minAvailable` ≥ `replicas` 时任何自愿驱逐都
+会被拒，`kubectl drain` **永远卡住**，而现场表现是「节点维护做不下去」，不是「PDB 配错了」。
+
+### 改法
+
+新增 `tests/test_k8s_wiring.py`（13 项），判据的核心是**不把字符串抄第二遍**：
+Pod 标签、容器端口名、Deployment 名、命名空间名只在事实源（`deployment.yaml` /
+`namespace.yaml`）里读一次，其它清单只能**引用**它们——于是「改 Pod 标签名」这类改动会在
+同一次运行里让所有引用它的清单一起变红。
+
+| 对接点 | 写错了会怎样 | 本文件的断言 |
+| --- | --- | --- |
+| `Service.selector` | EndpointSlice 里一个就绪地址都没有，而 Pod 全绿 | `test_Service的选择器必须选中Pod的标签` |
+| `Service.ports[].targetPort` | 转发时连不上后端 | `test_Service的每个端口都必须有名字且targetPort指向容器端口名` |
+| `Ingress` backend（Service 名 + 端口名） | 503，而两端各自都不报错 | `test_Ingress必须指向存在的Service与存在的端口名` |
+| `PDB.selector` | drain 照删（形同虚设） | `test_PDB的选择器必须选中Pod的标签且不许把驱逐全挡住` |
+| `PDB.minAvailable ≥ replicas` | drain **永远卡住** | 同上 |
+| `NetworkPolicy.podSelector` | 「默认全拒」管的是空集合 | `test_NetworkPolicy必须管到Pod且两个方向都纳管` |
+| `HPA.scaleTargetRef.name` | HPA 找不到目标 / 副本区间自相矛盾 | `test_HPA必须指向存在的Deployment且副本数区间自洽` |
+| `ServiceMonitor` 的 selector + port + namespace | `up == 0`，看起来像「服务挂了」 | `test_ServiceMonitor的选择器端口名与命名空间必须三处自洽` |
+| `envFrom` / `claimName` | Pod 起不来（发布时才报） | `test_工作负载引用的ConfigMap_Secret_PVC_都必须存在` |
+| **新加一个带对接点的清单** | 上面每一条都可能漏掉它 | `test_范围守卫_每个带对接点的清单都要有人守` |
+| 关键对象名字漂移 | `kubectl get svc <旧名>` 变成「没找到」 | `test_关键对象的名字必须与Deployment一致`（3 个参数化） |
+
+还有**守卫的守卫**：每条断言前先证明事实源真的读到了——否则「什么都没查」与「全都对」
+长得一模一样（第六十批的教训）。
+
+### 实测
+
+| 手工变异（字节级替换） | 旧三个守卫 | `test_k8s_wiring.py` |
+| --- | --- | --- |
+| M1 `Service.selector` 少一个字母 | 没拦住 | **拦住** |
+| M2 Service 端口名 `http`→`web` | 没拦住 | **拦住** |
+| M3 `targetPort: http`→`htp` | 没拦住 | **拦住** |
+| M4 `PDB.selector` 少一个字母 | 没拦住 | **拦住** |
+| M5 `PDB.minAvailable: 1`→`3`（≥replicas 2） | 没拦住 | **拦住** |
+| M6 `HPA.scaleTargetRef.name` 改名 | 没拦住 | **拦住** |
+| M7 `NetworkPolicy.podSelector` 少一个字母 | 没拦住 | **拦住** |
+| M8 `ServiceMonitor.endpoints[].port` 改名 | 没拦住 | **拦住** |
+| M9 `envFrom.configMapRef.name` 改名 | 没拦住 | **拦住** |
+| M10 备份 CronJob `claimName` 改名 | 没拦住 | **拦住** |
+| M11 盘上多一个带选择器的清单 | 没拦住 | **拦住**（范围守卫） |
+
+- 旧三个守卫 = `test_k8s_manifests.py` + `test_crd_schemas.py` + `test_observability_config.py`，
+  每个变异都真跑了它们（返回码 0 = 全绿 = 没拦住）。
+- 每个变异都是**字节级替换、跑完立即从原始字节还原**，并用 `sha256` 验证是逐字节还原；
+  跑完 `git status --porcelain` 只有新增的那个测试文件（没有任何 YAML 残留改动）。
+- M11 的探针必须**带上本仓的标签约定**才算公平：一个连 `app.kubernetes.io/name: warden-agent`
+  都没有的新清单，会先被「每个清单都要带这个名字标签」那条抓住——它抓的是标签，不是对接点。
+- 全量：**1718** 收集 / **1714** passed（真 PG，498.7 秒）/ **1674** passed（无 PG，562.5 秒），
+  **0 failed / 0 errors**；覆盖率 **90.31%**（真 PG）/ **87.08%**（无 PG），门槛 86%。
+  覆盖率与上一批**完全相同**：本批**改了零行 `src/`**（只加测试 + 改三处文档），而
+  `--cov=warden_agent` 只统计 `src/`——数字相同是应该的，不是抄错。耗时比上一批（271.0 秒）
+  大约 1.8 倍，两次都带了 `--cov`，差异来自**同期本机在跑别的命令**，只报实测、不当性能结论。
+- **删文件矩阵（写文档时为了核一句自己写的话才真跑的）**：把 13 个 `deploy/k8s/*.yaml`
+  逐个从盘上拿掉（重命名为 `*.yaml.delmatrix-bak`，不在 `glob("*.yaml")` 里）、真跑三条守卫、
+  然后**从原始字节还原并 sha256 校验**（跑完 `git status --porcelain` 无 YAML 残留）：
+
+  | 被拿掉的文件 | 谁红了 |
+  | --- | --- |
+  | `backup-cronjob.yaml` | `test_k8s_manifests.py::test_备份保留策略不许按mtime删` |
+  | `backup-pvc.yaml` | `test_k8s_wiring.py::test_工作负载引用的ConfigMap_Secret_PVC_都必须存在` |
+  | `configmap.yaml` | `test_k8s_manifests.py::test_优雅停机时间必须小于terminationGracePeriodSeconds` |
+  | `deployment.yaml` | **收集期红**（`rc=2`）：`AssertionError: k8s/deployment.yaml 里没有 Deployment（事实源不见了）` |
+  | `hpa.yaml` | `test_k8s_manifests.py::test_HPA最小副本与部署一致` |
+  | `ingress.yaml` | `test_k8s_manifests.py::test_ingress为SSE关了代理缓冲` |
+  | `migrate-job.yaml` | `test_k8s_wiring.py::test_范围守卫_每个带对接点的清单都要有人守` |
+  | `namespace.yaml` | **收集期红**（`rc=2`，同上：事实源在模块加载时只读一次） |
+  | `networkpolicy.yaml` | `test_k8s_wiring.py::test_NetworkPolicy必须管到Pod且两个方向都纳管` |
+  | `pdb.yaml` | `test_k8s_manifests.py::test_PDB至少留一个副本` |
+  | `secret.example.yaml` | `test_k8s_manifests.py::test_密钥示例里没有真实凭据` |
+  | `service.yaml` | **收集期红**（`rc=2`，同上） |
+  | `serviceaccount.yaml` | `test_k8s_manifests.py::test_所有工作负载引用的ServiceAccount必须存在` |
+
+  **结论：13/13 全红，「删了没人管」的盲点不存在**——而这个结论是我**推理错了一次、
+  真跑一遍才发现**的（见「本批我自己也错过」第 5 条）。
+
+### 本批我自己也错过（记下来，别只记成功）
+
+1. **文档里先写了一句我没验过的话。** 新文件的第一版 docstring 里我断言
+   「`grep -rl "selector|targetPort|scaleTargetRef" tests/` 命中的**测试文件数 = 0**」。
+   实际大小写不敏感地 grep 会命中 **3 个文件**——其中 `tests/test_observability_config.py`
+   确实在查选择器，只是查的是 Operator 的 **release 标签选择**层。
+   **把一次窄查询的结果当成事实写进文档**，和第六十批那条「守卫自己撒谎」是同一个病：
+   **我的取证方式决定了我的结论，而我没说清取证范围**。已改成准确表述（并写出两处真实命中）。
+2. **又一次差点把「没真跑」写成结论。** 变异表第一版里 M11 那一行写的是「旧守卫：没拦住」——
+   可我当时**根本没拿旧守卫跑过 M11**（只跑了新守卫）。补跑后发现真实情况是：
+   旧守卫拦得住，但拦的是另一件事（新清单没带标签约定），于是探针补上标签后再测，才是公平的对照。
+3. **写守卫的时候，守卫自己连语法/格式都没过。** 13 条里第一版有 3 处低级错：
+   f-string 里嵌套 ASCII 双引号导致 `ast.parse` SyntaxError、两行超 100 列（`ruff` E501）。
+   我**先写完 400 行再去跑**，而本仓的纪律本该是「每加一条就真跑一次」。
+   教训：**守卫的语法错误和守卫的语义错误，都会让我误以为「我做完了」**。
+4. **（写文档时又抓到一处）我把「现场」写成了自己脑补的形状。** 三处文档里我都写了
+   「`kubectl get pdb` 把 `expectedPods` / `currentHealthy` 显示成**空**」——
+   实际这两个字段在 `-o wide` 里**根本不显示**（它们在 `kubectl describe` 里）。
+   这次回集群现场复现，真正看到的是 **`ALLOWED DISRUPTIONS 0`**（对照：真选得中的那个是 1），
+   清理后 `kubectl get pdb -A` 只剩 `warden/warden-agent`。已按实测改三处文档。
+   **同一个病第四次发作。**
+5. **我推理出来的「盲点」，真跑一遍发现不存在。** 核「删清单文件谁管」时我的推理是：
+   两个守卫都用 `glob("*.yaml")` 遍历**盘上存在的文件** ⇒ 文件被删掉时它们都只剩
+   「剩下的文件都对」⇒ 没人管。**我差点把这句推理写进文档**（更早一版写的是
+   「那由 `test_k8s_manifests.py` 的显式存在性断言抓」——归属也是错的）。
+   改成真跑一遍：13 个文件逐个拿掉 + 跑三条守卫 = **13/13 全红**（表见「实测」）。
+   盲点不存在，**要改的是我写的那句话**。
+
+**元教训**：以上五条里有四条是同一个形状——**我的「证据」来自一次窄查询或一次没跑的推理，
+而我把它当成事实写进了文档**。治法是第六十批那条再加一层：**守卫要体检，取证也要体检**
+（多问一句「这个结论是怎么来的、它覆盖了多大范围」）。
+
+### 已知限制（别把结论说大）
+
+1. 本文件是**静态**判据：不连集群、不需要 Docker、不联网。它证的是「这些字符串互相对得上」，
+   **不证明**集群里真的通了（那需要真集群演练，见 `scripts/k8s_rollback_drill.sh` 那条路）。
+2. **变异门禁看不见 YAML**（`[tool.mutmut]` 只改 Python 源码）⇒ 这条守卫没有变异兜底，
+   「它会红吗」只能手工量（就是上面的表）。
+3. 「该有的清单根本不存在」（比如谁把 `pdb.yaml` 删了）**不是**本文件的职责，
+   但**也不是没人管**：13 个 `deploy/k8s/*.yaml` 逐个真删实测 **13/13 全红**（表见「实测」）——
+   其中 10 个是断言红，3 个（`deployment.yaml` / `service.yaml` / `namespace.yaml`）是
+   **收集期红**（`rc=2`），因为本文件把**事实源在模块加载时只读一次**（刻意的设计：
+   同一个事实源只读一遍），代价是「源文件没了」会以收集错误的形状出现——不过那句错误
+   是人写的：`AssertionError: k8s/deployment.yaml 里没有 Deployment（事实源不见了）`。
+4. **`Ingress` 后面的真链路没验**：TLS Secret（`warden-tls`）是否存在、nginx 是否真能把请求
+   送到 Pod，都需要真集群 + ingress-nginx——**没验**，继续挂在账本上（本批只保证「字符串对得上」）。
+
+---
 ## 2026-10-04（第六十一批：门禁挂了哪个目录，就是它的全部职责范围——少一个 `s` 的 `matchName`，`deploy/` 的 72 个用例全绿）
 
 > 入口：自检要求「证伪前面标成已完成的项」。我原定的题「k8s 清单从未被静态真校验」**当场被证伪**

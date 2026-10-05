@@ -52,7 +52,7 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1705 项测试（2026-10-04 第六十一批实测两个口径：带真 PG **1701 passed / 4 skipped**；无 PG **1661 passed / 44 skipped**；两种口径都是 **0 failed / 0 errors**）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1718 项测试（2026-10-04 第六十二批实测两个口径：带真 PG **1714 passed / 4 skipped**；无 PG **1674 passed / 44 skipped**；两种口径都是 **0 failed / 0 errors**）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -588,13 +588,13 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**0 项失败**（共 1705 项收集，2026-10-04 第六十一批实测，`--junitxml` 口径）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
-  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1701 passed / 4 skipped / 0 failed / 0 errors**（271.0 秒）；
-  无 PG（**真把容器 `docker stop` 掉**即此口径）→ **1661 passed / 44 skipped / 0 failed / 0 errors**（294.5 秒；多跳的 40 条是需要真库的用例）。
+- **测试**：**0 项失败**（共 1718 项收集，2026-10-04 第六十二批实测，`--junitxml` 口径）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
+  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1714 passed / 4 skipped / 0 failed / 0 errors**（498.7 秒）；
+  无 PG（**真把容器 `docker stop` 掉**即此口径）→ **1674 passed / 44 skipped / 0 failed / 0 errors**（562.5 秒；多跳的 40 条是需要真库的用例）。
   ⚠️ 想让本地指标落到「无 PG 口径」有两种做法：`docker stop warden-pg-test`，或把 `WARDEN_TEST_PG_*` 里的端口指到一个没人监听的端口。**但这两种都别只凭“我设了环境变量”下结论——判口径永远看 `skipped` 是 4 还是 44。** 第五十二批在这里栽过：当时门控**不读端口**（只读 host/db/user/password），于是两次“双口径”其实**两次都是 PG 口径**（`skipped` 都是 4）；第五十二批把端口接上并加了守卫 `tests/test_config_surface.py::test_PG门控真的认环境变量里的端口`（子进程真探活，不是读源码文本）。
-  时间账：449.8 秒 / 456.3 秒是同机同批实测；第五十三批同口径是 228.8 秒 / 226.3 秒——**这不是性能回归，是两次跑的东西不一样**：本批两次都带了 `--cov=warden_agent`（覆盖率收集把总时间大致翻倍），第五十三批那两次没带。再往前第五十二批是 732 秒 / 578 秒，同一批改动的第一轮 637 秒——**差异全在同期本机在跑别的命令**，所以这里只报实测，**不拿它当性能回归结论**。
+  时间账：498.7 秒 / 562.5 秒是同机同批实测；第五十三批同口径是 228.8 秒 / 226.3 秒——**这不是性能回归，是两次跑的东西不一样**：本批两次都带了 `--cov=warden_agent`（覆盖率收集把总时间大致翻倍），第五十三批那两次没带。再往前第五十二批是 732 秒 / 578 秒，同一批改动的第一轮 637 秒——**差异全在同期本机在跑别的命令**，所以这里只报实测，**不拿它当性能回归结论**。
   带真 PG 时剩下的 4 条跳过**全是平台/工具链限制、与 PG 无关**：本机 PATH 没 `pg_dump`/`pg_restore`（PG 备份端到端）、win32 建不了符号链接（2 条）、win32 无内核隔离原语；其余按环境跳过的还有未构建前端时的 SPA、无 node 时的 MCP。
-  覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：2026-10-04 第六十一批复测 **带真 PG 90.31% / 无 PG 87.08%**
+  覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：2026-10-04 第六十二批复测 **带真 PG 90.31% / 无 PG 87.08%**
   （语句 10644 / 分支 2660）——**两者都过闸，而无 PG 是最差情况、余量只剩 1.08 个点**；
   这与 `pyproject.toml` 里「门槛贴太近会变成噪声门禁」的取向对照着看：余量大的那边说明门禁还能再抬。
   跳过的测试会在没有 PG 时自动跳过、CI 保持绿；其余按环境跳过的还有：未构建前端时的 SPA、无 node 时的 MCP。覆盖状态机、工具稳定性层与接线、执行循环、审批、持久化恢复、跨 Run 恢复计划与**工作进程续跑**、HTTP 契约、**多租户越权拦截（含 403 不回显他人身份、审计/模型按调用者收敛）**、**patch 路径边界（防越出工作区）**、**幂等并发原子占位（409 而非重复执行）**、**入站限流**、**跨副本幂等/事件/限流共享**、凭证加密**与落库（换实例读同一库仍在、库里翻不到明文、按身份隔离）**与密钥脱敏、**凭证密钥托管（KMS/HSM 信封加密：env 与两条 provider 接入路径）**、**RAG 接线（模型真能调 `knowledge.search` 并拿到来源）与检索质量**、**记忆落盘 + 按 `owner` 归属隔离（换实例读同一库仍在、跨用户不可见）**、**真实联网抓取的 SSRF 防护（含重定向绕过）与出站限速/配额（全局、单 host、并发、日配额，含多副本共享与"策略先于限速"的顺序保证）**、**链路追踪（W3C traceparent 解析/生成/传播）**、SSE 流式、多 Agent、技能系统、MCP、Git、Coding Agent、沙箱两档隔离、启动期鉴权、端到端演示等
@@ -628,6 +628,7 @@ python -m warden_agent.demo_e2e                                                 
   **配置面守卫**同法——AST 扫描「谁读了哪个环境变量」，超出声明的 `consumers` 即报错
 - **CI**：`ci.yml` 在每次 push 与 PR 时运行 —— `ruff` + `mypy --strict` + `pytest`（quality）；容器构建冒烟 + `promtool` 规则校验 + trivy 镜像扫描（container）；pip-audit + bandit + gitleaks（security）；SBOM（syft/SPDX）上传（sbom）；schema 迁移检查（migration，SQLite + 真 PG）。打 `v*` tag 时额外 build+push 镜像并用 cosign keyless 签名（image-signing；PR 上不跑）
 - **K8s 清单的静态校验（说清职责范围，第六十一批）**：CI 里那条 `kubeconform -strict` **只挂了 `deploy/k8s` 一个目录**；`deploy/observability` 的两个 CR（`ServiceMonitor` / `PrometheusRule`）由**按 commit 固定**的上游 schema 校验（`deploy/observability/schemas/`，带 `sha256` 与来源），判据在 `tests/test_crd_schemas.py`（含「新增 CR 清单必须进校验名单」的范围守卫）。**少一个 `s` 的 `matchName` 曾让 `deploy/` 的 72 个用例全绿**——CRD 是结构化 schema，未知字段会被**静默剪掉**，`kubectl apply` 成功 ≠ 配置生效。细节见 `deploy/observability/README.md`。
+- **清单之间的「对接点」被静态对账（第六十二批）**：`Service.spec.selector` / `ports[].targetPort` / `Ingress` backend / `PDB.selector` / `NetworkPolicy.podSelector` / `ServiceMonitor` 的 selector+port / `HPA.scaleTargetRef` / `envFrom` 名字 / 备份 CronJob 的 `claimName` —— 这些**字符串**错一个字母，K8s **不会报错**：选择器选不中就是**空集，而空集完全合法**（Pod 照样全绿、`kubectl apply` 照样成功）。真集群里的现场（本机 kind 集群，实测原文见 `CHANGELOG.md`）：一个把 `app.kubernetes.io/name` 写成 `app.kubernetes.io/names` 的 PDB 被 `kubectl apply` **成功接受**（`... created`，连 warning 都没有），而 `kubectl get pdb -o wide` 只把 `ALLOWED DISRUPTIONS` 显示成 **0**（真正选得中的那个是 **1**）——**这个 0 很毒**：健康集群在滚动更新期间同样是 0。判据在 `tests/test_k8s_wiring.py`（13 项；事实源只读一次：Pod 标签/端口名/对象名只在 `deployment.yaml`、`namespace.yaml` 里读，其它清单只能**引用**）+ **范围守卫**（新加带对接点的清单必须进名单）+ 守卫自己的体检。**手工变异 11 条：旧三个守卫 0/10 拦住，本条 10/10 + 范围守卫全拦**（每个变异字节级还原、sha256 验证）。**删文件也有人管**：13 个 `deploy/k8s/*.yaml` 逐个真删实测 **13/13 全红**（见 `CHANGELOG.md` 的删文件矩阵）。**它只证「字符串对得上」，不证集群里真的通了**。
 - **安全基线**：密钥经 `.env` 加载不进代码；`.gitignore` 屏蔽密钥、数据库与日志文件
 - **确定性优先**：凡确定性可解的环节——多 Agent 分派、意图路由信号、离线测试替身——不交给模型自由发挥，行为可复现
 - **失败是常态**：超时、重试、降级、熔断、断点恢复不是异常处理，而是内建的默认执行语义
