@@ -536,6 +536,79 @@ def test_pin_app_image_replaces_placeholder(tmp_path: Path) -> None:
     assert "REPLACE_ME" not in text
 
 
+def test_pin_app_image_没有占位符时必须失败而不是静默成功(tmp_path: Path) -> None:
+    """清单里已经没有占位符可回写时，`--app-image` **必须**非 0 退出（退出码 4）。
+
+    这条守的失败模式（本步以前会**正常退出 0**）：job 绿灯、job summary 里「已钉进清单的引用」
+    那段 diff 是**空的**，而清单里仍然是 `REPLACE_ME/…` —— 照着它 apply 会在**上线时**才
+    manifest unknown。风险从「构建期立刻暴露」被推到「上线期才暴露」，中间每一步都是绿的，
+    所以没有人会去看。这正是脚本头注释警告的形状：「以为钉过了、其实没钉」比「没钉」危险。
+
+    为什么不能靠别的防线：`scripts/check_pinned_images.py` 是**故意**放行占位符的
+    （它是发布锚点，见 `PLACEHOLDER_PREFIX`），所以那两条防线都不表达
+    「这次发布到底钉上了没有」——这句话只能在这一步说。
+    """
+    root = _make_repo(tmp_path)
+    manifest = root / "deploy" / "k8s" / "deployment.yaml"
+    manifest.write_text(
+        "spec:\n  template:\n    spec:\n      containers:\n"
+        f"        - name: app\n          image: ghcr.io/acme/warden-agent:0.1.0@{FAKE_DIGEST}\n",
+        encoding="utf-8",
+    )
+    before = manifest.read_text(encoding="utf-8")
+
+    proc = _run(
+        root,
+        "pin_image_digests.sh",
+        prelude=DOCKER_STUB,
+        args=["--app-image", "ghcr.io/acme/warden-agent:0.1.0"],
+    )
+
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert manifest.read_text(encoding="utf-8") == before
+    # 报错必须给出可执行的下一步（三种原因 + 该怎么做），而不是只说「没找到」
+    assert "REPLACE_ME" in proc.stderr
+    assert "什么都没钉" in proc.stderr
+    assert "显式更新" in proc.stderr
+
+    # --dry-run 也一样：它承诺的退出码 0 意味着「会这样改」，而没有可改的东西就不是成功
+    dry = _run(
+        root,
+        "pin_image_digests.sh",
+        prelude=DOCKER_STUB,
+        args=["--dry-run", "--app-image", "ghcr.io/acme/warden-agent:0.1.0"],
+    )
+    assert dry.returncode == 4, dry.stdout + dry.stderr
+
+
+def test_pin_app_image_回写清单里的每一处占位符(tmp_path: Path) -> None:
+    """一处占位符不够：本仓的 `deploy/k8s/` 有 2 处（Deployment + 迁移 Job），都得钉。
+
+    只钉第一个文件就收工，与「只自动钉 Dockerfile 的 FROM」是同一形状的空洞：写进
+    job summary 的那份 diff 看起来很像成功，而另一个清单带着占位符上线。
+    """
+    root = _make_repo(tmp_path)
+    job = root / "deploy" / "k8s" / "migrate-job.yaml"
+    job.write_text(
+        "spec:\n  template:\n    spec:\n      initContainers:\n"
+        "        - name: migrate\n          image: REPLACE_ME/warden-agent:0.1.0\n",
+        encoding="utf-8",
+    )
+
+    proc = _run(
+        root,
+        "pin_image_digests.sh",
+        prelude=DOCKER_STUB,
+        args=["--app-image", "ghcr.io/acme/warden-agent:0.1.0"],
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for path in (root / "deploy" / "k8s" / "deployment.yaml", job):
+        text = path.read_text(encoding="utf-8")
+        assert f"image: ghcr.io/acme/warden-agent:0.1.0@{FAKE_DIGEST}" in text, path
+        assert "REPLACE_ME" not in text, path
+
+
 def test_收窄PATH的私有目录剔除docker但保留coreutils(tmp_path: Path) -> None:
     """把「这条 PATH 里没有 docker」变成**可检查的事实**。
 

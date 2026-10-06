@@ -515,7 +515,9 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: 把 digest 钉进部署清单（产出可直接 apply 的引用）
-        # 复用仓库自己的脚本（fail-closed：解析不出 digest 就非 0 退出，绝不静默跳过），
+        # 复用仓库自己的脚本（fail-closed：解析不出 digest、**或清单里没有可回写的占位符**，
+        # 都非 0 退出——后者是「空 diff」的形状：本步绿灯+summary 里 diff 为空，
+        # 而清单里仍是占位符，照着它 apply 会在**上线时**才 manifest unknown），
         # 在 runner 里改写 deploy/k8s/*.yaml 的占位 image:，再把 diff 打进 job summary——
         # 这样"签名的那一个"与"准备部署的那一个"是**同一个字符串**，不靠人抄。
         run: |

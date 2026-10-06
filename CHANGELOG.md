@@ -4,6 +4,127 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-06（第六十九批：「钉完 0 处」也算成功——发布最后一步的「成功」从来没有后置条件；外加投递容器的代理口径）
+
+### 现场
+**入口是一条“绿得可疑”的 run。** 第六十八批把 `gh run list` 里 `37456267583` 的 `success` 当作“交付面全绿”的证据写进 `docs/复核索引.md`，而那个 run 里 `image-signing`（签名 + 钉 digest）与 `mutation`（变异测试）都被 `if:` 挡成 skipped；本批我在**同一个 sha**（`68501ec`）上手跑 `workflow_dispatch`（run **`37464309137`**），`image-signing` **第一次真跑起来，当场红**，失败在「把 digest 钉进部署清单」这一步。顺着这条红挖出四层：
+
+**第一层，门口就是 126。** `.github/workflows/ci.yml:524` 直接写
+`scripts/pin_image_digests.sh --app-image "$IMAGE"`（**没有 `bash ` 前缀**），而 `git ls-files -s`
+里 8 个 `scripts/*.sh` 全是 `100644` ⇒ Linux runner 上这一行是 `Permission denied`、退出码 **126**。
+它潜伏很久没被发现，是因为那个 job 的 `if:`（`.github/workflows/ci.yml:443-445`）把 push / PR
+全挡掉了（只在 `push v* tag` 或 `workflow_dispatch` 上跑）——**只在“真要发布”那一刻炸**。
+
+交付面「钉 digest」的纪律里，`--app-image`（把已推送的应用镜像回写 `deploy/k8s/*.yaml` 的
+`REPLACE_ME/…` 占位符）是**发布 job 的最后一步**（`.github/workflows/ci.yml`）。它的 fail-closed
+只管「解析不出 digest」（退出码 3）；当清单里**已经没有占位符**（上一版发布已换成真实引用、
+或 YAML 形状变了）时循环一次都不进 ⇒ 退出码 **0** + `回写了 0 个清单文件` + `完成。`，
+而 job summary 里「已钉进清单的引用」那段 diff 是**空的**。后果是把「manifest unknown」
+从构建期推到**上线期**，而中间每一步都是绿的。两条防线都不表达这件事：
+`scripts/check_pinned_images.py` **故意**放行 `REPLACE_ME/`（它是发布锚点，见复核索引 §1178）。
+
+第二个同形状的漏：`runtime/notify.py` 的投递容器构造 `httpx.Client` 时漏了 `trust_env=False`，
+而 `cli.py::_client()` 早就是这个决定（注释原文：避免 `127.0.0.1` 被代理转发导致 502）。
+可见度差异是关键：CLI 上用户当场看见报错，投递失败**只记一行 warning**
+（`send()` 的取向是“投递失败绝不拖垮业务”）⇒ 同一类失败在这里变成静默。
+
+### 改了什么
+1. 8 个 `scripts/*.sh`（`pin_image_digests.sh` / `rollback.sh` / `mutation.sh` / `run_local.sh`…）
+   索引模式 `100644` → `100755`：就是上面那条 126 的直接修法。
+   Windows 工作区存不了可执行位，所以用 `git update-index --chmod=+x <路径>` 落进**索引**。
+2. 新守卫 `tests/test_script_exec_bits.py`：凡是被「直接执行」的地方，那个脚本必须 `100755`。
+   判据是 workflow `run:` 行的**第一个 token** 是 `scripts/*.sh`，以及文档里以 `scripts/*.sh`
+   开头的**整行**（`deploy/k8s/README.md` 与 `docs/operations.md` 里都是“照抄即用”的命令行）；
+   `bash scripts/x.sh`、`uv run bash scripts/x.sh` **不算**（本仓两种写法都有，只钉“承诺了可执行”的）。
+   守**索引模式**而不是 `os.access(X_OK)`：本仓 CI 在 Linux、开发机在 Windows，
+   Windows 工作区里没有可执行位（`core.fileMode=false`）⇒ 那里是**假绿**；索引里的 `100755`
+   才是“Git 会把什么写进树、runner checkout 出来是什么”的真值。
+3. 新守卫 `tests/test_ci_job_gates.py` + 台账 `tests/CI_JOB_GATES.yaml`：把「哪些 job 在什么事件下
+   不跑」钉成可校验的东西。四条判据：① workflow 里任何带 `if:` 的 job 都必须有条目（没签字 = 红）；
+   ② 台账里不许有失效条目（job 没了 / `if:` 没了）；③ `gate` 必须与 workflow 的 `if:` **逐字一致**；
+   ④ 每条必须写清 `why` / `not_run_on` / `run_it_now`（“怎么真跑一次”必须可复现）。
+4. `scripts/pin_image_digests.sh`：`pin_app_image()` 加**后置条件**——记录真被改写的文件
+   （`touched`），为 0 时 `die … 4`（新退出码 4），报错给出三种原因 + 各自出路
+   （已经是真实引用的显式更新 / 形状变了改成 `image: REPLACE_ME/仓库:tag` / 路径漂移了核对口径）；
+   `--dry-run` 同样适用（它承诺的 0 意味着「会这样改」）。头注释与 `--help` 退出码表同步，
+   并声明 `--app-image` 的幂等性与其它动作**不同**。
+5. `.github/workflows/ci.yml` 同步该步注释（文档与代码同源）。
+6. `tests/test_release_scripts.py` +2：没有占位符必须退 4（文件一字节不动、报错给出出路、`--dry-run` 亦然）；
+   **每一处**占位符都要被回写（真仓 `deploy/k8s/` 是 2 处）。
+7. `runtime/notify.py`：投递容器默认 `trust_env=False`；新增 `WARDEN_ALERT_WEBHOOK_TRUST_PROXY`
+   （默认 0）供只能经代理出网的部署显式打开；失败日志**随当前口径自述原因**
+   （提到具体代理变量名与这个开关；开关已打开时改说“已在经代理，代理不可达就是这个现象”）。
+8. 登记进 `core/settings.py::ENV_SPECS`（README 计数 84→85），`docs/operations.md` 新增
+   「投递走不走系统代理」小节（含诚实边界：Windows 注册表代理不检测）。
+9. `tests/test_notify.py` +4（默认直达（行为级）/ 开关打开真被代理吃掉（负面对照，防“永真假绿”）/
+   失败日志自述 / 直接构造也默认不走代理），并把那条「真回环投递」测试的失败信息改成
+   **带上通道日志**——它上次红过，而当时的 `--tb=line` 把真异常丢了，事后无法回溯。
+
+### 验证
+- 冻结全量**两次独立跑**（口径 `CI=1` + `--cov=warden_agent --cov-fail-under=86`，两次都 freeze-before == freeze-after，即跑测试期间无人写仓库）：
+  - 第一次 tree `b693e4d4b172b321debfbe0e543a32a9f643181c`：
+    junit **1782 tests / 0 failures / 0 errors / 4 skipped**，`1778 passed, 4 skipped in 610.41s`，
+    覆盖率 **90.31%**（门槛 86 达标），ruff `All checks passed!`，
+    mypy `Success: no issues found in 115 source files`。
+  - 第二次 tree `be59b212cb8c4a6cd9a23d6256d81c7facb59863`（CHANGELOG 条目与索引文字落盘之后的树）：
+    **逐项同数**——1782 tests / 0 failures / 0 errors / 4 skipped，`1778 passed, 4 skipped in 566.81s`，`90.31%`。
+  - 两次树的差异**只有记录文字**（`CHANGELOG.md`、`docs/复核索引.md`）：`src/`、`tests/`、`scripts/`、`deploy/`、`.github/` 逐字节一致。
+  - 用例数 **1768 → 1782（+14）**，逐文件可核：`test_ci_job_gates.py` +5（新文件）、
+    `test_script_exec_bits.py` +3（新文件）、`test_notify.py` +4（另把上轮那条红改成端到端同名 1 条）、
+    `test_release_scripts.py` +2。
+  - 基线 **1768** 的取法（可复现）：`git worktree add --detach <仓库外路径> 68501ec`，
+    再在那个工作区里 CI=1 `python -m pytest tests --collect-only -q` 逐文件求和。
+    **不能拿本批中途哪一次全量的 1770 当基线**——那次树里已经含了本批 2 条新用例（`test_pin_app_image_*`）。
+  - 同一轮里，上一轮唯一那条红（`tests/test_notify.py::test_真HTTP接收端_投递链到端`，`delivered=False`）**转绿**。
+- 最终提交树另跑一次冻结全量作为放行门（数字与上两次一致；见提交信息与
+  `C:/Users/g1534/Desktop/wardenagent文档/67-钉完0处也算成功（2026-10-06）.md`）——因为本仓有"文档与代码同源"类断言
+  （README 环境变量计数、`docs/operations.md` 小节、索引行），改文档**也可能**让测试红，所以文档落盘后必须再跑一次。
+- 变异矩阵 A（脚本可执行位 / job 门控台账）**4/4**：M1 `git update-index --chmod=-x scripts/pin_image_digests.sh`
+  → 只有 `test_workflow_里直接执行的脚本必须可执行` 红；M2 台账里删掉 `image-signing` 条目 →
+  `test_每个被门控的_job_都在台账里` 红；M3 台账 `gate` 条件漂移 →
+  `test_台账里的_gate_与_workflow_逐字一致` 红；M4 给 `ci.yml` 的 `sbom` 新加一个 `if:`（未签字）→
+  又是 `test_每个被门控的_job_都在台账里` 红。还原核对：台账 sha256 `54a59f9d…`、
+  ci.yml sha256 `af3bae14…` 一致；`git ls-files -s` 复核 8 个脚本全部 `100755`；还原后复跑全绿。
+  **首跑撞到的东西当场写进守卫里**：M1 第一次实测是 **2 红**，多出来的那条是「鉴别力对照」——
+  它的 755 尺子原来拿的正是被守的 `pin_image_digests.sh`，于是尺子被拿走时跟着红；
+  换成 `scripts/run_local.sh`（本仓用 `bash scripts/run_local.sh` 调用、不要求 +x）才有干净信号。
+- 变异矩阵 B（发布脚本后置条件）**3/3**：M1 删掉后置条件 → 只有新用例 1 红，其输出就是活的现场
+  （`回写了 0 个清单文件` + `完成。` + `assert 0 == 4`）；M2 只回写第一个文件 → 只有新用例 2 红；
+  M3 退出码 4→0 → 只有新用例 1 红；三次都字节级还原（sha256 `afdeec19…`）。
+  最硬的一列：**三条变异下，改动前就存在的 `test_pin_app_image_replaces_placeholder` 全部保持绿**
+  ⇒ 本批之前仓库里没有任何东西看得见这个洞。
+- 变异矩阵 C（notify 代理口径）**4/4**：M5 不传 `trust_env` → 2 红；M6 默认值改 `True` → 1 红；
+  M7 工厂不读新开关 → 2 红；M8 失败日志不自述原因 → 1 红；还原后全绿（sha256 `8bbc493d…`）。
+  **M6 的第一次预期是错的**：4 条新测试全走 `notifier_from_env`（它显式传值）⇒ 改默认值**零红**，
+  据此补了一条「直接构造也默认不走代理」。
+- 真仓正向对照（只读、`--dry-run`）：`--app-image ghcr.io/acme/warden-agent:0.1.0` → 退 0、
+  报出 `deployment.yaml` + `migrate-job.yaml` 两处、`回写了 2 个清单文件`，且 `deploy/` 子树哈希前后一致
+  ⇒ 新守卫在真仓**不会误伤**。
+- M9（诊断自检）：把那条回环测试的目标改成死端口 → 失败信息里出现
+  `通道日志='…告警投递失败（url=…）…'` + 完整 `ConnectError` 堆栈 ⇒ 下次红能自己说出原因。
+
+### 教训
+① **「什么都没做」和「做成了」必须可区分**：`0 个` / `完成。` / 退 0 是同一个形状的三种说法。
+这个脚本自己的头注释早就写过「以为钉过了、其实没钉」比「没钉」危险，而那条纪律只落在
+「解析失败」那一侧，**没落在「解析成功但一处都没改」那一侧**。
+② **后置条件要落在“产出”上**：只查前置（能不能拿到 digest）的 fail-closed，在「输入合法、
+工作量恰好为零」时会静默成功；这类空洞只在产出物为空时出现。
+③ **默认参数值是承诺的一半**：工厂显式传值时，改默认值不会让任何守卫变红（实测零红）。
+④ **别把结论建在推测上**：那条红的真因**无法回溯**（当时 `--tb=line` 丢了异常），所以本批
+**不写**“已修好某个 bug”，只写“已消除代理这一类诱因 + 让下次红自己说出原因”。可证伪的部分：
+本机 CPython 的 `getproxies_registry()` 完全不读 `ProxyOverride`，httpx 的旁路只来自环境 `NO_PROXY`
+⇒ 系统代理一旦打开（注册表里躺着 `127.0.0.1:7897`），`trust_env=True` 会把 `127.0.0.1` 的投递
+也送去代理（实测 127.0.0.1:9 复现 `ConnectError: [WinError 10061]`）。
+⑤ **run 的结论是 run 级的**：一条被 `if:` 挡掉的 job 在 run 页面上长得和成功一样。
+第六十八批把 `gh run list` 的 `success` 当“交付面全绿”的证据，而那个 run 里最关键的两步没跑；
+本批手跑 `workflow_dispatch` 才让它第一次真跑、当场红。⇒ 「哪些 job 在什么事件下不跑」必须钉成
+可校验的台账（`tests/CI_JOB_GATES.yaml` + `tests/test_ci_job_gates.py`），且 `gate` 与 workflow 的
+`if:` 逐字比对，否则条件漂移是沉默的。
+⑥ **守卫的“尺子”不能拿被守的对象**：M1 首跑 2 红，多出来的那条只是“尺子被拿走了”。
+同理，**Windows 上“可执行”的判据是 git 索引（`100755`），不是文件系统**——
+`os.access(X_OK)` 在这台机器上会假绿。
+
+---
 ## 2026-10-06（第六十八批：CI 的两条红，一条是「口径没定」、一条是「前提不是事实」）
 
 ### 现场

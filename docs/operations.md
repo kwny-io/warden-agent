@@ -58,6 +58,24 @@ warden stuck --older-than-min 60 --notify # 同时把告警投递到 WARDEN_ALER
 `⚠️ 告警未投递：N 个 Run（通道 X）——<原因>`（`--json` 时这行只走 stderr，stdout 仍是纯 JSON），
 原因区分「未配通道（`WARDEN_ALERT_WEBHOOK_URL` 为空）」与「通道投递失败（非 2xx / 连不上 / 超时，详见日志 warning）」。
 
+#### 投递走不走系统代理
+
+投递容器**默认 `trust_env=False`**：告警 webhook 通常是**内网**地址（自建网关、群机器人中转），
+被系统代理转发一次就是一次静默失败——现象是连不上 / 502，而 `send()` 按设计只记一行 warning
+（“投递失败绝不准拖垮业务”），所以它比 CLI 的同类失败难查得多。这与 `cli.py` 的
+`_client()`（`trust_env=False`，避免 `127.0.0.1` 被代理转发导致 502）是同一口径。
+
+只能经代理出网的部署用显式开关打开：
+
+```bash
+export WARDEN_ALERT_WEBHOOK_TRUST_PROXY=1   # 默认 0；打开后才读 HTTP(S)_PROXY / ALL_PROXY
+```
+
+失败日志会自己把这条说出来，不用猜：日志里会跟一句
+「（注意：环境里有 `HTTP_PROXY`/`HTTPS_PROXY`，但本客户端 `trust_env=False`……设 `WARDEN_ALERT_WEBHOOK_TRUST_PROXY=1`）」；
+开关已打开时那句改成「已启用 `trust_env`，投递会经系统代理……代理不可达就是这个现象」。
+⚠️ 诚实边界：Windows 注册表里的代理设置不在这个提示的检测范围内（只看环境变量）。
+
 所以惯用的 cron 判断写成：
 
 ```bash

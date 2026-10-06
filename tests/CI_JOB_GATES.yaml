@@ -1,0 +1,57 @@
+# 「被 if: 门控的 job」签字台账。
+#
+# 为什么会有这个文件：一条**没跑**的 job 在 run 结论里长得像一次**成功**——run 页面上
+# 「success」分不出「整条交付链都验过了」和「最关键那几步今天压根没跑」。本仓已经吃过两次这个亏：
+#
+#   * 第六十八批把 `gh run list` 里的 `success`（run 37456267583）当作"交付面全绿"的证据写进了
+#     `docs/复核索引.md`，而那个 run 里 `image-signing` 与 `mutation` 都被 `if:` 挡掉、**skipped**；
+#   * 第六十九批我在同一个 sha（68501ec）上手跑了一次 `workflow_dispatch`（run 37464309137），
+#     `image-signing` 第一次真的跑起来，**当场红**：失败在「把 digest 钉进部署清单」——
+#     既有"钉完 0 处也算成功"，又有"脚本索引模式 100644 ⇒ 126"。
+#
+#     ⇒ 结论：**run 绿 ≠ 交付链绿**。哪些 job 在什么事件下不跑，必须有人签字、有地方查。
+#
+# 与 `tests/SKIP_LEDGER.yaml` 的关系：那个台账管"**用例级**跳过"（pytest 的 skipped），
+# 由 `scripts/check_skipped_tests.py` 校验；这里管"**job 级**门控"，由
+# `tests/test_ci_job_gates.py` 校验。两者是同一件事的两个层级：跳过必须有人签字。
+#
+# 两条规则（新增门控自动撞红，不需要人记得来改）：
+#   1. `ci.yml` 里任何一个带 `if:` 的 job，**没有条目就是红**。
+#   2. `gate` 必须与 workflow 里的 `if:` 表达式**逐字一致**；改了条件就撞红，
+#      逼人回来写清"这次改的是什么时候不跑"。`not_run_on` 必须写明它会在哪些事件上缺席。
+#
+# 怎么真跑（验证门控后面的东西到底还活着没有）：
+#   gh workflow run ci.yml --ref <分支>            # 手动触发，所有 workflow_dispatch 门控都会跑
+#   gh run watch <run-id> && gh run view <run-id> --json jobs
+#
+# 注意：**不要**为了让某次 run "看起来更完整"而把门控删掉——门控有它的成本/风险理由
+# （见每条 why）。要的只是"缺席要看得见"，不是"每次 push 都全跑"。
+entries:
+  - workflow: ci.yml
+    job: mutation
+    gate: "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+    runs_on: [schedule, workflow_dispatch]
+    not_run_on: [push, pull_request]
+    why: >
+      变异测试要跑 4 个分片、每个分片都要把源码逐个突变后重跑测试——放每次 push 上会把
+      开发回环拖成小时级。它也不是那种"漏一次就有安全事故"的门禁：变异分数是**趋势性**指标，
+      周更 + 手动足够。代价必须写明白：push 上的绿灯**不含**它。
+    run_it_now: gh workflow run ci.yml --ref dev
+    added: 2026-10-06
+    evidence: "run 37461282520（push：skipped）/ run 37464309137（dispatch：4 片全 success）"
+
+  - workflow: ci.yml
+    job: image-signing
+    gate: "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch'"
+    runs_on: [push (v* tag), workflow_dispatch]
+    not_run_on: [push (普通分支), pull_request]
+    why: >
+      keyless 签名要 `id-token: write` 与 GHCR 推送权限，签的对象必须是**要发布的那个镜像**；
+      PR 与普通分支 push 上没有可发布对象，硬签只会把别人的 PR 弄红（与本仓"新门禁不得误伤 PR"
+      的取向一致）。代价：**dev 分支上每次 push 的绿灯从来不覆盖"签名 + 钉 digest"这条路**——
+      第六十九批之前没人意识到这一点，于是这两条路各自带着一个"空洞的成功"潜伏到了发布当天。
+    run_it_now: gh workflow run ci.yml --ref dev
+    added: 2026-10-06
+    evidence: >
+      run 37461282520（push：skipped）/ run 37464309137（dispatch：红在「把 digest 钉进部署清单」，
+      两个根因都在第六十九批修掉）
