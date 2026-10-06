@@ -15,10 +15,17 @@
 # 由 `scripts/check_skipped_tests.py` 校验；这里管"**job 级**门控"，由
 # `tests/test_ci_job_gates.py` 校验。两者是同一件事的两个层级：跳过必须有人签字。
 #
-# 两条规则（新增门控自动撞红，不需要人记得来改）：
+# 三条规则（新增门控自动撞红，不需要人记得来改）：
 #   1. `ci.yml` 里任何一个带 `if:` 的 job，**没有条目就是红**。
 #   2. `gate` 必须与 workflow 里的 `if:` 表达式**逐字一致**；改了条件就撞红，
 #      逼人回来写清"这次改的是什么时候不跑"。`not_run_on` 必须写明它会在哪些事件上缺席。
+#   3. `run_it_now` 必须把 `workflow_dispatch` 的**必需入参**带齐（即 `-f tag=…`）。
+#      ——第六十九批收尾时补的：台账第一版两条 `run_it_now` 都写成 `gh workflow run ci.yml --ref dev`，
+#      而 `ci.yml` 的 `workflow_dispatch.inputs.tag` 是 `required: true`（有意如此：不让分支名冒充版本号），
+#      于是那条命令**抄下来就跑不动**：GitHub 回 `HTTP 422: Required input 'tag' not provided`。
+#      原来的判据只断言它以 `gh workflow run` 开头 ⇒ 钉在文字上、不会红——与台账想治的是同一种病。
+#      （step 级跳过不在本台账覆盖范围：`evals-real` 没 `DEEPSEEK_API_KEY` 时跳过真实模型评测，
+#        见 CHANGELOG 第六十九批「本批的已知限制」。）
 #
 # 怎么真跑（验证门控后面的东西到底还活着没有）：
 #   gh workflow run ci.yml --ref <分支>            # 手动触发，所有 workflow_dispatch 门控都会跑
@@ -36,7 +43,7 @@ entries:
       变异测试要跑 4 个分片、每个分片都要把源码逐个突变后重跑测试——放每次 push 上会把
       开发回环拖成小时级。它也不是那种"漏一次就有安全事故"的门禁：变异分数是**趋势性**指标，
       周更 + 手动足够。代价必须写明白：push 上的绿灯**不含**它。
-    run_it_now: gh workflow run ci.yml --ref dev
+    run_it_now: gh workflow run ci.yml --ref dev -f tag=v0.1.0-rcNN   # tag 是必需入参，见文件头规则 3
     added: 2026-10-06
     evidence: "run 37461282520（push：skipped）/ run 37464309137（dispatch：4 片全 success）"
 
@@ -50,8 +57,10 @@ entries:
       PR 与普通分支 push 上没有可发布对象，硬签只会把别人的 PR 弄红（与本仓"新门禁不得误伤 PR"
       的取向一致）。代价：**dev 分支上每次 push 的绿灯从来不覆盖"签名 + 钉 digest"这条路**——
       第六十九批之前没人意识到这一点，于是这两条路各自带着一个"空洞的成功"潜伏到了发布当天。
-    run_it_now: gh workflow run ci.yml --ref dev
+    run_it_now: gh workflow run ci.yml --ref dev -f tag=v0.1.0-rcNN   # 必需入参：缺它直接 HTTP 422
     added: 2026-10-06
     evidence: >
       run 37461282520（push：skipped）/ run 37464309137（dispatch：红在「把 digest 钉进部署清单」，
-      两个根因都在第六十九批修掉）
+      两个根因都在第六十九批修掉）/ run 37540647177（dispatch：**全绿**——真构建、真推 GHCR、
+      真取回 registry 权威 digest、真 keyless 签名、用外部验证者约束独立校验、真钉 digest）：
+      这条门已从「存在但从未运行」变成「跑过且通过」

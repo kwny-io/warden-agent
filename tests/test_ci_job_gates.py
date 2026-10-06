@@ -12,7 +12,11 @@
   2. 台账里不许有失效条目（job 没了 / `if:` 没了）；
   3. `gate` 必须与 workflow 的 `if:` **逐字一致**（改了条件就撞红，逼人回来表态）；
   4. 每条必须写清 `why`、`not_run_on`、`run_it_now`（"怎么真跑一次"必须可复现，
-     否则下一次想知道门控后面还活着没有，只能靠猜）。
+     否则下一次想知道门控后面还活着没有，只能靠猜）；
+  5. `run_it_now` 必须把 `workflow_dispatch` 的**必需入参**带齐（`-f tag=…`）。
+     第 5 条是第六十九批收尾补的：第一版两条 `run_it_now` 都写成 `gh workflow run ci.yml --ref dev`，
+     而 `inputs.tag` 是 `required: true` ⇒ 手动真跑的命令**根本跑不动**（`HTTP 422: Required input 'tag' not provided`）。
+     而第 4 条只断言它以 `gh workflow run` 开头 ⇒ **钉在文字上的判据不会红**，正是这个台账要治的病。
 """
 
 from __future__ import annotations
@@ -51,6 +55,29 @@ def _ledger() -> dict[tuple[str, str], dict[str, Any]]:
         assert key not in out, f"台账里 {key} 重复了"
         out[key] = entry
     return out
+
+
+def _required_dispatch_inputs(workflow: str) -> set[str]:
+    """workflow 的 `workflow_dispatch.inputs` 里声明为 `required` 的入参名。
+
+    注意 YAML 1.1 会把裸 `on:` 解析成布尔键 `True`，所以两个键都要试。
+    """
+    path = WORKFLOWS / workflow
+    data: Any = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    triggers = data.get("on") or data.get(True) or {}
+    if not isinstance(triggers, dict):
+        return set()
+    dispatch = triggers.get("workflow_dispatch")
+    if not isinstance(dispatch, dict):
+        return set()
+    inputs = dispatch.get("inputs")
+    if not isinstance(inputs, dict):
+        return set()
+    return {
+        str(name)
+        for name, spec in inputs.items()
+        if isinstance(spec, dict) and spec.get("required")
+    }
 
 
 def test_台账非空且每条都能解析() -> None:
@@ -107,3 +134,24 @@ def test_每条都写清了为什么_何时不跑_怎么真跑() -> None:
             f"{where} 的 run_it_now 必须是可直接复制的 `gh workflow run …`（现在是 {run_it_now!r}）"
         )
         assert entry.get("added"), f"{where} 没写 added（空洞要留日期，才好判断是不是历史遗留）"
+
+
+def test_真跑命令把必需入参带齐() -> None:
+    """`run_it_now` 是"怎么真跑一次"的唯一说明：少一个必需入参，抄下来就是 HTTP 422。
+
+    现场：台账两条 `run_it_now` 都写成 `gh workflow run ci.yml --ref dev`，
+    而 `ci.yml` 的 `workflow_dispatch.inputs.tag` 是 `required: true`
+    （有意如此：不让分支名冒充版本号）⇒ 这两条命令**手动真跑时根本跑不动**。
+    判据钉在**机制**上：从 workflow 里读出 `required` 入参，再看 `run_it_now` 有没有带 `-f <name>=`。
+    """
+    bad: list[str] = []
+    for (wf, job), entry in sorted(_ledger().items()):
+        required = _required_dispatch_inputs(str(wf))
+        cmd = str(entry.get("run_it_now") or "")
+        missing = sorted(name for name in required if f"-f {name}=" not in cmd)
+        if missing:
+            bad.append(
+                f"{wf}:{job} 的 run_it_now 缺必需入参 {missing}（缺了就是 HTTP 422，"
+                f"等于这条「怎么真跑」抄不动）：{cmd!r}"
+            )
+    assert not bad, "\n".join(bad)
