@@ -1914,7 +1914,15 @@ C（退出码改回 3）→ **3 条红**；D（给 `NotifyOutcome` 加 `__bool__
 
 - `mcp-client.mjs` 用 `server.split(" ")` 切命令，所以本地入口那个路径**不能带空格**
   （已写进 `local_everything_server()` 的 docstring）；没有修这个解析器——它不在本批的症状上。
-- 本批**没有**在真 GHCR 上跑发布流水线（仍为已知欠账，需凭据与真 runner）。
+- 本批**已经**在真 GHCR 上跑过发布流水线：`workflow_dispatch`（run `37540647177`，sha `4c65ce0`）
+  让 `image-signing` 真构建、真推送、真 keyless 签名、真独立校验、真钉 digest，全绿。
+  这条门用的是自动提供的 `GITHUB_TOKEN`（`packages: write`）+ GitHub OIDC keyless，
+  **不需要任何外部凭据**——我先前把它写成“需凭据与真 runner”是错的，那会白白放过一次本来能做的验收。
+  仍未做过的只剩：push 一个真 `v*` git tag 触发的**正式**发布入口，以及把镜像**部署到真集群**（需集群凭据）。
+- **同一次 run 里 `evals-real` 是“跳过”**：未配 `DEEPSEEK_API_KEY` 时它跳过真实模型质量评测
+  （日志显式写明，但不等于跑过）⇒ **这个 run 的绿也不等于“交付链全验过”**。
+  本批的 job 级台账（`tests/CI_JOB_GATES.yaml`）只覆盖带 `if:` 的 job，**step 级跳过还没进台账**，
+  作为下一批第一项。
 
 ---
 ## 2026-10-03（第五十批：把 `.env` 这条静默通道也关掉——第四十九批只堵了一半）
