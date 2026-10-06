@@ -1,0 +1,42 @@
+# 交付/演练清单里「还没钉 digest」的外部镜像台账。
+#
+# 为什么会有这个文件：`scripts/check_pinned_images.py` 要求交付/演练清单里每个外部
+# `image:` 要么钉在 `@sha256:` 上，要么在这里记账。目的不是给未钉的镜像开后门，
+# 而是不让「等等再钉」变成「永远不钉」——每条都必须写清**为什么现在没钉**和
+# **什么时候必须回头复核**。
+#
+# 怎么复核：跑 `.venv/Scripts/python.exe scripts/check_pinned_images.py`。
+# 过了 `review_by` 守卫就红。**优先钉住**，而不是把日期往后推；推日期是允许的，
+# 但那等于承认这次复核没做，得在 `reason` 里写清为什么。
+#
+# 钉 digest 时必须注意：镜像站的 digest 与上游**不是同一个东西**（本批实录：
+# 2026-10-04 实测同一个 postgres 镜像，上游名下是 `sha256:f1c337…`，镜像站
+# `docker.m.daocloud.io` 名下是 `sha256:a3b7f4…`）。拿镜像站的 digest 写进交付清单，
+# 等于钉了一个上游不认的东西。（这里有意不写具体 tag：写了就会与上面的 tag 重复一遍，
+# 两处一漂移就是新的一类不一致。）
+entries:
+  - image: prom/prometheus:v2.55.0
+    added: 2026-10-05
+    reason: >
+      `deploy/observability/docker-compose.yml`（README 里写明是**本地演练**栈，
+      不在生产交付路径上）。本机对 `registry-1.docker.io` 直连不通
+      （`net/http: TLS handshake timeout`），取不到权威 digest。取到就钉，别推日期。
+    review_by: 2027-01-03
+  - image: prom/alertmanager:v0.27.0
+    added: 2026-10-05
+    reason: >
+      同上（本地演练栈）。这个镜像比另外三个更值得优先钉：它负责**真的发告警**，
+      浮动 tag 意味着有人在演练里改了告警路由，而你以为自己复现的是同一套。
+    review_by: 2027-01-03
+  - image: prom/blackbox-exporter:v0.25.0
+    added: 2026-10-05
+    reason: >
+      同上（本地演练栈）。探测逻辑依赖挂进来的 blackbox.yml，镜像换了而配置没换时
+      会静默改变探测语义。
+    review_by: 2027-01-03
+  - image: grafana/grafana:11.3.0
+    added: 2026-10-05
+    reason: >
+      同上（本地演练栈）。11.3.0 这个 tag 是大镜像、插件与数据源都在里面，浮动 tag
+      下「演练时看到的面板」和上次可能不是同一个版本。
+    review_by: 2027-01-03

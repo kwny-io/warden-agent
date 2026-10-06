@@ -130,6 +130,12 @@ jobs:
           docker run --rm -v "$PWD/deploy/k8s:/m:ro" \
             ghcr.io/yannh/kubeconform:v0.6.7@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c \
             -summary -strict /m
+      - name: 交付/演练清单的镜像引用（钉 digest 或进台账）
+        # 为什么单独一条：它**不需要网络、不需要 docker**，所以到处都能跑；但它守的失败模式很贵——
+        # `deploy/k8s/backup-cronjob.yaml` 里用的是浮动 tag 的 postgres，于是“CI 验的那个 postgres”
+        # 和“备份时真跑的那个”是两回事（第六十四批实录）。
+        # 判定逻辑在 scripts/check_pinned_images.py 里，本地同样能跑（不搞成“只能在 CI 里验”）。
+        run: uv run --frozen python scripts/check_pinned_images.py
       - name: 断言 PostgreSQL 集成测试真的执行了（防静默跳过）
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
         # 副作用是——**如果 CI 里的 service 没连上，它们会静默跳过、CI 依然绿**，

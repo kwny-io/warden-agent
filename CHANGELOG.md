@@ -4,6 +4,99 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-05（第六十四批：交付清单里的镜像，靠人记得传 `--also`）
+
+> 入口：上一批的「已知限制」里自己写下了这件事——`scripts/pin_image_digests.sh` **自动**钉的只有
+> Dockerfile 的 `FROM`；`deploy/**` 里的 `image:` 要**有人在命令行显式传 `--also <ref>` / 
+> `--app-image <ref>`** 才会被钉，而那份清单**没有任何地方穷举、也没有静态守卫**。
+> 于是「等等再钉」可以永远不钉：**没人报错**。这批把这个洞封掉。
+
+### 现场（这批之前）
+`deploy/**` 与仓库根 compose 一共 **7 处**外部镜像引用，钉住的 **0 处**：
+- `deploy/k8s/backup-cronjob.yaml:75` —— `postgres:16-alpine`（浮动 tag）
+- `deploy/k8s/*.yaml` 的 2 处 `REPLACE_ME/…`（发布占位符，由 `--app-image` 回写，合法）
+- `deploy/observability/docker-compose.yml` 4 处（prometheus / alertmanager / blackbox-exporter / grafana，浮动 tag）
+
+最贵的一处是备份 Job 的 postgres：**CI 的集成测试跑的是 `postgres:16-alpine@sha256:cf78e766…`
+（第六十三批刚钉的），而备份 Job 跑的是浮动 tag** —— 「CI 验过的那个 postgres」和「备份时真跑的
+那个」在任何文档上都看不出是两回事。
+
+### 改了什么
+1. **`scripts/check_pinned_images.py`**（新，离线）：解析交付/演练清单（仓库根 `docker-compose.yml|yaml`
+   + `deploy/**/*.yml|yaml`），每个外部 `image:` 必须 ① 形如 `<ref>@sha256:<64位十六进制>`，或
+   ② 在 `deploy/IMAGE_LEDGER.yaml` 台账里有条目（`image`/`added`/`reason`/`review_by` 齐全、
+   `review_by` 未过期、不重复登记、且清单里确实还在用它）。`REPLACE_ME/…` 占位符**只允许**出现在
+   `deploy/k8s/`；本仓应用镜像（`warden-agent` / `ghcr.io/…`）不在管辖内。
+2. **`deploy/k8s/backup-cronjob.yaml:77`**：postgres 钉成**与 CI 同一个 digest**，
+   `postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685`，
+   注释里写清「换版本时三处一起换（这里 + `ci.yml:40` + `ci.yml:306`）」。
+3. **`deploy/IMAGE_LEDGER.yaml`**（新）：演练栈那 4 个进台账，每条写清为什么现在没钉
+   （本机到 `registry-1.docker.io` 直连不通：`net/http: TLS handshake timeout`）与复核期限 `2027-01-03`。
+4. **`tests/test_pinned_images.py`**（新，15 个用例）：每个用例对应一条真实失败模式——浮动 tag、
+   占位 digest、变量插值、台账过期 / 孤儿 / 缺字段 / 重复登记、坏 YAML 不许静默跳过。
+5. **CI 的 `quality` 作业**新增一步（kubeconform 之后）：`uv run --frozen python scripts/check_pinned_images.py`。
+   它不需要网络也不需要 docker，所以本地跑同一条命令就能复现 CI 的判定。
+
+### 守卫自己也会撒谎（这批我自己在守卫里找到并修掉的 3 个洞）
+1. **占位 digest 会被判成「钉住了」**：`sha256:000…0` / `sha256:fff…f` 能过「64 位十六进制」这条正则，
+   于是守卫报绿，而实际拉取时是 `manifest unknown` —— **Pod 从未起来过**。
+   现在：64 位**全都相同**的 digest 一律按占位值处理（真 digest 不可能 64 位同一个字符）。
+   口径与 `tests/test_k8s_manifests.py` 一致，但那条只覆盖 `deploy/k8s` + `deploy/observability` 的 `.yaml`。
+2. **变量插值直接绕过守卫**：`image: ${REGISTRY}/app:1.0` 里没有字面量，守卫看不见，也就永远绿。
+   现在：含 `$` / `{` 的镜像引用**直接红**（等价于「没钉」），并给出修法。
+3. **台账会腐化**：只在「清单里已不再使用该镜像」时留着条目不报 —— 台账会越攒越长，最后没人知道哪条还活着。
+   现在：孤儿条目 / 重复登记 / 缺字段 / 过期，四类都是红；过期那条的报错里直接给出两条出路（钉住 /
+   重新评估并改日期），因为「推日期」本身也可以通过。
+
+### 本批我自己也错过（五条）
+1. **测试夹具写了 `sha256:` + `"1" * 64`**，被守卫判成占位值而红 —— **守卫对了、用例错了**。
+   已换成 `hashlib.sha256(b"pinned-images-test").hexdigest()`，并补一条用例专门钉住「全 1 也算占位」，
+   防止以后有人把规则收窄回「只怼全 0 / 全 f」。
+2. **差点沿用了「镜像站 digest 可以当权威」这个错误念头**（上一批已经实测证伪过一次）：同一个
+   `postgres:16`，上游名下是 `sha256:f1c337…`、`docker.m.daocloud.io` 名下是 `sha256:a3b7f4…` ——
+   **不是同一个东西**。拿镜像站的 digest 钉进交付清单，等于钉了一个上游不认的引用。这条写进了台账注释。
+3. **差点把 `backup-cronjob.yaml` 的注释当成「有人忘了钉」**：注释里写着「发布流水线会用 `--also` 钉它」。
+   真实形状要难看得多 —— **流程是有的，但它依赖人记得传参数，而没人守这件事**。
+   这也正是为什么不补一句文档、而要写静态守卫。
+4. **我新写的 docstring 把 tag 写飘了，被上一批的守卫抓住**：第一次全量跑出来 `1 failed` ——
+   `tests/test_ci_tool_pinning.py::test_文档里引用的版本不漂移` 报 `scripts/check_pinned_images.py:17`：
+   台账 `16-alpine` vs 实际 `16`（我举例「镜像站 digest 不能当权威」时写成了不带 `-alpine` 的那个 tag）。
+   修法**不是**把文档改成台账的写法（那会把没测过的 tag 说成测过的），而是**把 tag 从这句里去掉**：
+   机制不依赖具体是哪个 tag，出处留在桌面笔记。这条反而是好消息：**那条守卫在一个批次之后仍然有效**。
+   同时它暴露了自己的边界（见「已知限制」）。
+5. **差点在后台全量跑着的时候改文件**：我先启动了后台全量，然后才去修 lint —— 而要改的
+   `scripts/check_pinned_images.py` 正是那批用例**以子进程方式执行**的文件，边改边跑会让结果不可信。
+   已 kill 并确认进程死了再重跑。教训：**要改的文件，先改完再跑全量**；文档同理
+   （`tests/test_config_surface.py` / `test_changelog_structure.py` 会读 `README.md` 与 `CHANGELOG.md`）。
+
+### 验证（可复现）
+- 守卫在真仓库：`扫描 7 处外部镜像引用：钉住 1、发布占位符 2、台账 4` → `✅ 全部钉住或有台账记录`，退出码 0。
+- **负控**（把台账临时改名）：退出码 1，逐条点名 4 个演练栈镜像并给出修法 ⇒ **守卫真会红，不是摆设**。
+- `tests/test_pinned_images.py`：15 passed（其中浮动 tag / 占位 digest / 变量插值 3 条是负控，必须红）。
+- **两口径全量**（与 CI 同款命令；本批改了**零行 `src/`**，只加脚本/测试/清单 + 改文档）：
+  - 真 PG（容器 `warden-pg-test` 起着）：**1739 passed / 4 skipped / 0 failed**，614.96s，覆盖率 **90.31%**（门槛 86%）
+  - 无 PG（`docker stop warden-pg-test` 后重跑，跑完 `docker start` 复原）：**1699 passed / 44 skipped / 0 failed**，573.70s，覆盖率 **87.08%**
+  - 两口径收集数都是 **1743**（上一批 1728 ⇒ **+15**，全部来自本批新增的 `tests/test_pinned_images.py`）；口径差 40 条全是 PG 用例。
+  - 覆盖率与上一批**相同**：本批改了**零行 `src/`**。
+- **上一批那个「文档 tag 漂移」守卫在本批抓到了我自己**（见「本批我自己也错过」第 4 条）：
+  第一次全量跑出来 `1 failed`，就是它。这不是噪音 —— 它证明那条守卫在一个批次之后仍然有效。
+
+### 已知限制（不要当成「已经解决了」）
+- **台账里那 4 个演练栈镜像仍然是浮动 tag。** 本机到 `registry-1.docker.io` 直连不通
+  （`net/http: TLS handshake timeout`），取不到权威 digest。本批保证的是「**不再无声地漂**」，
+  不是「已经钉死了」；`review_by: 2027-01-03` 过了守卫就红。
+- **不能用镜像站的 digest 当权威**：实测同一个镜像在镜像站名下与上游不是同一个 digest
+  （镜像站会重签名 manifest）。拿镜像站的 digest 写进交付清单，等于钉了一个上游不认的东西。
+- **本批的守卫只看字面量。** 变量插值会被报红（有意），但「用脚本生成清单再 apply」这条路它管不到。
+- **上一批那个「文档 tag 漂移」守卫只扫三个目录，而且不读 `.md`**：
+  `tests/test_ci_tool_pinning.py` 的 `_SCAN_DIRS = (".github", "scripts", "tests")`、
+  `_FILE_SUFFIXES` 不含 `.md` ⇒ `README.md` / `CHANGELOG.md` / `docs/**` / `deploy/**` 里的 tag 漂移
+  **目前无人守**（本批 `deploy/IMAGE_LEDGER.yaml` 注释里那句话就落在范围外，是我按同源原则手改的，
+  不是被守卫逼的）。留给下一批的判据：把扫描范围扩到 `.md` 与 `deploy/`，并先清掉它翻出来的历史写法。
+- **`tests/test_release_scripts.py` 的旧纪律还在**：`deploy/**` 的 `image:` 仍会由
+  `pin_image_digests.sh --also` 在发布时处理。本批加的是**下限**（不许无声漂移），不是替代它。
+
+---
 ## 2026-10-04（第六十三批：门禁自己执行的那个程序，谁也没钉住）
 
 > 入口：自检要求「先证伪前面标成已完成的项」，并且要求「这一步要改变某个真实的失败模式」。

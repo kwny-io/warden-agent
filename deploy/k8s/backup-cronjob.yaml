@@ -67,12 +67,14 @@ spec:
               type: RuntimeDefault
           containers:
             - name: pg-backup
-              # 只用 tag，**不在这里写假 digest**（全 0 的 sha256 能过语法校验，
-              # 但 Pod 调度时会 `manifest unknown`——备份会“看起来配了、其实从没产出过”）。
-              # 发布流水线负责把这一行钉成真实 digest：
+              # 与 CI 里那两个 service 容器用**同一个 digest**（`.github/workflows/ci.yml:40` 与 `:300`）。
+              # 这里原本只写 tag，理由是「发布流水线会用
               #   scripts/pin_image_digests.sh --also postgres:16-alpine --app-image <ref>
-              # 手工核实 digest 的方式：docker buildx imagetools inspect postgres:16-alpine
-              image: postgres:16-alpine
+              # 把它钉住」——那条命令**要有人记得传 `--also` 才会发生**，而没人守这件事：
+              # 结果是 CI 验的是一个 postgres，备份 Job 跑的是另一个（浮动 tag 后来的任何一天）。
+              # 换版本时三处（这里 + ci.yml:40 + ci.yml:300）一起换。
+              # 手工核实：docker buildx imagetools inspect postgres:16-alpine
+              image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
               imagePullPolicy: IfNotPresent
               command: ["/bin/sh", "-c"]
               args:
