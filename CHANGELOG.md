@@ -4,6 +4,69 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-06（第六十八批：CI 的两条红，一条是「口径没定」、一条是「前提不是事实」）
+
+### 现场
+第六十七批推送 `31f0762` 后，`quality` job 红在 Pytest 步，恰好两条，而它们**都不是「CI 环境玄学」**：
+
+- `tests/test_skipped_tests.py::test_真仓库的台账现在就能通过`：它把**宿主环境原样传给子进程**，
+  而它要跑的守卫在 `CI=true` 且**没有 junit** 时**本来就该红**（「守卫自己没数据」必须是失败，
+  这是第五十五批定的规矩）。于是门禁里红的那一条，恰恰是「台账没问题」那一侧。
+  更糟的是同一个文件里 `_run()` 会**主动 pop 掉 `CI`** ⇒ **两种口径**，且没有任何一处是声明的。
+- `tests/test_release_scripts.py::test_pin_needs_docker_and_says_so`：收窄 PATH 时，代码把
+  **宿主那个真 coreutils 目录**拼进去，而它在 Linux 上就是 `/usr/bin`——**docker 也住在 `/usr/bin`**
+  （ubuntu runner 如此）⇒ 「这条 PATH 里没有 docker」在 CI 上**恒假**，而本机 Windows
+  两者天然在不同目录 ⇒ **永远绿**。CI 实录：断言 `rc=2`、实得 `0`——脚本真去 registry 解析出了 digest，
+  于是「没有 docker 时的失败路径」这条承诺在门禁里从来没被验过。
+
+### 改了什么（本批零行 `src/`）
+1. **`tests/test_skipped_tests.py`**：抽出 `_guard_env()` 作为**唯一入口**——谁跑守卫都得**主动定死**
+   「算不算 CI」（`pop`/`set` 掉 `CI`，并屏蔽 `WARDEN_TEST_PG_*`），不再继承宿主的偶然状态；
+   真仓库用例显式声明用**本地口径**（它查的是台账本身，不是「CI 里有没有 junit」，后者另有专测）。
+2. **`tests/test_release_scripts.py`**：不把断言改成「能过」，而是**把前提变成事实**——
+   新增 `_FORBIDDEN_IN_NARROWED_PATH`（docker/kubectl/podman/nerdctl/ctr/skopeo/buildah…）
+   与 `_tools_dir_without()`：照着宿主工具目录造一个**私有目录**，剔除容器/k8s 工具、**保留 coreutils**
+   （链接三级回退：符号链接 → 硬链接 → 复制，因为 Windows 上常拿不到符号链接权限；
+   源目录里连 `sed` 都没有时**宁可不造**——否则脚本会死在 `sed: command not found`，
+   症状看起来像「发布脚本坏了」）。`_child_path()` 在收窄时改用它。
+3. **同一文件的自检也修了**：`_no_tools_path()` 原先断言的是**收窄前的那个空目录**里找不到 docker
+   （注释却写着「自检要查子 bash 实际拿到的 PATH」）⇒ **检查了个寂寞**；现在断言 `effective`
+   （子 bash 真拿到的 PATH），并新增 1 条用例直接钉住「docker/kubectl 被剔除、`sed`/`grep` 仍在、
+   源目录无 `sed` 时返回 None」。
+
+### 验证
+- **CI 精确口径**：`uv run --frozen ruff check src tests scripts` → `All checks passed!`
+  （仓库锁定的 ruff，不是我 venv 里的版本）。
+- 两个文件在 **`CI=true`** 下（正是红时的条件）：**49 passed**。
+- **因果证据 1**：`CI=true` 跑守卫、不带 junit → `rc=1` +「守卫自己没数据必须是失败」
+  ⇒ 旧写法在 CI 里**必红**，不是偶发。
+- **因果证据 2**：模拟 `/usr/bin`（`sed` 与 `docker` 同住一个目录）：旧写法 `which docker` = 真路径；
+  新私有目录 = `None`，而 `which sed` 仍命中 ⇒ **既删掉了 docker，也没把脚本饿死**。
+- **全量（CI 模式，`CI=true`，含 `--cov`）**：junit `tests=1768 failures=0 errors=0 skipped=4 time=544.254`（终端 `9:04`）→
+  **1764 passed / 4 skipped / 0 failed / 0 errors**（544.25 秒），覆盖率 **90.31%**（门槛 86%），`pytest_rc=0`。
+  **冻结点成立**：跑前/跑后 `git add -A && git write-tree` 都是 `a317f232d013c753bccc4e9b33556ef2b607215e`。
+  跑前预测「无 PG 基线 1709 + 本批新增 1 条」；实测 `skipped=4` 说明本机 PG 容器是**起着的**
+  ⇒ 走的是**真 PG 口径**，对应 **1763 + 1 = 1764**，一条不多一条不少。
+  剩余 4 条跳过全是平台限制（无 `pg_dump`/`pg_restore`、win32 无符号链接 ×2、win32 无内核隔离原语），
+  与 `tests/SKIP_LEDGER.yaml` 台账一致。
+
+### 教训（本批 4 条）
+① **同一个文件里两套口径 = 没有口径**。红的那条恰好是「没问题」那一侧，说明判据挂在宿主状态上；
+  口径必须由测试**自己声明**，否则「结论是环境的函数」。
+② **「让断言能过」是错的修法**，尤其当断言写的是「这个环境里没有 X」时——要修的是**让前提成为事实**
+  （造私有目录、剔除清单入册），而不是把 `rc=2` 改成「非 0 也行」。
+③ **同名目录在不同平台上的内容差异**，会让「没有 X」类断言在一边恒真、一边恒假；
+  本机 Windows 与 CI Linux 在这类断言上**互不覆盖**，所以「本机全绿」对它们零信息量
+  （与第六十六批同源：`which()`、`/usr/bin` 这类宿主事实不能当判据）。
+④ **`ruff format --check` 不是门禁**：本批顺手核了，HEAD 版本本来就有格式漂移，而 CI 只跑
+  `ruff check`（`ci.yml:134`）⇒ 不做无意义的全仓格式化（那只会造出无从审阅的 diff）；
+  但**自己新增的行不添新漂移**。
+⑤ **冻结点要埋在命令里，不是收尾时补的仪式**：本批第一轮全量跑完就拿到了
+  `1764 passed / 4 skipped`，但那命令里**没埋** `git write-tree` ⇒ 只能算**观测值**；
+  带冻结点复跑后同口径耗时是 **544.25 秒**（首轮是 576.51 秒，差了 32 秒）——
+  两份数字**确实不是同一件事**，所以第一轮那个数根本不该被引用。
+
+---
 ## 2026-10-06（第六十七批：镜像里那行 `|| npm install`，把「锁文件漂移」吞成了安静的另一种成功）
 
 ### 现场

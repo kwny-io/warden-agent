@@ -13,7 +13,10 @@
   7. CI 里没有 junit 报告                     ⇒ 红（「守卫自己没数据」不是通过）；本地放行
 
 外加两条「守卫的守卫」：
-  8. 真仓库的台账现在就能通过（防 YAML/字段被改坏）
+  8. 真仓库的台账现在就能通过（防 YAML/字段被改坏）。
+     第六十七批补：它必须**主动定死「算不算 CI」**。原先它把宿主环境原样传给子进程，
+     而 `_run()` 却会 pop 掉 `CI`——同一个文件里两种口径。于是 CI 里它变红，
+     而红的那条恰恰是「台账没问题」：**在门禁里测本机状态的用例，等于没有用例**。
   9. `ci.yml` 里「预热规则求值镜像」那一步必须仍在 **Pytest 之前**、签字守卫在 **之后**
      —— 这两条命令的位置就是这个批次承诺的全部机制：删掉预热步骤，求值用例就会在
      CI 里静默跳过（守卫那时才会红，但红得晚了一步：那是事后）。所以位置本身要被钉住。
@@ -83,6 +86,23 @@ def _entry(
     return entry
 
 
+def _guard_env(*, ci: bool = False) -> dict[str, str]:
+    """构造子进程环境：**主动定死**「算不算 CI」，不继承宿主的偶然状态。
+
+    第六十七批实录：`CI=true` 时子进程会被判成 CI 环境，而这条守卫在 CI 里
+    没有 junit 就是**必须红**的。所以谁要跑它，就得把口径说清；
+    靠宿主环境碰巧是什么，就是靠运气测。（同一文件里两套口径那个坑也一并收掉。）
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("WARDEN_TEST_PG_")}
+    # Windows 控制台默认 cp936，编不了（与守卫无关，只为断言好读）
+    env["PYTHONIOENCODING"] = "utf-8"
+    if ci:
+        env["CI"] = "1"
+    else:
+        env.pop("CI", None)
+    return env
+
+
 def _run(
     tmp_path: Path,
     cases: list[tuple[str, str]] | None = None,
@@ -98,13 +118,7 @@ def _run(
         args += ["--junitxml", str(_junit(tmp_path, cases))]
     if entries is not None:
         args += ["--ledger", str(_write_ledger(tmp_path, entries))]
-    env = {k: v for k, v in os.environ.items() if not k.startswith("WARDEN_TEST_PG_")}
-    # Windows 控制台默认 cp936，编不了（与守卫无关，只为断言好读）
-    env["PYTHONIOENCODING"] = "utf-8"
-    if ci:
-        env["CI"] = "1"
-    else:
-        env.pop("CI", None)
+    env = _guard_env(ci=ci)
     done = subprocess.run(
         args, capture_output=True, text=True, encoding="utf-8", env=env, timeout=120
     )
@@ -202,13 +216,17 @@ def test_CI里没有junit报告是失败_本地放行(tmp_path: Path) -> None:
 
 
 def test_真仓库的台账现在就能通过() -> None:
-    """防把台账改坏：YAML 合法、字段齐全、id 都能解析。"""
+    """防把台账改坏：YAML 合法、字段齐全、id 都能解析。
+
+    口径固定为**本地**（`_guard_env()` 会 pop 掉 `CI`）：这条用例查的是台账本身，
+    不是「CI 里有没有 junit 报告」（那是下面那条用例的事）。
+    """
     done = subprocess.run(
         [sys.executable, str(GUARD), "--ledger", str(LEDGER)],
         capture_output=True,
         text=True,
         encoding="utf-8",
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        env=_guard_env(),
         timeout=120,
     )
     assert done.returncode == 0, done.stdout + done.stderr

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shlex
@@ -22,6 +23,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -77,6 +79,72 @@ def _coreutils_dir(bash: str | None) -> str | None:
     return None
 
 
+# 收窄 PATH 时要在两件事上同时成立：「没有 docker/kubectl」与「coreutils 仍然在」。
+# `_coreutils_dir()` 给的是**宿主那个真目录**，而它在 Linux 上就是 `/usr/bin`——docker 也住在那里
+# （GitHub 的 ubuntu runner 就是）。于是「这条 PATH 里没有 docker」在 CI 上恒假、本机 Windows 全绿：
+# 第六十七批实录，`quality` job 因此连红：`test_pin_needs_docker_and_says_so` 断言 rc=2，
+# 实得 0，脚本真去 registry 解析出了 digest。
+# 解法不是改断言，而是**把前提变成事实**：自己造一个私有工具目录，缺什么由清单说清。
+_FORBIDDEN_IN_NARROWED_PATH = (
+    "docker",
+    "docker.exe",
+    "docker-compose",
+    "kubectl",
+    "kubectl.exe",
+    "podman",
+    "nerdctl",
+    "ctr",
+    "skopeo",
+    "buildah",
+)
+
+
+@functools.lru_cache(maxsize=2)
+def _tools_dir_without(
+    source: str | None,
+    forbidden: tuple[str, ...] = _FORBIDDEN_IN_NARROWED_PATH,
+) -> str | None:
+    """照着 `source` 造一个私有工具目录，但剔除容器/k8s 工具。
+
+    返回 None ⇒ 调用方应当退回旧行为（宁可收窄不成，也不要造出一个"连 sed 都没有"的目录：
+    那会让脚本死在 `sed: command not found`，症状看起来像"发布脚本坏了"）。
+
+    链接优先符号链接（Linux 正常路径），失败退硬链接，再失败退复制
+    ——Windows 上没有符号链接权限时前两条都会失败（第六十七批：新增用例要在
+    本机 Windows 也能跑）。
+    """
+    if not source:
+        return None
+    src = Path(source)
+    if not src.is_dir():
+        return None
+    forbidden_names = set(forbidden)
+    entries = [e for e in src.iterdir() if e.name not in forbidden_names]
+    if not any(e.name in {"sed", "sed.exe"} for e in entries):
+        return None
+    box = Path(tempfile.mkdtemp(prefix="warden-narrow-path-"))
+    for entry in entries:
+        target = box / entry.name
+        try:
+            target.symlink_to(entry)
+            continue
+        except OSError:
+            pass
+        try:
+            os.link(entry, target)
+            continue
+        except OSError:
+            pass
+        if entry.is_file():
+            try:
+                shutil.copy2(entry, target)
+            except OSError:
+                continue
+    if not any((box / n).exists() for n in ("sed", "sed.exe")):
+        return None
+    return str(box)
+
+
 def _child_path(narrowed: str | None) -> str:
     """给子 bash 构造 PATH：**自己把工具链放进去**，不继承宿主的路。
 
@@ -87,6 +155,9 @@ def _child_path(narrowed: str | None) -> str:
     """
     base = narrowed if narrowed is not None else os.environ.get("PATH", "")
     coreutils = _coreutils_dir(BASH)
+    if narrowed is not None and coreutils:
+        # 收窄时不能用宿主那个目录（Linux 上它是 /usr/bin，docker 就在里面）
+        coreutils = _tools_dir_without(coreutils) or coreutils
     return f"{coreutils}{os.pathsep}{base}" if coreutils else base
 
 
@@ -291,8 +362,12 @@ def _no_tools_path(tmp_path: Path) -> str:
     path = str(empty)
     effective = _child_path(path)
     for tool in ("docker", "kubectl"):
-        assert shutil.which(tool, path=path) is None, (
-            f"脚手架自检失败：这条 PATH 里居然能找到 {tool} —— \"没有工具\"的前提不成立"
+        # 查**子 bash 实际拿到的那个 PATH**（effective），不是收窄前的那个空目录：
+        # 旧版查的是 `path`，于是上面那句"自检要查子 bash 实际拿到的 PATH"只是句注释，
+        # 检查了个寂寞——CI 上 docker 就从 effective 里被找出来了（第六十七批）。
+        assert shutil.which(tool, path=effective) is None, (
+            f"脚手架自检失败：**子 bash 实际拿到的** PATH 里居然能找到 {tool}"
+            f"（PATH={effective!r}）—— 「没有工具」的前提不成立，那几条用例会去调真工具。"
         )
         ok, out = _shim_wins_on_path(tool, effective)
         assert ok, (
@@ -459,6 +534,30 @@ def test_pin_app_image_replaces_placeholder(tmp_path: Path) -> None:
     text = (root / "deploy" / "k8s" / "deployment.yaml").read_text(encoding="utf-8")
     assert f"image: ghcr.io/acme/warden-agent:0.1.0@{FAKE_DIGEST}" in text
     assert "REPLACE_ME" not in text
+
+
+def test_收窄PATH的私有目录剔除docker但保留coreutils(tmp_path: Path) -> None:
+    """把「这条 PATH 里没有 docker」变成**可检查的事实**。
+
+    第六十七批：这句话在 CI 上曾经恒假（宿主的 `/usr/bin` 里既有 `sed` 也有 `docker`），
+    表现为本机全绿、`quality` job 红，而红的原因看起来像"发布脚本坏了"。
+    """
+    src = tmp_path / "host-tools"
+    src.mkdir()
+    for name in ("sed", "grep", "docker", "kubectl"):
+        (src / name).write_text("#!/bin/sh\n", encoding="utf-8")
+
+    box = _tools_dir_without(str(src))
+    assert box, "应当能造出私有工具目录"
+    names = {p.name for p in Path(box).iterdir()}
+    assert not (names & {"docker", "kubectl"}), f"容器/k8s 工具没被剔除：{sorted(names)}"
+    assert {"sed", "grep"} <= names, f"coreutils 被误伤：{sorted(names)}"
+
+    # 源目录里连 sed 都没有 ⇒ 宁可不造（否则脚本会死在 "sed: command not found"）
+    bare = tmp_path / "no-sed"
+    bare.mkdir()
+    (bare / "docker").write_text("#!/bin/sh\n", encoding="utf-8")
+    assert _tools_dir_without(str(bare)) is None
 
 
 def test_pin_needs_docker_and_says_so(tmp_path: Path) -> None:
