@@ -73,6 +73,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client
+      # promtool 的**真值求值**（tests/test_alert_rules_evaluated.py 的第 3 步）要本机
+      # 已有 prom/prometheus 镜像——那个测试**故意不联网拉镜像**（测试不该联网），
+      # 所以预热只能发生在 workflow 里。之前没人拉它 ⇒ 那条求值用例**每天在 CI 里跳过**、
+      # 而 CI 每天绿：「告警规则被真求值过」在门禁里是空的（与上面 pg_dump、下面 web/dist 同一个形状）。
+      # 它由「跳过签字」守卫（scripts/check_skipped_tests.py + tests/SKIP_LEDGER.yaml）看着：
+      # 那条签字是 `allowed_in: [local]`——**这步一旦被删，守卫在 CI 里直接变红**。
+      # tag 未钉 digest：取不到权威 digest（理由记在 tests/test_ci_tool_pinning.py 的待钉台账里），
+      # 与 `container` job 里跑 promtool 的那个容器同 tag。
+      - name: 预热规则求值镜像（让 promtool 真值求值真的跑）
+        run: docker pull prom/prometheus:v2.55.0
       # SPA 测试（tests/test_web.py::test_t10）在 web/dist 缺失时跳过。
       # 之前 CI 从不构建前端 → 它**每次都在跳过**。这里显式构建，让它真的执行。
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
@@ -144,6 +154,14 @@ jobs:
         # / `_HAS_PG`，含 pg_dump 端到端），不再手写文件名清单——手写清单漏一个就留一个口子。
         # 它直接解析上面 Pytest 步骤的 junit 报告（每个用例带文件信息），所以不必重复跑子集。
         run: uv run --frozen python scripts/check_pg_tests_ran.py --junitxml /tmp/pytest-junit.xml
+      - name: 断言被跳过的用例都有人签字（防静默跳过，覆盖所有轴）
+        # 上一步只守 **PG 一条轴**。这一步是它的一般化：读同一份 junit，要求**每一条**
+        # 被跳过的用例都在 tests/SKIP_LEDGER.yaml 里有人签字，并区分两种承诺——
+        #   `allowed_in: [local]`  本地可以跳，**CI 里必须真跑**
+        #   `allowed_in: [ci]`     CI 里这个场景不成立，那**本地必须真跑**
+        # 所以上面那几处预热（pg_dump / web/dist / promtool 镜像）一被删、或者谁新增一条
+        # “本机有才跑”的用例没签字，这里就红——「跳过」不再能静默地装在绿里。
+        run: uv run --frozen python scripts/check_skipped_tests.py --junitxml /tmp/pytest-junit.xml
 
   container:
     runs-on: ubuntu-latest

@@ -37,15 +37,19 @@ def test_sqlite满足RunStore接口() -> None:
 
 
 def _postgres_available() -> bool:
-    try:
-        import psycopg
+    """PG 是否可用。**必须走 test_postgres_integration 里那一套判据**，别自己连一次。
 
-        conn = psycopg.connect(host="localhost", dbname="postgres",
-                               user="postgres", password="", connect_timeout=2)
-        conn.close()
-        return True
-    except Exception:
-        return False
+    自己连的代价（第六十五批实测，两个方向都错）：
+      1. `WARDEN_TEST_PG_PORT` 这类旋钮对它无效——切「无 PG 口径」时它会**继续连真库**
+         （把端口旋钮指向空端口后，它照样真跑）。口径就不纯了。
+      2. PG 不在默认端口时（远端库 / CI 换端口）它连不上 ⇒ **静默跳过**，而整套仍然
+         报「0 failed」。这正是第五十二批修掉的形状，当时漏了这个文件。
+
+    静态守卫（防再有人手写一次）：`tests/test_skipped_tests.py::test_所有PG门控都走同一个可用性判据`。
+    """
+    from tests.test_postgres_integration import _pg_available
+
+    return _pg_available()
 
 
 @pytest.mark.skipif(

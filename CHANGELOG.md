@@ -4,6 +4,143 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-06（第六十五批：一条「跳过」的用例，在报告里长得像一次「成功」）
+
+> 入口：第六十四批的「已知限制」里，我把自己写的一句「CI 里每一步 `docker run` 都钉在 `@sha256:` 上」
+> 改掉了——因为同一段下面还列着 4 个没钉的。复审那处时顺手核了一句更要紧的话：
+> **「告警规则被真求值过」这句话，在门禁里到底成不成立。**
+
+### 现场（这批之前，三个已取证的形状）
+
+1. **真做求值的那条用例，在 CI 里每天跳过。** 真正把 `*.rules.test.yml` / `*.slo.test.yml` 交给
+   promtool `test rules` **真求值**的是 `tests/test_alert_rules_evaluated.py:193` 的
+   `test_promtool真值求值通过`（第 3 步）；`:180` 的 `_promtool_available()` 跑
+   `docker images -q prom/prometheus:v2.55.0`，`:194` 拿不到就 `pytest.skip(...)`
+   （**测试故意不联网拉镜像**）。而 `.github/workflows/ci.yml` 的 `quality` job 里
+   **一条 `docker pull` 都没有**——promtool 那一步在**另一个 job**（`container`，:180 附近）。
+   ⇒ 这条用例在 CI 里**静默跳过、CI 每天绿**；「告警规则被真求值过」在门禁里是空的。
+   本机有镜像（从镜像站拉的），所以**本地是真跑的**——「本机绿」和「CI 绿」在这里不是一件事。
+   顺带纠正我自己的话：第六十三批的 CHANGELOG 把 `ci.yml` 里那步 promtool 写成「规则求值」，
+   它是 `check rules`（**语法**），不是求值。
+2. **仓库已经为「PG」这一条轴造了防静默跳过的守卫**（`scripts/check_pg_tests_ran.py`：
+   解析 junit、按 `skipif` 标记自动发现 PG 用例、断言零跳过），但**只有这一条轴**。
+3. **PG 门控自己有两处实现。** `tests/test_store_interface.py` 自己拼连接
+   （`host="localhost", password=""`），而 `tests/test_postgres_integration.py::_pg_params()`
+   才是读了环境变量（含 `WARDEN_TEST_PG_PORT`）的那个。两个方向都错：切「无 PG 口径」时
+   它**还在连真库**（口径不纯）；PG 不在默认端口时它连不上 ⇒ **静默跳过**，整套照样报零失败。
+   这正是第五十二批修掉过的形状——**当时漏了这个文件**。
+
+### 改了什么
+
+1. **`scripts/check_skipped_tests.py`**（新，离线）：读主 pytest 产出的 junit，要求**每一条**
+   `<skipped>` 用例都在 `tests/SKIP_LEDGER.yaml` 里有人签字。两条规则、**都不是手写文件清单**：
+   - **未签字的跳过 = 红**：谁新增一条「本机有才跑」的用例，它就自动出现在 junit 里 ⇒ 守卫自动红，
+     逼人当场表态（让它真跑，或签字 + 写理由）。
+   - **签字写了「CI 里不许跳」就不许跳**：`allowed_in: [local]` 是一条**承诺**（本地可以跳、
+     CI 必须真跑）；`allowed_in: [ci]` 是反向承诺。允许在门禁里留空洞的条目必须带 `review_by`
+     ——**空洞必须有期限**。
+   - 边界也钉住了：参数化用例名是 `test_x[参数]`（中括号直接接名字、**没有 `::``**），
+     只按 `::` 前缀匹配会**静默漏掉签字**。
+2. **`tests/SKIP_LEDGER.yaml`**（新，14 条签字）：本仓实际会跳的每一条都写清为什么。其中
+   **10 条 `[local]`**（CI 里必须真跑）、**3 条 `[ci]`**（win32 的 WSL 转发器 / 内核档前提）、
+   **1 条两端都允许跳**（`tests/test_sandbox_isolation.py::test_内核档下网络调用真的失败`：
+   只有在真有内核档的环境里才有内容；如实记账，不强行要求某一端）。
+3. **`.github/workflows/ci.yml`**：`quality` job 在 Pytest **之前**加一步
+   `docker pull prom/prometheus:v2.55.0`（**测试自己不该联网，预热镜像本就该在 workflow 里**）；
+   在 `check_pg_tests_ran.py` 之后加签字守卫那一步。两条命令的**先后顺序本身就是机制**。
+4. **`tests/test_store_interface.py`**：PG 门控改成**单一事实源**——
+   `from tests.test_postgres_integration import _pg_available`，不再自己拼连接。
+5. **`tests/test_skipped_tests.py`**（新，10 条）：逐条构造「它必须红的场景」（未签字跳过 /
+   CI 里跳过 `[local]` 条目 / 参数化名字 / 文件级签字 / 台账字段非法 / CI 没有 junit），
+   外加三条**守卫的守卫**：
+   - 真仓库的台账现在就能通过（防 YAML 被改坏）；
+   - **静态扫描：`tests/` 里每一次 `psycopg.connect(...)` 都必须带 `**_pg_params()`**——
+     PG 门控只能有一处实现，`test_store_interface.py` 那个漏网之鱼就是这么来的；
+   - **`ci.yml` 里「预热镜像」必须排在产出 junit 的 Pytest 之前、签字守卫必须排在其后**——
+     **位置就是这批承诺的全部机制**：删掉预热，求值用例又会静默跳过。
+
+### 守卫今天就会红（有牙的证据）
+
+四个方向都真跑过（本批两份 junit 各验两遍）：
+
+| junit | 本地口径 | `CI=true` 口径 |
+|---|---|---|
+| 真 PG（4 条跳过） | `rc=0` | `rc=1`（点名 3 条） |
+| 无 PG（44 条跳过） | `rc=0` | `rc=1`（点名 43 条） |
+
+`rc=0` / `rc=1` 不是两句话，而是四个真跑过的方向。没被点名的那 1 条正是台账里**两端都允许跳**
+的那条（`tests/test_sandbox_isolation.py::test_内核档下网络调用真的失败`：只在真有内核档的环境里才有内容）
+——**守卫不是无差别地吼，它按签字逐条判**；参数化用例（`test_…[参数]`，如
+`tests/test_pg_concurrent_init.py` 那两条各 3 个参数）也逐条点名，没被当成没签字。
+
+- `rc=1` 那条逐条 `::error::` 点名「只允许本地跳、却真在 CI 里跳了」的用例，例如
+  `tests/test_backup_retention.py::test_pg备份端到端_产物可校验`（要 `pg_dump` 客户端——而
+  `ci.yml:72` 就有「安装 postgresql-client」那一步，所以它在 CI 里没有理由跳）、
+  `tests/test_patch_path_guard.py::test_应用期拒绝符号链接逃逸`、
+  `tests/test_sandbox.py::test_只读工作区_不拷贝指向外部的符号链接`（后两条是 win32 建不了符号链接，
+  CI 的 ubuntu 上必须真跑）——**这两条恰恰是防「路径守卫被符号链接绕过」的回归，CI 里空掉等于没人守**。
+- 「CI 口径拿不到 junit 就失败」也真撞到过一次：我把路径里的反斜杠弄丢了，守卫没**静默通过**，
+  而是 `rc=1` + `::error:: 没有 junit 报告`——同源失败模式在这里是响的。
+- 第六十五批之前，同样的 junit + 同样的问题**没有任何程序会红**。
+
+### 这批我自己也错过
+
+1. **我以为「无 PG 口径」的跳过数是 44，实测 46。** `_promtool_available()` 用 `docker images -q`，
+   它需要 **docker 守护进程在跑**；而第一轮 stage1 跑的时候引擎是关着的（脚本 stage2 才去拉引擎）
+   ⇒ 求值那两条**多跳了一次**。**同一份命令、同一台机器、两个跳过数（44 / 46），差别只在引擎状态。**
+   已把「**引擎必须起来、只停 PG 容器**」写进口径定义（台账 reason + README + 索引 §7 都补了这句）。
+2. **守卫第一版把 junit 的 `classname` 当路径用。** `file` 属性才有 `tests/…` 的形状，而
+   实测本仓**所有**跳过用例的 `file` 属性都是**空的**（真 PG 口径 4/4、无 PG 口径 46/46）
+   ⇒ `classname` 回退不是边角，而是**唯一能用的那条路**。只用 `file` 的守卫会把每一条跳过都判成
+   「未签字」（方向是**假红**，比假绿好，但仍然要修对）。
+3. **`main()` 里必须 `reconfigure(errors="replace")`**：守卫的消息会**引用 junit 里的跳过原因**
+   （仓库自己写的中文字符），而本机控制台是 cp936——打印到一半崩掉，守卫自己就成了新的失败模式。
+4. **「缺 junit」在 CI 里必须是失败、本地放行**：否则守卫会很安静地什么都验不了（同源失败模式）。
+5. **我把重跑脚本写成了带中文注释的 `.cmd`，cmd.exe 按 cp936 读它 ⇒ 当场崩在注释上，
+   一条 pytest 都没跑到**（`'…' 不是内部或外部命令`，exit 255）。**失败是响的**（没有产生
+   任何半截数字），但教训和上面第 1 条同源：**证据链里的每一步都要当代码看待**——
+   工具链的编码前提和被测代码的编码前提一样能骗人。重写为纯 ASCII 后重跑。
+6. **我把全量跑绿了，却漏了 lint。** `tests/test_skipped_tests.py` 里有 **7 处超 100 列（E501）**，
+   `ruff check` 7 个错——我是收尾时才跑的。而 CI 里 `ruff` 那一步（`.github/workflows/ci.yml:122`）
+   就在 pytest **之前**：这个提交当时推上去，CI 会在 lint 步就红，而我拿着「1753 passed」说「全量绿」。
+   **同一批的主题又咬了我一次**：pytest 绿 ≠ 门禁绿，门禁是**那几步的合取**，我在「收工」这一刻
+   又只拿了其中一步的数（和「只看退出码就相信『验过了』」是同一个毛病）。已把 `ruff check src tests
+   scripts` + `mypy src/warden_agent` 两道跟 pytest 一起跑完才收工。
+
+### 验证（两口径全量，与 CI 同款命令；本批改了零行 `src/`）
+
+- 真 PG（容器 `warden-pg-test`，与 CI 的 PG service 同口径）：**1753 收集 / 1749 passed /
+  4 skipped / 0 failed / 0 errors**（539.47 秒，含 `--cov`，覆盖 **90.31%**）
+- 无 PG（**docker 引擎在跑**，只把容器 `docker stop` 掉）：**1709 passed / 44 skipped /
+  0 failed / 0 errors**（537.94 秒，含 `--cov`，覆盖 **87.08%**）
+- （同一天引擎关着时的同一份命令：**1707 passed / 46 skipped**（574.92 秒）——多跳的 2 条就是
+  promtool 求值那两条，所以口径定义里那句「引擎在跑」不是修辞）
+- 两口径收集数都是 **1753**（上一批（第六十四批）1743 ⇒ **+10**，全部来自本批新增用例；
+  注意 README 里当时写的 1728 是**第六十三批**的数字——那正是下一批要封的洞，见桌面第 63 篇 §9）
+- 门槛 86%（`[tool.coverage.report] fail_under = 86`）；新守卫全部离线，不需要网络与 docker
+- **可复现性**：文档改完后又在那棵**将要提交的树**上重跑了一次真 PG 全量（`C:/tmp/report65_final_pg.xml`）：
+  同样的 **1753** 条用例 id（与上一轮**逐条相同**，只有耗时不同）、**1749 passed / 4 skipped /
+  0 failed / 0 errors**、覆盖 **90.31%**，两个守卫 `rc=0`、`ruff check src tests scripts` 与
+  `mypy src/warden_agent`（115 个文件）全过 ⇒ 数字可复现，不是一次侥幸。
+- 收尾时又改了 `.md`（就是这一节），所以重跑了**所有读文档的测试**（8 个文件：
+  `test_changelog_structure` / `test_config_surface` / `test_git` / `test_k8s_manifests` /
+  `test_mutation_shards` / `test_observability_config` / `test_release_scripts` /
+  `test_run_server_main`——`grep -rln 'README.md\|CHANGELOG.md\|复核索引' tests/` 的全部命中）。
+  这是**做强制的第二步**：先改完要改的文件再跑全量，而不是反过来（第六十四批的教训）。
+
+### 已知限制
+
+- 签字台账**不追求穷举「理论上的跳过」**（比如「git 不在 PATH 时」）——那种情况真发生时守卫会红，
+  当场签字即可；这正是它存在的意义。它只签**实际会发生、且需要区分环境**的那些。
+- `docker pull prom/prometheus:v2.55.0` 仍是**浮动 tag**（本机 `registry-1.docker.io` 直连不通，
+  取不到权威 digest；镜像站名下的 digest 不是同一个东西）——理由记在
+  `tests/test_ci_tool_pinning.py` 的 `_PENDING` 待钉台账里，与 `container` job 里跑 promtool 的
+  那个容器**同 tag**。
+- 本批只覆盖 `quality` job 那份 junit；**`container` job 自己的测试跳过情况没读它的 junit**。
+- 求值用例即使真跑，也只证「这些 test.yml 里的用例通过」，不证「线上阈值选得对」。
+- 签字守卫只保证「跳过是有人认过的」，**不保证签字的人写对了理由**。
+
+---
 ## 2026-10-05（第六十四批：交付清单里的镜像，靠人记得传 `--also`）
 
 > 入口：上一批的「已知限制」里自己写下了这件事——`scripts/pin_image_digests.sh` **自动**钉的只有

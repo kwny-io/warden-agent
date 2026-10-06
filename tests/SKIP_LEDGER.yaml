@@ -1,0 +1,119 @@
+# 「被跳过的用例」签字台账。
+#
+# 为什么会有这个文件：一条**跳过**的用例在报告里长得像一次**成功**——`0 failed` 里
+# 分不出「验过了」和「根本没跑」。本仓已经吃过一次这个亏：`tests/test_alert_rules_evaluated.py`
+# 的第 3 步（promtool 真值求值）需要本机先有 `prom/prometheus:v2.55.0` 镜像，而 CI 的
+# `quality` job 里没人拉这个镜像 ⇒ 它在 CI 里每天跳过、CI 每天绿，「告警规则被真求值过」
+# 这句话在门禁里是空的。`scripts/check_skipped_tests.py` 读主 pytest 产出的 junit，
+# 要求**每一条被跳过的用例都在这个台账里有签字**。
+#
+# 两条规则（都不是「手写文件清单」，新增跳过会自动撞红）：
+#   1. 未签字的跳过 = 红。谁新增一条“本机有才跑”的用例，守卫当场变红，逼人表态。
+#   2. `allowed_in` 写了 `ci` 才允许在 CI 里跳，且这种条目必须带 `review_by`（空洞有期限）。
+#      `allowed_in: [local]` 是一条**承诺**：本地可以跳，**CI 里必须真跑**。
+#      `allowed_in: [ci]` 是反向承诺：CI 里这个场景不成立，那**本地必须真跑**（本机就得跑）。
+#
+# 本台账**不追求穷举“理论上的跳过”**（比如「git 不在 PATH 时」）——那种情况真发生时守卫会红，
+# 当场签字即可；这正是它存在的意义。它只签**实际会发生、且需要区分环境**的那些。
+#
+# 口径指纹（沿用 tests/test_config_surface.py 里那条约定）：真 PG 口径 `skipped=4`、
+# 无 PG 口径 `skipped=44`。数不对就是口径变了——以前的判据是“人肉记住 4 或 44”，
+# 现在是“每条都得有人签字”。
+#
+# 怎么跑：
+#   CI（主 pytest 之后，主步骤要带 --junitxml）：
+#     uv run --frozen python scripts/check_skipped_tests.py --junitxml /tmp/pytest-junit.xml
+#   本地：`.venv/Scripts/python.exe scripts/check_skipped_tests.py [--junitxml C:\tmp\junit.xml]`
+#   缺 junit 时：本地放行（只做台账自检），CI 报红——「守卫自己没数据」不是通过。
+entries:
+  # ---- 本机可以跳，CI 必须真跑（CI 已把前置条件准备好）----
+  - id: tests/test_alert_rules_evaluated.py::test_promtool真值求值通过
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: >
+      第 3 步真值求值要本机已有 `prom/prometheus:v2.55.0`（测试**故意**不联网拉镜像，
+      见该文件「已知限制」）。跳过判据是 `docker images -q`，而它还需要 **docker 守护进程在跑**：
+      引擎没起来时同样跳过（第六十五批实录：同一份命令、同一台机器，跳过数 44/46 随引擎状态变——
+      引擎在跑 44，引擎没起来 46。核数字前先看环境，别先看数字）。
+      本机没预热镜像时跳过是合理的；但 **CI 里不许跳**——
+      `.github/workflows/ci.yml` 在 Pytest 之前有一步「预热规则求值镜像」专门拉它。
+      如果那一步被删掉，这条守卫会在 CI 里红：那正是它要拦的事（这条回归在门禁里变空）。
+  - id: tests/test_web.py::test_t10_react_spa_服务和资源
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: >
+      后端 SPA 服务要 `web/dist`（构建产物、不入库）。本地没构建时跳过；CI 里前端门禁
+      那一步会 `npm run build` 产出它（那一步的注释里就写着「让 tests/test_web.py::test_t10
+      能真跑」）⇒ CI 不许跳。
+  - id: tests/test_backup_retention.py::test_pg备份端到端_产物可校验
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: >
+      要 `pg_dump`/`pg_restore`（postgresql-client）。本机没装这些客户端时跳过；CI 里有一步
+      「安装 postgresql-client（让 pg_dump 端到端测试真的跑）」⇒ CI 不许跳。
+  - id: tests/test_store_interface.py::test_postgres_存储全流程
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: >
+      要一个可用的 PostgreSQL。本地没起库时跳过；CI 的两个 job 都配了 `services: postgres` ⇒ CI 不许跳。
+  - id: tests/test_patch_path_guard.py::test_应用期拒绝符号链接逃逸
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: >
+      要能创建符号链接。Windows 上没开开发者模式/没特权时建不了 ⇒ 本地跳过是环境的锅；
+      CI（ubuntu）必须真跑——**这条回归恰恰是防「路径守卫在符号链接上被绕过」的**，
+      CI 里空掉等于没人守。
+  - id: tests/test_sandbox.py::test_只读工作区_不拷贝指向外部的符号链接
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: 同上（建不了符号链接）。CI（ubuntu）必须真跑。
+  # ---- 反向：CI 里场景不成立，本地必须真跑 ----
+  - id: tests/test_release_scripts.py::test_wsl转发器不会被当成可用bash
+    allowed_in: [ci]
+    added: 2026-10-05
+    review_by: 2027-01-03
+    reason: >
+      这条回归测的是「**Windows 的 WSL 转发器不该被当成可用 bash**」——场景只存在于
+      Windows 且**没装** WSL 发行版的机器上（本机就是，所以本地它必须真跑）。
+      CI 是 ubuntu，连 `C:\Windows\System32\bash.exe` 都不存在 ⇒ CI 里跳过是必然、
+      也是正当的。**除非**哪天 CI 换到 Windows runner：那时这条签字必须删掉。
+  - id: tests/test_sandbox_isolation_gate.py::test_构建期就按声明解析档位
+    allowed_in: [ci]
+    added: 2026-10-05
+    review_by: 2027-01-03
+    reason: >
+      这条断言的前提是「**给不了内核档**」（要求它当场报错）。本机 win32 没有网络命名空间
+      原语 ⇒ 前提成立、本地必须真跑。CI 的 ubuntu 若 `unshare` 可用，前提不成立（跳过是
+      正当的）；若不可用，它会真跑。所以 CI 里跳不跳都合规，本地不许跳。
+  - id: tests/test_sandbox_isolation_gate.py::test_注册shell_run时声明内核档但给不了会失败
+    allowed_in: [ci]
+    added: 2026-10-05
+    review_by: 2027-01-03
+    reason: 同上（同一条前提：本机给不了内核档，所以本地必须真跑）。
+  - id: tests/test_sandbox_isolation.py::test_内核档下网络调用真的失败
+    allowed_in: [ci, local]
+    added: 2026-10-05
+    review_by: 2027-01-03
+    reason: >
+      **这条是唯一允许两端都跳的**：它只有在**真有内核档**的环境里才有内容
+      （本机 win32 没有 ⇒ 本地跳；CI 的 ubuntu 有没有要看 `unshare` 权限 ⇒ CI 也可能跳）。
+      这里如实记账而不是强行要求某一端：真正的证据只能来自「有内核档的机器/容器」。
+      复核时的动作：要么在有内核档的环境里跑一次并存证，要么把这条用例改成
+      「档位不可用时也断言点什么」（别让隔离边界只靠容器那条路背书）。
+  # ---- 本地没 PG 时整套跳过（CI 必须真跑：PG 轴另有 check_pg_tests_ran.py）----
+  - id: tests/test_notify_event_bus.py
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: 整个文件 `pytestmark = skipif(not _pg_available())`：本地没库时不跑；CI 有 PG ⇒ 不许跳。
+  - id: tests/test_pg_concurrent_init.py
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: 同上（文件级 PG 门控）。
+  - id: tests/test_postgres_audit_memory.py
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: 同上（文件级 PG 门控）。
+  - id: tests/test_postgres_integration.py
+    allowed_in: [local]
+    added: 2026-10-05
+    reason: 同上（文件级 PG 门控，PG 轴那 40 条的主要来源）。
