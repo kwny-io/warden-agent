@@ -15,6 +15,21 @@
 它潜伏很久没被发现，是因为那个 job 的 `if:`（`.github/workflows/ci.yml:443-445`）把 push / PR
 全挡掉了（只在 `push v* tag` 或 `workflow_dispatch` 上跑）——**只在“真要发布”那一刻炸**。
 
+原始日志（`gh run view 37464309137 --log-failed`，sha `68501ec`，2026-10-06T12:36:24Z，可复现）：
+
+```
+##[group]Run scripts/pin_image_digests.sh --app-image "$IMAGE"
+scripts/pin_image_digests.sh --app-image "$IMAGE"
+/home/runner/work/_temp/42d6dad6-…-….sh: line 1: scripts/pin_image_digests.sh: Permission denied
+##[error]Process completed with exit code 126.
+```
+
+同一个 sha 上，**`push` 事件那个 run（`37461282520`，sha `68501ec`）是 `success`**，因为它的 job 列表就是
+`image-signing: skipped` + `变异测试（${{ matrix.shard }}）: skipped` + `container` / `evals-real` /
+`migration` / `quality` / `sbom` / `security` 全 `success`（`gh run view 37461282520 --json jobs` 可复现）。
+换成 `workflow_dispatch` 后同一个 sha（run `37464309137`）：除 `image-signing: failure` 外全绿。
+**“绿 run”与“交付面全绿”不是一回事**：前者是事件选择的函数。
+
 交付面「钉 digest」的纪律里，`--app-image`（把已推送的应用镜像回写 `deploy/k8s/*.yaml` 的
 `REPLACE_ME/…` 占位符）是**发布 job 的最后一步**（`.github/workflows/ci.yml`）。它的 fail-closed
 只管「解析不出 digest」（退出码 3）；当清单里**已经没有占位符**（上一版发布已换成真实引用、
