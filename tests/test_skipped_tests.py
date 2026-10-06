@@ -17,6 +17,12 @@
   9. `ci.yml` 里「预热规则求值镜像」那一步必须仍在 **Pytest 之前**、签字守卫在 **之后**
      —— 这两条命令的位置就是这个批次承诺的全部机制：删掉预热步骤，求值用例就会在
      CI 里静默跳过（守卫那时才会红，但红得晚了一步：那是事后）。所以位置本身要被钉住。
+    第六十五批又补两条同形状的：
+  10. 「安装 ts 客户端依赖」那一步也必须在 **Pytest 之前**：少了它，`tests/test_mcp.py` 里
+      4 条真实连接用例**每天在 CI 里跳过**（日志里的原因：`ts 客户端依赖未安装`），
+      而本机装了依赖所以本地永远看不到——这就是本批那个坑的形状。
+  11. 「上传 junit」那一步必须存在、且带 `if: always()`：守卫要守的是 **CI**，而跳过集
+      按环境变（本机 4 条 / CI 8 条）。Pytest 红的时候恰好最需要那份 junit。
 """
 
 from __future__ import annotations
@@ -278,3 +284,52 @@ def test_预热镜像那一步必须留在Pytest之前() -> None:
     assert marks["junit"] < marks["guard"], (
         "签字守卫必须排在产出 junit 的那一步之后，否则它没有数据可验"
     )
+
+
+def test_ts客户端依赖必须在Pytest之前() -> None:
+    """少了这一步，`tests/test_mcp.py` 的 4 条真实连接用例**每天在 CI 里跳过**。
+
+    第六十五批实录：本机装了 `ts/mcp-client/node_modules`，所以这 4 条在本机是跑的，
+    而 CI 从来没装过 ⇒ 它们每天在 CI 日志里以「ts 客户端依赖未安装」跳着、CI 每天绿。
+    这正是「跳过即静默」的通用形状：**前置条件没在 workflow 里备好**。
+    """
+    lines = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines()
+    markers = {
+        "npm": "working-directory: ts/mcp-client",
+        "junit": "--junitxml=/tmp/pytest-junit.xml",
+    }
+    marks: dict[str, int] = {}
+    for index, raw in enumerate(lines, start=1):
+        code = raw.split("#", 1)[0]
+        for key, needle in markers.items():
+            if needle in code:
+                marks.setdefault(key, index)
+    assert set(marks) == set(markers), f"ci.yml 里少了某一步：{marks}"
+    assert marks["npm"] < marks["junit"], (
+        f"安装 ts 客户端依赖必须排在 Pytest 之前（现在 npm 在 {marks['npm']} 行、"
+        f"pytest 在 {marks['junit']} 行）——否则那 4 条真实 MCP 集成用例在 CI 里永远静默跳过"
+    )
+
+
+def test_CI必须上传junit且Pytest红了也要传() -> None:
+    """守卫要守的是 **CI**，而跳过集按环境变（本机 4 条 / CI 8 条（第六十五批实测））。
+
+    没有这份产物，本地复核就只能拿自己的 junit 去核台账 —— 那正是本批踩的坑：
+    台账是用「我机器上的观察」建的，而它要守的环境是 CI。`if: always()` 保证
+    Pytest 红的时候（恰好最需要核台账的时刻）产物依然在。
+    """
+    text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "actions/upload-artifact@" in text, "ci.yml 里没有上传 junit 的步骤"
+    # 取**这一整个步骤**：从它的 `- name:` 到下一条 `- name:` 为止。
+    # （我第一版是从 `actions/upload-artifact@` 往后切，结果丢了写在 `uses:` **前面**的
+    #   `if: always()` —— 检查自己的窗口也得对着真文件看一眼。）
+    _, _, after_first = text.partition("上传 junit")
+    block = after_first.split("- name:", 1)[0]
+    assert "if: always()" in block, (
+        "上传 junit 必须带 `if: always()`：Pytest 失败时最需要这份 junit"
+        "（守卫要按 CI 的真数据核台账，而 CI 才是它要守的环境）"
+    )
+    assert "name: pytest-junit" in block and "/tmp/pytest-junit.xml" in block, (
+        "上传的必须是 Pytest 产出那份 junit（名字/路径对不上就等于没传）"
+    )
+    assert "if-no-files-found: error" in block, "junit 没了就大声红——不静默降级"

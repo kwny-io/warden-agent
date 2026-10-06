@@ -118,6 +118,18 @@ jobs:
         run: |
           npx playwright install --with-deps chromium
           npm run test:e2e
+      - name: 安装 ts 客户端依赖（让真实 MCP 集成在 CI 里真的跑）
+        # `tests/test_mcp.py` 有 4 条"真实连接"用例，门控在 `client_ready()` 上（`src/warden_agent/mcp/client.py:262`），
+        # 它要求 `ts/mcp-client/node_modules` 存在（入口 `mcp-client.mjs` 是签入的源码，不需要构建）。
+        # 而 workflow 从来没装过它 ⇒ 这 4 条**每天都在 CI 里跳过**、CI 每天绿（第六十五批从 CI 日志的
+        # SKIPPED 行里实录：`环境不具备真实 MCP 集成条件：ts 客户端依赖未安装`）。
+        # 与上面 `docker pull prom/prometheus` 同一个形状：**前置条件必须在 workflow 里备好**，
+        # 否则"在本机才跑"的用例在 CI 里就只是绿色噪声。
+        # 注意：这里刻意**不去 tests/SKIP_LEDGER.yaml 里签字**。签字是"允许留洞"，
+        # 而这是一个可以直接堵上的洞（npm ci + package-lock.json 就能复现）。
+        # 它由"跳过签字"守卫看着：这步一被删，那 4 条又会跳过、而它们没有签字 ⇒ CI 直接红。
+        working-directory: ts/mcp-client
+        run: npm ci
       - name: Ruff (lint)
         run: uv run --frozen ruff check src tests scripts
       - name: Mypy (strict)
@@ -131,6 +143,23 @@ jobs:
         run: |
           uv run --frozen pytest --tb=short -rs -p no:cacheprovider --cov=warden_agent \
             --junitxml=/tmp/pytest-junit.xml
+      - name: 上传 junit（Pytest 红了也要有，供本地用 CI 的真数据核"跳过台账"）
+        # 为什么必须 `if: always()`：守卫最该被复核的时刻恰恰是 Pytest 红的时候。
+        # 而"跳过集"是**按环境变的**（第六十五批实录：本机是 4 条，CI 里是 8 条；
+        # 其中 4 条 test_mcp 只在 CI 跳过，因为 CI 没装 ts 客户端依赖）。
+        # 拿不到 CI 的 junit，就只能拿本机的 junit 去核台账——那正是本批踩的坑：
+        # 台账是用"我机器上的观察"建的，而它要守的是 CI。
+        # 本地复核（不用重跑测试）：
+        #   gh run download <run-id> -n pytest-junit -D /tmp/ci-junit
+        #   uv run --frozen python scripts/check_skipped_tests.py \
+        #     --junitxml /tmp/ci-junit/pytest-junit.xml
+        # `if-no-files-found: error`：junit 是上游步骤的产物，没了就大声红，不静默降级。
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: pytest-junit
+          path: /tmp/pytest-junit.xml
+          if-no-files-found: error
       - name: K8s manifests 校验（kubeconform，官方 schema 严格模式）
         # 只查**字段合法性**（官方 schema）；"我们的要求"（探针齐全、优雅停机时间小于
         # terminationGracePeriodSeconds、非 root + rootfs 只读、不用 :latest、多副本必配 PG…）

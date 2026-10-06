@@ -257,6 +257,28 @@ dirname() {
 """
 
 
+def _shim_wins_on_path(tool: str, path: str) -> tuple[bool, str]:
+    """在**子 bash 实际拿到的 PATH** 上，函数替身是否仍然压过同名可执行文件。
+
+    这是那批替身用例真正需要的前提。原来自检断言的是「有效 PATH 里 `which(tool)` 找不到」，
+    而它**在 GitHub 的 ubuntu runner 上恒假**：`/usr/bin/docker` 存在，coreutils（`sed`）也在
+    `/usr/bin` —— 「PATH 里没有 docker」与「PATH 里有 sed」在那里不可能同时成立
+    （第六十五批实录：这条自检让 `quality` job 在 CI 里连红两次，而本机 Windows 全绿）。
+    函数在命令查找中优先于 PATH，所以正确的判据是「`command -v` 打印的是**函数名**、不是路径」，
+    它与宿主装了什么无关。
+    """
+    probe = subprocess.run(
+        [BASH, "-c", f"{tool}() {{ :; }}\ncommand -v {tool}"],
+        env={**os.environ, "PATH": path},
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=SESSION_TIMEOUT,
+    )
+    out = (probe.stdout or "").strip()
+    return (probe.returncode == 0 and out == tool), out
+
+
 def _no_tools_path(tmp_path: Path) -> str:
     """返回一个确定找不到 docker/kubectl 的 PATH 值（空目录），并当场自检。
 
@@ -272,9 +294,11 @@ def _no_tools_path(tmp_path: Path) -> str:
         assert shutil.which(tool, path=path) is None, (
             f"脚手架自检失败：这条 PATH 里居然能找到 {tool} —— \"没有工具\"的前提不成立"
         )
-        assert shutil.which(tool, path=effective) is None, (
-            f"脚手架自检失败：子 bash 实际拿到的 PATH 里能找到 {tool} ——"
-            "coreutils 目录里不该有它，请重选 `_coreutils_dir` 的候选"
+        ok, out = _shim_wins_on_path(tool, effective)
+        assert ok, (
+            f"脚手架自检失败：子 bash 的 PATH 上，函数替身没能压过真实 {tool}"
+            f"（`command -v {tool}` 打出 {out!r}，应当是函数名 {tool!r}）"
+            " —— 那批替身用例会去调真工具，结论就不可信了"
         )
     return path
 

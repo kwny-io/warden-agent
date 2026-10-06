@@ -12,6 +12,14 @@
 #   2. `allowed_in` 写了 `ci` 才允许在 CI 里跳，且这种条目必须带 `review_by`（空洞有期限）。
 #      `allowed_in: [local]` 是一条**承诺**：本地可以跳，**CI 里必须真跑**。
 #      `allowed_in: [ci]` 是反向承诺：CI 里这个场景不成立，那**本地必须真跑**（本机就得跑）。
+#   3. **签字只能按 CI 的观察写**（第六十五、六十六批的教训）：这个台账要守的是 CI，
+#      而跳过集**按环境变**。第六十五批我拿**本机**的 junit 建台账——本机装着
+#      `ts/mcp-client/node_modules`，所以 `tests/test_mcp.py` 那 4 条真实连接用例在本机是跑的，
+#      台账里就没它们；而 CI 里它们**每天跳过**（日志原文：`ts 客户端依赖未安装`）⇒ 台账对 CI 是瞎的。
+#      判据：
+#        ① 建/核台账要拿 **CI 的 junit**（workflow 已把它传成 `pytest-junit` 产物，`if: always()`）；
+#        ② 本机看不到的跳过，靠 `ci.yml` 的步骤清单推：每个门控的**前置条件**在 CI 里备好了吗；
+#        ③ **能补好的前置条件就不要签字**——签字是「允许留洞」，能堵的洞就该堵上（如上面那 4 条）。
 #
 # 本台账**不追求穷举“理论上的跳过”**（比如「git 不在 PATH 时」）——那种情况真发生时守卫会红，
 # 当场签字即可；这正是它存在的意义。它只签**实际会发生、且需要区分环境**的那些。
@@ -25,6 +33,9 @@
 #     uv run --frozen python scripts/check_skipped_tests.py --junitxml /tmp/pytest-junit.xml
 #   本地：`.venv/Scripts/python.exe scripts/check_skipped_tests.py [--junitxml C:\tmp\junit.xml]`
 #   缺 junit 时：本地放行（只做台账自检），CI 报红——「守卫自己没数据」不是通过。
+#   要核**CI 的真实跳过集**（不重跑测试）：
+#     gh run download <run-id> -n pytest-junit -D /tmp/ci-junit
+#     uv run --frozen python scripts/check_skipped_tests.py --junitxml /tmp/ci-junit/pytest-junit.xml
 entries:
   # ---- 本机可以跳，CI 必须真跑（CI 已把前置条件准备好）----
   - id: tests/test_alert_rules_evaluated.py::test_promtool真值求值通过

@@ -4,6 +4,104 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-06（第六十六批：我把 CI 说成绿的，而 `quality` 已经在 GitHub 上红了两小时）
+
+### 现场
+第六十五批的收尾我写的是「全量 **1753 passed**」，并据此宣布交付。而 GitHub 上 `dev` 的最后
+两次 run（`37421778931`、`37433695109`）**都是 failure**：红的步骤是 `Pytest`，
+具体是 `tests/test_release_scripts.py` 的两条（`test_pin_needs_docker_and_says_so`、
+`test_rollback_needs_kubectl_and_says_so`）的**脚手架自检**：
+`脚手架自检失败：子 bash 实际拿到的 PATH 里能找到 docker`。
+
+三件事叠在一起，才让我看不见它：
+1. **「全量绿」只覆盖了门禁的一段**：CI 里 `quality` 是 Ruff → Mypy → Pytest → K8s → 守卫的**合取**，
+   而我只在本机验了 pytest（第六十五批⑥已经因为同一个形状吃过一次亏：`ruff` 7 处 E501）。
+2. **那两条只会在 Linux 上红**：判据是「有效 PATH 里 `which(docker)` 找不到」，而 GitHub 的
+   ubuntu runner 上 coreutils（`sed`）和 `docker` **同在 `/usr/bin`** ⇒ 「PATH 里没 docker」与
+   「PATH 里有 sed」在那里**不可能同时成立**，断言恒假。本机 Windows 的 coreutils 在
+   `Git/usr/bin`、docker 在 `Program Files\Docker`，天然不同目录 ⇒ 本机永远绿。
+3. **我没有把 CI 当成「已交付」的证据去读**（第六十四批第七条教训就是这个），
+   收尾时只跑了本机命令就宣布交付。（同一时间 CI 日志里还躺着 8 条 SKIPPED。）
+
+### 改了什么
+1. **自检改成查它真正关心的事**：函数替身在**子 bash 实际拿到的 PATH** 上是否还压过同名可执行文件。
+   判据 = `bash -c 'docker() { :; }; command -v docker'` 打出的是**函数名**（函数在命令查找里优先于
+   PATH，与宿主装了什么无关），而不是「PATH 里找不到 docker」（那只是在描述宿主环境）。
+   真 Linux 复现（`python:3.12-slim` 里 `install -m 755 /bin/true /usr/bin/docker`）：
+   旧判据 `which` 打出 `/usr/bin/docker`（恒假）、新判据打出 `docker`（成立）。
+2. **CI 里再也不会有「本机装了才跑」的用例**：workflow 补上 `npm ci`（`ts/mcp-client`）。
+   `tests/test_mcp.py` 有 4 条真实连接用例门控在 `client_ready()` 上（`mcp/client.py:262`），
+   要求 `ts/mcp-client/node_modules` 存在，而 CI 从没装过 ⇒ 它们**每天在 CI 里跳过**
+   （日志原文：`环境不具备真实 MCP 集成条件：ts 客户端依赖未安装`），CI 每天绿。
+   与 promtool 镜像**同一个形状**：前置条件没在 workflow 里备好。
+3. **把 CI 的真 junit 当验收材料传出来**：`actions/upload-artifact`（钉 SHA
+   `ea165f8d65b6e75b540449e92b4886f43607fa02`）、`if: always()`、`if-no-files-found: error`。
+   理由：守卫要守的是 **CI**，而跳过集**按环境变**（本机 4 条 / CI 8 条）——
+   本批的台账就是用本机观察建的，对 CI 是瞎的。本地复核不再需要重跑测试：
+   `gh run download <run-id> -n pytest-junit -D /tmp/ci-junit` 再喂给 `check_skipped_tests.py`。
+4. 上面这些**位置与存在性都被钉住了**（`tests/test_skipped_tests.py` 第 10、11 条）：
+   删掉 `npm ci` 那一步、或给上传步骤去掉 `if: always()`，本地当场红。
+   台账头部也补上了第三条规则：**签字只能按 CI 的观察写**（附「能堵的洞不要签字」）。
+
+### 这批我自己也错过
+① 把「本机 pytest 全绿」直接当成「CI 绿」（第六十四批写过的教训，又犯一次）；
+② 第一版自检**只是换了个说法描述同一个宿主环境**（`which` → 「子 bash 的 PATH」），
+   在 Linux 上照样恒假——修的是措辞不是机制，靠真 Linux 复现才发现；
+③ 我新写的静态检查**自己也错了**：窗口从 `uses:` 往后切，丢掉了写在它**前面**的
+   `if: always()` ——当场被它自己撞红（检查自己的窗口也得对着真文件看一眼）。
+④ 我在 CHANGELOG 顶部插新批次时，**把第六十五批的 `## ` 标题吃掉了**（`oldText` 就是那行标题，
+   `newText` 忘了把它补回去），两批正文并成了一个段落——而文件表面看起来完全正常。
+   本仓的 `tests/test_changelog_structure.py` 当场抳到（`gap:65` + 重复的 `### ` 标题），
+   这就是那条守卫存在的理由（它的 docstring 里写着我在第四十八、四十九批也抳过两次）。
+⑤ 为了在**真 Linux** 上验那两条红，容器里的复现脚本连撞三次——而每一次**都是我把唯一的
+   诊断信息自己丢掉的**：脚本里写了 `apt-get update -qq >/dev/null 2>&1`，于是失败只剩一个
+   孤儿退出码 `100`（恰是 apt 的错误码），我差点当成「容器工具坏了」而放弃这条路；
+   接着我又用**裸 socket** 去探「容器有网吗」——socket 不走代理、直接回 OK，第二次骗过自己。
+   真因是 Docker Desktop 把宿主机的代理（`127.0.0.1:7890`）注入了容器，而容器里的
+   `127.0.0.1` 是它自己（清空 `*_PROXY` 之后**也不行**，那是另一个真因，见「已知限制」）。
+   而且外层 `.cmd` 以 `echo` 收尾 ⇒ 载荷失败时任务状态仍然报 `completed / exit 0`：
+   **任务状态不是载荷的结果，只能看载荷自己打出来的 `RC=`。**
+   **「没有输出」不是「没有原因」，是我把原因关掉了。**
+⑥ 我**在全量测试跑的 9 分 15 秒里改了树**：pytest 于是读到半编辑的中间态，报出 2 条
+   **没人写过的红**——恰好是 `tests/test_changelog_structure.py` 的那两条（`gap:65` + 重复
+   `### ` 标题），看上去「像我刚写的新守卫红了」，我差点据此去查自己的守卫。
+   真因是**快照不一致**，不是代码。权威全量因此重跑一遍，并加上了冻结点证据（跑前/跑后各取一次
+   `git write-tree`，两人相等才允许引用数字）。
+
+### 验证
+- **权威全量（冻结点 `e00fbc9dbfc67a8fa0732e9fb69953ad838ea957`，HEAD `6ff0361e`）**：
+  `uv run --frozen pytest --cov=warden_agent --junitxml=...`（真 PG 容器 `warden-pg-test`、
+  prometheus 镜像已预热）→ junit `tests=1755 failures=0 errors=0 skipped=4`、
+  **1751 passed / 4 skipped / 0 failed**（531.82 秒）、覆盖 **90.31%**（门槛 86%）；
+  `ruff check .` → `All checks passed!`；`mypy src/warden_agent` → 115 文件无问题；
+  两个守卫在新 junit 上都是 `rc=0`（`check_pg_tests_ran.py`、`check_skipped_tests.py`）。
+  **数字带冻结点**：跑前和跑后各取一次 `git write-tree`（先 `git add -A`，含未跟踪新文件），
+  两次相等才引用——上一轮就是在全量的 9 分 15 秒里改了树，报出 2 条**没人写过的红**（见⑥）。
+  ⚠️ 同一次跑里 `mypy warden_agent` 报 `Cannot read file`——那是我在 `.cmd` 里漏了 `src/` 前缀，
+  **是我的命令错，不是代码错**（CI 的真口径是 `mypy src/warden_agent`，已按它重跑）。
+- 真 Linux 的**机制**复现（不需要网络，所以能跑）：同一个 `python:3.12-slim` 容器内
+  `install -m 755 /bin/true /usr/bin/docker` 后——旧判据打出 `/usr/bin/docker`（恒假）、
+  新判据打出 `docker`（成立）。
+- 真 Linux 的**整套**套件：本机做不到，交给 CI（证据与原因见「已知限制」）。
+- **验收判据是 CI 自己**（这类失败模式只能用它的环境判）：本批提交后以 CI 绿为准，
+  run id 与结论按惯例在提交后回填（同第六十五批回填 sha 的做法）。
+
+### 已知限制
+- 本机（Windows）**无论如何都跑不出**那两条红：那是个 Linux-only 的失败模式。
+- 本机**也无法**用容器跑整套 Linux 套件（本批试过，失败得可复现）：Docker Desktop 把宿主机的
+  系统代理设置注入容器（`HTTP(S)_PROXY=http://127.0.0.1:7890`），而容器里的 `127.0.0.1` 是它自己
+  ⇒ apt 直接 `exit 100`（`E: Unable to locate package git`）；把 `*_PROXY` 全部清空后，容器内
+  直连 HTTPS 又变成 `SSL: UNEXPECTED_EOF_WHILE_READING`（宿主 `curl` 直连 pypi 是 `200`、
+  宿主 `7890` 根本没有监听，那个值只是 Windows 系统设置里的残留），`--network host` 同样失败
+  ⇒ 容器里装不上 `uv`/依赖。因此 Linux 侧的**整套**验证只能由 CI 证；本机保留的 Linux 证据是上面
+  那支**不需要网络**的定向探针，它证的是「判据改对了」，**不是**「整套在 Linux 绿」——别把这条
+  读成后者。
+- `npm ci` 给 `quality` job 多加了约 20–40 秒（`cache-dependency-path` 仍只指 `web/package-lock.json`，
+  ts 客户端的 `node_modules` 没进缓存——**故意**：缓存键写错会静默复用脏依赖）。
+- 上传的 junit 是**唯一一份**产物（不含覆盖率 html）；想要覆盖率报告得另开一条。
+
+
+
 ## 2026-10-06（第六十五批：一条「跳过」的用例，在报告里长得像一次「成功」）
 
 > 入口：第六十四批的「已知限制」里，我把自己写的一句「CI 里每一步 `docker run` 都钉在 `@sha256:` 上」
