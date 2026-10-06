@@ -4,6 +4,92 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-06（第六十七批：镜像里那行 `|| npm install`，把「锁文件漂移」吞成了安静的另一种成功）
+
+### 现场
+第六十六批把 CI 的 `quality` job 修绿（本机范围内），收尾时按第六十六批新加的纪律做了一次**横切**：
+把仓里所有「把响亮失败变安静」的写法过一遍（`|| true` / `;` / `2>/dev/null` / `except: pass`）。
+三处中标，其中两处**不是问题**、一处是真缺陷：
+
+- `ci.yml` 里 `bandit ... || true`：**不是问题**。紧跟其后就是真门禁（`--severity-level medium` 必须 0
+  条），注释写明 Low 只记录不拦截。
+- `scripts/mutation.sh` 里 `mutmut run || true`：**不是问题**。注释写明退出码交给下面的分数门禁，
+  且另有反假绿的时间戳校验。
+- **`Dockerfile` 的 web-build 阶段**：`COPY web/package.json web/package-lock.json* ./` +
+  `RUN npm ci || npm install`——**没写理由，也没有任何后置检测**。
+
+这条回退的语义（本机实测、**不需要网络**）：锁文件与 `package.json` 不同步时 `npm ci` 退出码 **1**
+并打印 `npm ci can only install packages when your package.json and package-lock.json or
+npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.`；
+而 `|| npm install` 恰好把这个 1 变成 0 ⇒ 镜像里装进**从没被任何人看过**的版本，而 CI 的
+前端门禁用的是**严格 `npm ci`**（`ci.yml` 的 web 门禁：「npm ci + typecheck + vitest coverage
++ build + playwright e2e」）⇒ **门禁测过的镜像 ≠ 交付的镜像**。
+
+「registry 不通时靠 `npm install` 兜底」这个理由是假的：**registry 不通时两者都失败**。
+而实测当前 `web/` 的锁是同步的（`npm ci --dry-run` → RC=0，`up to date`）⇒ 这条回退今天是**死代码**，
+它**唯一**的真实效果就是在将来掩盖一次锁文件漂移。
+同一行的第二个口子一起堵：`package-lock.json*` 让锁文件**可选**——锁文件真缺失时 `COPY` 不报错、
+而是少拷一个文件，正好嗂给上面那条回退。
+
+⚠️ **本批原定主题不是这个**。原计划是把 CI 的 Node 20 改成 22（“前端依赖要 >=22 而门禁跑 20”），
+两个硬检查把它否定了：① `web/package.json` 与 `ts/mcp-client/package.json` **都没有 `engines`**
+（写 `"node": ">=22"` 的是装进来的 devDependency `@testing-library/jest-dom@7.0.1`）；
+② 门禁并非“不碰前端”——`ci.yml` 的 web 门禁已完整（见上）。
+⇒ “20 改 22”**不改变任何失败模式**（只改一行字面量），按本仓判据**不做**，主题换成上面那条。
+
+### 改了什么
+1. **`Dockerfile`**：`COPY web/package.json web/package-lock.json ./`（**去掉可选通配**）+ `RUN npm ci`
+   （**去掉 `|| npm install`**），并把“为何不留回退”当场写在行上方（含这条回退在哪个环境下为假）。
+2. **`tests/test_dockerfile_install_fail_closed.py`（新，12 条）**：静态判据两条——依赖安装行必须
+   **恰好**是 `npm ci`（不许 `||` / `;` / `&&` 串第二条安装，不许用短名 `npm i`）；拷清单的 `COPY`
+   必须**点名** `web/package-lock.json`、不许带 `*`。**含负面对照**：拿**合成的坏 Dockerfile**
+   自检扫描器（9 种坏写法逐条必须被抓到），以及“注释里提到坏写法不算违规”的对照——
+   因为**真文件里就写着“不许 `|| npm install`”的理由**。
+3. `README.md` 容器层那条、`docs/复核索引.md` §7 新增一行、本文件——三处口径入册。
+
+### 验证
+- `python -m ruff check .` → `All checks passed!`（含新守卫）。
+- 新守卫：`python -m pytest -q tests/test_dockerfile_install_fail_closed.py` → **12 passed**。
+- **端到端证伪**（不只跑正面）：备份改好的 `Dockerfile` → `git show HEAD:Dockerfile` 把**旧写法
+  放回工作区** → 守卫**红**且正好点名 2 条（`RUN npm ci || npm install` 与
+  `COPY web/package.json web/package-lock.json* ./`）→ 还原后 `diff -q` **逐字节相同** → 再绿。
+- 全量（**带冻结点**）：跑前/跑后各取一次 `git write-tree`，两次都是 `a4a7bfa333d05639dab5b1a917aafc37ed0725db`
+  ⇒ **FREEZE_OK**（该冻结点上的 `HEAD` 是第六十六批的 `db2cdeb`，本批改动当时还没提交）：
+  带真 PG → junit `tests=1767 failures=0 errors=0 skipped=4`、**1763 passed / 4 skipped / 0 failed**（525.11 秒）、
+  覆盖 **90.31%**（门槛 86%）；`ruff check .` = All checks passed；本批新守卫 12 passed；
+  `mypy src/warden_agent` = Success（115 files，**本批脚本已修正成 CI 的真实命令**）。
+  ⚠️ 「无 PG」口径**本批没重测**（仍是第六十五批实测的 1709 / 44），见《复核索引》§2。
+  ⚠️ **冻结树与本提交的树只差文档**（回填这些数字 + 补记教训 4）：提交前又跑了一遍
+  `tests/test_changelog_structure.py` + `tests/test_skipped_tests.py`（19 passed）、本批新守卫（12 passed）
+  与 `ruff check .`（All checks passed）——数字与代码属同一个树（`a4a7bfa3`），只把台账补实了。
+
+### 验收
+本批的验收线同上批：**CI 自己的 `quality` job 绿**。⚠️ 第六十六批与本批的提交**都还没推上去**
+（本机代理 `127.0.0.1:7897` 无监听、直连 github 超时），两批**共用一次** CI 验收。
+
+### 这批我自己也错过
+1. **原定主题的前提是假的**：我没先核 `web/package.json` 有没有 `engines` 就定了主题，两个硬检查一查就塌。
+   教训：**主题落地前先把它的前提当断言验一遍**。
+2. 新守卫第一版有 **3 处 E501**，是 `ruff check .` 才抳到的（第六十五批⑥、第六十六批①同源：
+   **先跑 CI 那几步再报绿**； pytest 全绿不等于门禁绿）。
+3. 为了判断“依赖要 >=22 而门禁跑 20”是警告还是硬错误，我去读 `.npmrc` 找 `engine-strict`，
+   **被安全规则拦下**（`secret.basename.npmrc`）——**没有绕过**。正确次序本该是先问“仓库里有没有人设过它”
+   （全仓搜索：**没有任何地方设过 `engine-strict`** ⇒ npm 默认是**警告**），而不是去读一个可能含凭据的文件。
+4. **我自己的证据脚本里 mypy 那一步的路径是错的**：写的是 `mypy warden_agent`（不存在的路径），
+   CI 的真实命令是 `ci.yml:136` 的 `mypy src/warden_agent`——它**响亮地报错**（rc=2），而我在第六十六批
+   仍写了「mypy ✓ 115 文件」，因为那个数字来自**更早另一次未冻结的跑**（`bb9cd6c8c`）。
+   事实为真、**证据错位**：第六十六批台账里这一格不算验过（本批把两个脚本都修了，并在
+   《复核索引》§2 顶部写了这条规矩）。教训：**「门禁绿」是那几步的合取，我自己写的证据脚本也是**——
+   一步写错，那一步要么假绿、要么假红，而**它看起来和真的一样**。
+
+### 已知限制（说实话）
+- 新守卫是**静态**的：**不跑** `docker build`（门禁不该依赖 docker 引擎的可用性）。真构建由 `ci.yml` 的
+  `container` / `sbom` / `publish` 三个 job 覆盖。
+- 本批只堵了**声明侧**（不许回退 + 锁文件必需）；**没有**在镜像里加 `npm ls` / `node -e` 自检，
+  **也没有**逐包比对镜像里的 `node_modules` 与锁文件。
+- `engine-strict` 那一项按“**未验明**”入册（结论方向：npm 默认警告），**没有**当结论写。
+
+---
 ## 2026-10-06（第六十六批：我把 CI 说成绿的，而 `quality` 已经在 GitHub 上红了两小时）
 
 ### 现场
@@ -67,6 +153,9 @@
    `### ` 标题），看上去「像我刚写的新守卫红了」，我差点据此去查自己的守卫。
    真因是**快照不一致**，不是代码。权威全量因此重跑一遍，并加上了冻结点证据（跑前/跑后各取一次
    `git write-tree`，两人相等才允许引用数字）。
+⑦ （**第六十七批补记**）本批「mypy ✓ 115 文件」那一格**证据不成立**：数字来自更早一次未冻结的跑
+   （`bb9cd6c8c`），而本批冻结点上那个 mypy 步跑的是 `mypy warden_agent`（不存在的路径；CI 真命令是
+   `mypy src/warden_agent`），rc=2。事实为真、**证据错位**。详见第六十七批教训 4。
 
 ### 验证
 - **权威全量（冻结点 `e00fbc9dbfc67a8fa0732e9fb69953ad838ea957`，HEAD `6ff0361e`）**：

@@ -26,8 +26,20 @@
 FROM node:20-slim AS web-build
 WORKDIR /build
 # 先拷锁文件装依赖（利用 Docker 层缓存）
-COPY web/package.json web/package-lock.json* ./
-RUN npm ci || npm install
+# 锁文件**不是可选的**（不再用 `package-lock.json*` 那个可选通配）：锁文件缺失必须在**构建期**
+#   立刻暴露成「文件找不到」，而不是悄悄退化成 `npm install` 重新解析一遍版本。
+COPY web/package.json web/package-lock.json ./
+# 只用 `npm ci`，**不留** `|| npm install` 回退（第六十七批）：那条回退能把一条**响亮失败**
+#   吞成**安静的另一种成功**——`npm ci` 在锁文件与 package.json 不同步时退出码 **1** 并打印
+#   「`npm ci` can only install packages when your package.json and package-lock.json or
+#   npm-shrinkwrap.json are in sync. Please update your lock file with `npm install`
+#   before continuing.」（本机实测，不需网络）；而 `|| npm install` 恰好把这个 1 变成 0
+#   ⇒ 镜像里装进**从没被任何人看过**的版本，与 CI 前端门禁（用的是严格 `npm ci`）测过的
+#   **不是同一批**——而本文件开头刚写过「构建/发布可复现」。
+#   「registry 不通时靠 `npm install` 兜底」是假的：registry 不通时两者都失败；
+#   这条回退唯一的真实效果就是掩盖锁文件漂移。
+#   盯住这两点的是 `tests/test_dockerfile_install_fail_closed.py`（含负面对照：它必须真能红）。
+RUN npm ci
 # 再拷源码构建
 COPY web/ ./
 RUN npm run build

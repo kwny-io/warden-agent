@@ -52,7 +52,7 @@
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——1755 项测试（2026-10-06 第六十六批实测：带真 PG **1751 passed / 4 skipped / 0 failed / 0 errors**，531.82 秒，跑前跑后树哈希相同=冻结点 `e00fbc9d`；无 PG **1709 passed / 44 skipped** 是第六十五批实测、本批未重测）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——**1767 项测试**（2026-10-06 第六十七批实测：带真 PG **1763 passed / 4 skipped / 0 failed / 0 errors**，525.11 秒，跑前跑后树哈希相同=冻结点 `a4a7bfa3`；无 PG **1709 passed / 44 skipped** 是第六十五批实测、后两批都未重测）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -103,6 +103,8 @@
   单副本走进程内（默认，零延迟），多副本设 `WARDEN_SHARED_STATE=1` + PostgreSQL 即放进共享存储，
   幂等、事件流、限额**全局一致**；恢复工作进程（`runtime/worker.py`）负责把崩溃的 Run 真正续跑
 - **容器层**：`Dockerfile` 多阶段构建 + **非 root 运行** + `HEALTHCHECK`；
+  **依赖安装 fail-closed**：只跑 `npm ci`、锁文件必需（不许可选通配、不留 `|| npm install` 回退，
+  否则锁文件漂移会被吞成“装上了另一套版本”而镜像照常构建成功，见 `tests/test_dockerfile_install_fail_closed.py`）；
   `docker-compose.yml` 里 `read_only` / `cap_drop: ALL` / `no-new-privileges` / 只发布到回环
 - **浏览器层（安全响应头）**：所有响应（*含 404/401/500 与 SSE*）带
   `Content-Security-Policy`（默认全禁再逐项开口：`script-src 'self'`、`object-src 'none'`、
@@ -588,12 +590,12 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**0 项失败**（共 1755 项收集，2026-10-06 第六十六批实测，`--junitxml` 口径；junit 原文 `tests=1755 failures=0 errors=0 skipped=4`）。**全量数字必须带冻结点**：跑前/跑后各取一次 `git write-tree`（先 `git add -A`），两次相等才允许引用（第六十六批教训⑥：在全量跑的 9 分 15 秒里改了树，于是报出 2 条**没人写过的红**）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
-  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1751 passed / 4 skipped / 0 failed / 0 errors**（531.82 秒，覆盖 90.31%；冻结点 `e00fbc9dbfc67a8fa0732e9fb69953ad838ea957`）；
-  无 PG（**docker 引擎在跑**、只把容器 `docker stop` 掉即此口径）→ **1709 passed / 44 skipped / 0 failed / 0 errors**（537.9 秒；多跳的 40 条是需要真库的用例）【第六十五批实测，本批未重测】。
+- **测试**：**0 项失败**（共 **1767** 项收集，2026-10-06 第六十七批实测，`--junitxml` 口径；junit 原文 `tests=1767 failures=0 skipped=4`）。**全量数字必须带冻结点**：跑前/跑后各取一次 `git write-tree`（先 `git add -A`），两次相等才允许引用（第六十六批教训⑥：在全量跑的 9 分 15 秒里改了树，于是报出 2 条**没人写过的红**）。**而且证据脚本里每一步都要按 CI 的真实命令写**（第六十七批教训④：脚本里 mypy 那一步写错成 `mypy warden_agent`（不存的路径），CI 的真实命令是 `ci.yml:136` 的 `mypy src/warden_agent`；它响亮地报了 rc=2，但我上一批把这个数字记成了“已验证”——事实为真、证据错位）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
+  带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1763 passed / 4 skipped / 0 failed / 0 errors**（525.11 秒，覆盖 90.31%；冻结点 `a4a7bfa333d05639dab5b1a917aafc37ed0725db`）；
+  无 PG（**docker 引擎在跑**、只把容器 `docker stop` 掉即此口径）→ **1709 passed / 44 skipped / 0 failed / 0 errors**（537.9 秒；多跳的 40 条是需要真库的用例）【第六十五批实测，此后两批均未重测】。
   **跳过不是「没事」**：每条被跳过的用例都得在 `tests/SKIP_LEDGER.yaml` 里有**签字**（`scripts/check_skipped_tests.py` 读 junit 逐条核），未签字=红；签了 `allowed_in: [local]` 的条目＝一条承诺「**CI 里必须真跑**」，在 CI 里被跳也会红（本批四个方向真跑过：两份 junit × 本地 / `CI=true` 口径）。**签字只能按 CI 的观察写**（第六十六批教训：台账若用**本机** junit 建，就对 CI 是瞎的——本机装着 `ts/mcp-client/node_modules` 时那 4 条真实 MCP 用例在本机跑、在 CI 却每天跳），所以 workflow 把 CI 的 junit 传成 `pytest-junit` 产物（`if: always()`），本地复核用 `gh run download <run-id> -n pytest-junit -D /tmp/ci-junit` 拿 **CI 的真数据**喂给守卫，不必重跑测试。
   ⚠️ 想让本地指标落到「无 PG 口径」有两种做法：`docker stop warden-pg-test`，或把 `WARDEN_TEST_PG_*` 里的端口指到一个没人监听的端口。**但这两种都别只凭“我设了环境变量”下结论——判口径永远看 `skipped` 是 4 还是 44。** 第五十二批在这里栽过：当时门控**不读端口**（只读 host/db/user/password），于是两次“双口径”其实**两次都是 PG 口径**（`skipped` 都是 4）；第五十二批把端口接上并加了守卫 `tests/test_config_surface.py::test_PG门控真的认环境变量里的端口`（子进程真探活，不是读源码文本）。
-  时间账：531.82 秒（第六十六批，带真 PG）/ 537.9 秒（第六十五批，无 PG）是同机实测；上一批（第六十四批）同口径是 614.96 秒 / 573.70 秒，第六十二批是 498.7 秒 / 562.5 秒，第五十三批是 228.8 秒 / 226.3 秒——**这不是性能回归，是两次跑的东西不一样**：本批两次都带了 `--cov=warden_agent`（覆盖率收集把总时间大致翻倍），第五十三批那两次没带。再往前第五十二批是 732 秒 / 578 秒，同一批改动的第一轮 637 秒——**差异全在同期本机在跑别的命令**，所以这里只报实测，**不拿它当性能回归结论**。
+  时间账：525.11 秒（第六十七批，带真 PG）/ 537.9 秒（第六十五批，无 PG）是同机实测；上一批（第六十六批）同口径是 531.82 秒，第六十四批是 614.96 秒 / 573.70 秒，第六十二批是 498.7 秒 / 562.5 秒，第五十三批是 228.8 秒 / 226.3 秒——**这不是性能回归，是两次跑的东西不一样**：近几批两次都带了 `--cov=warden_agent`（覆盖率收集把总时间大致翻倍），第五十三批那两次没带。再往前第五十二批是 732 秒 / 578 秒，同一批改动的第一轮 637 秒——**差异全在同期本机在跑别的命令**，所以这里只报实测，**不拿它当性能回归结论**。
   带真 PG 时剩下的 4 条跳过**全是平台/工具链限制、与 PG 无关**：本机 PATH 没 `pg_dump`/`pg_restore`（PG 备份端到端）、win32 建不了符号链接（2 条）、win32 无内核隔离原语；其余按环境跳过的还有未构建前端时的 SPA、**没装 ts 客户端依赖时的 MCP**（`ci.yml` 已补 `npm ci --prefix ts/mcp-client` 那一步，所以这 4 条真实 MCP 集成用例在 CI 里**不再跳过**：第六十六批之前它们每天都在 CI 里跳、CI 每天绿）。
   覆盖率门槛 **86%**（`[tool.coverage.report] fail_under = 86`）：2026-10-06 第六十五批复测 **带真 PG 90.31% / 无 PG 87.08%**（未变）
   （语句 10644 / 分支 2660）——**两者都过闸，而无 PG 是最差情况、余量只剩 1.08 个点**；
