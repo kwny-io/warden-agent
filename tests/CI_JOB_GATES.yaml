@@ -99,4 +99,8 @@ step_gates:
       API 看不出来，只有日志里的 `##[notice]` 能作证——job `112628616387` 第 202 行）。
       第七十批加入签字 + 回执后：没签字 ⇒ 这一步直接红（已用从 `ci.yml` 抽出的脚本在本地跑通两个分支：
       `ALLOW_EVAL_SKIP=1` 下 RC=0 并产出回执 + 写入 step summary；开关置空下 RC=1 且**不**产回执）；
-      签字 ⇒ 绿，但必须带 `eval-skip-receipt` artifact（待一次真 run 复核）。
+      签字 ⇒ 绿，但必须带 `eval-skip-receipt` artifact。
+      **已复核（第七十批，push run 37583001400 @ 14dc3a03）**：为什么还绿 = 因为写了 `ALLOW_EVAL_SKIP=1` 并产出了回执；
+      该 step 结论 success 且 artifact 列表里确实有 `eval-skip-receipt`（461 B，内部含 `run_id`/`sha`/`event`
+      ⇒ 回执与它所属的 run 对得上）；同一 run 里 `quality`/`security`/`sbom`/`migration`/`container` success，
+      `image-signing` / `变异测试` 按各自门控 skipped。

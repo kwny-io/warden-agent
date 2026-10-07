@@ -25,7 +25,7 @@ fi
 于是"今天到底跑没跑真实评测"只以一行 notice 日志的形式存在：**结论列、失败数、覆盖率、junit 全都看不出来**。这不是本仓的 bug，是平台没这一层事实 ⇒ 只能自己造证据。**假设错了就是设计歪了**，所以这一批从"再验一次"开始。
 
 ### 改了什么（本批零行 `src/`）
-1. `.github/workflows/ci.yml` 的 `evals-real`：步骤改名并加 `id: eval`；该步骤 `env:` 新增签字开关 `ALLOW_EVAL_SKIP: "1"`；缺 key 时**先看签字**——未签字 ⇒ `::error::` + `exit 1`（缺席必须被显式放弃，不能被动发生）；签字跳过 ⇒ `skipped=true` 写进 `$GITHUB_OUTPUT`、写回执 `$RUNNER_TEMP/eval-skip-receipt.json`（reason/commit/run_url）、并在 step summary 里写明「有它 ⇔ 真评测没跑」；并新增 `actions/upload-artifact`，`name: eval-skip-receipt`，**`if: steps.eval.outputs.skipped == 'true'`**。
+1. `.github/workflows/ci.yml` 的 `evals-real`：步骤改名并加 `id: eval`；该步骤 `env:` 新增签字开关 `ALLOW_EVAL_SKIP: "1"`；缺 key 时**先看签字**——未签字 ⇒ `::error::` + `exit 1`（缺席必须被显式放弃，不能被动发生）；签字跳过 ⇒ `skipped=true` 写进 `$GITHUB_OUTPUT`、在**仓库根**写回执 `eval-skip-receipt.json`（字段 `skipped`/`job`/`step`/`reason`/`signed_by`/`repo`/`run_id`/`sha`/`event`——全部取自 `GITHUB_*` 环境变量，所以回执**不可能对错行**）、并在 step summary 里写明「有它 ⇔ 真评测没跑」；并新增 `actions/upload-artifact`，`name: eval-skip-receipt`，**`if: steps.eval.outputs.skipped == 'true'`**。
 2. `tests/CI_JOB_GATES.yaml` 新增 `step_gates:` 段（workflow / job / step / skip_when / allow_flag / receipt_artifact / notice / how_to_really_run / added / evidence），首条即 `ci.yml:evals-real:模型质量评测（--mode real）`。
 3. `tests/test_ci_job_gates.py` 新增 6 条 step 级守卫（全文件 12 passed）：字段写全 / job+step 真实存在 / 签字开关真的在 `env:` 且脚本真的判断它 / 回执 artifact 真的被**条件**上传 / notice 字样真的在 workflow 里 / **workflow 里新出现的静默跳（同一 step 内 `::notice::` + `exit 0`）未登记就红**。
 4. 回执的**双向**性：有回执 = 跳过；**无回执 + success = 真跑**（真跑时回执文件根本不存在，条件上传自然跳过）。
@@ -35,13 +35,7 @@ fi
 - 用例数对账（两个独立口径）：`1782 → 1789`（**+7**）= 本批 6 条 step 级守卫（`tests/test_ci_job_gates.py` 函数 `6 → 12`）+ 1 条第六十九批的守卫 `test_真跑命令把必需入参带齐`——它随提交 `108b348` 落盘，但那次 run 在 lint 那关就红了，所以它的**首次全量执行**其实是本批这次冻结。
 - 真实 shell 两条分支（跑的就是 `ci.yml` 里那一段脚本）：无 key + `ALLOW_EVAL_SKIP=1` ⇒ `exit 0` + 回执 + step summary；无 key + 无签字 ⇒ `::error::` + `exit 1` + **没有**回执。
 - 变异矩阵（`C:/Users/g1534/wa70/mut70.py`，8 条守卫逐个撞红、跑完按内容还原并校验字节一致）：**8/8 都真会红**，每条打印 rc 与第一条断言（台账缺字段 / step 名不存在 / 删 `env` 里的开关 / 脚本不再判断开关 / 回执步骤改名 / 回执去掉 `if:` / notice 文案不符 / 新增未登记的静默跳）。
-- CI 证据：`docs/复核索引.md` 同一行（push run 的 `evals-real` 结论 + artifact 列表里有没有 `eval-skip-receipt`）。
-
-真实 shell 分支复现（本机，跑的就是那一段脚本）：无 key + `ALLOW_EVAL_SKIP=1` ⇒ `exit 0` + 回执 + step summary；无 key + 无签字 ⇒ `::error::` + `exit 1` + **没有**回执。
-
-变异矩阵（`C:/Users/g1534/wa70/mut70.py`，8 条守卫逐个撞红并校验还原字节一致）：**8/8 都真会红**，且每条打印 rc 与第一条断言（台账缺字段 / step 名不存在 / 删 `env` 里的开关 / 脚本不再判断开关 / 回执步骤改名 / 回执去掉 `if:` / notice 文案不符 / 新增未登记的静默跳）。
-
-CI 证据：跑在同一个 sha 上的 run（见 `docs/复核索引.md` 对应行）——`evals-real` 仍是 `success`，但现在**要么**有 `eval-skip-receipt` artifact（= 跳过，已签字），**要么**没回执（= 真的跑了评测）。
+- **CI 实测（本批交付面证据）**：提交 `14dc3a03`（树 `332a2d82`）推送后 run **`37583001400`** = `success`（`event=push`；远端 sha 用 `gh api repos/kwny-io/warden-agent/branches/dev` 核准，`local == remote`）；`gh run view 37583001400 --json jobs` 里 `evals-real` 的 step 是 `success 模型质量评测（--mode real）` + `success 跳过回执（只在跳过分支产生；有它 ⇔ 真实评测没跑）`。artifact 列表里**确实有** `eval-skip-receipt`（461 B）——`gh run download 37583001400 -n eval-skip-receipt` 拿到的 `eval-skip-receipt.json`（artifact 里是 `indent=2` 多行，这里排成一行）：`{"skipped": true, "job": "evals-real", "step": "模型质量评测（--mode real）", "reason": "DEEPSEEK_API_KEY 未配置，且 ALLOW_EVAL_SKIP=1（已签字）", "signed_by": "ci.yml 里的 ALLOW_EVAL_SKIP（=1）", "repo": "kwny-io/warden-agent", "run_id": "37583001400", "sha": "14dc3a033c7955ba7a8a6fbd3b66af36c8bc3ff5", "event": "push"}` ⇒ 一个月后翻记录的人不再只能读日志：**用 run id + sha 就能验「这次到底跑没跑」**——有回执 = 跳过（谁签的字写在里面），没回执 = 评测真跑了。同一次 run 的其余 job：`quality`/`security`/`sbom`/`migration`/`container` 全 `success`；`image-signing` 与 `变异测试（${{ matrix.shard }}）` 按 `if:` **skipped**（后者 `if: schedule || workflow_dispatch`，`ci.yml:320`；跳过时 job 名连矩阵都不展开，所以在列表里长成模板原文——那是 GitHub 的显示方式，不是缺陷）。
 
 ### 教训
 1. **假设必须实测**：我以为"step 级也是 `skipped`"，实测是 `success`；假设写进设计，整条门就会歪。
