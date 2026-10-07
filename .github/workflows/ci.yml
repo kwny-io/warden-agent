@@ -425,15 +425,63 @@ jobs:
       - name: Install (按 uv.lock 固定版本)
         run: uv sync --frozen
       - name: 模型质量评测（--mode real）
+        id: eval
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # 签字开关：只在“没 key”这个事实发生时才有意义。它不是“跳过就算验过”，
+          # 而是把默认行为从“静默绿”改成“要么红、要么一次显式签字”。
+          # 为什么写在 workflow 里而不是仓库变量：可 diff、可 review、守卫断言得到、本地 clone 能复现。
+          ALLOW_EVAL_SKIP: "1"
         run: |
           if [ -z "$DEEPSEEK_API_KEY" ]; then
-            echo "::notice::未配置 DEEPSEEK_API_KEY → 跳过真实模型质量评测（既不失败，也不算跑过）"
+            if [ "$ALLOW_EVAL_SKIP" != "1" ]; then
+              echo "::error::没有 DEEPSEEK_API_KEY，也没有签字（ALLOW_EVAL_SKIP != 1）——真实模型质量评测**没有跑**"
+              echo "::error::要么配好仓库 secret DEEPSEEK_API_KEY，要么在 ci.yml 里显式写下 ALLOW_EVAL_SKIP: \"1\" 表示接受跳过。"
+              exit 1
+            fi
+            echo "::notice::未配置 DEEPSEEK_API_KEY，且已签字（ALLOW_EVAL_SKIP=1）→ 跳过真实模型质量评测（既不失败，也不算跑过）"
+            {
+              echo "### 真实模型质量评测：**未运行**"
+              echo
+              echo "原因：仓库未配置 \`DEEPSEEK_API_KEY\`；本次按 \`ALLOW_EVAL_SKIP=1\` 签字跳过。"
+              echo "证据：本次 run 的 artifact \`eval-skip-receipt\`（**有它 ⇔ 真评测没跑**）。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY'
+          import json, os, pathlib
+          pathlib.Path("eval-skip-receipt.json").write_text(
+              json.dumps(
+                  {
+                      "skipped": True,
+                      "job": "evals-real",
+                      "step": "模型质量评测（--mode real）",
+                      "reason": "DEEPSEEK_API_KEY 未配置，且 ALLOW_EVAL_SKIP=1（已签字）",
+                      "signed_by": "ci.yml 里的 ALLOW_EVAL_SKIP（=1）",
+                      "repo": os.environ.get("GITHUB_REPOSITORY"),
+                      "run_id": os.environ.get("GITHUB_RUN_ID"),
+                      "sha": os.environ.get("GITHUB_SHA"),
+                      "event": os.environ.get("GITHUB_EVENT_NAME"),
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # 退码 1 = 低于阈值（真门禁）；退码 2 = 环境/参数问题（含"忘了配 key"）
           uv run --frozen python -m warden_agent.evals --mode real --min-pass-rate 0.6 --detail
+
+      - name: 跳过回执（只在跳过分支产生；有它 ⇔ 真实评测没跑）
+        if: steps.eval.outputs.skipped == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: eval-skip-receipt
+          path: eval-skip-receipt.json
+          if-no-files-found: error
+          retention-days: 30
 
   image-signing:
     # 交付面缺口 item 5：镜像签名（先 push GHCR，再签）。

@@ -19,6 +19,12 @@
      ⇒ 手动真跑的命令**根本跑不动**（`HTTP 422: Required input 'tag' not provided`）。
      而第 4 条只断言它以 `gh workflow run` 开头 ⇒ **钉在文字上的判据不会红**，
      正是这个台账要治的病。
+  6.（第七十批）**step 级跳过**（`step_gates:` 段）：workflow 里某个 step **内部**自己 `exit 0` 时，
+     run 结论与「真跑了」一模一样（step 级 conclusion 同样是 `success`，平台事实，
+     实测于 run 37570764622）⇒ 这一层只能靠四个钉子：登记（skip_when / how_to_really_run）、
+     签字开关（allow_flag）、回执 artifact（receipt_artifact）、notice 字样；
+     外加一条自动撞红：
+     `ci.yml` 里再出现新的静默跳却未登记 ⇒ 红。
 """
 
 from __future__ import annotations
@@ -158,3 +164,165 @@ def test_真跑命令把必需入参带齐() -> None:
                 f"等于这条「怎么真跑」抄不动）：{cmd!r}"
             )
     assert not bad, "\n".join(bad)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# step 级跳过（第七十批）：**run 结论看不见它**，所以只能靠「登记 + 签字 + 回执」。
+# 平台事实（实测）：step 内部自己 `exit 0` 的跳过，step 级 conclusion 仍是 `success`；
+# 只有整个 job 被 `if:` 跳过才是 `skipped`。⇒ 这一层不能靠 API，必须靠台账与 artifact。
+
+
+def _step_scripts(workflow: str) -> list[tuple[str, str, str]]:
+    """[(job, step 名, 脚本文本)]：workflow 里所有带 `run:` 的步骤。"""
+    data: Any = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8")) or {}
+    out: list[tuple[str, str, str]] = []
+    for job_name, job in (data.get("jobs") or {}).items():
+        for step in (job or {}).get("steps") or []:
+            script = step.get("run")
+            if isinstance(script, str) and script.strip():
+                out.append((str(job_name), str(step.get("name") or ""), script))
+    return out
+
+
+def _steps_of(workflow: str) -> list[tuple[str, dict[str, Any]]]:
+    """[(job, step dict)]：用于查 `uses:` / `with:` / `env:`。"""
+    data: Any = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8")) or {}
+    out: list[tuple[str, dict[str, Any]]] = []
+    for job_name, job in (data.get("jobs") or {}).items():
+        for step in (job or {}).get("steps") or []:
+            if isinstance(step, dict):
+                out.append((str(job_name), step))
+    return out
+
+
+def _step_env(workflow: str, job: str, step: str) -> dict[str, Any]:
+    """某个具名步骤的 `env:`（没写就是空 dict）。"""
+    for j, s in _steps_of(workflow):
+        if j == job and str(s.get("name") or "") == step:
+            return dict(s.get("env") or {})
+    return {}
+
+
+def _step_ledger() -> list[dict[str, Any]]:
+    raw: Any = yaml.safe_load(LEDGER.read_text(encoding="utf-8")) or {}
+    entries = raw.get("step_gates") or []
+    assert entries, "`step_gates:` 是空的——空台账会让下面每条断言都变成永真"
+    return entries
+
+
+def test_step_级台账每条都写全了() -> None:
+    for entry in _step_ledger():
+        where = f"{entry.get('workflow')}:{entry.get('job')}:{entry.get('step')}"
+        for key in (
+            "workflow",
+            "job",
+            "step",
+            "skip_when",
+            "allow_flag",
+            "receipt_artifact",
+            "notice",
+            "how_to_really_run",
+            "added",
+            "evidence",
+        ):
+            assert entry.get(key), f"{where} 缺 {key}"
+        assert len(str(entry["skip_when"]).strip()) >= 20, f"{where} 的 skip_when 太短"
+        assert len(str(entry["evidence"]).strip()) >= 20, f"{where} 的 evidence 太短"
+
+
+def test_step_级条目指向的_job_与_step_真实存在() -> None:
+    bad: list[str] = []
+    for entry in _step_ledger():
+        wf, job, step = str(entry["workflow"]), str(entry["job"]), str(entry["step"])
+        steps = _step_scripts(wf)
+        if not any(j == job and s == step for j, s, _ in steps):
+            names = sorted({s for j, s, _ in steps if j == job})
+            bad.append(f"{wf}:{job} 里没有名为 {step!r} 的步骤（该 job 的 run 步骤：{names}）")
+    assert not bad, "\n".join(bad)
+
+
+def test_step_级的签字开关在_workflow_里真被用到() -> None:
+    """`allow_flag` 不能只是个名字：必须在该 step 的 `env:` 里显式给出，
+    且脚本里真的拿它做判断。"""
+    bad: list[str] = []
+    for entry in _step_ledger():
+        wf = str(entry["workflow"])
+        job = str(entry["job"])
+        step = str(entry["step"])
+        flag = str(entry["allow_flag"])
+        script = {s: sc for j, s, sc in _step_scripts(wf) if j == job}.get(step, "")
+        env = _step_env(wf, job, step)
+        if flag not in env:
+            bad.append(
+                f"{wf}:{job}:{step} 的 env 里没有 `{flag}`"
+                "（签字开关必须写在 workflow 里：可 diff、可 review、守卫断言得到）"
+            )
+        if f"${flag}" not in script:
+            bad.append(f"{wf}:{job}:{step} 的脚本里没有 `${flag}` 判断——签字开关没被真正使用")
+    assert not bad, "\n".join(bad)
+
+
+def test_step_级跳过必须产出回执_artifact_且上传是有条件的() -> None:
+    """回执是“有它 ⇔ 那一步没跑”的双向证据：既要有上传步骤，且**必须带 `if:`**
+    （无条件上传会在“真跑了”的场合也试图上传不存在的文件，那个⇔就断了）。"""
+    bad: list[str] = []
+    for entry in _step_ledger():
+        wf = str(entry["workflow"])
+        name = str(entry["receipt_artifact"])
+        uploads = [
+            step
+            for _, step in _steps_of(wf)
+            if str(step.get("uses", "")).startswith("actions/upload-artifact")
+            and str((step.get("with") or {}).get("name") or "") == name
+        ]
+        if not uploads:
+            names = sorted(
+                str((s.get("with") or {}).get("name") or "")
+                for _, s in _steps_of(wf)
+                if str(s.get("uses", "")).startswith("actions/upload-artifact")
+            )
+            bad.append(
+                f"{wf} 声明跳过时产出 artifact `{name}`，但 workflow 里没有上传它的步骤"
+                f"（已见 upload-artifact 的 name：{names}）"
+            )
+            continue
+        for step in uploads:
+            if not str(step.get("if") or "").strip():
+                bad.append(
+                    f"{wf} 的 artifact `{name}` 上传步骤没有 `if:`——"
+                    "无条件上传会在“真跑了”的场合也去上传不存在的文件，回执就不再是双向证据"
+                )
+    assert not bad, "\n".join(bad)
+
+
+def test_step_级跳过的_notice_字样还在_workflow_里() -> None:
+    """notice 是“人看的那一层”（日志里的 `##[notice]`）。它被改掉 ⇒ 台账要跟着走。"""
+    bad: list[str] = []
+    for entry in _step_ledger():
+        wf = str(entry["workflow"])
+        needle = str(entry["notice"])
+        if needle not in (WORKFLOWS / wf).read_text(encoding="utf-8"):
+            bad.append(f"{wf} 里找不到 notice 字样 {needle!r}")
+    assert not bad, "\n".join(bad)
+
+
+def test_workflow_里的静默跳过都被登记了() -> None:
+    """新增一处“step 内部自己决定不跑”（形如 `::notice::` + `exit 0`）而未登记 ⇒ 红。
+
+    这是 job 级规则 1 在 step 层的对应物：光靠“记得来登记”是治不住新洞的。
+    """
+    registered = {
+        (str(e["workflow"]), str(e["job"]), str(e["step"])) for e in _step_ledger()
+    }
+    unregistered: list[str] = []
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        for job, step, script in _step_scripts(path.name):
+            silent = ("::notice::" in script or "::warning::" in script) and "exit 0" in script
+            if silent and (path.name, job, step) not in registered:
+                unregistered.append(f"{path.name}:{job}:{step}")
+    assert not unregistered, (
+        "这些 step 里有「看起来成功、其实跳过了」的分支，但没在 step_gates 里登记：\n"
+        + "\n".join(f"  {x}" for x in sorted(unregistered))
+        + "\n（step 级结论在 run 里**看不出来**，所以必须登记："
+        "skip_when / allow_flag / receipt_artifact / notice）"
+    )
