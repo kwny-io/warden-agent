@@ -175,6 +175,13 @@ jobs:
         # 和“备份时真跑的那个”是两回事（第六十四批实录）。
         # 判定逻辑在 scripts/check_pinned_images.py 里，本地同样能跑（不搞成“只能在 CI 里验”）。
         run: uv run --frozen python scripts/check_pinned_images.py
+      - name: Markdown 表格里的竖线（未转义会被 GFM 当分隔符）
+        # 为什么单独一条：这条失败模式的**静默**程度很高——`git diff` 里那一行完全正常，
+        # 而 GitHub 上它会被多切出格子，多余的格内容**直接不显示**。第七十二批实测：
+        # `README.md` 第 535 行（首页的功能表）就这样丢过两格，`docs/复核索引.md` 也丢过；
+        # 权威渲染器的行为（gfm 的 <table> 输出）写在 `scripts/check_md_tables.py` 的文档里。
+        # 不需要网络、不需要 docker；判定逻辑在脚本里，本地同样能跑。
+        run: uv run --frozen python scripts/check_md_tables.py
       - name: 断言 PostgreSQL 集成测试真的执行了（防静默跳过）
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
         # 副作用是——**如果 CI 里的 service 没连上，它们会静默跳过、CI 依然绿**，
