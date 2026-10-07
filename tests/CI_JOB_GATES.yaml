@@ -45,7 +45,7 @@ entries:
       周更 + 手动足够。代价必须写明白：push 上的绿灯**不含**它。
     run_it_now: gh workflow run ci.yml --ref dev -f tag=v0.1.0-rcNN   # tag 是必需入参，见文件头规则 3
     added: 2026-10-06
-    evidence: "run 37461282520（push：skipped）/ run 37464309137（dispatch：4 片全 success）"
+    evidence: "run 37461282520（push：skipped）/ run 37568118099（push：skipped；同一 run 里 6 个非门控 job 全 success）/ run 37464309137（dispatch：4 片全 success）"
 
   - workflow: ci.yml
     job: image-signing
@@ -63,4 +63,5 @@ entries:
       run 37461282520（push：skipped）/ run 37464309137（dispatch：红在「把 digest 钉进部署清单」，
       两个根因都在第六十九批修掉）/ run 37540647177（dispatch：**全绿**——真构建、真推 GHCR、
       真取回 registry 权威 digest、真 keyless 签名、用外部验证者约束独立校验、真钉 digest）：
+      run 37568118099（push：skipped，与 not_run_on 逐字一致；同一 run 里另外 6 个 job 全 success）——
       这条门已从「存在但从未运行」变成「跑过且通过」
