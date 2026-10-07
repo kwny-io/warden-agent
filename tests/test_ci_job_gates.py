@@ -14,9 +14,11 @@
   4. 每条必须写清 `why`、`not_run_on`、`run_it_now`（"怎么真跑一次"必须可复现，
      否则下一次想知道门控后面还活着没有，只能靠猜）；
   5. `run_it_now` 必须把 `workflow_dispatch` 的**必需入参**带齐（`-f tag=…`）。
-     第 5 条是第六十九批收尾补的：第一版两条 `run_it_now` 都写成 `gh workflow run ci.yml --ref dev`，
-     而 `inputs.tag` 是 `required: true` ⇒ 手动真跑的命令**根本跑不动**（`HTTP 422: Required input 'tag' not provided`）。
-     而第 4 条只断言它以 `gh workflow run` 开头 ⇒ **钉在文字上的判据不会红**，正是这个台账要治的病。
+     第 5 条是第六十九批收尾补的：第一版两条 `run_it_now` 都写成
+     `gh workflow run ci.yml --ref dev`，而 `inputs.tag` 是 `required: true`
+     ⇒ 手动真跑的命令**根本跑不动**（`HTTP 422: Required input 'tag' not provided`）。
+     而第 4 条只断言它以 `gh workflow run` 开头 ⇒ **钉在文字上的判据不会红**，
+     正是这个台账要治的病。
 """
 
 from __future__ import annotations
@@ -142,7 +144,8 @@ def test_真跑命令把必需入参带齐() -> None:
     现场：台账两条 `run_it_now` 都写成 `gh workflow run ci.yml --ref dev`，
     而 `ci.yml` 的 `workflow_dispatch.inputs.tag` 是 `required: true`
     （有意如此：不让分支名冒充版本号）⇒ 这两条命令**手动真跑时根本跑不动**。
-    判据钉在**机制**上：从 workflow 里读出 `required` 入参，再看 `run_it_now` 有没有带 `-f <name>=`。
+    判据钉在**机制**上：从 workflow 里读出 `required` 入参，
+    再看 `run_it_now` 有没有带 `-f <name>=`。
     """
     bad: list[str] = []
     for (wf, job), entry in sorted(_ledger().items()):
