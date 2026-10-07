@@ -41,7 +41,8 @@ gh api -X POST /markdown -f mode=gfm -f text='| a\\\\ | b | …'
 `cell_count_mismatch`（多的格在 GitHub 上被静默丢掉，实测）、`unreadable`（读不出来不能算通过）。
 - **退出码契约**：`0` 扫过且干净 / `1` 有缺陷 / `2` 启动失败。**空扫描必须红**：第一版写完后自问
 “如果 glob 打错了呢”——一个文件都没扫到时输出与“全干净”长得一模一样，只是这次缺席的是门禁自己。
-- **接进 CI（这一步才是要害）**：`.github/workflows/ci.yml` 的 `quality` 作业新增一步（在 ruff/mypy 之前）；
+- **接进 CI（这一步才是要害）**：`.github/workflows/ci.yml` 的 `quality` 作业新增一步，位置在
+**Pytest 与镜像引用检查之后**（第七十二批冻结时是 `ci.yml:178`；行号会随上文增删漂移，位置只认“之后”这句描述）；
 `tests/test_md_tables.py` 里一条守卫**断言 ci.yml 里真有这行命令** ⇒ 把门禁摘掉也会红。
 - `--paths` 供负面对照；显式排除 `.mimosa/`（本机 Agent 产物，CI 里不存在）——不排除的话
 “本机扫到的文件集”与 CI 不同 ⇒ 本机红、CI 绿（或反之），是最难查的一类不一致。
@@ -73,13 +74,28 @@ gh api -X POST /markdown -f mode=gfm -f text='| a\\\\ | b | …'
 不做列宽、对齐、表头重复这类风格判断——那些只影响观感，不影响“会不会渲染错”。
 2. 它只回答“渲染结果的格子数与作者写下的一样吗”，**不替你判断作者到底想不想让这一格出现**。
 3. `.mimosa/` 的排除是“本机与 CI 看到同一批文件”的要求，**不是仓库约定**（CI 里它不存在）。
-4. 本批的冻结点与提交树**差了文件**（逐字核对过）：`CHANGELOG.md`（本段）与
-`scripts/check_md_tables.py`（只改了一行 docstring 里写错的测试文件名 `test_md_tables_gate.py` →
-`test_md_tables.py`）；因此提交树上**补跑了**本批新门禁与所有读文档的守卫
-（`tests/test_md_tables.py`、`test_changelog_structure.py`、`test_config_surface.py`、`test_mutation_shards.py`），
-而不引“冻结数字对提交树也成立”这句话（除了这两文件，其余文件内容逐字节相同）。
+4. **冻结口径**（v3）：`git add -A` + `git write-tree`，并断言 `tree == HEAD^{tree}` 与新文件在树里
+   ⇒ **冻结树 == 提交树 `8863ce822a1d9d40a681a7fce3922bb5e748fb66`（逐字节相同，含本批两个新文件）**；
+   所以上面 §证据 里的数字对提交 `46e30da` **逐字成立**，不需要“补跑 / 只差某文件”这类声明。
+   前两版判据是错的，留在这里当反例：v1 用 `git stash create` 的 **commit** SHA——它含 author/committer
+   时间戳，隔几秒必然不同 ⇒ **假红**（实测跑前/跑后差 292 秒，而两次的 `tree` 相同），取 `^{tree}` 才是内容；
+   v2 的 `git stash create` **不含未跟踪文件** ⇒ 冻结树里根本没有本批新增的 `scripts/check_md_tables.py`
+   与 `tests/test_md_tables.py`，它只证明“已跟踪文件没变”，**盖不住交付面**；v1 还让每条 ❌ 只打印、
+   不进退出码（“✅ 全量绿”与“❌ 工作区变了”同屏而 rc=0 —— 只打印不过闸 = 没门禁）。
 5. 本批没动 `src/`（零行）；没引第三方 markdown lint（它报风格、不报“会不会渲染错”：
-会在“补齐空格”上给 200 条噪声，却漏掉“格数错位”）；没把索引里 34 张表重排/美化（只修会造成错位的那处）。
+   会在“补齐空格”上给 200 条噪声，却漏掉“格数错位”）；没把索引里 34 张表重排/美化（只修会造成错位的那处）。
+
+### 交付面核验（run 级，补记）
+- **run `37637714216`**（`event=push`、sha `46e30da`、`conclusion=success`）：按 **sha 认领**（不取“最近一条”），
+  `local == remote` 由 `gh api repos/kwny-io/warden-agent/branches/dev` **独立核准**（不用 git 的传输结果自证）。
+  作业：`sbom`/`quality`/`security`/`migration`/`evals-real`/`container` = `success`；
+  `image-signing` 与 `变异测试（${{ matrix.shard }}）` 按 `if:` skipped（`event=push` 下本就该跳）。
+- **本批门禁在 CI 里真的跑了**：`quality` 作业里那一步（显示名 `Markdown 表格里的竖线（未转义会被 GFM 当分隔符）`）
+  = `success`，位置在 `Pytest` / `上传 junit` / `K8s manifests 校验` / `交付/演练清单的镜像引用` **之后**（作业末尾）。
+- ⚠️ 提交 K 的**消息**被 amend 过一次：初版把这一步写成“（在 ruff/mypy 之前）”，**是假的**；
+  **树没变**（amend 前后 `git write-tree` 都是 `8863ce82…`）⇒ 上面的冻结证据对 `46e30da` 逐字成立。
+  教训：**“我把它加进 CI 了”与“它加在 CI 的什么位置”是两个断言，后者也要核**——位置错了意味着
+  它在 ruff/mypy/pytest 之前失败时，你先看到的是风格报错，看不到门禁的红。
 
 ---
 ## 2026-10-07（第七十一批：说好每周跑的那次体检，一次都没发生过——触发器本身也要“缺席要看得见”）
