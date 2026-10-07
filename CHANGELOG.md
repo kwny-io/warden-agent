@@ -65,7 +65,7 @@ schedule 触发器；`if:` 里提到 `schedule` 却从 `runs_on` 里划掉 ⇒ �
   矩阵在**冻结树上重跑一次**（基线 18 passed），跑完还原后 `git add -A && git write-tree` 仍等于冻结树 `bddd8a74…`
   ⇒ “没留下改动”也是逐字节验过的，不靠“我记得改回来了”。
 - `ruff check tests/test_ci_job_gates.py` → `All checks passed!`。
-- CI 实测（交付面证据，提交 K）：`{{CI_K}}`
+- CI 实测（交付面证据，提交 K）：推送后 run **`37602147893`** = `success`（`event=push`；远端 sha 用 `gh api repos/kwny-io/warden-agent/branches/dev` 独立核准 `local == remote`）。`gh run view 37602147893 --json jobs` 的作业结论：`quality`/`security`/`sbom`/`migration`/`container`/`evals-real` = `success`；`image-signing` 与 `变异测试（${{ matrix.shard }}）` 按 `if:` **skipped**——`event=push` 下本就该跳，而它们跳过的理由正是**自己声明过的 `schedule`** ⇒ 这次 run 本身就是本批结论的反向印证：「承诺每周跑」的那条 cron，从头到尾一次都没响过。artifact 三个（本批与上批同形，说明交付面没退）：`warden-agent-sbom`（327503 B）、`eval-skip-receipt`（461 B，`evals-real` 在 push 下仍走签字跳过）、`pytest-junit`（39792 B）。
 
 ### 教训
 1. **“写在配置里”和“真的会发生”是两件事。** 本批三层（job → step → trigger）是同一个病：
