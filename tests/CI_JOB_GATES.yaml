@@ -33,6 +33,19 @@
 #      签字开关叫什么（allow_flag）、跳过时产出哪个 artifact 当回执（receipt_artifact）、日志里必须出现什么字样（notice）”，
 #      由守卫断言它们都还活在 workflow 里；`ci.yml` 里任何 step 出现“静默跳过”形态而未登记 ⇒ 红。
 #
+#   5. **触发器级缺席也要签字**（第七十一批）：`on.schedule` 写在哪 **不等于** 它会响——GitHub 只从
+#      **默认分支** 上的 workflow 文件求值 `schedule`（平台文档原文：*This event will only trigger a
+#      workflow run if the workflow file exists on the default branch* / *Scheduled workflows will only
+#      run on the default branch*，
+#      https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows ）。
+#      本仓实测：cron `0 3 * * 1` 于 `2760bd6`（2026-09-22）加进 `dev` 的 `ci.yml`，而默认分支是 `master`
+#      （HEAD 停在 2026-09-07，`dev` 领先 122 提交），`master` 的 `ci.yml` 里 **没有** `schedule:`
+#      ⇒ 全仓 69 次 run 里 `event=schedule` **0 次**（应交火 2 次：2026-09-28 / 2026-10-05）。
+#      ⇒ 文件末尾的 `triggers:` 段：每个“我承诺它会自己响”的触发器都要登记 cron / 从哪个分支被求值
+#      （`evaluated_from`）/ 观察到过几次（`last_observed_fire`）/ 怎么验（`how_to_verify`）/
+#      什么时候必须回来复核（`review_by`，过期即红）；`last_observed_fire: never` 的条目还必须写
+#      `root_cause`（为什么没响）与 `unblock`（怎样才能响，含代价）。
+#
 # 怎么真跑（验证门控后面的东西到底还活着没有）：
 #   gh workflow run ci.yml --ref <分支>            # 手动触发，所有 workflow_dispatch 门控都会跑
 #   gh run watch <run-id> && gh run view <run-id> --json jobs
@@ -43,7 +56,13 @@ entries:
   - workflow: ci.yml
     job: mutation
     gate: "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
-    runs_on: [schedule, workflow_dispatch]
+    runs_on: [workflow_dispatch]
+    runs_on_note: >
+      第七十一批修正：原来这里写 `[schedule, workflow_dispatch]`——但“写在 `if:` 里”不等于“会发生”。
+      本仓的 cron 从未被求值（默认分支不是 `dev`；见末尾 `triggers:` 段的 `ci.yml / schedule`），
+      所以事实口径只有 `workflow_dispatch` 一条。`if:` 里的 `schedule` 仍然留着（那一天它会跑 4 个分片），
+      等 trigger 修好（`review_by` 2026-11-07）再把 `schedule` 加回这一行——加回来之前，
+      守卫 `test_声明在_schedule_上跑的条目必须对应一个真的会响的触发器` 会拦住这次漂移。
     not_run_on: [push, pull_request]
     why: >
       变异测试要跑 4 个分片、每个分片都要把源码逐个突变后重跑测试——放每次 push 上会把
@@ -104,3 +123,51 @@ step_gates:
       该 step 结论 success 且 artifact 列表里确实有 `eval-skip-receipt`（461 B，内部含 `run_id`/`sha`/`event`
       ⇒ 回执与它所属的 run 对得上）；同一 run 里 `quality`/`security`/`sbom`/`migration`/`container` success，
       `image-signing` / `变异测试` 按各自门控 skipped。
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 触发器级（第七十一批）：**“我承诺它会自己响”本身就是一个必须被验证的断言。**
+#
+# 为什么需要这一层：`schedule` 这类触发器的缺席**没有任何本地痕迹**——没有 run、没有日志、
+# 没有红色，什么都没有，而 `on:` 块在文件里照样好看。本仓已经吃过一次：cron 写在 `dev` 上，
+# 默认分支是 `master`，于是“每周一 03:00 的体检”从 2026-09-22 至今**一次都没发生过**，
+# 而 `docs/operations.md` 与下面的 `runs_on` 都把它当“会跑”在引用。
+#
+# 三层的关系：job 级管“哪些 job 在什么事件下不跑”，step 级管“哪一步自己决定不跑”，
+# 这一层管“**那个事件本身到底会不会发生**”。三层合起来才回答“这次绿灯覆盖了什么”。
+triggers:
+  - workflow: ci.yml
+    kind: schedule
+    cron: "0 3 * * 1"
+    evaluated_from: 默认分支
+    why: >
+      依赖与基镜像的新 CVE **不需要改代码就会出现**：只在 push/PR 上扫描的话，“没人提交”就等于
+      “没人检查”（本仓实测过：用陈旧缓存的基镜像扫会命中 13 条“其实已修”的 CVE，拉新后 0 条）。
+      它同时是 `mutation`（4 分片变异）与 `image-signing`（真签名 + 钉 digest）的唯一“正常”触发——
+      也就是说，这一条 cron 不响，等于那两条门每次 push 的 `skipped` 永远等不到自己的那一天。
+    expected_cadence_days: 7
+    last_observed_fire: never
+    root_cause: >
+      `schedule` 只从**默认分支**的 workflow 文件求值。本仓默认分支是 `master`（HEAD `ad98639`，
+      2026-09-07 之后无提交），而 cron 写在工作分支 `dev` 的 `ci.yml` 里（`2760bd6` 2026-09-22 加入；
+      `dev` 已领先 `master` 122 提交）；`master` 上的 `ci.yml` 只有 `push: [master]` 与 `pull_request`，
+      **没有** `schedule:`。⇒ 这份 cron 永远不会被求值，而不是“这次没轮到”。
+    unblock: >
+      两条路，都要**仓库所有者**决定（所以这条 trigger 现在带着 `review_by` 期限）：
+      (1) 把默认分支改成 `dev`（`gh repo edit --default-branch dev`）：本仓开发全在 `dev`、`master` 已停
+      122 个提交，改完 cron 立刻生效、且默认分支上的 workflow 就是最新版；代价是仓库首页/PR 基线/新克隆的
+      默认分支都变。
+      (2) 保持 `master` 为默认分支，把 `schedule:`（以及它要跑的 job）同步到 `master` 的 `ci.yml`：
+      代价是定时跑的是 `master` 的**旧代码**——等于体检一个月前的仓库。
+      两条路都没走之前，这条 trigger 的诚实状态就是“声明的、从未发生”。
+    how_to_verify: >-
+      gh run list --event schedule --limit 5 --json databaseId,conclusion,createdAt（空数组 ＝ 从未响过）
+      ；gh repo view --json defaultBranchRef --jq .defaultBranchRef.name（默认分支是否就是 cron 所在分支）
+    review_by: 2026-11-07
+    added: 2026-09-22
+    evidence: >
+      2026-10-07 实测（全部命令可复现）：全仓 run 按事件分组 = {dynamic: 1, push: 66, workflow_dispatch: 2}
+      （合计 69，已取全量）⇒ `schedule` **0 次**；`gh run list --event schedule --limit 20` ⇒ `[]`；
+      `gh repo view --json defaultBranchRef` ⇒ `master`；`git show origin/master:.github/workflows/ci.yml`
+      ⇒ `on: push: branches: [master] / pull_request`（无 schedule；`git ls-tree origin/master -- .github/workflows`
+      显示默认分支上只有这一个 workflow）；`git rev-list --count origin/master..origin/dev` ⇒ 122。
+      应交火 2 次（cron 加入之后的周一：2026-09-28、2026-10-05）、实交火 0 次。

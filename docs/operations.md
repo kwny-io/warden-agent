@@ -297,7 +297,7 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | 抓取只有去标签粗提取 | 拿不到 SPA / 正文抽取 | 需要 headless 浏览器 |
 | ~~没有告警规则库 / SLO / 链路追踪 / 灰度~~ | **已补齐**（规则库+SLO、traceparent 链路、健康门控灰度） | 见第九～十一节；~~span 送后端仍需接 OTel exporter~~ **已补（2026-09-23）**：`core/otel.py` 零依赖 OTLP 导出，配 `OTEL_EXPORTER_OTLP_ENDPOINT` 即送收集器 |
 | `warden_stuck_runs` 抓取时现算 | ~~每次抓取对存储做一次只读扫描~~ **已加 15s TTL 缓存**（与默认抓取间隔一致） | 刷新失败时保留上次值、**绝不写 0**（写 0 会把告警悄悄消掉） |
-| **漏洞扫描的有效性取决于基镜像新鲜度** | 用陈旧缓存的基镜像扫会命中"其实已修"的 CVE（实测 13 条 → 拉新后 0 条） | 冒烟脚本构建已加 `--pull`（受限网络可 `SMOKE_NO_PULL=1`）；CI 每周定时跑 + dependabot 盯基镜像 |
+| **漏洞扫描的有效性取决于基镜像新鲜度** | 用陈旧缓存的基镜像扫会命中"其实已修"的 CVE（实测 13 条 → 拉新后 0 条） | 冒烟脚本构建已加 `--pull`（受限网络可 `SMOKE_NO_PULL=1`）；dependabot 盯基镜像；CI 的**每周定时**（`schedule: 0 3 * * 1`）**当前实际不响**——`schedule` 只从默认分支求值，而 cron 写在 `dev`、默认分支是 `master`（详见 `tests/CI_JOB_GATES.yaml` 的 `triggers:` 段，`review_by` 2026-11-07） |
 | 进程内事件总线保留上限 | 超 `WARDEN_EVENT_KEEP`（默认 500）会丢最早事件 | 只影响进度展示；丢弃有警告、消费者能收到「存在缺口」提示 |
 | 熔断/出站并发/`InProcessRunLock` 的**进程内语义** | 每副本各一份 | 已文档化（多副本须用共享实现） |
 | **记忆按 `owner` 隔离**（2026-09-22 起） | 升级前写入的记忆 `owner` 为空串，**用户在 `/memory/{scope}` 与召回里看不到** | 空串 = 部署级共享；需要保留的旧数据应补写 `owner`（`UPDATE memories SET owner=? WHERE uid=?`） |

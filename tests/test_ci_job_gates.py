@@ -25,10 +25,20 @@
      签字开关（allow_flag）、回执 artifact（receipt_artifact）、notice 字样；
      外加一条自动撞红：
      `ci.yml` 里再出现新的静默跳却未登记 ⇒ 红。
+  7.（第七十一批）**触发器级**（`triggers:` 段）：`on.schedule` 写在哪**不等于**它会响——
+     GitHub 只从**默认分支**上的 workflow 文件求值 `schedule`（平台文档原文：
+     *This event will only trigger a workflow run if the workflow file exists on the default
+     branch*、*Scheduled workflows will only run on the default branch*）。
+     现场：cron `0 3 * * 1` 加在 `dev`
+     （`2760bd6`，2026-09-22），而默认分支是 `master`（HEAD 停在 2026-09-07）⇒ 全仓 69 次 run 里
+     `event=schedule` **0 次**，而 `docs/operations.md` 与 `runs_on` 都把它当“会跑”在引用。
+     这类缺席**没有任何本地痕迹**（没 run、没日志、没红色），所以只能靠台账：
+     cron / `evaluated_from` / `last_observed_fire` / `how_to_verify` / `review_by`（过期即红）。
 """
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 from typing import Any
 
@@ -326,3 +336,187 @@ def test_workflow_里的静默跳过都被登记了() -> None:
         + "\n（step 级结论在 run 里**看不出来**，所以必须登记："
         "skip_when / allow_flag / receipt_artifact / notice）"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 触发器级（第七十一批）：**“我承诺它会自己响”本身就是一个必须被验证的断言。**
+#
+# 与上面两层的关系：job 级管“哪些 job 在什么事件下不跑”，step 级管“哪一步自己决定不跑”，
+# 这一层管“**那个事件本身到底会不会发生**”。只有三层都在，才能回答“这次绿灯覆盖了什么”。
+
+_TRIGGER_KEYS = (
+    "workflow",
+    "kind",
+    "cron",
+    "evaluated_from",
+    "why",
+    "expected_cadence_days",
+    "last_observed_fire",
+    "how_to_verify",
+    "review_by",
+    "added",
+    "evidence",
+)
+
+
+def _workflow_triggers(workflow: str) -> dict[str, Any]:
+    data: Any = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8")) or {}
+    triggers = data.get("on") or data.get(True) or {}
+    return triggers if isinstance(triggers, dict) else {}
+
+
+def _declared_crons(workflow: str) -> list[str]:
+    """workflow 的 `on.schedule` 里声明的 cron（没写就是空表）。"""
+    sched = _workflow_triggers(workflow).get("schedule")
+    if sched is None:
+        return []
+    if isinstance(sched, dict):
+        sched = [sched]
+    assert isinstance(sched, list), (
+        f"{workflow} 的 on.schedule 形状不认识（{type(sched).__name__}）——"
+        "不认识的形状会让下面每条断言静默放过"
+    )
+    out: list[str] = []
+    for item in sched:
+        assert isinstance(item, dict) and "cron" in item, (
+            f"{workflow} 的 schedule 条目缺 cron：{item!r}"
+        )
+        out.append(str(item["cron"]))
+    return out
+
+
+def _trigger_ledger() -> list[dict[str, Any]]:
+    raw: Any = yaml.safe_load(LEDGER.read_text(encoding="utf-8")) or {}
+    entries = raw.get("triggers") or []
+    assert entries, "`triggers:` 是空的——空台账会让下面每条断言都变成永真"
+    return entries
+
+
+def test_触发器台账每条都写全了() -> None:
+    for entry in _trigger_ledger():
+        where = f"{entry.get('workflow')}:{entry.get('kind')}:{entry.get('cron')}"
+        for key in _TRIGGER_KEYS:
+            assert entry.get(key) not in (None, ""), f"{where} 缺 {key}"
+        for key, least in (("why", 40), ("evidence", 40), ("how_to_verify", 20)):
+            assert len(str(entry[key]).strip()) >= least, f"{where} 的 {key} 太短"
+
+
+def test_每个声明的_schedule_都在触发器台账里() -> None:
+    """workflow 里新加一条 cron 而没登记 ⇒ 红（job 级规则 1 在触发器层的对应物）。"""
+    registered = {
+        (str(e["workflow"]), str(e["cron"]))
+        for e in _trigger_ledger()
+        if e.get("kind") == "schedule"
+    }
+    missing: list[str] = []
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        for cron in _declared_crons(path.name):
+            if (path.name, cron) not in registered:
+                missing.append(f"{path.name}: {cron}")
+    assert not missing, (
+        "这些 schedule 触发器没在 tests/CI_JOB_GATES.yaml 的 `triggers:` 里登记：\n"
+        + "\n".join(f"  {x}" for x in missing)
+        + "\n每条要写：evaluated_from / last_observed_fire / how_to_verify / review_by / evidence"
+        "（写在 on: 里 ≠ 会发生：schedule 只从默认分支求值）"
+    )
+
+
+def test_触发器台账里的_cron_与_workflow_逐字一致() -> None:
+    """双向：登记的 cron 必须还在 workflow 里（否则台账在说一件不存在的事）。"""
+    stale: list[str] = []
+    for entry in _trigger_ledger():
+        if entry.get("kind") != "schedule":
+            continue
+        wf, cron = str(entry["workflow"]), str(entry["cron"])
+        crons = _declared_crons(wf)
+        if cron not in crons:
+            stale.append(f"{wf} 里没有 cron {cron!r}（现在声明的是：{crons}）")
+    assert not stale, "\n".join(stale)
+
+
+def test_触发器台账的复核期限没过期() -> None:
+    """空洞必须有期限：到日子没回来复核就红——逼人回答“它到底响了没有”。
+
+    这是**故意**与日历耦合的判据：一个从未响过的触发器没有别的强制力，
+    只有期限能让它不能“安静地一直是假的”。
+    """
+    today = datetime.date.today()
+    bad: list[str] = []
+    for entry in _trigger_ledger():
+        where = f"{entry.get('workflow')}:{entry.get('kind')}:{entry.get('cron')}"
+        try:
+            added = datetime.date.fromisoformat(str(entry["added"]))
+            review = datetime.date.fromisoformat(str(entry["review_by"]))
+        except ValueError as exc:
+            bad.append(f"{where} 的日期不是 ISO 形式（YYYY-MM-DD）：{exc}")
+            continue
+        if review < added:
+            bad.append(f"{where} 的 review_by({review}) 早于 added({added})")
+        elif review < today:
+            bad.append(
+                f"{where} 的复核期限已过（review_by={review}，今天={today}）："
+                "回去复核这个触发器到底响了没有，再更新 last_observed_fire 与 review_by"
+            )
+    assert not bad, "\n".join(bad)
+
+
+def test_从未响过的触发器必须写明原因与解锁代价() -> None:
+    """`last_observed_fire: never` 不能只是一句“它就是不响”：要写清机制与出路（含代价）。"""
+    bad: list[str] = []
+    for entry in _trigger_ledger():
+        if str(entry.get("last_observed_fire")) != "never":
+            continue
+        where = f"{entry.get('workflow')}:{entry.get('kind')}:{entry.get('cron')}"
+        for key, least in (("root_cause", 40), ("unblock", 40)):
+            text = str(entry.get(key) or "").strip()
+            if len(text) < least:
+                bad.append(
+                    f"{where} 的 {key} 缺失或太短（{text!r}）："
+                    "never 的触发器必须能自证“为什么不会响”与“怎样才能响”"
+                )
+    assert not bad, "\n".join(bad)
+
+
+def test_schedule_承诺与观察到的现实必须一致() -> None:
+    """两个方向都要拦：
+
+    * `runs_on` 里承诺了 `schedule` ⇒ 必须有真的响过（`last_observed_fire != never`）的
+      schedule 触发器；
+    * `if:` 里写了 `schedule` 却把它从 `runs_on` 划掉 ⇒ 必须有一条 `never` 的 schedule
+      触发器做依据，并写 `runs_on_note` 说明何时加回来。
+
+    现场（第七十一批）：`mutation` 的 `if:` 含 `schedule`，但 cron 从未被求值
+    ⇒ `runs_on` 只能是 `[workflow_dispatch]` + `runs_on_note`。
+    """
+    fired = {
+        str(e["workflow"])
+        for e in _trigger_ledger()
+        if e.get("kind") == "schedule" and str(e.get("last_observed_fire")) != "never"
+    }
+    dead = {
+        str(e["workflow"])
+        for e in _trigger_ledger()
+        if e.get("kind") == "schedule" and str(e.get("last_observed_fire")) == "never"
+    }
+    gated = _gated_jobs()
+    bad: list[str] = []
+    for (wf, job), entry in sorted(_ledger().items()):
+        where = f"{wf}:{job}"
+        promised = "schedule" in [str(x).split()[0] for x in (entry.get("runs_on") or [])]
+        mentioned = "schedule" in str(gated.get((wf, job)) or "")
+        if promised and wf not in fired:
+            bad.append(
+                f"{where} 的 runs_on 承诺了 schedule，但 {wf} 没有一条真的响过的 schedule 触发器"
+            )
+        if mentioned and not promised:
+            if wf not in dead:
+                bad.append(
+                    f"{where} 的 if: 提到 schedule 却没算进 runs_on，"
+                    f"而 {wf} 没有一条 `last_observed_fire: never` 的 schedule 触发器做依据"
+                )
+            elif not str(entry.get("runs_on_note") or "").strip():
+                bad.append(
+                    f"{where} 把 schedule 从 runs_on 里划掉了，必须写 runs_on_note："
+                    "依据是什么、等触发器修好后何时加回来"
+                )
+    assert not bad, "\n".join(bad)

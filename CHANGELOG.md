@@ -4,6 +4,88 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-07（第七十一批：说好每周跑的那次体检，一次都没发生过——触发器本身也要“缺席要看得见”）
+
+### 现场
+**从上一批的邻居问题开始，先查证再动手。** 第七十批把 step 级跳过钉成「签字 + 回执」后，
+`变异测试` 与 `image-signing` 的 `if:` 都写着 `github.event_name == 'schedule' || …`——
+也就是说它们的「正常」触发是那条“每周一 03:00 UTC”的 cron。于是先问一句：**那条 cron 到底响过没有？**
+
+三条命令、三条事实（都可复现）：
+
+```
+gh run list --limit 100 --json event --jq 'group_by(.event)[]|"\(.[0].event)\t\(length)"'
+  → dynamic 1 / push 66 / workflow_dispatch 2      # 全仓 69 次 run，已取全量
+gh run list --event schedule --limit 20 --json databaseId
+  → []                                             # schedule 事件：一次都没有
+gh repo view --json defaultBranchRef --jq .defaultBranchRef.name
+  → master
+```
+
+再挖机制：`git rev-list --count origin/master..origin/dev` → **122**（`master` 的 HEAD 停在 `ad98639`，
+2026-09-07，即一个月前）；cron 是 `2760bd6`（2026-09-22）加进 **`dev`** 的 `ci.yml` 的；
+而 `git show origin/master:.github/workflows/ci.yml` 里 `on:` 只有 `push: branches: [master]`
+与 `pull_request`，**没有 `schedule:`**（`git ls-tree origin/master -- .github/workflows` 也只有这一个 workflow）。
+
+⇒ 平台文档原文：*This event will only trigger a workflow run if the workflow file exists on the default
+branch*、*Scheduled workflows will only run on the default branch*。**“cron 写在哪个分支”≠“cron 在哪个分支上被求值”**：
+写在 `dev` 上、默认分支是 `master` ⇒ 这份 `schedule` **永远不会被求值**，不是“这次没轮到”。
+按 cron 加入时间算，应交火 2 次（2026-09-28、2026-10-05）、实交火 **0 次**。
+
+这一层的缺席比第七十批那层更彻底：step 级跳过至少在 run 里留了一行 notice；
+**触发器的缺席什么痕迹都没有**——没 run、没日志、没红色，而 `on:` 块在文件里照样好看，
+`docs/operations.md` 与台账的 `runs_on` 都把它当“会跑”在引用。
+
+### 改了什么（本批零行 `src/`）
+1. `tests/CI_JOB_GATES.yaml` 新增**第三层台账** `triggers:`（workflow / kind / cron / evaluated_from / why /
+expected_cadence_days / last_observed_fire / how_to_verify / review_by / added / evidence；
+`last_observed_fire: never` 的还必须写 `root_cause` 与 `unblock`）。首条即
+`ci.yml:schedule:0 3 * * 1`，`evaluated_from: 默认分支`，`last_observed_fire: never`，`review_by: 2026-11-07`。
+2. `tests/test_ci_job_gates.py` 新增 6 条触发器级守卫（全文件 **18 passed**）：字段写全 /
+**workflow 里新出现 `on.schedule` 未登记就红** / 登记的 cron 必须逐字还在 workflow 里 /
+`review_by` 过期即红（**故意与日历耦合**：一个从未响过的触发器没有别的强制力）/ `never` 必须自证机制与出路 /
+**`schedule` 的承诺与现实必须一致**——两个方向都拦：`runs_on` 里承诺了 `schedule` ⇒ 必须有一条真响过的
+schedule 触发器；`if:` 里提到 `schedule` 却从 `runs_on` 里划掉 ⇒ 必须有一条 `never` 的触发器做依据
+并写 `runs_on_note`。
+3. 台账 `mutation` 条目修正：`runs_on: [schedule, workflow_dispatch]` → **`[workflow_dispatch]`**
++ `runs_on_note`（写在 `if:` 里不等于会发生；触发器修好后加回来）。
+4. `docs/operations.md` 里 CVE/基镜像那行从「CI 每周定时跑」改成「**当前实际不响**」
++ 指向台账与 `review_by`。
+
+### 验证
+- **全量冻结**（`CI=1` + `--cov-fail-under=86`）：`1791 passed / 4 skipped / 0 failed / 0 error`，628.04s；
+覆盖率 **90.31%**（要求 86%）TOTAL 10658 行 / 852 未覆盖；`ruff check src tests scripts` → `All checks passed!`；
+`mypy src/warden_agent` → `Success: no issues found in 115 source files`；
+跑前跑后树哈希一致 **`bddd8a7406ccbb9ba89d419a215598ffd2ed21f0`**（RC1=RC2=RC3=0）。
+用例数对账：汇集数 `1789 → 1795`（+6）= 本批 6 条触发器级守卫，与变异矩阵逐条对应。
+- **变异矩阵**（`C:/Users/g1534/wa71/mutate71.sh`，逐条改坏事实、跑完按内容还原并用 sha256 核对还原）：
+`M1` 台账去掉 `how_to_verify` / `M2` 给 `ci.yml` 加一条**未登记**的 cron / `M3` 台账 cron 改成 `0 4 * * 1` /
+`M4` `review_by` 改成过去日期 / `M5` 去掉 `root_cause` / `M6` `runs_on` 加回 `schedule` /
+`M7` 去掉 `runs_on_note` —— **7/7 都真会红**（`FAILED` 的正是被变异打击的那一条守卫），且锚点不唯一时直接报“★锚点失败”（不许把“没变异”读成“守卫没用”）；
+  矩阵在**冻结树上重跑一次**（基线 18 passed），跑完还原后 `git add -A && git write-tree` 仍等于冻结树 `bddd8a74…`
+  ⇒ “没留下改动”也是逐字节验过的，不靠“我记得改回来了”。
+- `ruff check tests/test_ci_job_gates.py` → `All checks passed!`。
+- CI 实测（交付面证据，提交 K）：`{{CI_K}}`
+
+### 教训
+1. **“写在配置里”和“真的会发生”是两件事。** 本批三层（job → step → trigger）是同一个病：
+   **缺席在系统里没有一个字段**。所以只能一层层自己造事实：`skipped`、回执、cron 的 `last_observed_fire`。
+2. **文档里写“会跑”，等于替它做承诺。** `docs/operations.md` 那句话在 15 天里一直是假的，
+   而且没有任何机制会因为它是假的而变红——引用的东西要指向一个可复核的东西（台账 + `review_by`），不是一句形容词。
+3. **工具链会默默毁掉结论。** `git show origin/master:.github/workflows/ci.yml` 在 Git-Bash 下会被 MSYS
+   路径转换撕掉冒号（`origin/master:path` 当 PATH 列表 → `origin\master;path`）报 `ambiguous argument`；
+   我第一遍还拿 `2>&1 | grep` 把 stderr 吞了，于是一个被报错顶掉的**空结果**差点被当成“默认分支上也没有 cron”。
+   ⇒ 要 `export MSYS2_ARG_CONV_EXCL='*'`，并且**不要用 grep 吞 stderr**。
+
+### 已知限制（说实话）
+- 这一层台账现在只管 `schedule` 一条（`repository_dispatch` 等本仓没用）；新加 cron 未登记会红，
+  但仓储**无法离线**知道“默认分支上到底存不存在这个 workflow”——那需要 `gh api` 或对远端的 git 知识，
+  两个东西都不该进确定性守卫 ⇒ 用 `how_to_verify`（一条可复制命令）+ `review_by`（期限）代替。
+- `review_by` 到期会让**全量套件变红（包括随后每一次 push 的 CI）**。这是有意的强制力，不是 bug；
+  代价是 2026-11-07 之后必须有人回答“它响了没有”，否则套件会一直红着。
+- 这条 cron 要真响，必须由**仓库所有者**做一个动作（改默认分支 或 把 `schedule` 同步到 `master`），
+  两条路的代价写在 `unblock` 里；在此之前，这条 trigger 的诚实状态就是“声明的、从未发生”。
+
 ## 2026-10-07（第七十批：跑与没跑，结论那一列一模一样——step 级跳过必须「签字 + 回执」）
 
 ### 现场
