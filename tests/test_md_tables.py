@@ -126,16 +126,44 @@ def test_散文里的竖线不算缺陷() -> None:
 
 
 def test_本机脏目录不会被算进扫描范围() -> None:
-    """`.mimosa/`（本机审计工具产物，已在 .gitignore）必须排除。
+    """本机才有的产物目录（`.mimosa/`、`.zcode/`、`mutants/`，都在 .gitignore）必须排除。
 
     不排除的话，CI 的干净 clone 与本机扫到的**文件数不同**——同一个仓库在本地红、在 CI 绿，
-    是假红里最难查的一种（第七十二批实测：本机 33 个 Markdown、排出后 12 个）。
+    是假红里最难查的一种（第七十二批实测：只排 `.mimosa/` 时，本机 12 个、提交树 10 个）。
     """
     root = ROOT
-    found = _GUARD.iter_markdown_files(root, ("**/*.md",))
-    files = {path.relative_to(root).as_posix() for path in found}
-    assert not any(name.startswith(".mimosa/") for name in files), sorted(files)[:5]
+    files = {
+        path.relative_to(root).as_posix()
+        for path in _GUARD.iter_markdown_files(root, ("**/*.md",))
+    }
+    for dirty in (".mimosa/", ".zcode/", "mutants/"):
+        assert not any(name.startswith(dirty) for name in files), (dirty, sorted(files)[:5])
     assert "README.md" in files
+
+
+def test_本机扫到的文件集与提交里的文件集一致() -> None:
+    """守卫看的文件集必须**等于** git 跟踪的集合——否则“本机红、CI 绿”是迟早的事。
+
+    价值不在于今天这两个目录，而在于**下一个**产物目录：新目录里出现 `.md` 时这条用例会红，
+    逼你在“跟进提交”与“加进 SKIP_DIRS 并写清理由”之间做一次明示选择。
+    同一个道理：门禁自己的缺席也要看得见（与 `test_扫到零个文件不算通过` 同源）。
+    """
+    root = ROOT
+    scanned = {
+        path.relative_to(root).as_posix()
+        for path in _GUARD.iter_markdown_files(root, ("**/*.md",))
+    }
+    tracked_raw = subprocess.run(
+        ["git", "ls-files", "-z", "*.md"], cwd=root, capture_output=True, check=True
+    ).stdout
+    tracked = {name for name in tracked_raw.decode("utf-8").split("\0") if name}
+    assert scanned == tracked, (
+        "守卫扫到的文件集与 git 跟踪的不一致：\n"
+        f"  只在本机（未被跟踪）={sorted(scanned - tracked)}\n"
+        f"  只在提交里={sorted(tracked - scanned)}\n"
+        "未被跟踪的产物目录 ⇒ 加进 scripts/check_md_tables.py 的 SKIP_DIRS（并写清理由）；"
+        "新文档 ⇒ 跟进提交。"
+    )
 
 
 def test_仓库里的Markdown现在是干净的() -> None:
