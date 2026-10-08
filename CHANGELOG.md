@@ -41,6 +41,9 @@
 `:341` `python:3.12-slim`（待钉）、`:203` `postgres:16-alpine`、
 `deploy/observability/README.md:40` `prom/prometheus:v2.55.0`（待钉）、
 `docs/复核索引.md:576` gitleaks `v8.21.2`），全批执行面引用从 18 → **23** 处。
+（行号口径：上面这几个是**守卫报的行**，即反斜杠拼接后那条语句的行；`grep -n` 数的「引用真正所在的行」
+在多行命令时会比它小 1——`deploy/observability/README.md` 是 39/40，`docs/复核索引.md` 是 575/576，单行的 `:203` 两边一致。
+写清楚是为了以后别拿两边的数字互相“对不账”。）
 
 ### 已知限制（写清楚，不装看不见）
 - 围栏里的 YAML 片段**按行取 `image:`**，不引 YAML 解析器（文档里的片段常常不是合法文档、也可能多文档，
@@ -48,9 +51,37 @@
 - 只扫围栏，不扫正文（理由见上，是划范围不是漏了）。
 - 不认 `docker compose -f …` 里由变量插值的镜像名（`.yml` 面同样口径，见 `check_pinned_images.py`）。
 - 与 `.yml` 面同一件事：还有 4 个执行体是浮动 tag（本机到 Docker Hub 不通、取不到权威 digest）。
+- **复制或改名 `tests/test_ci_tool_pinning.py` 会让守卫对自己报红**：台账宿主文件是靠**精确路径**排除的（`_SKIP_FILES`），
+  副本不再匹配那个路径 ⇒ 它把自己文档字符串里的 digest 字面量当成「文档里的引用」。本批跑对照实验时**真踩到了**（见下）；
+  没去“修”：多一条只为一个假设场景服务的分支、而那条分支自己又没有变异钉住，比记下这个边界更糟。
 
 ### 本地证据
-（冻结数字待回填：pytest 收集/通过/跳过、覆盖率、ruff、mypy、冻结树 sha256 对账、变异矩阵）
+冻结（`CI=1`，带真 PG 口径；解释器是仓库 `.venv`）：
+- **1818 收集 / 1814 passed / 4 skipped / 0 failed / 0 errors**（620.99s；junit 原文 `tests="1818" failures="0" skipped="4" errors="0"`）。
+- 覆盖率 `TOTAL 10658 852 2664 335 → 90%`（`fail_under = 86`）。
+- `ruff check src tests scripts` → `All checks passed!`；`mypy src/warden_agent` → `Success: no issues found in 115 source files`。
+- **本批新门禁单独跑一遍**（第72批教训①）：`tests/test_ci_tool_pinning.py` 15 passed；读文档的三个门禁一起跑 48 passed；
+  另两个既有门禁也在冻结里：`扫描 10 个 Markdown / 101 张表：缺陷 0 处`、`扫描 7 处外部镜像引用：钉住 1、发布占位符 2、台账 4`。
+- **树对账**：`T1 = T2 = dabf86b8a9a6b76c0b534e707d7248bf6ff9480f`（`git stash create` 的纯内容树，**含未跟踪文件**）、
+  dirty 形状 `fabad62d8a48912a`、keyfiles `8316306fa60fbce1`，跑前 = 跑后；**本批代码提交的 `git rev-parse HEAD^{tree}` 与它逐字相等**（`bc0d8c7`）
+  ⇒ 「这份数字跑的就是这棵树」不是一句话，是一次比对。
+
+变异矩阵（`wa73/mutate.py`，7 条；每条都要求「本批门禁红」且「同一变异下本批之前的守卫绿」，收尾字节级还原后逐一比对 sha256）：
+`M0` 文档里 postgres digest 退回 64 个 0（= 本批修掉的真现场）· `M1` `_fence_mask` 围栏内外取反 · `M2` `image:` 只认行首 ·
+`M3` 台账 tag 改成 `16` · `M4` 历史日志不再排除 · `M5` git 清单丢掉 `README.md` · `M6` 文档围栏按 digest 级判。
+**7/7 全部 `本批=red 旧守卫=green`**，`MUTATE_RC=0`。
+
+> 这一轮矩阵扣出的两个错都**不在守卫里，在“怎么验守卫”里**：①`M5` 第一版砍的是 `git ls-files` 结果里的第一个 `.md`，
+> 而那恰好是**已被排除**的 `CHANGELOG.md` ⇒ 等于没改，差点记成“判据没被守住”
+> （**变异要打在“被观测的量”上，不是“存在的量”上**）；②`M0` 想证“本批之前没人看得见”，却把本批之前的守卫**复制**成
+> `tests/zz_head_pinning.py` 再跑——守卫靠**精确路径**排除台账宿主文件，副本不再匹配 ⇒ 它把自己文档字符串里的 digest
+> 当成「文档引用」而报红，红的与旧守卫的视力无关。改成同路径原地换内容才是真对照。
+
+### 交付面（run 级）
+- ⚠️ **本批推送尚未成功**：本机代理 `127.0.0.1:7897` 此刻没有监听（`netstat` 计数 0），直连 github 报
+  `Recv failure: Connection was reset` ⇒ 「已推 + run 级」证据在冻结时点**不可得**，如实标「未推」。
+- 网络恢复后补：按 **sha** 认领 run（不许回退“最近一条”），逐 job 看 `conclusion`，并写明这次**没跑**的是什么
+  （`image-signing` 与 4 个 `变异测试` 在分支 push 上按 `if:` skipped——分支绿从来不覆盖签名与钉 digest 那条路）。
 
 ---
 ## 2026-10-07（第七十二批：表格里的竖线也算交付面——CI 里第一次有东西会读 Markdown 渲染）
