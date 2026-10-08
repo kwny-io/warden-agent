@@ -78,10 +78,19 @@
 > 当成「文档引用」而报红，红的与旧守卫的视力无关。改成同路径原地换内容才是真对照。
 
 ### 交付面（run 级）
-- ⚠️ **本批推送尚未成功**：本机代理 `127.0.0.1:7897` 此刻没有监听（`netstat` 计数 0），直连 github 报
-  `Recv failure: Connection was reset` ⇒ 「已推 + run 级」证据在冻结时点**不可得**，如实标「未推」。
-- 网络恢复后补：按 **sha** 认领 run（不许回退“最近一条”），逐 job 看 `conclusion`，并写明这次**没跑**的是什么
-  （`image-signing` 与 4 个 `变异测试` 在分支 push 上按 `if:` skipped——分支绿从来不覆盖签名与钉 digest 那条路）。
+- **已推并核完**：`46e30da..2f6b9e4 dev -> dev`（`rc=0`）—— 一次推上去的是本批 2 个提交 + 前批积压的 3 个（`e374829` / `d1bb89d` / `2dd59ae`）。
+  冻结时点我写的是「代理无监听 + 直连被 reset ⇒ 推不上去」；两小时后**同一条直连命令**
+  （`git -c http.proxy= -c https.proxy= push origin dev`）一次成功 ⇒ 那两句事实没错、**结论写早了**：断网结论必须带时间戳，
+  交付面字段只能写「待补」，不能写「做不到」。（同一条命令「一次成功」与「被 reset」本轮各实测到一次。）
+- **远端独立核准**（不看 git 的传输结果）：`gh api repos/kwny-io/warden-agent/branches/dev --jq .commit.sha` = `2f6b9e4eb7d5a72014c2b75c4680d8728b2bde45` = 本地 `HEAD`。
+- **run 按 sha 认领**（不许回退「最近一条」）：**`37715597379`**（`event=push`、`sha=2f6b9e4e…`）⇒ `conclusion = success`。
+  作业级（`gh run view --json jobs`）：`quality` / `sbom` / `evals-real` / `container` / `security` / `migration` = `success`（6），
+  `变异测试`（矩阵 4 个 shard）与 `image-signing` = `skipped`（该事件下按 `if:`）——分支绿从来不覆盖签名、钉 digest 与变异那条路。
+- ⚠️ **`evals-real` 的 `success` 不等于「评测跑了」**：随 run 存档的 artifact `eval-skip-receipt`（461 B）里 `eval-skip-receipt.json` 的
+  `reason` 逐字为 `DEEPSEEK_API_KEY 未配置，且 ALLOW_EVAL_SKIP=1（已签字）`，`signed_by` = `ci.yml 里的 ALLOW_EVAL_SKIP（=1）`
+  ⇒ **本仓 push run 上真评测从不执行**；「跳过回执（只在跳过分支产生；有它 ⇔ 真实评测没跑）」这一步 `success` 且产物存在，就是它的证据。
+  所以本批只能写「评测：跳过（有回执，理由如上）」——写成「评测通过」就是把缺席讲成在场。
+  要让它真跑得先给仓库配 `DEEPSEEK_API_KEY`；本地的 `--mode real` 同因缺 key 没跑，这一步的凭据是「跳过回执 + 两个门禁」而不是评测数字。
 
 ---
 ## 2026-10-07（第七十二批：表格里的竖线也算交付面——CI 里第一次有东西会读 Markdown 渲染）
