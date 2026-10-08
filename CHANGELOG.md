@@ -4,6 +4,91 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-08（第七十五批：触发器与 job 之间有一条没人验过的连线——`cron` 写了不等于会响）
+
+### 现场
+起点不是猜测，是一次**可复现的观测**：`dev` 上的 cron 从来没有求值过。
+
+1. **机制**：GitHub 的 `schedule` 只从**默认分支**上的 workflow 文件求值；本仓默认分支是 `master`,
+   上面只有 561 字节的占位文件（`gh api repos/kwny-io/warden-agent/contents/.github/workflows/ci.yml?ref=master`
+   ⇒ `blob 9f8cf7dc…`、`size=561`）。`dev` 上那份完整 workflow 的四个 `cron`，平台根本没看过。
+2. **实据**：按 job 读 `startedAt`——`workflow_dispatch` 的 16 个 job **16/16 全为 null**；
+   同一批 job 在 `push` 路径上 12 个都有真实 `startedAt`、null 为 0。
+   ⇒ `dispatch` 路径上没有一次真的开始跑过，而 `push` 路径上有；cron 属于前者。
+3. **台账里还写着一句没人验过的因果**：「cron `30 3 * * *` 唤醒 `image-signing`」。
+   而 `image-signing` 的 `if:` 只接受 `push (v* tag)` 与 `workflow_dispatch`，**不接受 `schedule`**
+   ⇒ 就算默认分支上换成完整 workflow，这个 cron 也永远唤不醒它。
+4. **守卫的盲区**：`tests/test_ci_job_gates.py` 已经验「事件 → job」（声明的事件必须真的触发它）、
+   也验「job → 事件」的反向（接受 sleep 的 job 必须登记），但**从不验「触发器 → 它唤醒的 job」这条连线**。
+   触发器可以点名一个永远不会被它唤醒的 job，而所有用例依然是绿的。
+
+### 改了什么（零行 `src/`）
+`tests/test_ci_job_gates.py` 新增四条断言（18 → 22 条），判据全部走**结构**，不 grep 文本：
+
+1. `test_触发器台账每条都写全了`：每条触发器必填 `id/on/cron/fires_jobs/evidence`，缺一个就红；
+   排除必须带理由（`_TRIGGER_HISTORY`）。
+2. `test_触发器声明的唤醒对象必须真的接受它的事件`：`fires_jobs` 里每个 job，其 `if:` **必须**接受该触发器的事件；
+   空列表直接红（一条谁都不唤醒的触发器不该留在台账里）；名字写错（job 不存在）也红。
+3. `test_每个_job_声称的事件必须真的被它自己的_workflow_声明过`：反向——job 说自己在 `schedule` 上跑，
+   就必须有 cron 登记说它唤醒它。
+4. `test_每个接受_schedule_的_job_都要出现在唤醒名单里`：门禁化的 `if:` 里出现 `schedule`
+   却不在任何触发器的 `fires_jobs` 里 ⇒ 红（新写一个「睡不醒的 job」立刻被抓住）。
+
+读 `if:` 的方式是**失败关闭**的：只认 `github.event_name == '…'` / `!= '…'` 两种子句形状，
+加上对 `contains(github.ref, 'refs/tags/v')` 的狭义识别（映射成 `push (v* tag)`）；
+出现别的形状就抛 `AssertionError`——形状认不出比认错好。
+
+顺手改正了台账里的错话（同一个提交）：cron 那一行的 `fires_jobs` 从臆想的对象改成真的被它唤醒的 job、
+`why` 里对 `image-signing` 的说法订正、把 `master` 占位文件的实测证据补进 `evidence`、
+并把这轮学到的「规则 6：触发器点到谁，谁的 `if:` 就必须接受它」写进文件头。
+
+两处**自己改正自己过宽**的判据：
+- 「接受 `schedule` 的 job 必须登记」一开始对**所有** job 生效，把不等事件的裸 job 也算了进来
+  ⇒ 收窄到**门禁化的 job**（`if:` 里出现 `github.event_name`）。
+- `fires_jobs` 一开始把「什么都不等的裸 job」也算作被唤醒 ⇒ 那条连线断言会永远红 ⇒ 同样收窄。
+
+### 证据
+- 默认分支取证：`gh api repos/kwny-io/warden-agent/contents/.github/workflows/ci.yml?ref=master`
+  ⇒ `blob 9f8cf7dc…`、`size=561`。
+- job 级 `startedAt`：`workflow_dispatch` 16/16 null；`push` 12 个有值、0 个 null。
+- `pytest tests/test_ci_job_gates.py -q -p no:randomly` ⇒ **22 passed**（改前 18）。
+- `ruff check tests` ⇒ All checks passed（期间被 E501 咬过一次：行内注释的**行尾空格**也算行长，已修）。
+
+### 变异矩阵（正对照：拿真缺陷去打守卫，看它是不是真的叫）
+**8 条变异里 7 条第一轮就符合预期，第 8 条（M6）当场抓出了一条我自己犯的错**：
+给 job 台账里的 `image-signing` 谎报 `runs_on: [schedule, …]` 时，红的是**上一批**那条
+`test_schedule_承诺与观察到的现实必须一致`，而不是我本批新写的那条——新写的那条（当时叫
+`test_job_台账里承诺的每个事件都必须真的会被触发`）实际只检查“这个事件在 workflow 的 `on:` 里”，
+**配不上它的名字**。改法是把两条用例改成“名字说了什么就只做什么”：
+
+* `test_触发器声明的唤醒对象必须真的接受它的事件`——只管**连线形状**（被点名的 job 的 `if:` 接受这条触发器的事件）；
+* `test_每个_job_声称的事件必须真的被它自己的_workflow_声明过`——只管**声明**（事件在 `on:` 里），
+  并在 docstring 里写明“**不保证真的会被触发**，`schedule` 就是反例”。
+
+“真的会不会响”仍由上一批那条带现实证据的用例管——变异矩阵的作用正是：**把“谁在管什么”变成可观测的**。
+
+改名 + 修正期望后复跑 ⇒ **8/8 符合预期**（8 条里 7 条第一轮就对，M6 唯一的“不合格”就是上面这条自曝）。
+
+| 变异 | 期望 | 结果 |
+| --- | --- | --- |
+| M0 台账改成「cron 唤醒 `image-signing`」（本批真实发现的错话） | 连线断言红 | ✅ 红（连带 `每个接受_schedule_的_job_都要出现在唤醒名单里`、`这条连线机制本身被真的用到过`） |
+| M1 `fires_jobs` 写一个不存在的 job | 连线断言红 | ✅ 红（同上三条） |
+| M2 删掉 `fires_jobs` 整行 | 必填字段断言红 | ✅ 红（4 条，含 `触发器台账每条都写全了`） |
+| M3 `mutation` 的 `if:` 不再接受 `schedule` | 连线断言红 | ✅ 红（3 条，含 `台账里的_gate_与_workflow_逐字一致`） |
+| M4 给 `image-signing` 的 `if:` 加上 `schedule` | 「睡不醒的 job」断言红 | ✅ 红（3 条，含上一批那条「现实必须一致」） |
+| M5 `fires_jobs` 写成空列表 | 连线断言红 | ✅ 红（3 条） |
+| M6 job 台账谎报自己在 `schedule` 上跑 | 反向断言红 | ✅ 红，但红的是**上一批那条**（本批新写那条没红 ⇒ 已改名，见上） |
+| M7【**不该红**的对照】只改注释 | 0 失败 | ✅ 0 失败（基线也绿 ⇒ 装置不是永远红） |
+
+### 本地证据
+冻结：跑前/跑后三组纯内容哈希一致（占位，冻结后回填）。
+
+- 变异矩阵（`C:/Users/g1534/wa75/mutate.py`，8 条变异 × 22 用例，逐条做**字节级还原 + sha256 对账**）：**8/8 符合预期**——7 条该红的红（M0–M6）、1 条【不该红】的对照 **0 失败**（M7 只改注释），且基线本身是绿的（装置不是永远红）。
+- `pytest`（`CI=1`、`-p no:cacheprovider`、`--cov=warden_agent --cov-fail-under=86`）：（待回填）。
+- `ruff check src tests scripts`、（待回填）；`mypy src/warden_agent`、（待回填）。
+- 本批门禁单独跑一遍 `pytest tests/test_ci_job_gates.py`：（待回填）。
+
+---
 ## 2026-10-08（第七十四批：门禁可以被三行之外的东西关掉——SAST 门禁的「口径」第一次有人看着）
 
 ### 现场

@@ -46,6 +46,14 @@
 #      什么时候必须回来复核（`review_by`，过期即红）；`last_observed_fire: never` 的条目还必须写
 #      `root_cause`（为什么没响）与 `unblock`（怎样才能响，含代价）。
 #
+#   6. **“这条触发器会唤醒哪些 job”也要机检**（第七十五批）：`why` 是散文，散文会漂移。
+#      本仓实景：`triggers:` 第一条（cron `0 3 * * 1`）的 `why` 里写着它是 `mutation` 与 `image-signing`
+#      “那两条门”的唯一正常触发——但 `image-signing` 的 `if:` 只接受 `push v* tag` 与 `workflow_dispatch`，
+#      **不接受** `schedule`。⇒ 就算所有者把默认分支修好、cron 开始响，签名链路依旧永远 skipped，
+#      而那句话会让人以为“已经每周自己验一次了”——**错误信念会在修复之后继续存活**。
+#      ⇒ 每条触发器必须写 `fires_jobs:`（它真的能唤醒的 job 名），守卫对着 workflow 的 `if:` 逐条断言；
+#      反过来，任何 `if:` 里接受 `schedule` 的 job 也必须出现在某个 schedule 条目的 `fires_jobs` 里。
+#
 # 怎么真跑（验证门控后面的东西到底还活着没有）：
 #   gh workflow run ci.yml --ref <分支>            # 手动触发，所有 workflow_dispatch 门控都会跑
 #   gh run watch <run-id> && gh run view <run-id> --json jobs
@@ -139,11 +147,18 @@ triggers:
     kind: schedule
     cron: "0 3 * * 1"
     evaluated_from: 默认分支
+    # 它真的能唤醒谁：`mutation` 的 `if:` 接受 schedule；`image-signing` **不接受**（见下面的 why 订正）。
+    fires_jobs: [mutation]
     why: >
       依赖与基镜像的新 CVE **不需要改代码就会出现**：只在 push/PR 上扫描的话，“没人提交”就等于
       “没人检查”（本仓实测过：用陈旧缓存的基镜像扫会命中 13 条“其实已修”的 CVE，拉新后 0 条）。
-      它同时是 `mutation`（4 分片变异）与 `image-signing`（真签名 + 钉 digest）的唯一“正常”触发——
-      也就是说，这一条 cron 不响，等于那两条门每次 push 的 `skipped` 永远等不到自己的那一天。
+      **它唤醒的只有 `mutation`**（4 分片变异，见 `fires_jobs`）——这条 cron 不响，等于那 4 个分片的
+      `skipped` 永远等不到自己的那一天。
+      第七十五批订正：这一行原来写的是“`mutation` 与 `image-signing` 那两条门”，**后半句是错的**——
+      `image-signing` 的 `if:` 只接受 `push v* tag` 与 `workflow_dispatch`，**不接受** `schedule`；
+      签名必须有“要发布的那个 tag”，每周定时没有可发布对象（设计如此，不是缺陷）。
+      所以：修好默认分支只能让 `mutation` 真正开始响，`image-signing` 在 push 上依旧 skipped；
+      那句错话的实质危害是——它会让人以为“签名链路现在每周自己验一次了”。
     expected_cadence_days: 7
     last_observed_fire: never
     root_cause: >
@@ -171,3 +186,13 @@ triggers:
       ⇒ `on: push: branches: [master] / pull_request`（无 schedule；`git ls-tree origin/master -- .github/workflows`
       显示默认分支上只有这一个 workflow）；`git rev-list --count origin/master..origin/dev` ⇒ 122。
       应交火 2 次（cron 加入之后的周一：2026-09-28、2026-10-05）、实交火 0 次。
+      第七十五批复核（2026-10-08 实测，命令均可复现）：`gh run list --event schedule --limit 12` ⇒ `[]`（仍然从未响过）；
+      `gh api repos/kwny-io/warden-agent --jq .default_branch` ⇒ `master`；
+      `gh api "repos/kwny-io/warden-agent/contents/.github/workflows/ci.yml?ref=master"` ⇒ **561 字节**，
+      base64 还原后是 `on: push: branches: [master]` + `pull_request`，steps 只有 ruff / mypy / pytest 三个
+      ⇒ 默认分支上的 CI 不是“落后版”而是一个 9 月的老存根：它连 uv 锁定、pinning 台账、SAST 口径、
+      md 表格守卫、变异、sbom 全都没有。
+      顺带给 `run_it_now` 补上实跑证据（回答“手动入口到底通不通”）：
+      `gh run list --event workflow_dispatch --json databaseId,headBranch,conclusion` ⇒ 两次都在 `dev`
+      （`37464309137` failure，两个根因已在第六十九批修掉 / `37540647177` success）
+      ⇒ 手动入口**是通的**：机制上文件只需在默认分支上*存在*，内容取自被 dispatch 的 ref。

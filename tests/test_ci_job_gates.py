@@ -34,11 +34,19 @@
      `event=schedule` **0 次**，而 `docs/operations.md` 与 `runs_on` 都把它当“会跑”在引用。
      这类缺席**没有任何本地痕迹**（没 run、没日志、没红色），所以只能靠台账：
      cron / `evaluated_from` / `last_observed_fire` / `how_to_verify` / `review_by`（过期即红）。
+  8.（第七十五批）**“它会唤醒谁”也是必须被验证的断言**（`fires_jobs:`）——`why` 是散文，散文会漂移。
+    现场：cron 那条的 `why` 写着它是 `mutation` 与 `image-signing` “那两条门”的唯一正常触发，
+    而 `image-signing` 的 `if:` 只接受 `push v* tag` 与 `workflow_dispatch`（不接受 `schedule`）
+    ⇒ 那句承诺**永远是假的**，而且默认分支被修好之后，它还会让人以为“签名链路每周自己验一次了”。
+    ⇒ ① 每条触发器写 `fires_jobs:`，守卫对着 workflow 的 `if:` 断言它真能唤醒这些 job
+    （表达式形状不认识就直接报错，不静默放过）；② 反向：任何 `if:` 接受 `schedule` 的 job，
+    必须出现在某条 `kind: schedule` 条目的 `fires_jobs:` 里——两边都不留缝。
 """
 
 from __future__ import annotations
 
 import datetime
+import re
 from pathlib import Path
 from typing import Any
 
@@ -349,6 +357,7 @@ _TRIGGER_KEYS = (
     "kind",
     "cron",
     "evaluated_from",
+    "fires_jobs",
     "why",
     "expected_cadence_days",
     "last_observed_fire",
@@ -518,5 +527,147 @@ def test_schedule_承诺与观察到的现实必须一致() -> None:
                 bad.append(
                     f"{where} 把 schedule 从 runs_on 里划掉了，必须写 runs_on_note："
                     "依据是什么、等触发器修好后何时加回来"
+                )
+    assert not bad, "\n".join(bad)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 触发器 → job 的连线（第七十五批）：**“这条触发器会唤醒哪些 job”以前只是散文。**
+# 实景：cron 条目的 `why` 写着它同时唤醒 `mutation` 与 `image-signing`；而 `image-signing` 的
+# `if:` 不接受 `schedule` ⇒ 修好默认分支也永远不会被它唤醒，那句承诺永远是假的。
+# 散文没人检查就会漂移，所以这里把它落成字段 `fires_jobs`，并对着 workflow 的 `if:` 双向断言。
+
+_CLAUSE_RE = re.compile(r"github\.event_name\s*(?P<op>==|!=)\s*['\"](?P<event>[A-Za-z_]+)['\"]")
+_EVENT_NAME_RE = re.compile(r"github\.event_name")
+
+
+def _declared_events(workflow: str) -> set[str]:
+    """workflow 的 `on:` 里声明了哪些事件（裸 `on:` 会被 YAML 1.1 解析成布尔键，两个都试）。"""
+    return {str(key) for key in _workflow_triggers(workflow)}
+
+
+def _job_conditions(workflow: str) -> dict[str, str]:
+    """{job 名: `if:` 表达式}（没有 `if:` 就是空串，空串 = 所有声明的事件都跑）。"""
+    data: Any = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8")) or {}
+    out: dict[str, str] = {}
+    for name, job in (data.get("jobs") or {}).items():
+        cond = (job or {}).get("if")
+        out[str(name)] = cond.strip() if isinstance(cond, str) else ""
+    return out
+
+
+def _accepted_events(workflow: str, expr: str) -> set[str]:
+    """`if:` 表达式接受哪些事件。
+
+    形状不认识就直接报错：**不认识的形状会让断言静默放过**（这是本仓反复吃过的亏）。
+    """
+    if not expr.strip():
+        return _declared_events(workflow)
+    accepted: set[str] = set()
+    excluded: set[str] = set()
+    for match in _CLAUSE_RE.finditer(expr):
+        (accepted if match.group("op") == "==" else excluded).add(match.group("event"))
+    rest = _CLAUSE_RE.sub("", expr)
+    assert not _EVENT_NAME_RE.search(rest), (
+        f"{workflow} 的 `if:` 里有守卫不认识的 `github.event_name` 用法：{expr!r}\n"
+        "守卫只认 `github.event_name == 'x'` 与 `!= 'x'`；形状变了就得回来改这里，别让它静默放过。"
+    )
+    if excluded:
+        return (_declared_events(workflow) | accepted) - excluded
+    return accepted
+
+
+def test_触发器声明的唤醒对象必须真的接受它的事件() -> None:
+    """`fires_jobs` 是“这条触发器唤醒谁”的唯一可机检形式；散文（`why`）不算证据。
+
+    口径要看清：本用例只管**连线形状**——被点名的 job 的 `if:` 确实接受这条触发器的事件。
+    “这条触发器是否真的会响”不在这里（那要现实证据，见
+    `test_schedule_承诺与观察到的现实必须一致`；变异 M6 恰好是被它抓住的，这是变异矩阵
+    当场抓出我自己写的一条用例名大过口径的结果）。
+    """
+    bad: list[str] = []
+    for entry in _trigger_ledger():
+        wf = str(entry["workflow"])
+        kind = str(entry["kind"])
+        where = f"{wf}:{kind}:{entry.get('cron')}"
+        fires = entry.get("fires_jobs")
+        assert isinstance(fires, list) and fires, (
+            f"{where} 的 fires_jobs 必须是非空列表（这条触发器到底唤醒了谁）。"
+            "一条谁都不唤醒的触发器不该留在台账里"
+        )
+        conditions = _job_conditions(wf)
+        for job in fires:
+            name = str(job)
+            if name not in conditions:
+                bad.append(f"{where} 的 fires_jobs 里有 {name!r}，但 {wf} 里没有这个 job")
+                continue
+            cond = conditions[name]
+            if not cond.strip():
+                bad.append(
+                    f"{where} 的 fires_jobs 里有 {name!r}，但它没有 `if:`："
+                    "所有事件都会跑它，不需要任何触发器“唤醒”；列在这里说明对机制的理解偏了"
+                )
+                continue
+            accepted = _accepted_events(wf, cond)
+            if kind not in accepted:
+                bad.append(
+                    f"{where} 说它会唤醒 {name}，但 {name} 的 `if:` 不接受 {kind}"
+                    f"（接受的是 {sorted(accepted)}；条件：{cond!r}）"
+                )
+    assert not bad, "\n".join(bad)
+
+
+def test_每个接受_schedule_的_job_都要出现在唤醒名单里() -> None:
+    """反向：新写一个 `if:` 里接受 `schedule` 的 job，却没登记“这条 cron 唤醒它” ⇒ 红。"""
+    bad: list[str] = []
+    for entry in _trigger_ledger():
+        if str(entry["kind"]) != "schedule":
+            continue
+        wf = str(entry["workflow"])
+        claimed = {str(x) for x in (entry.get("fires_jobs") or [])}
+        for name, cond in sorted(_job_conditions(wf).items()):
+            if cond.strip() and "schedule" in _accepted_events(wf, cond) and name not in claimed:
+                bad.append(
+                    f"{wf}:{name} 的 `if:` 接受 schedule，但没有任何 schedule 触发器"
+                    f"把它写进 fires_jobs（条件：{cond!r}）"
+                )
+    assert not bad, "\n".join(bad)
+
+
+def test_这条连线机制本身被真的用到过() -> None:
+    """防空转：至少要有一条“触发器 → 带 `if:` 的 job，且 `if:` 里真有这个事件”的连线。"""
+    pairs = 0
+    for entry in _trigger_ledger():
+        wf, kind = str(entry["workflow"]), str(entry["kind"])
+        conditions = _job_conditions(wf)
+        for job in entry.get("fires_jobs") or []:
+            cond = conditions.get(str(job), "")
+            if cond.strip() and kind in _accepted_events(wf, cond):
+                pairs += 1
+    assert pairs >= 1, (
+        "没有任何一条触发器指向一个被 `if:` 门控的 job——上面两条断言等于空转"
+        "（台账或 workflow 被改空了就会这样）"
+    )
+
+
+def test_每个_job_声称的事件必须真的被它自己的_workflow_声明过() -> None:
+    """`runs_on` 里的每个事件，必须在**它的 workflow 的 `on:` 里**，否则要写 `runs_on_note`。
+
+    口径要看清：这条只保证“事件被声明过”，**不保证“真的会被触发”**——`schedule` 是本仓现成的
+    反例（`on:` 里有它，平台却从不求值）。真伪由 `test_schedule_承诺与观察到的现实必须一致`
+    与新增的两条连线断言管。名字写大过口径，就是本批在治的病。
+    """
+    bad: list[str] = []
+    for (wf, job), entry in sorted(_ledger().items()):
+        declared = _declared_events(wf)
+        note = str(entry.get("runs_on_note") or "").strip()
+        for item in entry.get("runs_on") or []:
+            event = str(item).split()[0]
+            if event not in _EVENTS:
+                bad.append(f"{wf}:{job} 的 runs_on 里 {item!r} 不是已知事件名")
+            elif event not in declared and not note:
+                bad.append(
+                    f"{wf}:{job} 承诺在 {event} 上跑，但 {wf} 的 `on:` 里没有 {event}"
+                    f"（现有：{sorted(declared)}）；要么改正 runs_on，要么写 runs_on_note 说明依据"
                 )
     assert not bad, "\n".join(bad)
