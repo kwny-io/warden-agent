@@ -4,6 +4,98 @@
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
 ---
+## 2026-10-08（第七十四批：门禁可以被三行之外的东西关掉——SAST 门禁的「口径」第一次有人看着）
+
+### 现场
+本批的起点是一次**真的静默关停实验**：`security` job 里的门禁是
+`bandit -r src/warden_agent --severity-level medium --confidence-level medium`。
+把它当门禁去问，三个方向都不是「是」：
+
+1. **一行 `# nosec` 就够（本机实测，同一份夹具只差一行注释）**：
+   - 无压制：`exit=1`、`results=1`、`SEVERITY.MEDIUM=1`
+   - 加 `# nosec B307`：`exit=0`、`results=0`，而 **bandit 自己报 `skipped_tests=1`**
+   ⇒ 门禁从红变绿，**唯一的痕迹是一个没人看的计数**；workflow 里也没有任何地方禁止 `# nosec`。
+2. **目标失效照样绿**：门禁参数 + 空目录 ⇒ `loc=0`、`exit=0`（实测）。
+   目录改名、路径拼错、文件被挪走——门禁都成了摆设，而 run 是绿的。
+3. **名字比口径大**：`--confidence-level medium` 会过滤掉 **Medium 但 LOW confidence** 的发现。
+   实测一条 B608（`"SELECT … %s" % uid`，SQL 字符串拼接）在门禁参数下 `results=0`、`exit=0`，
+   但它的 severity 就是 **Medium**（`SEVERITY.MEDIUM=1`）⇒ CI 注释里那句「Medium 及以上必须为 0」
+   **从来没保证过 B608 这一类**，而那正是「SQL 拼接」最常见的形状。
+4. **三行之外的开关**：`|| true` / `--exit-zero` / `--skip B101` / `-x`，以及 `.bandit` 文件、
+   `pyproject.toml` 里的 `[tool.bandit] skips`——都能在**不碰那一步**的前提下把它变成哑巴。
+
+### 改了什么（零行 `src/`）
+新增 `scripts/check_sast_gate.py`：**把门禁当被测物**，而不是「再跑一遍同样的话」。
+判据只用**退出码 + bandit 自己的 JSON metrics**（`loc`/`nosec`/`skipped_tests`/`SEVERITY.*`/`results`），
+不 grep 文本、不人读输出——理由是本仓已有一次同类教训：`scripts/gitleaks_reverse_control.sh` 第一版
+用 `grep -q "leaks found"` 当判据，而 `"no leaks found"` 也含这个子串 ⇒ 那条对照**永真**。
+
+- `audit_ci()`：从 `ci.yml` 里取两个步骤（打印全量 / 拦 Medium），断言
+  ① 门禁那一步**必须原样含** `--severity-level medium --confidence-level medium`（口径被改就红，`gate_flags_changed`）；
+  ② **不含**任何禁用词 `|| true` / `--exit-zero` / `--skip` / `-s ` / ` -x` / `--ignore`（`gate_neutered`）；
+  ③ **两个步骤扫同一个目标**（打印 `src/warden_agent`、拦 `src` ⇒ `target_mismatch`：
+  那样「看得见」与「拦得住」就是两件事）；
+  ④ 门禁步骤被删/改名 ⇒ `gate_step_missing`（**被测物不在，不能算通过**）。
+- `audit_suppression_switches()`：`.bandit` / `bandit.yaml` / `.bandit.yaml` / `[tool.bandit]` ⇒ `config_bypass`。
+- **真扫一遍**（同一组参数、同一个目标），并把「标尺本身可用」逐条断言：
+  `loc >= 12000`（本机实测 21162；扫到 0 行 ⇒ `empty_scan`）；出现 `nosec`/`skipped_tests` ⇒
+  每个压制点必须在 `tests/SAST_SUPPRESSION_LEDGER.yaml` 里按 `file+code+reason+signed_by` 登记，
+  否则 `suppressed_without_signature` 并**点名 `路径:行号`**（不是只给一个计数）；
+  `SEVERITY.MEDIUM + SEVERITY.HIGH != results` ⇒ **有发现被 confidence 档漏掉** ⇒ `severity_filtered_out`。
+- **两个对照由守卫自己跑、自己判**（不是声明）：正对照 = 含 B307 的夹具在门禁参数下**必须红**（`exit != 0`）；
+  负对照 = 同一夹具加 `# nosec` 后**必须绿且 `skipped_tests >= 1`**（证明「红→绿」这条路真的喂到了扫描器）；
+  空扫描对照 = 目标不存在时 `loc == 0`（这就是 loc 下限在守的东西）。
+- 退出码：`0` 干净 / `1` 有缺陷 / `2` **启动失败**（读不到 `ci.yml`、`python -m bandit` 跑不起来）——
+  「守卫自己崩了」绝不能与「干净」同形。
+- `.github/workflows/ci.yml`：门禁注释改成**真实口径**（Medium 及以上**且 High confidence**，
+  并写明 B608/B113 这一档在过滤器之外），其后新增一步跑这个守卫。
+- `tests/test_sast_gate.py`（新增）：把上面每一条都钉成用例——包括**负面对照**（不给它加
+  `# nosec` 就看不见的那条路）与 `min_LOC` 地板那条（只扫到两行也算「干净」的假绿）。
+- `tests/SAST_SUPPRESSION_LEDGER.yaml`（新增）：压制签字台账，现状是**空清单**（本批实测 `nosec=0`、
+  `skipped_tests=0`）——它存在是为了让「哪天有人加 `# nosec`」时，守卫能红。
+
+### 变异矩阵（证这些判据不是死代码）
+
+本批在仓库外（`C:/Users/g1534/wa74/mutate.py`）对被测物做了 10 次定点变异：每次只改一处、先断言“变异前被钉住的用例是绿的”，跑完整个测试文件后再字节级还原。结果 **10/10 全部被抓**：
+
+| 变异 | 动的那一处 | 抓它的判据 |
+|---|---|---|
+| M0 | `ci.yml` 里门禁步骤改名（等于让它消失） | 守卫 `rc=1`（`gate_step_missing`） |
+| M1 | 门禁命令后加 `\|\| true` | 守卫 `rc=1`（`gate_neutered`） |
+| M2 | 门禁丢掉 `--confidence-level medium` | 守卫 `rc=1`（`gate_flags_changed`） |
+| M3 | 门禁扫的目标改宽（`src/warden_agent` → `src`） | 守卫 `rc=1`（`target_mismatch`） |
+| M4 | `MIN_LOC` 改成 0（等于不设限） | 用例 `rc=1`（loc 地板那条） |
+| M5 | 让「被压制但没签字」这条判据永不触发 | 用例 `rc=1` + 守卫 `rc=1` |
+| M6 | 让「Medium 档被 confidence 漏掉」这条判据永不触发 | 守卫 `rc=1` |
+| M7 | 让配置旁路检查永远返回空 | 用例 `rc=1` |
+| M8 | 正对照的夹具不再含 Medium 缺陷（`eval` 改成 `str`） | 守卫 `rc=1` + 用例 `rc=1` |
+| M9 | 被测物不在时 `main()` 返回 0 | 用例 `rc=1`（退出码语义那条） |
+
+还原后与跑前**字节一致**（`ci.yml` `5107ca9f4d073404…`、`check_sast_gate.py` `60985fe03e77100c…`），而变异窗口之外再取一次 `git status --porcelain`：只剩本批有意改的那几个文件（同批另存了一份 `wa74/ref74_shas.txt` 当脚本自己账之外的独立参照）。
+
+**矩阵自己的坑（写下来，因为下一次一定会再碰到）**：第一版矩阵用文本模式读写锚点——那会把 CRLF 悄悄归一成 LF，「还原」之后字节就不一样了；换成字节读写之后又忘了把锚点按文件真实行尾展开（仓库里是 CRLF，锚点字面量写的是 LF），于是第二版 10 条锚点**全部命不中**、整轮空跑，却印出「10 条不成立」——看上去像「守卫没接住」，其实是矩阵没变异。第三版同时做到「字节还原 + 锚点按行尾展开」（并且先断言 `raw.count(anchor) == 1`），才拿到 10/10。
+
+### 本地证据
+
+冻结：跑前/跑后三组纯内容哈希都一致（`git add -A` 之后取，含未跟踪新文件）——`tree=453016016698812c…`、`shape=d9e195906f0e789a`、`keys=a724b9ed9610f7ab`。
+
+- `pytest`（`CI=1`、`-p no:cacheprovider`、`--cov=warden_agent --cov-fail-under=86`）：**1833 passed / 4 skipped**，用时 680.31s（0:11:20），覆盖率 **90.31%**（门槛 86%）。4 条 skipped 全是平台/工具链限制：本机无 `pg_dump`/`pg_restore`、win32 建不了符号链接 ×2、win32 没有网络命名空间原语。
+- `ruff check src tests scripts`：rc=0。
+- `mypy src/warden_agent`（CI 口径，115 文件）：rc=0。
+- 三个门禁都**在冻结里单独跑过**（不只靠全量套件代跑）：`check_md_tables.py` ⇒「扫描 10 个 Markdown / 102 张表：缺陷 0 处」；`check_pinned_images.py` ⇒ rc=0；本批新增的 `check_sast_gate.py` ⇒ `loc=21162 Medium=0 High=0 results=0 nosec=0 skipped_tests=0 exit=0`（下限 `loc>=12000`），且三个对照同时成立：正对照 `exit=1`、压制后 `exit=0 skipped_tests=1`、空扫描 `loc=0`。
+- 变异矩阵 **10/10**（见上一节）。
+
+⚠️ 这份数字是在**冻结树**（`tree=4530160166…`）上测的；提交与它的差量只有回填这些数字的散文（本节 + `docs/复核索引.md`），用 `git diff --stat <冻结树> HEAD` 可以看出只有 `.md`。
+
+### 已知限制
+- 它是**读 workflow 文本**的（`yaml.safe_load`），不是 GitHub 的求值器：
+  无法知道「平台上这一步到底会不会被跑」——`if:`、环境变量、规则集都可能在别处把它关掉。
+- 只覆盖 `security` job 里 bandit 这一条命令；gitleaks、pip-audit、trivy 的口径不在本批范围。
+- `MIN_LOC = 12000` 是**本机实测值**（21162）留的余量，不是仓库公约：真把代码删掉一半时会误报，
+  那时要一并调低下限并在这里写理由。
+- `read_ledger()` 按 `file` 做前缀匹配（`site.startswith(file)`）：同一文件多规则、目录级登记这类写法它不区分。
+- 它**不判断**某条 `# nosec` 的理由够不够格，只要求「写了理由 + 有人签字」——人审仍在人那边。
+
 ## 2026-10-07（第七十三批：文档里可复制的命令也是执行面——5 处围栏里躺着 1 个必拉不动的 digest）
 
 ### 现场

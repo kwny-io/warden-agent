@@ -267,8 +267,26 @@ jobs:
         # 基线（2026-09-23）：Medium 0、Low 28。
         # 此前 `migrations.py` 里两处 B608（常量表名的 f-string）用 `# nosec B608` 显式接受；
         # item 4 已把该文件删除（迁移改成显式 schema 版本），现在**无任何 #nosec 压制**，
-        # Medium 0 是真实扫描结果。将来若出现必须压制的项，要在本注释里写明理由。
+        # Medium 0 是真实扫描结果。将来若出现必须压制的项，按 tests/SAST_SUPPRESSION_LEDGER.yaml
+        # 的格式写清理由与签字人——**散文不算断言**（下面那条守卫只认台账里的条目）。
+        #
+        # 口径要说准（第七十四批实测）：这条命令拦的是「Medium 及以上 **且 High confidence**」。
+        # B608（SQL 字符串拼接）、B113（requests 无 timeout）这类是 Medium/**LOW** confidence，
+        # 在 `--confidence-level medium` 下**根本不会被报出来**（实测 results=0、exit=0）。
+        # 所以名字里的“Medium 及以上”不等于“覆盖所有 Medium”。这个差距由
+        # scripts/check_sast_gate.py 看着：一旦出现“Medium 档但被 confidence 漏掉”的发现，
+        # 它会红，并要求要么修掉、要么把口径登记清楚。
         run: uv run --frozen bandit -r src/warden_agent --severity-level medium --confidence-level medium
+
+      - name: 断言 SAST 门禁的口径没被静默关掉（压制 / 空扫描 / 参数 / 配置旁路）
+        # 为什么单独一条：门禁可以被三行之外的东西关掉，而且绿 run 里全都看不出来——
+        #   ① 一行 `# nosec` 让它从红变绿（实测：exit 1 → 0，bandit 自己的 skipped_tests 从 0 → 1）；
+        #   ② 目标写错/目录改名 ⇒ bandit 扫 0 行照样 exit=0（实测 loc=0、exit=0）；
+        #   ③ `.bandit` / `[tool.bandit] skips` 换一份配置；
+        #   ④ `|| true` / `--skip` / `--exit-zero` 直接把它变成哑巴。
+        # 脚本把本文件里那两个步骤当**被测物**（参数、目标、禁用词），并跑正/负两个对照：
+        # 正对照证明“含 Medium 缺陷的夹具会被拦”，负对照自检证明“上述拦截真的喂到了扫描器”。
+        run: uv run --frozen python scripts/check_sast_gate.py
 
       - name: 秘密扫描（gitleaks，扫全历史）
         # 扫 **history** 而不只是工作区：已提交过的凭据也要能发现（就算后来删掉，历史里还在）。

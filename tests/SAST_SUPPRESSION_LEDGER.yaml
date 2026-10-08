@@ -1,0 +1,22 @@
+# SAST 压制的签字台账（`scripts/check_sast_gate.py` 读这个文件）
+#
+# 为什么要有它：`# nosec` 只是**一行注释**，但它能让 security job 的门禁静默变绿。
+# 实测（第七十四批，本机）：
+#   夹具无压制   ⇒ exit=1、results=1、SEVERITY.MEDIUM=1
+#   夹具加 #nosec ⇒ exit=0、results=0、bandit 自己的 skipped_tests=1
+# 也就是说：压制**可计数**，但只有人肯去看那个计数才看得见。这条守卫就是那个"人"。
+#
+# 规则：扫描目录里出现 `nosec`（或 bandit 报 `skipped_tests > 0`）时，
+# **每一个压制点**都要能在下面的清单里按 `file` + `code` 找到一条理由与签字人；
+# 找不到 ⇒ 守卫红，并在报错里点名 `路径:行号`。
+#
+# 格式（四个字段缺一不可——`reason` 不是散文，它是断言；`signed_by` 要能追到人/文件）：
+#   suppressions:
+#     - file: src/warden_agent/某文件.py      # 相对仓库根，与报错里的路径一致
+#       code: B608                            # bandit 的规则号
+#       reason: 为什么必须压制（不接受"误报"两个字；写清为什么改不掉）
+#       signed_by: 谁签的字（人名 / 复核记录路径 / 关联 issue）
+#
+# 现状：**零压制**（本批实测 `nosec=0`、`skipped_tests=0`），所以这里是空清单。
+# 一旦有人加 `# nosec`，即便忘了来登记，守卫也会红——这就是这张表存在的意义。
+suppressions: []
