@@ -647,14 +647,16 @@ python -m warden_agent.demo_e2e                                                 
   ⇒ 证明「红→绿」真的喂到了扫描器，而不是参数写错导致什么都没扫）。压制不是禁止、是**要签字**：
   `tests/SAST_SUPPRESSION_LEDGER.yaml` 里按 `file`+`code`+`reason`+`signed_by` 登记（缺一不可，报错点名 `路径:行号`）。
   退出码 `0` 干净 / `1` 有缺陷 / `2` **启动失败**（读不到 `ci.yml`、bandit 跑不起来）——「守卫自己崩了」不与「干净」同形。
-- **触发器与 job 之间有一条没人验过的连线（第七十五批）**：台账里写着「cron `30 3 * * *` 唤醒 `image-signing`」，
+- **触发器与 job 之间有一条没人验过的连线（第七十五批）**：台账里**原本写着**「cron `0 3 * * 1`（每周一 03:00 UTC）唤醒 `image-signing`」（本批订正：这条 cron 的 `fires_jobs` 只留 `mutation`），
   而 `image-signing` 的 `if:` 只接受 `push (v* tag)` 与 `workflow_dispatch`、**不接受 `schedule`**
   —— 这句因果从来没成立过（也不会成立：平台规则下 `schedule` 只在**默认分支**上求值，本仓默认分支 `master`
-  上只有 561 字节的占位 workflow）。判据在 `tests/test_ci_job_gates.py`（18 → 22 条，全走结构、不 grep 文本）：
+  上只有 561 字节的占位 workflow）。判据在 `tests/test_ci_job_gates.py`（18 → 24 条，全走结构、不 grep 文本）：
   触发器的 `fires_jobs` 点到的每个 job，其 `if:` **必须**接受该触发器的事件（空列表、名字写错都红）；
   job 声称自己在 `schedule` 上跑，就必须有 cron 登记说唤醒它；门禁化 `if:` 里出现 `schedule`
-  却不在任何 `fires_jobs` 里即红。`if:` 的解析是**失败关闭**的——只认 `github.event_name == / !=` 与
-  `contains(github.ref, 'refs/tags/v')`，出现别的形状直接断言失败（形状认不出比认错好）。
+  却不在任何 `fires_jobs` 里即红。`if:` 的解析是**失败关闭**的——认得 `github.event_name == / !=`（点号与
+  `github['event_name']` 两种写法）与 `github.event.schedule` 的比较；出现别的 `github.event.*` 用法就
+  断言失败（形状认不出比认错好）。`github.ref` 这类**收窄**不算（`startsWith(...)` 就是），守卫按事件集
+  做过近似。
   ⚠️ 它只能离线读字面形状：运行时算出来的事件名、以及「默认分支上到底有没有这份 workflow」它都看不见，
   后者仍由台账的 `how_to_verify` + `review_by`（见第七十一批）管。
 - **安全基线**：密钥经 `.env` 加载不进代码；`.gitignore` 屏蔽密钥、数据库与日志文件

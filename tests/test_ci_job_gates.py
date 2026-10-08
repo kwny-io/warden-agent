@@ -50,6 +50,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
@@ -537,8 +538,24 @@ def test_schedule_承诺与观察到的现实必须一致() -> None:
 # `if:` 不接受 `schedule` ⇒ 修好默认分支也永远不会被它唤醒，那句承诺永远是假的。
 # 散文没人检查就会漂移，所以这里把它落成字段 `fires_jobs`，并对着 workflow 的 `if:` 双向断言。
 
-_CLAUSE_RE = re.compile(r"github\.event_name\s*(?P<op>==|!=)\s*['\"](?P<event>[A-Za-z_]+)['\"]")
+_CLAUSE_RE = re.compile(
+    r"github(?:\.event_name|\[['\"]event_name['\"]\])\s*(?P<op>==|!=)\s*['\"](?P<event>[A-Za-z_]+)['\"]"
+)
 _EVENT_NAME_RE = re.compile(r"github\.event_name")
+# `github.event.schedule` 是 GitHub 给 schedule 事件提供的字段（值就是触发它的那个 cron 串）：
+# 拿它做比较的条件**只在 schedule 下成立**，所以必须被认成“接受 schedule”。
+# 不认它的后果实测过（第七十五批独立复核给出的反例 A1）：写
+# `if: github.event.schedule == '0 3 * * 1'` 的 job 真会被 cron 唤醒，却**不必出现在台账里**——
+# 因为守卫看不懂 `github.event_name` 之外的条件，就把它当成“什么都不接受”了。
+_SCHEDULE_CLAUSE_RE = re.compile(
+    r"github(?:\.event\.schedule|\[['\"]event\.schedule['\"]\])\s*(?P<op>==|!=)\s*['\"]"
+)
+# 不认识的 `github.event.*` 用法必须**报错**：静默认成“什么都不接受”会让
+# “连线断了”和“守卫看不懂”变成同一件事。（`github.ref` / `github.ref_name` 这类**收窄**不算，
+# 它们不改变“这条 job 接受哪些事件”——`image-signing` 的 `startsWith(github.ref, …)` 就是例子。）
+_EVENT_FIELD_RE = re.compile(
+    r"github(?:\.event\.(?!schedule\b)[A-Za-z_]+|\[['\"]event\.[^'\"]*['\"]\])"
+)
 
 
 def _declared_events(workflow: str) -> set[str]:
@@ -567,10 +584,19 @@ def _accepted_events(workflow: str, expr: str) -> set[str]:
     excluded: set[str] = set()
     for match in _CLAUSE_RE.finditer(expr):
         (accepted if match.group("op") == "==" else excluded).add(match.group("event"))
+    for match in _SCHEDULE_CLAUSE_RE.finditer(expr):
+        (accepted if match.group("op") == "==" else excluded).add("schedule")
     rest = _CLAUSE_RE.sub("", expr)
+    rest = _SCHEDULE_CLAUSE_RE.sub("", rest)
     assert not _EVENT_NAME_RE.search(rest), (
         f"{workflow} 的 `if:` 里有守卫不认识的 `github.event_name` 用法：{expr!r}\n"
         "守卫只认 `github.event_name == 'x'` 与 `!= 'x'`；形状变了就得回来改这里，别让它静默放过。"
+    )
+    assert not _EVENT_FIELD_RE.search(rest), (
+        f"{workflow} 的 `if:` 里有守卫不认识的 `github.event.*` 用法：{expr!r}\n"
+        "这类条件可能改变“这条 job 接受哪些事件”，守卫看不懂时**必须报错**\n"
+        "（静默忽略会把“连线断了”和“守卫看不懂”变成同一件事）。\n"
+        "要支持新形状就来这里加一条正则 + 一个用例；只是**收窄**（`github.ref` 之类）不用管。"
     )
     if excluded:
         return (_declared_events(workflow) | accepted) - excluded
@@ -632,6 +658,58 @@ def test_每个接受_schedule_的_job_都要出现在唤醒名单里() -> None:
                     f"把它写进 fires_jobs（条件：{cond!r}）"
                 )
     assert not bad, "\n".join(bad)
+
+
+def test_解析器认得两种事件字段写法与_schedule_字段() -> None:
+    """把解析器本身钉住（第七十五批独立复核给的 A1 反例）。
+
+    三种写法必须等价；**不认识的形状必须报错**而不是静默返回空集——
+    静默返回空集的后果实测过：写 `github.event.schedule == '…'` 的 job 真会被 cron 唤醒，
+    却因为守卫看不懂而**不必登记**。
+    """
+    assert _accepted_events("ci.yml", "github.event_name == 'schedule'") == {"schedule"}
+    assert _accepted_events("ci.yml", "github['event_name'] == 'schedule'") == {"schedule"}
+    assert _accepted_events("ci.yml", "github.event.schedule == '0 3 * * 1'") == {"schedule"}
+    assert _accepted_events("ci.yml", "github.event_name != 'schedule'") == {
+        "push",
+        "pull_request",
+        "workflow_dispatch",
+    }
+    with pytest.raises(AssertionError):
+        _accepted_events("ci.yml", "github.event.pull_request.draft == false")
+
+
+def test_只在_schedule_上跑的_job_必须有一条_cron_会唤醒它() -> None:
+    """反向的“睡不醒的 job”：`if:` 若**只**接受 `schedule`，就必须有 cron 登记说它唤醒它。
+
+    为什么不能只看台账：`test_每个接受_schedule_的_job_都要出现在唤醒名单里` 只遍历台账里**已有**的
+    schedule 条目——独立复核给出的反例 A2 正是从这里钻的：新写一个 workflow，里面放一个
+    `if: github.event_name == 'schedule'` 的 job，全仓没有任何 cron ⇒ 那条用例不会红，
+    而这个 job 永远等不到自己的那一天。本用例扫的是**全仓所有 workflow**，不依赖台账先有记录。
+    """
+    only_schedule: dict[str, list[str]] = {}
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        workflow = path.name
+        if not _declared_events(workflow):
+            continue
+        for job, expr in _job_conditions(workflow).items():
+            if _accepted_events(workflow, expr) == {"schedule"}:
+                only_schedule.setdefault(workflow, []).append(job)
+
+    fired: dict[str, set[str]] = {}
+    for entry in _trigger_ledger():
+        if entry.get("kind") == "schedule":
+            fired.setdefault(str(entry.get("workflow")), set()).update(
+                str(x) for x in (entry.get("fires_jobs") or [])
+            )
+
+    for workflow, jobs in only_schedule.items():
+        for job in jobs:
+            assert job in fired.get(workflow, set()), (
+                f"`{workflow}` 的 `{job}` 只在 `schedule` 上跑，却没有任何 cron 登记说它唤醒它"
+                "——要么给它所在的 workflow 补一条带 `fires_jobs` 的 `triggers:` 条目，"
+                "要么它的 `if:` 里加上别的事件。这正是“凌晨那次唤醒从来没到过任何人手里”的形状。"
+            )
 
 
 def test_这条连线机制本身被真的用到过() -> None:

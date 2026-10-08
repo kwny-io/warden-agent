@@ -15,7 +15,7 @@
 2. **实据**：按 job 读 `startedAt`——`workflow_dispatch` 的 16 个 job **16/16 全为 null**；
    同一批 job 在 `push` 路径上 12 个都有真实 `startedAt`、null 为 0。
    ⇒ `dispatch` 路径上没有一次真的开始跑过，而 `push` 路径上有；cron 属于前者。
-3. **台账里还写着一句没人验过的因果**：「cron `30 3 * * *` 唤醒 `image-signing`」。
+3. **台账里原本写着一句没人验过的因果**（本批已订正为只唤醒 `mutation`）：「cron `0 3 * * 1`（每周一 03:00 UTC）唤醒 `image-signing`」。
    而 `image-signing` 的 `if:` 只接受 `push (v* tag)` 与 `workflow_dispatch`，**不接受 `schedule`**
    ⇒ 就算默认分支上换成完整 workflow，这个 cron 也永远唤不醒它。
 4. **守卫的盲区**：`tests/test_ci_job_gates.py` 已经验「事件 → job」（声明的事件必须真的触发它）、
@@ -23,20 +23,25 @@
    触发器可以点名一个永远不会被它唤醒的 job，而所有用例依然是绿的。
 
 ### 改了什么（零行 `src/`）
-`tests/test_ci_job_gates.py` 新增四条断言（18 → 22 条），判据全部走**结构**，不 grep 文本：
+`tests/test_ci_job_gates.py` 新增四条断言（18 → 22 条），另补两条（独立复核之后，见下节，共 24 条），
+判据全部走**结构**，不 grep 文本：
 
-1. `test_触发器台账每条都写全了`：每条触发器必填 `id/on/cron/fires_jobs/evidence`，缺一个就红；
-   排除必须带理由（`_TRIGGER_HISTORY`）。
-2. `test_触发器声明的唤醒对象必须真的接受它的事件`：`fires_jobs` 里每个 job，其 `if:` **必须**接受该触发器的事件；
+1. `test_触发器声明的唤醒对象必须真的接受它的事件`：`fires_jobs` 里每个 job，其 `if:` **必须**接受该触发器的事件；
    空列表直接红（一条谁都不唤醒的触发器不该留在台账里）；名字写错（job 不存在）也红。
-3. `test_每个_job_声称的事件必须真的被它自己的_workflow_声明过`：反向——job 说自己在 `schedule` 上跑，
-   就必须有 cron 登记说它唤醒它。
-4. `test_每个接受_schedule_的_job_都要出现在唤醒名单里`：门禁化的 `if:` 里出现 `schedule`
+2. `test_每个接受_schedule_的_job_都要出现在唤醒名单里`：门禁化的 `if:` 里出现 `schedule`
    却不在任何触发器的 `fires_jobs` 里 ⇒ 红（新写一个「睡不醒的 job」立刻被抓住）。
+3. `test_这条连线机制本身被真的用到过`：防空转——至少有一对 (触发器, `fires_jobs` 里的 job) 真的成立，
+   否则「判据存在」与「判据真的在管东西」长得一样。
+4. `test_每个_job_声称的事件必须真的被它自己的_workflow_声明过`：反向——job 说自己在 `schedule` 上跑，
+   就必须有 cron 登记说它唤醒它。（口径：它只保「被声明过」，**不保「会发生」**——`schedule` 就是反例。）
 
-读 `if:` 的方式是**失败关闭**的：只认 `github.event_name == '…'` / `!= '…'` 两种子句形状，
-加上对 `contains(github.ref, 'refs/tags/v')` 的狭义识别（映射成 `push (v* tag)`）；
-出现别的形状就抛 `AssertionError`——形状认不出比认错好。
+（触发器台账那些必填字段的判据是**第 71 批**就有的 `test_触发器台账每条都写全了` + `_TRIGGER_KEYS`，本批没动。）
+
+读 `if:` 的方式是**失败关闭**的：认得 `github.event_name == '…'` / `!= '…'`（点号与 `['event_name']`
+两种写法都认），以及 `github.event.schedule` 的比较（它只在 `schedule` 下成立 ⇒ 记成「接受 schedule」）；
+出现别的 `github.event.*` 用法就抛 `AssertionError`——形状认不出比认错好。
+`github.ref` 这类**收窄**不算（`image-signing` 的 `startsWith(github.ref, 'refs/tags/v')` 就是）：
+它不改变「这条 job 接受哪些事件」，守卫按事件集做过近似，这一点写在代码注释里。
 
 顺手改正了台账里的错话（同一个提交）：cron 那一行的 `fires_jobs` 从臆想的对象改成真的被它唤醒的 job、
 `why` 里对 `image-signing` 的说法订正、把 `master` 占位文件的实测证据补进 `evidence`、
@@ -47,46 +52,109 @@
   ⇒ 收窄到**门禁化的 job**（`if:` 里出现 `github.event_name`）。
 - `fires_jobs` 一开始把「什么都不等的裸 job」也算作被唤醒 ⇒ 那条连线断言会永远红 ⇒ 同样收窄。
 
+### 独立复核（两个只读子代理）发现的四件事——包括我自己写错的两处散文
+交付前派了两个只读 reviewer 子代理：一个专找**假阴性**（哪次真实改动会让守卫仍然绿），
+一个逐字核对**散文 vs 文件**。它们拓出四件事，四条都在本批内改掉了：
+
+1. **散文里的 cron 串是我编的**：README 与索引两处都写「cron `30 3 * * *` 唤醒 `image-signing`」（本 CHANGELOG 当时写的是正确的 `0 3 * * 1`，只有那两处是我编的串），
+   而台账（`tests/CI_JOB_GATES.yaml`）与 `ci.yml` 里都是 `0 3 * * 1`（每周一 03:00 UTC）——
+   `30 3 * * *` 全仓**只出现在散文里**。这正是本仓反复吃过的「散文复述代码事实」那个病，
+   而所有守卫全绿（它们不读散文）。
+2. **`_TRIGGER_HISTORY` 这个常量不存在**：散文把第 73 批「排除必须带理由」的写法（`_MD_HISTORY`）
+   搬到了触发器这层；实际只有 `_TRIGGER_KEYS`（12 个必填字段），**没有任何排除表**。
+3. **假阴性 A1（真缺陷，已修）**：条件写成 `github.event.schedule == '0 3 * * 1'` 的 job
+   真会被 cron 唤醒，而旧解析器只认 `github.event_name` ⇒ 它被当成「什么都不接受」⇒
+   **不必登记**。修法：认这个字段（点号与索引两种写法）+ 不认识的 `github.event.*` 一律报错，
+   并补一条直接钉解析器的用例 `test_解析器认得两种事件字段写法与_schedule_字段`。
+4. **假阴性 A2（真缺陷，已修）**：`test_每个接受_schedule_的_job_都要出现在唤醒名单里` 只遍历
+   台账里**已有**的条目 ⇒ 新写一个 workflow、里面放一个 `if: github.event_name == 'schedule'` 的 job、
+   全仓没有任何 cron，也不会红（这个 job 永远等不到自己的那一天）。修法：新增
+   `test_只在_schedule_上跑的_job_必须有一条_cron_会唤醒它`——扫**全仓所有 workflow**，
+   不依赖台账先有记录。
+
+（复核还给了第三条缝 B1：用 `needs:` 搭住上流任务时，job 自己的 `if:` 没变而它永远不会跑。
+那超出本层口径——本层只保「事件与 job 的连线形状」，已在
+`test_触发器声明的唤醒对象必须真的接受它的事件` 的 docstring 里写明「这条触发器是否真的会响不在这里」。）
+
+### 交付（本地 + CI 实测）
+
+- **提交**：`779a8db`（tree `66e13087687874e5a87b0f1d259425480b964ffc`），零行 `src/`；改动 `tests/CI_JOB_GATES.yaml`、
+  `tests/test_ci_job_gates.py`、`CHANGELOG.md`、`README.md`、`docs/复核索引.md`。
+- **CI**：push run `37794972489` = **success**（`event=push`，sha 与提交一致）。作业级：
+  `quality`/`security`/`container`/`sbom`/`migration`/`evals-real` = success；
+  `变异测试（${{ matrix.shard }}）`、`image-signing` = **skipped（预期）**——前者只在 schedule/dispatch 路径上跑，
+  后者只在 `v*` tag 上跑。
+- **跳过要签字，而且真的签了**（第七十批的机制，本批第一次在真实 run 上验到）：`evals-real` 里那个
+  step「模型质量评测（`--mode real`）」被跳过 ⇒ 产出 artifact `eval-skip-receipt`（461 B），内容：
+  `reason: DEEPSEEK_API_KEY 未配置，且 ALLOW_EVAL_SKIP=1（已签字）`、
+  `signed_by: ci.yml 里的 ALLOW_EVAL_SKIP（=1）`，`run_id`/`sha`/`event` 与实际 run 一致。
+- **本地**：`pytest tests/test_ci_job_gates.py -q -p no:randomly` = **24 passed**（改前 18）；
+  `ruff check src tests scripts` 通过。
+- **变异矩阵**：**10/10 符合预期**（10 条变异 × 24 用例，逐条按字节还原 + sha256 对账）——它当场抓出**我自己**的两处错，
+  两处都是「我给装置写的预期错了」，不是守卫错了：
+  1. M6 的预期被我写在「本批新写的用例」名下，实际是被**上一批**那条带现实证据的用例
+     （`test_schedule_承诺与观察到的现实必须一致`）抓住——用例名大过口径。
+  2. M9 的预期被我写成「解析器单测」，而那条单测只吃字面字符串、**不读 `ci.yml`**，
+     根本不可能抓到这个变异。亲手复现抓到的实际报错是：
+     ``AssertionError: ci.yml 的 `if:` 里有守卫不认识的 `github.event.*` 用法：'github.event.pull_request.draft == false'``
+     ——即设计中的**失败关闭**，抓住它的是两条扫全仓 workflow 的用例。
+     取证脚本：`C:/Users/g1534/wa75/m9_reason.py`（跑完按字节还原并校验 sha256）。
+- **冻结点**（跑前/跑后三组纯内容哈希逐字相同，同一棵树上取的数）：全量 `pytest` **1839 passed, 4 skipped**（708.60s，覆盖率 **90.31%**，门槛 86%）；4 条跳过都是环境限制（`pg_dump`/`postgresql-client` 缺失、两处符号链接、win32 没有网络命名空间原语）；`ruff check src tests scripts` = All checks passed；`mypy src/warden_agent` = Success: no issues found in **115** source files；五条守卫全 rc=0，本批新门禁**单独跑**也 rc=0（不靠全量 pytest 间接覆盖）；三组哈希 `tree=b6940c37576f6c0a609175cd194a69afae1ab170` / `dirty形状=7325235aa94ba7d8` / `关键文件=4981fdb7faf9c335`；变异矩阵 **10/10**（含 M7「只改注释」必须 0 失败的反向对照——证明这套断言不是见谁都咬）。
+
 ### 证据
 - 默认分支取证：`gh api repos/kwny-io/warden-agent/contents/.github/workflows/ci.yml?ref=master`
   ⇒ `blob 9f8cf7dc…`、`size=561`。
 - job 级 `startedAt`：`workflow_dispatch` 16/16 null；`push` 12 个有值、0 个 null。
-- `pytest tests/test_ci_job_gates.py -q -p no:randomly` ⇒ **22 passed**（改前 18）。
+- `pytest tests/test_ci_job_gates.py -q -p no:randomly` ⇒ **24 passed**（改前 18）。
 - `ruff check tests` ⇒ All checks passed（期间被 E501 咬过一次：行内注释的**行尾空格**也算行长，已修）。
 
 ### 变异矩阵（正对照：拿真缺陷去打守卫，看它是不是真的叫）
-**8 条变异里 7 条第一轮就符合预期，第 8 条（M6）当场抓出了一条我自己犯的错**：
-给 job 台账里的 `image-signing` 谎报 `runs_on: [schedule, …]` 时，红的是**上一批**那条
-`test_schedule_承诺与观察到的现实必须一致`，而不是我本批新写的那条——新写的那条（当时叫
-`test_job_台账里承诺的每个事件都必须真的会被触发`）实际只检查“这个事件在 workflow 的 `on:` 里”，
-**配不上它的名字**。改法是把两条用例改成“名字说了什么就只做什么”：
+**10 条变异，10/10 符合预期**；其中 **2 条当场抓出的是我自己的错**（都是我写的「预期」不对，不是守卫不对），
+另有 2 条是被独立复核逼出来的假阴性、修完立刻钉进矩阵：
 
-* `test_触发器声明的唤醒对象必须真的接受它的事件`——只管**连线形状**（被点名的 job 的 `if:` 接受这条触发器的事件）；
-* `test_每个_job_声称的事件必须真的被它自己的_workflow_声明过`——只管**声明**（事件在 `on:` 里），
-  并在 docstring 里写明“**不保证真的会被触发**，`schedule` 就是反例”。
+1. **M6｜我的「预期」指错了用例（用例名大过口径）**：给 job 台账里的 `image-signing` 谎报
+   `runs_on: [schedule, …]`，红的是**上一批**那条带现实证据的 `test_schedule_承诺与观察到的现实必须一致`，
+   而不是我写的「本批新写那条」。新写那条（当时叫 `test_job_台账里承诺的每个事件都必须真的会被触发`）
+   只检查「事件在 workflow 的 `on:` 里」，**配不上它的名字**。改法是把两条改成名实相符：
+   `test_触发器声明的唤醒对象必须真的接受它的事件` 只管**连线形状**；
+   `test_每个_job_声称的事件必须真的被它自己的_workflow_声明过` 只管**声明**，并在 docstring 里写明
+   「**不保证真的会被触发**，`schedule` 就是反例」。
+2. **M9｜我的「预期」写在一个结构上不可能抓它的用例上**：把 `image-signing` 的 `if:` 换成守卫不认识的
+   `github.event.*` 字段，我原以为该由解析器的单测报红——那条单测只吃**字面字符串**、**不读 `ci.yml`**，
+   根本看不见这个变异。亲手复现抓到它的实际报错原文是：
+   ``AssertionError: ci.yml 的 `if:` 里有守卫不认识的 `github.event.*` 用法：'github.event.pull_request.draft == false'``
+   —— 即设计中的**失败关闭**；真正抓住它的是两条扫全仓 workflow 的用例。取证脚本
+   `C:/Users/g1534/wa75/m9_reason.py`（跑完按字节还原并校验 sha256，树恢复为 `5107ca9f…`）。
+   **教训：预期必须指名真的会红的那条用例，并亲手看到报错原文——「红了」不等于「按设想红了」。**
+3. **M8/M9 是被独立复核逼出来的**：两个只读子代理交回两条**假阴性**（A1：条件写
+   `github.event.schedule == '0 3 * * 1'` 的 job 真会被 cron 唤醒，旧解析器却当它「什么都不接受」⇒
+   不必登记；A2：只遍历台账**已有**条目 ⇒ 新 workflow 里 schedule-only 的 job 不会红）。
+   修完立刻把这两条反例做成变异 M8/M9 钉进矩阵——**复核结论不落成变异，就等于没修**。
+4. **M7 是「不该红」的对照**：只改注释（语义不变）⇒ **0 失败**，且基线本身是绿的 ⇒ 证明装置不是永远红。
+5. 跑前逐条预检「锚点在本文件里恰好命中 1 次」：第一版有 3 条锚点命中 **0 次**（CRLF 行尾）⇒
+   那 3 条当时是**空跑但报 ok**；修完才敢看结果。
 
-“真的会不会响”仍由上一批那条带现实证据的用例管——变异矩阵的作用正是：**把“谁在管什么”变成可观测的**。
-
-改名 + 修正期望后复跑 ⇒ **8/8 符合预期**（8 条里 7 条第一轮就对，M6 唯一的“不合格”就是上面这条自曝）。
-
-| 变异 | 期望 | 结果 |
+| 变异 | 期望 | 结果（红在哪几条） |
 | --- | --- | --- |
-| M0 台账改成「cron 唤醒 `image-signing`」（本批真实发现的错话） | 连线断言红 | ✅ 红（连带 `每个接受_schedule_的_job_都要出现在唤醒名单里`、`这条连线机制本身被真的用到过`） |
-| M1 `fires_jobs` 写一个不存在的 job | 连线断言红 | ✅ 红（同上三条） |
-| M2 删掉 `fires_jobs` 整行 | 必填字段断言红 | ✅ 红（4 条，含 `触发器台账每条都写全了`） |
-| M3 `mutation` 的 `if:` 不再接受 `schedule` | 连线断言红 | ✅ 红（3 条，含 `台账里的_gate_与_workflow_逐字一致`） |
-| M4 给 `image-signing` 的 `if:` 加上 `schedule` | 「睡不醒的 job」断言红 | ✅ 红（3 条，含上一批那条「现实必须一致」） |
-| M5 `fires_jobs` 写成空列表 | 连线断言红 | ✅ 红（3 条） |
-| M6 job 台账谎报自己在 `schedule` 上跑 | 反向断言红 | ✅ 红，但红的是**上一批那条**（本批新写那条没红 ⇒ 已改名，见上） |
+| M0 台账改成「cron 唤醒 `image-signing`」（本批真实发现的错话） | 连线断言红 | ✅ 红 3 条（含 `触发器声明的唤醒对象必须真的接受它的事件`） |
+| M1 `fires_jobs` 写一个不存在的 job | 连线断言红 | ✅ 红 3 条 |
+| M2 删掉 `fires_jobs` 整行 | 必填字段断言红 | ✅ 红 4 条（含 `触发器台账每条都写全了`） |
+| M3 `mutation` 的 `if:` 不再接受 `schedule` | 连线断言红 | ✅ 红 3 条（含 `台账里的_gate_与_workflow_逐字一致`） |
+| M4 给 `image-signing` 的 `if:` 加上 `schedule` | 「睡不醒的 job」断言红 | ✅ 红 3 条（含上一批那条「现实必须一致」） |
+| M5 `fires_jobs` 写成空列表 | 连线断言红 | ✅ 红 3 条 |
+| M6 job 台账谎报自己在 `schedule` 上跑 | 反向断言红 | ✅ 红 1 条，但是**上一批那条**（本批新写那条没红 ⇒ 已改名，见上） |
 | M7【**不该红**的对照】只改注释 | 0 失败 | ✅ 0 失败（基线也绿 ⇒ 装置不是永远红） |
+| M8（复核反例 A1）新加一个只在 `schedule` 上跑、条件写 `github.event.schedule == '0 3 * * 1'`、且不登记的 job | 新 job 与连线都要红 | ✅ 红 3 条（含 `每个被门控的_job_都在台账里`） |
+| M9（反例 A1 的孪生）`image-signing` 的 `if:` 换成守卫不认识的 `github.event.*` 字段 | 失败关闭（不许静默当成「什么都不接受」） | ✅ 红 3 条（含 `台账里的_gate_与_workflow_逐字一致`） |
 
 ### 本地证据
-冻结：跑前/跑后三组纯内容哈希一致（占位，冻结后回填）。
 
-- 变异矩阵（`C:/Users/g1534/wa75/mutate.py`，8 条变异 × 22 用例，逐条做**字节级还原 + sha256 对账**）：**8/8 符合预期**——7 条该红的红（M0–M6）、1 条【不该红】的对照 **0 失败**（M7 只改注释），且基线本身是绿的（装置不是永远红）。
-- `pytest`（`CI=1`、`-p no:cacheprovider`、`--cov=warden_agent --cov-fail-under=86`）：（待回填）。
-- `ruff check src tests scripts`、（待回填）；`mypy src/warden_agent`、（待回填）。
-- 本批门禁单独跑一遍 `pytest tests/test_ci_job_gates.py`：（待回填）。
+冻结：跑前/跑后三组纯内容哈希一致（`git add -A` 之后取，含未跟踪新文件）——三组哈希见上「冻结点」一行（本批最终树重跑后回填）。
+
+- 变异矩阵（`C:/Users/g1534/wa75/mutate.py`，**10 条**变异 × **24** 用例，逐条做**字节级还原 + sha256 对账**）：**10/10 符合预期**——9 条该红的红（M0–M6、M8、M9）、1 条【不该红】的对照 **0 失败**（M7 只改注释），且基线本身是绿的（装置不是永远红）。
+- `pytest`（`CI=1`、`-p no:cacheprovider`、`--cov=warden_agent --cov-fail-under=86`）：**1837 passed / 4 skipped**，用时 688.62s（0:11:28），覆盖率 **90.31%**（门槛 86%）。4 条 skipped 全是平台/工具链限制：无 `pg_dump`/`pg_restore`、win32 建不了符号链接 ×2、win32 没有网络命名空间原语。
+- `ruff check src tests scripts`：rc=0（All checks passed）；`mypy src/warden_agent`：rc=0（Success: no issues found in 115 source files）。
+- **本批门禁单独跑一遍**（第七十二批的教训：新门禁不许只靠全量间接覆盖）：`pytest tests/test_ci_job_gates.py` rc=0。三个已有守卫脚本（`check_md_tables.py` / `check_pinned_images.py` / `check_sast_gate.py`）也都 rc=0：分别是「扫描 10 个 Markdown / 103 张表：缺陷 0 处」「扫描 7 处外部镜像引用：钉住 1、发布占位符 2、台账 4」「门禁口径实测：loc=21162 Medium=0 High=0 results=0 nosec=0 skipped_tests=0 exit=0（下限 loc>=12000）」。
 
 ---
 ## 2026-10-08（第七十四批：门禁可以被三行之外的东西关掉——SAST 门禁的「口径」第一次有人看着）
