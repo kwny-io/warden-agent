@@ -84,6 +84,7 @@
 - `mypy src/warden_agent`（CI 口径，115 文件）：rc=0。
 - 三个门禁都**在冻结里单独跑过**（不只靠全量套件代跑）：`check_md_tables.py` ⇒「扫描 10 个 Markdown / 102 张表：缺陷 0 处」；`check_pinned_images.py` ⇒ rc=0；本批新增的 `check_sast_gate.py` ⇒ `loc=21162 Medium=0 High=0 results=0 nosec=0 skipped_tests=0 exit=0`（下限 `loc>=12000`），且三个对照同时成立：正对照 `exit=1`、压制后 `exit=0 skipped_tests=1`、空扫描 `loc=0`。
 - 变异矩阵 **10/10**（见上一节）。
+- 推送侧（远端证据）：run **`37754694887`**（`event=push`、`sha=0dd3f34…`）= **success**，六个 job 全 success；新增的门禁步骤「断言 SAST 门禁的口径没被静默关掉」在每个跑 SAST 的 job 里都是 ✓；产物 `eval-skip-receipt`（461 B）在场 ⇒ 真实评测是**跳过**（未配 `DEEPSEEK_API_KEY`、已签字），不是「跑过且通过」。
 
 ⚠️ 这份数字是在**冻结树**（`tree=4530160166…`）上测的；提交与它的差量只有回填这些数字的散文（本节 + `docs/复核索引.md`），用 `git diff --stat <冻结树> HEAD` 可以看出只有 `.md`。
 
