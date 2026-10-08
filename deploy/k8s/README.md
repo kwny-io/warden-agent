@@ -200,7 +200,7 @@ spec:
     fsGroup: 10001
   containers:
     - name: pg
-      image: postgres:16-alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
       command: ["sleep", "infinity"]
       envFrom:
         - configMapRef: { name: warden-config }

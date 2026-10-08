@@ -23,6 +23,12 @@ RepoDigest，即 `docker pull <上游名>` 时上游 registry 给出的 manifest
 镜像站的 digest **不能**当权威：2026-10-04 实测同一个 `postgres:16` 在上游名下是 `f1c337…`、
 在 `docker.m.daocloud.io` 名下是 `a3b7f4…`——镜像站自己重签名了 manifest。
 
+交付文档也在这条判据里（第七十三批加）：`.md` 的**代码围栏**是读者会照抄执行的命令——既然读者会执行
+`docker run … ghcr.io/gitleaks/gitleaks:v8.21.2`，它就是执行面的一部分，**必须与门禁同一个程序**
+（`docs/复核索引.md` 里那条 gitleaks 反向对照命令就是这么写出来的）。围栏之外的一律不算：
+`CHANGELOG.md` 与 `docs/复核索引.md` 正文里满是“某天实测上游 digest 是 `f1c337…`”这类**观测记录**，
+拿今天的台账去比对它们，等于要求把历史记录改假。
+
 不钉什么（有意为之，不是图省事）：
 
 - `Dockerfile` 的 `FROM node:20-slim` / `FROM python:3.12-slim`：本仓对**基镜像**的政策是拉新
@@ -36,12 +42,23 @@ RepoDigest，即 `docker pull <上游名>` 时上游 registry 给出的 manifest
 已知限制：钉住的 digest **不会自动更新**（dependabot 只覆盖 Dockerfile 基镜像与 GitHub
 Actions，看不见 `docker run` 里的镜像）。这是**故意的**：门禁换一个程序必须是一次显式决定——
 本守卫报红 → 人工取新 digest → 改台账 → 在 CHANGELOG 里写清为什么换。
+
+另外三条已知边界（不是漏洞，是划出来的范围）：
+
+- **`.md` 的正文散文不扫**（只扫代码围栏）。散文里的 `postgres:16` 是叙述，不是可复制的命令；
+  把散文也扫进来，历史记录会天天误报，守卫就会被人学会忽略。
+- **`CHANGELOG.md` 显式排除**，理由写在 `_MD_HISTORY` 里（排除必须带理由，不能是一个裸名字）。
+- 围栏里的 YAML 片段**按行取 `image:`**，不引 YAML 解析器：文档里的片段常常不是合法文档、
+  也可能是多文档（`deploy/k8s/namespace.yaml` 就是两段），用 `yaml.safe_load` 会直接抛错。
+  代价是缩进奇怪、或键名被引号包起来的写法会漏——今天 10 个交付文档围栏里只有 1 处 `image:`，
+  等它有实例再收紧。
 """
 
 from __future__ import annotations
 
 import ast
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -52,6 +69,16 @@ _SKIP_NAMES = {"__pycache__", ".mypy_cache", ".pytest_cache"}
 _FILE_SUFFIXES = {".py", ".sh", ".yml", ".yaml"}
 # 本文件自己：里面必然有 digest 字面量与仓库名（台账），不能拿它当"引用"来判。
 _SKIP_FILES = {"tests/test_ci_tool_pinning.py"}
+
+# 交付文档（`.md`）的**代码围栏**里写的命令，是读者会照抄执行的 ⇒ 走同一台账。
+# 围栏之外的正文不算：那里的历史观测记录（“某天上游 digest 是 f1c337…”）改了就是把记录改假。
+# 排除**必须带理由**：否则它就是一个静默豁免（与 `_PENDING` 同一条纪律）。
+_MD_HISTORY: dict[str, str] = {
+    "CHANGELOG.md": "历史日志：里面的旧 tag 是当天的记录，拿今天的台账去比它等于要求改假",
+}
+_FENCE = "```"
+# 围栏里的 YAML 片段：只认 `image: <值>` 这一行，不引 YAML 解析器（片段可能不合法、也可能多文档）。
+_IMAGE_LINE_RE = re.compile(r"^\s*(?:- )?image:\s*[\"']?(?P<value>[^\"'\s#]+)")
 
 # 仓库名 -> (tag, digest, 来源与取数日期)。digest 必须是模块文档里那条可复核的权威值。
 _PINNED: dict[str, tuple[str, str, str]] = {
@@ -312,7 +339,50 @@ def _execute_context_refs(path: str, suffix: str, text: str, doc: set[int]) -> l
     return refs
 
 
-def _scan() -> tuple[list[_Ref], list[_Ref], int]:
+def _tracked_md_files() -> list[str]:
+    """提交里的 `.md` 清单——**从提交里取，不从磁盘上捞**，而且**不带 pathspec**。
+
+    磁盘上还有工作区里的临时文档（`.zcode/plans/*.md`、草稿），它们不是交付面；反过来，
+    新加的交付文档必须自动进入范围。所以两侧都得对着 `git ls-files`（第七十二批的教训：
+    “本机扫到的文件集”与“提交里的文件集”必须相等，差一条就是一条静默漏检）。
+
+    后缀过滤留在 Python 里（不在 git 的 pathspec 上）：这样用例那侧可以用**另一条 argv**
+    （`git ls-files "*.md"`）当独立 oracle——否则“这个辅助函数漏了一个文件”会让两侧一起变小，
+    那条相等断言就变成恒真。
+    """
+    proc = subprocess.run(
+        ["git", "-c", "core.quotePath=false", "ls-files"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert proc.returncode == 0, f"git ls-files 失败，拿不到交付文档清单：{proc.stderr.strip()}"
+    lines = proc.stdout.replace("\r\n", "\n").split("\n")
+    return [p for p in lines if p.endswith(".md")]
+
+
+def _fence_mask(source: str) -> tuple[str, set[int]]:
+    """把代码围栏**之外**的行掏空（行号保持不变），返回 (掏空后的文本, 围栏内行号)。
+
+    为什么掏空而不是只截出围栏：解析器靠整段文本的行号与结构（反斜杠续行拼接、行首赋值匹配），
+    掏空之后 `path:lineno` 仍然对得上原文，报出来的位置可以直接去看。
+    """
+    keep: list[str] = []
+    inside = False
+    fence_lines: set[int] = set()
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        if line.lstrip().startswith(_FENCE):
+            inside = not inside
+            keep.append("")
+            continue
+        keep.append(line if inside else "")
+        if inside:
+            fence_lines.add(lineno)
+    return "\n".join(keep), fence_lines
+
+
+def _scan() -> tuple[list[_Ref], list[_Ref], int, list[str]]:
     """返回 (执行型引用, 全量引用, 读到的文件数)。
 
     全量引用（含文档/注释）用"按登记过的仓库名去搜"的方式取——这样文档漂移也守得住，
@@ -321,6 +391,7 @@ def _scan() -> tuple[list[_Ref], list[_Ref], int]:
     executed: list[_Ref] = []
     refs: list[_Ref] = []
     files = 0
+    md_files: list[str] = []
     for top in _SCAN_DIRS:
         for path in sorted((_ROOT / top).rglob("*")):
             if path.suffix not in _FILE_SUFFIXES or any(p in _SKIP_NAMES for p in path.parts):
@@ -371,10 +442,39 @@ def _scan() -> tuple[list[_Ref], list[_Ref], int]:
                                 False,
                             )
                         )
-    return executed, refs, files
+    # 交付文档的代码围栏（见模块文档与 `_MD_HISTORY`）
+    for rel in _tracked_md_files():
+        if rel in _MD_HISTORY:
+            continue
+        md_files.append(rel)
+        source_md = (_ROOT / rel).read_text(encoding="utf-8-sig", errors="replace")
+        masked, fence_lines = _fence_mask(source_md)
+        executed.extend(_execute_context_refs(rel, ".md", masked, fence_lines))
+        for lineno, line in enumerate(masked.splitlines(), start=1):
+            if lineno not in fence_lines:
+                continue
+            match = _IMAGE_LINE_RE.match(line)
+            if match is None:
+                continue
+            token = match.group("value").strip().rstrip(",")
+            image = _IMAGE_RE.fullmatch(token)
+            if image is not None and (image.group("tag") or image.group("digest")):
+                executed.append(
+                    _Ref(
+                        rel,
+                        lineno,
+                        image.group("repo"),
+                        image.group("tag"),
+                        image.group("digest"),
+                        True,
+                        line.strip(),
+                        True,
+                    )
+                )
+    return executed, refs, files, md_files
 
 
-_EXECUTED, _REFS, _FILES = _scan()
+_EXECUTED, _REFS, _FILES, _MD_FILES = _scan()
 _EXTERNAL_EXECUTED = [r for r in _EXECUTED if not r.is_internal]
 
 
@@ -485,3 +585,86 @@ def test_yaml_services_的镜像也走同一台账() -> None:
         repo = image.split("@")[0].rsplit(":", 1)[0]
         assert repo in _PINNED, f"service 镜像 {image} 不在台账里"
         assert "@sha256:" in image, f"service 镜像 {image} 没钉 digest"
+
+
+def test_交付文档里可复制的镜像命令也必须同源() -> None:
+    """`.md` 围栏里的命令可以只写 tag（读者自己敲），但 tag 必须与台账一致；
+    带了 digest 更要对得上；**没登记的镜像直接红**（先在台账里登记，再写进文档）。"""
+    hits = [r for r in _EXECUTED if r.path.endswith(".md") and not r.is_internal]
+    assert len(hits) >= 3, f"交付文档围栏里只扫到 {len(hits)} 处镜像命令，判据可能是空的"
+    for r in hits:
+        assert r.repo in _PINNED or r.repo in _PENDING, (
+            f"{r.where}：文档里的镜像没进台账 → 先登记再写进文档\n  {r.text}"
+        )
+        want = (_PINNED.get(r.repo) or _PENDING.get(r.repo))[0]
+        if r.tag is not None:
+            assert r.tag == want, (
+                f"{r.where}：文档里的 tag 漂移（台账 {want}，实际 {r.tag}）→ {r.text}"
+            )
+        if r.digest is not None and r.repo in _PINNED:
+            assert r.digest == _PINNED[r.repo][1], f"{r.where}：文档里的 digest 与台账不一致"
+
+
+def test_围栏判据的两个方向() -> None:
+    """正向：围栏里的漂移 tag 会被认出来；反向：正文里的同一句话不会被当成执行面。"""
+    drift = "```bash\ndocker run --rm ghcr.io/yannh/kubeconform:v0.0.1 \\\n  -summary /m\n```\n"
+    masked, fence_lines = _fence_mask(drift)
+    found = _execute_context_refs("docs/x.md", ".md", masked, fence_lines)
+    assert [r.repo for r in found] == ["ghcr.io/yannh/kubeconform"], found
+    assert found[0].tag == "v0.0.1"
+    assert found[0].is_doc, "文档围栏里的引用必须按“文档”待遇（tag 级判据，不是 digest 级）"
+
+    prose = "我们当时跑的是 ghcr.io/yannh/kubeconform:v0.0.1 那个版本，记录在这里。\n"
+    masked_prose, fence_lines_prose = _fence_mask(prose)
+    assert fence_lines_prose == set(), "正文里没有围栏"
+    assert _execute_context_refs("docs/x.md", ".md", masked_prose, fence_lines_prose) == [], (
+        "正文散文被当成执行面了——历史记录会被天天误报"
+    )
+
+
+def test_围栏里的_yaml_片段能认出_image_行() -> None:
+    """文档里贴的清单片段：`image:` 行按行取（不引解析器，片段可能不合法/多文档）。"""
+    snippet = (
+        "```yaml\n"
+        "spec:\n  containers:\n    - name: app\n"
+        "      image: REPLACE_ME/warden-agent:0.1.0\n"
+        "```\n"
+    )
+    masked, fence_lines = _fence_mask(snippet)
+    line = next(
+        text for lineno, text in enumerate(masked.splitlines(), start=1) if lineno in fence_lines
+        and _IMAGE_LINE_RE.match(text)
+    )
+    match = _IMAGE_LINE_RE.match(line)
+    assert match is not None and match.group("value") == "REPLACE_ME/warden-agent:0.1.0"
+
+
+def test_历史日志显式排除而且要写出理由() -> None:
+    assert "CHANGELOG.md" in _MD_HISTORY, "历史日志必须显式排除（否则旧 tag 天天误报）"
+    assert len(_MD_HISTORY["CHANGELOG.md"]) >= 20, "排除必须带理由，不能是一个裸名字"
+    assert "CHANGELOG.md" not in _MD_FILES, "历史日志被扫了"
+
+
+def test_交付文档的扫描集等于提交里的_md_集() -> None:
+    """两侧必须相等：少一个 = 新文档静默漏出范围；多一个 = 扫到了非交付面的东西。
+
+    oracle 必须**独立于被测代码**：这里另起一条 argv（`git ls-files "*.md"`）直接问 git，
+    不复用 `_tracked_md_files()`——复用的话“辅助函数漏掉一个文件”会让两侧同时变小、断言恒真。
+    """
+    proc = subprocess.run(
+        ["git", "-c", "core.quotePath=false", "ls-files", "*.md"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert proc.returncode == 0, f"独立口径问不出来：{proc.stderr.strip()}"
+    independent = {p for p in proc.stdout.replace("\r\n", "\n").split("\n") if p}
+    assert len(independent) >= 8, f"独立口径只看到 {len(independent)} 个 .md，这条判据可能是空的"
+    expected = independent - set(_MD_HISTORY)
+    assert expected == set(_MD_FILES), (
+        "扫描集与提交集不一致：\n  提交里没扫到的："
+        + str(sorted(expected - set(_MD_FILES)))
+        + "\n  扫了但不在提交里的："
+        + str(sorted(set(_MD_FILES) - independent))
+    )
