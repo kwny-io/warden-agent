@@ -53,6 +53,14 @@
   不做「文档里的命令能不能跑」的判断（那是 eval 与演练的活）。
   **剩余缺口**：`check_md_tables.py` / `check_pinned_images.py` / `check_sast_gate.py` 同样只处理
   stdout、没处理 stderr（同一类坑），本批只修了自己新加的那个守卫，不扩大战场。
+- **推送与 CI（收尾回填：第七十五批攒的提交也在这批一起推上去）**：`dev` 推送成功——**直连第 1 次就成了**
+  （`git -c http.proxy= -c https.proxy= push origin dev`，UTC `2026-10-09T08:45:52Z`，回执 `wa76/push76.out`）。
+  远端 `5193463…` 由 GitHub API 核准（不靠 git 传输自证），本地 `HEAD` = `5193463`；此前未推的
+  `67a2763`（X）与 `e435625`（第七十五批的文档提交）也在这一次推上去。CI run `37906977070`
+  （事件 `push`，sha `5193463`）= **success**：作业级 `quality` / `security` / `container` / `sbom` /
+  `migration` / `evals-real` = success，`image-signing` 与 `变异测试` = skipped（两条都是**预期**跳过，
+  账见第七十五批小节）。本批新加的守卫确实在 CI 里**被执行**（不只是存在），由 `quality` 作业里的
+  连线断言 `test_每个守卫脚本都必须被_ci_真的调用` 钉住。
 
 ## 2026-10-08（第七十五批：触发器与 job 之间有一条没人验过的连线——`cron` 写了不等于会响）
 
