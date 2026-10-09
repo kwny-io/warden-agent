@@ -182,6 +182,16 @@ jobs:
         # 权威渲染器的行为（gfm 的 <table> 输出）写在 `scripts/check_md_tables.py` 的文档里。
         # 不需要网络、不需要 docker；判定逻辑在脚本里，本地同样能跑。
         run: uv run --frozen python scripts/check_md_tables.py
+      - name: 交付文档里的反引号转义与「路径:行号」（文档说了不代表说得对）
+        # 为什么单独一条：这两类失败模式都**排版期看不出、CI 也全绿**——
+        # GFM 在行内代码里不认反斜杠转义，作者以为在转义、读者看到多余的反斜杠；
+        # 文档点名的行号越界时，读者照着跳过去会扑空。第七十六批实测：
+        # `docs/复核索引.md` 指的 `src/warden_agent/web/server.py:1433`，而那个文件只有 886 行；
+        # `CHANGELOG.md` 里两处反引号转义把外层代码 span 提前关掉、后半句掉出代码块。
+        # 判据边界（围栏内不算、CHANGELOG 的历史行号不算、双反引号包裹的正解不算）
+        # 写在 scripts/check_doc_claims.py 的模块文档里。
+        # 不需要网络、不需要 docker；本地同样能跑。
+        run: uv run --frozen python scripts/check_doc_claims.py
       - name: 断言 PostgreSQL 集成测试真的执行了（防静默跳过）
         # 为什么单独一条：PG 集成测试用 skipif 保护（没有库时跳过，保证本地/无库 CI 不红）。
         # 副作用是——**如果 CI 里的 service 没连上，它们会静默跳过、CI 依然绿**，

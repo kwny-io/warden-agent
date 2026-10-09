@@ -749,3 +749,42 @@ def test_每个_job_声称的事件必须真的被它自己的_workflow_声明�
                     f"（现有：{sorted(declared)}）；要么改正 runs_on，要么写 runs_on_note 说明依据"
                 )
     assert not bad, "\n".join(bad)
+
+
+# 故意不在 CI 里跑的守卫脚本：键是文件名，值是理由。
+# 「排除必须带理由」——没有理由的排除就是一条悄悄失效的门禁。
+_NOT_IN_CI: dict[str, str] = {}
+
+
+def test_每个守卫脚本都必须被_ci_真的调用() -> None:
+    """「写了守卫」≠「CI 里有人跑它」：这是同一族病的脚本层版本。
+
+    现场：本仓 `scripts/check_*.py` 共 7 个，前 6 个在 `ci.yml` 里各有独立步骤；
+    第七十六批新加的 `scripts/check_doc_claims.py` 第一版**只活在本地**——
+    脚本能跑、它自己的测试也能过、文档里也能写「已加守卫」，而 CI 里没人调用它：
+    下次交付面上的 Markdown 又被写坏时，没有任何东西会红。
+
+    （同一族的前三层已经在台账里各有一节：job 级 `if:`、step 级 `exit 0`、
+    触发器级 `schedule`；这里补上第四层——**脚本到底有没有人调用**。）
+
+    口径：只要求工作流文件的**非注释行**里出现过这个文件名（真能跑起来的那次调用必然要写它），
+    不解析命令行参数——那会变成「钉在文字上」的判据，而文字判据不会红。
+    **注释行不算**：本批给 `ci.yml` 那一步写了段「为什么单独一条」的注释，里面就点到这个文件名；
+    只看整份文件的话，「把调用注释掉」也能过。
+    """
+    scripts = sorted(path.name for path in (REPO / "scripts").glob("check_*.py"))
+    assert len(scripts) >= 7, f"只找到 {len(scripts)} 个守卫脚本，glob 或目录结构变了吗"
+    invoked_lines = [
+        line
+        for path in sorted(WORKFLOWS.glob("*.y*ml"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    invoked = "\n".join(invoked_lines)
+    orphaned = [name for name in scripts if name not in invoked and name not in _NOT_IN_CI]
+    assert not orphaned, (
+        f"这些守卫脚本在 .github/workflows 里一次都没被调用：{orphaned}"
+        "——脚本存在不等于门禁存在。要么加一条步骤，要么写进 _NOT_IN_CI 并说明理由"
+    )
+    stale = sorted(name for name in _NOT_IN_CI if name not in scripts)
+    assert not stale, f"_NOT_IN_CI 里的这些脚本已经不存在了：{stale}"
