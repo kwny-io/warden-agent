@@ -33,9 +33,9 @@ Warden Agent 是一个**有状态的 Agent 运行时**，支持两种部署形�
 
 | 用处 | 位置 | 塌成代理 IP 的后果 |
 |---|---|---|
-| 匿名限流分桶 | `web/ratelimit.py` 的 `client_key(user_id, host)` | 所有匿名调用者共用一个配额 → 一个客户端能把别人挤成 429 |
-| 匿名幂等作用域 | `web/server.py` 的 `ip:<host>:<Idempotency-Key>` | 两个客户端用同一个 `Idempotency-Key` 时，**后到的读到前一个的缓存响应体** |
-| 审计来源 IP | 审计账本 | 只记录到代理 |
+| 匿名限流分桶 | `client_key` 定义在 `web/ratelimit.py:101`（匿名时键是 `ip:{host}`） | 所有匿名调用者共用一个配额 → 一个客户端能把别人挤成 429 |
+| 匿名幂等作用域 | `idem_key` 定义在 `web/server.py:684`（键是 `{caller_scope}:{Idempotency-Key}`，匿名时 `caller_scope` 就是 TCP 对端地址——**这里没有 `ip:` 前缀**，那是上面限流的键） | 两个客户端用同一个 `Idempotency-Key` 时，**后到的读到前一个的缓存响应体** |
+| 审计来源 IP | 审计账本（PG 下 `PostgresAuditStore` 定义在 `web/audit.py:498`） | 只记录到代理 |
 
 实测（`tests/test_proxy_trust.py` 就是照这个写的）：两个真实客户端 A/B 从同一个代理进来，限 1 次/分钟时 A=200、B=429；两者用同一个 `Idempotency-Key` 打 `/chat/{run_id}` 时，B 拿到的是 A 的缓存响应体（`回答一`），而不是自己执行得到的 `回答二`。
 
@@ -65,7 +65,7 @@ WARDEN_TRUSTED_PROXIES=10.0.0.0/8,172.17.0.1     # 取值 = 代理自己的地�
 | 事件流 | `InProcessEventBus` | `SqlEventBus` | 客户端连副本 A、事件产生在 B → **收不到事件** |
 | 限流计数 | `InProcessRateLimitStore` | `SqlRateLimitStore` | 实际总限额 ≈ 配置值 × 副本数 |
 
-切换方式：设 `WARDEN_SHARED_STATE=1`，并把存储换成 `PostgresStore`（见下文）。
+切换方式：设 `WARDEN_SHARED_STATE=1`，并把存储换成 `PostgresStore`（定义在 `store/postgres.py:82`，见下文）。
 `SqlEventBus` 用**轮询增量**读事件表（默认间隔 250ms）——比 Pub/Sub 延迟略高，
 但零新依赖且对 SQLite/PostgreSQL 通用；需要更低延迟可换 Redis/NATS 实现，
 只要满足 `EventBus` 协议，上层一行不改。
@@ -80,23 +80,23 @@ WARDEN_TRUSTED_PROXIES=10.0.0.0/8,172.17.0.1     # 取值 = 代理自己的地�
 
 | 状态 | 位置 | 多副本后果 | 现状 |
 |---|---|---|---|
-| 幂等表 | `web/coordination.py` | 幂等失效 | ✅ 可切共享存储 |
-| SSE 事件总线 | `web/coordination.py` | 丢事件 | ✅ 可切共享存储 |
-| 限流计数桶 | `web/coordination.py` | 限额翻倍 | ✅ 可切共享存储 |
+| 幂等表 | `InProcessIdempotencyStore` 定义在 `web/coordination.py` | 幂等失效 | ✅ 可切共享存储 |
+| SSE 事件总线 | `InProcessEventBus` 定义在 `web/coordination.py` | 丢事件 | ✅ 可切共享存储 |
+| 限流计数桶 | `InProcessRateLimitStore` 定义在 `web/coordination.py` | 限额翻倍 | ✅ 可切共享存储 |
 | 出站并发信号量 | `web/outbound.py` | 每副本各 N（不全局） | 如需全局并发上限，把"在飞请求数"也放共享存储 |
-| 会话缓存 `SessionRegistry._sessions` | `web/server.py` | 各副本各自缓存（会从库重建，**正确但不省内存**） | 可保留（纯缓存） |
+| 会话缓存 | `SessionRegistry._sessions` 定义在 `web/session_registry.py`（27 行起） | 各副本各自缓存（会从库重建，**正确但不省内存**） | 可保留（纯缓存） |
 | 凭证密文与租约 | `credential/vault.py` | 已落库（`credentials` / `credential_leases` 表）→ 多副本共用一个库 | ✅ 可切共享存储；密钥材料仍需各副本统一 |
 | 工具稳定性层熔断状态 | `tool/stability.py` | 每个副本各自熔断（**刻意不全局**） | 熔断器按实例隔离是常见做法：全局熔断会造成"一个副本抖动、全体熔断"的同步失败。如需全局语义，换外置熔断 |
 | RAG 向量库 | `rag/knowledge.py` | 各副本各自索引（同一份文档索引结果一致，**不共享但等价**） | 索引成本 × 副本数；大语料建议外置向量库 |
 | 记忆库 | `memory/store.py` | PG 主存储 → `PostgresMemoryStore`（多副本共享）；否则 SQLite（每副本一份） | 多副本配 PG 即共享；并发写同一 key 无分布式锁（后写覆盖前写） |
 | 审计账本 | `web/audit.py` | PG 主存储 → `PostgresAuditStore`（多副本共享，链写入跨副本串行）；否则 SQLite（每副本一本账） | 多副本配 PG 即共享；链密钥 `WARDEN_AUDIT_KEY` 各副本必须一致 |
 
-**持久化本身是可共享的**：`RunStore`（SQLite / PostgreSQL 同接口）、审计表、存档点表、
+**持久化本身是可共享的**：`RunStore` 定义在 `store/base.py:19`（是 `Protocol`，SQLite / PostgreSQL 同接口）、审计表、存档点表、
 记忆表都在数据库里。
 
 ## 多副本部署要点
 
-1. **存储换 PostgreSQL**：`pip install "psycopg[binary]"`，用 `PostgresStore`
+1. **存储换 PostgreSQL**：`pip install "psycopg[binary]"`，用 `PostgresStore`（定义在 `store/postgres.py`）
    （与 `SqliteStore` 同接口；`docker-compose.yml` 里的 `db` 服务是显式 opt-in）。
    ⚠️ SQLite 是**单机文件**，跨主机共享文件系统跑多副本不受支持——多副本请用 PostgreSQL。
 2. **开共享协调状态**：`WARDEN_SHARED_STATE=1`。
