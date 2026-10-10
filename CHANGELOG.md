@@ -72,7 +72,8 @@
   判定方法是「先看进程表，别看 diff」，清理后重跑即绿（最终 `freeze78c` 全绿）。
 - **本地证据**：本批受影响五文件单独跑 **94 项全绿**；全量 **1887 passed / 4 skipped**、覆盖率 **90.31%**
   （门槛 86%）；`ruff check src tests scripts`、`mypy src/warden_agent` 通过；冻结
-  `tree=028ae9c7…` / `shape=5d77104e…` / `keys=c84515cd…` 跑前跑后**各自一致**（回执 `wa78/freeze78c.log`）；
+  `tree=028ae9c7…` / `shape=5d77104e…` / `keys=c84515cd…` 跑前跑后**各自一致**（三对账的原始行见
+  `wa78/freeze78.reconcile.txt`；门禁与 pytest 输出见 `wa78/freeze78c.log`）；
   矩阵回执 `wa78/matrix78b.out`。
 - **本批自己引入又自己抓到的缺陷：接线把行号推走了**。接线改变了 `ci.yml` 的行号，而**接线前**写的坐标
   留在了随货交付的注释里：`tests/test_registry_retry.py:298` 写 `ci.yml:562-564`、实际 **567-569**
@@ -87,8 +88,34 @@
   本行后面那个**真分隔符竖线**就被指成「代码 span 里的竖线」。最小复现：
   `| a | x ``\`` y | z |` 这种行会被报成缺陷。本批先把写法改成「末尾的续行反斜杠」（避开这个构造）
   、把最小复现归入「第七十八批之二（#46）」——**假阳会让守卫本身不可信**，所以它得连同一个用例一起修。
-- **交付面**：X = `7140ead`（tree `028ae9c7…`，amend 只改信息）、Y = 本提交；远端实测与逐 job 结论
-  见回执 `wa78/ci78.Y.out`（本次 run 的 run id 与 skipped 名单在下一次提交里回填）。
+- **交付面**：X = `7140ead`（tree `028ae9c7…`，amend 只改信息）、Y = 本提交；远端 run =
+  **`38076347508`**（`dev`）。作业级与 step 级结论见下（回执 `wa78/ci78.Y.out`、`wa78/ci78Y.rerun.out`）。
+- **首轮 quality 红，但红点不在本批**：`tests/test_web_stream_disconnect.py::test_客户端断线后租约与并发名额都归还`
+  期望第二个请求 200、实到 **503**（`detail` 就是 SSE 并发上限那条）。
+- **这条红的机制是读出来的、不是猜的（并用确定性对照证实）**：`src/warden_agent/web/routes/chat.py` 的
+  `drive()` 只在**收尾的 finally** 里 `worker_done.set() → lease.stop() → sse_gate.release()`，而
+  「最终回答落库」发生在流循环**内部**（也就是 gate 释放**之前**）；用例却把「落库」当成「名额已归还」的
+  判据、**立刻**发第二个请求 ⇒ 那段窗口里必然 503。对照实验（`wa78/probe_flake.py`，只在探针里把
+  `SseConcurrencyGate.release` 人为延后，**不碰仓库**）：**延后 0s ⇒ 首次 200 / 落库 True / 第二个请求 200；
+  延后 1.5s ⇒ 200 / True / 503**（两条都与预期一致）。同一用例本地 **20/20 绿**、CI attempt 2 也绿（0.099s）。
+- **处置：带机制与复现数的重跑**（attempt 2 只重跑失败作业）⇒ **1891 tests / 0 failures / 0 errors / 2 skipped**、
+  `gh run view --log-failed` **0 字节**，作业级全绿（quality / container / sbom / image-signing / migration /
+  evals-real / security）。这正是本批开篇那句「第三方抖一下就把门禁标红，人会开始习惯性 `gh run rerun`」的
+  **镜像**：敢重跑是因为**能说出机制**、且本地有复现数——判据是「说不说得清」，不是「重跑后绿了」。
+- **用例侧的真缺陷已归「第七十八批之二」**：它要求名额**立刻**归还，而代码只保证**收尾时**归还 ⇒ 断言测的是
+  **未被设计保证的行为**。修法：改成有界等待（如限时 5s 内等到 200），语义仍是「门不被永久锁住」。
+  **不混进本批**——本批是 registry 重试，混进来 review 分不清因由。
+- **step 级自证**：CI 的 junit 产物里 `tests.test_registry_retry::test_每一处碰registry的命令都走这个脚本`
+  **真的在 CI 里跑了且绿**（0.012s）⇒ ③⑥ 的加宽守卫活在**门禁**里，不只在本地。两条 skipped 都是平台门
+  （`test_wsl转发器不会被当成可用bash`、`test_内核档下网络调用真的失败`）；本地 4 skipped / CI 2 skipped，
+  而两边总数都是 **1891**（各自平台跳各自不适用的用例）。
+- **Z 的冻结，以及本批第三次抓到的同类病：引错回执**。`wa78/freeze78.sh` 的 `say()` 原来只打 stdout
+  ⇒ `wa78/freeze78c.log` 里**根本没有三对账行**，而交付面（本文件与 `docs/复核索引.md`）此前把它当成
+  三对账回执——**「有回执」不等于「回执里有那条证据」**，与开篇那条 429 病、第三节那条「判据 ≠ 要观测的
+  事件」是同一族。已修脚本（`say` 也 tee 进 log，并把清空 log 提到第一次 `say` **之前**、否则「跑前」那行会被
+  截掉），并把每次冻结的原始三对账行抽成 `wa78/freeze78.reconcile.txt`（里面同时留着 78b 那次**作废**的
+  原因：测试期间树被改过 ⇒ tree/keys 跑前跑后不一致）；Z 自身的冻结回执是 `wa78/freeze78g.log`
+  （跑前跑后一致、结论全绿；提交前另用「当前树 == 回执里的跑后 tree」把这一步卡住）。
 - **还没做 / 做不到（下一步的入口）**：`pin_image_digests.sh` 的 `imagetools` 仍不重试（要先定
   「交付面也吃抖动」这条策略）；`docker run` 的隐式拉取仍在判据外（要先能只重试拉取那一段）；
   重试对**幂等**命令才安全，所以将来加站点必须先回答「重复执行会不会留下第二份副作用」。
