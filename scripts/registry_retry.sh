@@ -8,7 +8,7 @@
 #   ① `sbom` 作业的 `docker build --pull`；
 #   ② **`container` 作业真正跑构建的那一处**——它在 `scripts/container_smoke.sh` 里
 #      （不是 ci.yml：ci.yml 里 `docker build --pull -t "$image"` 那一行属于 `image-signing`）。
-#   ③ **普查抓到的第三处**（同一类匿名拉取，本批一并接线）：`ci.yml:85` 的
+#   ③ **普查抓到的第三处**（同一类匿名拉取，本批一并接线）：`ci.yml:90` 的
 #      `docker pull prom/prometheus:v2.55.0`——`quality` 作业预热 promtool 求值要用的镜像。
 #      它原先是一条裸 `run:`，抖一下整个门禁就红。`docker pull` 幂等，重试没有重复副作用。
 #      （判据写进 tests/test_registry_retry.py 第 7 节；那里同时写明了**故意不包**的边界。）

@@ -295,7 +295,7 @@ def test_尝试次数非法时rc1_且不跑命令(tmp_path: Path) -> None:
 
 # **碰 registry 的动词**：这些命令都会因为限流（429）/5xx/超时把整个门禁标成红，所以都要走本脚本。
 #   build / buildx build / buildx imagetools / push / pull / manifest / login
-# 判据**必须先把 `\` 续行拼合成一条逻辑行**再找动词：`ci.yml:562-564` 是三行**一条**命令
+# 判据**必须先把 `\` 续行拼合成一条逻辑行**再找动词：`ci.yml:567-569` 是三行**一条**命令
 #   （`GHCR_USER=… \` ＋ `bash scripts/registry_retry.sh -- \` ＋ `bash -c '… docker login …'`），
 #   逐物理行匹配会把**已经包好**的 login 误报成没包 —— 那正是本批反复在治的那类「误伤」。
 #
@@ -379,7 +379,7 @@ def test_每一处碰registry的命令都走这个脚本() -> None:
       1) 第一版 `break` 在第一处匹配上，只钉住了 `ci.yml` 里 `sbom` 那行：把 `image-signing`
          或 `container_smoke.sh` 退回裸 `docker build`，它照样绿（靶子 M7/M8）；
       2) 第二版只认 `docker build`：`push` / `pull` / `login` / `imagetools` 哪一处退回裸命令
-         它都照样绿。`ci.yml:85` 那处裸 `docker pull`（匿名拉 Docker Hub，与 `f5901ac` 那次红
+         它都照样绿。`ci.yml:90` 那处裸 `docker pull`（匿名拉 Docker Hub，与 `f5901ac` 那次红
          同一类限流）就是这么活到今天的——本批接线（靶子 M17/M19）。
     """
     hits = _registry_verb_lines()

@@ -678,6 +678,29 @@ python -m warden_agent.demo_e2e                                                 
   `CHANGELOG.md` 的历史行号、双反引号包裹的正解、第三方源码路径、命令行里夹一半的引用都不判；
   退出码 `0`/`1`/`2` 把「干净」「有缺陷」「查不动」分开。
   ⚠️ 它只证「行号在界内」，**不证那一行说的还是不是同一件事**。
+- **第四类（第七十八批）：`docker build --pull` 被第三方匿名拉取限流（429）打红，而没人看着「哪些命令真的碰 registry」**：
+  第七十七批的 X 实测首轮红——`sbom` 与 `container` 两个作业都死在
+  `#5 [internal] load metadata for docker.io/library/node:20-slim` ⇒
+  `unexpected status from HEAD request to registry-1.docker.io/v2/library/node/manifests/20-slim: 429 Too Many Requests`。
+  真正危险的不是这一次红，而是**人会开始习惯性 `gh run rerun`**：门禁的红一旦可以靠重跑消掉，它就不再是门禁。
+  本批：① `scripts/registry_retry.sh` 统一重试（可重试/不可重试判据分开；退避且最后一次失败后不等；
+  **stdout 只留被测命令自己的输出**——上游 `digest=$(…)` 不能被日志污染；stderr 落盘 + 收尾回显；
+  rc **2** = 重跑没用、rc **3** = 用尽该重跑；`$GITHUB_STEP_SUMMARY` 里一行 ASCII 标记让人一眼看出
+  「该重跑还是别重跑」）；② 接线 **6 处** + `scripts/container_smoke.sh:93`
+  （`.github/workflows/ci.yml:90` 预热镜像的 `docker pull`、`436` sbom 构建、`563`/`567-569`/`570`/`575`
+  image-signing 的构建 / `docker login` / `push` / `buildx imagetools inspect`）；
+  ③ 自接线守卫 `tests/test_registry_retry.py::test_每一处碰registry的命令都走这个脚本`——
+  **这条断言被自己的历史证伪过两次**（第一版 `break` 在第一处匹配上、第二版只认 `docker build`），
+  所以判据现在按 registry 动词集合，且**必须先把末尾带续行反斜杠的物理行拼成逻辑行**再匹配
+  （否则会把已经包好的 `docker login` 误报成裸命令）。「触网却不走重试」的站点**不许静默放行**：
+  逐条写进 `DELIBERATELY_UNWRAPPED` 并带理由，另有断言要求「写了豁免的文件必须真的扫到了动词」
+  （否则豁免会过期成空话）。
+  ⚠️ 边界是**决定**不是遗漏：`docker run/exec/rm/logs/inspect` 只碰本地 daemon，重试 `docker run` 会产生
+  **重复副作用**（多起一个容器、端口被占、`--name` 冲突）⇒ 宁可一次失败让人看清现场；
+  `docker run <registry 镜像>` 的**隐式拉取**确实触网，但与「起容器」是同一条命令，没法只重试拉取那一段。
+  所以「加站点」的前置问题永远是**「重复执行会不会留下第二份副作用」**。
+  ⚠️ 它只证「命令有没有被包上」，**不证重试策略本身对不对**（哪些错误该重试是判据里的硬名单，
+  名单写错它照样绿）；`pin_image_digests.sh` 的 `imagetools` 本批故意不包（交付面也吃抖动这条策略未定）。
 - **安全基线**：密钥经 `.env` 加载不进代码；`.gitignore` 屏蔽密钥、数据库与日志文件
 - **确定性优先**：凡确定性可解的环节——多 Agent 分派、意图路由信号、离线测试替身——不交给模型自由发挥，行为可复现
 - **失败是常态**：超时、重试、降级、熔断、断点恢复不是异常处理，而是内建的默认执行语义
