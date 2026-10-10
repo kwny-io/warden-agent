@@ -81,8 +81,13 @@ jobs:
       # 那条签字是 `allowed_in: [local]`——**这步一旦被删，守卫在 CI 里直接变红**。
       # tag 未钉 digest：取不到权威 digest（理由记在 tests/test_ci_tool_pinning.py 的待钉台账里），
       # 与 `container` job 里跑 promtool 的那个容器同 tag。
+      # 这里拉的是 **Docker Hub 匿名**：与 2026-10-09 那次红（提交 `f5901ac`）同一类限流（429），
+      # 所以它和 `sbom` / `image-signing` 走同一条路——重试只吃可重试的错，凭据/构造错仍旧立刻
+      # 失败（rc 2）；`docker pull` 幂等，重试没有重复副作用。
+      # （`docker run <镜像>` 的**隐式拉取**故意不包：它和「起容器」是同一条命令，重试会重复副作用。
+      #   判据与全部边界见 tests/test_registry_retry.py 第 7 节。）
       - name: 预热规则求值镜像（让 promtool 真值求值真的跑）
-        run: docker pull prom/prometheus:v2.55.0
+        run: bash scripts/registry_retry.sh -- docker pull prom/prometheus:v2.55.0
       # SPA 测试（tests/test_web.py::test_t10）在 web/dist 缺失时跳过。
       # 之前 CI 从不构建前端 → 它**每次都在跳过**。这里显式构建，让它真的执行。
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4

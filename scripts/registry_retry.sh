@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 对 **registry 抖动** 做退避重试：docker 的 build / push / buildx imagetools inspect
+# 对 **registry 抖动** 做退避重试：docker 的 build / push / pull / login / buildx imagetools inspect
 # 都要走 registry，而 registry 会限流（429）、会 5xx、会超时、会把连接掐掉。
 #
 # 为什么值得一个脚本（而不是在 workflow 里手写 while）：
@@ -8,6 +8,10 @@
 #   ① `sbom` 作业的 `docker build --pull`；
 #   ② **`container` 作业真正跑构建的那一处**——它在 `scripts/container_smoke.sh` 里
 #      （不是 ci.yml：ci.yml 里 `docker build --pull -t "$image"` 那一行属于 `image-signing`）。
+#   ③ **普查抓到的第三处**（同一类匿名拉取，本批一并接线）：`ci.yml:85` 的
+#      `docker pull prom/prometheus:v2.55.0`——`quality` 作业预热 promtool 求值要用的镜像。
+#      它原先是一条裸 `run:`，抖一下整个门禁就红。`docker pull` 幂等，重试没有重复副作用。
+#      （判据写进 tests/test_registry_retry.py 第 7 节；那里同时写明了**故意不包**的边界。）
 #   报错原文：`#5 [internal] load metadata for docker.io/library/node:20-slim` →
 #   `unexpected status from HEAD request to registry-1.docker.io/v2/library/node/manifests/20-slim:
 #    429 Too Many Requests` → `failed to solve`。
@@ -23,8 +27,10 @@
 #      digest 就被污染了（而 `ci.yml` 是用 `grep -qE '^sha256:[0-9a-f]{64}$'` **逐行**校验它的，
 #      脏值混进去不会报错，只会往下走）。所以失败尝试的 stdout **整段丢掉**。
 #      代价：成功那一次的 stdout 要等命令跑完才出现（构建进度本来就走 stderr，无影响）。
-#   3) **stderr 一边进日志、一边实时留给屏幕**：构建要跑十几分钟，缓冲 stderr
-#      等于 CI 上十几分钟一片空白；而重试判据必须能看到错误原文。
+#   3) **stderr 落临时文件、本次尝试结束后整体回显**：判据要读错误原文，而 `2> >(tee …)`
+#      这种进程替换是**异步**的——判据可能在 `tee` 落盘前就读到半截（复核 #3 指出的平台相关性）。
+#      改成同步重定向去掉这层不确定性；**代价要认下来**：一次尝试跑多久，屏幕就安静多久
+#      （构建进度本来走 stderr，所以十几分钟的构建在 CI 上不再有中间输出，只有收尾回显）。
 #   4) 回执与判据都在日志里：每次尝试都写明「第 N/M 次」与错误首行，
 #      并且**每一行都带一个 ASCII 机器标记**（`OK` / `RETRY` / `NONRETRYABLE` / `EXHAUSTED`
 #      ＋ `attempt=n/m`）——因为 CI 日志与用例都要能 grep 它，而中文在不同终端下
@@ -36,6 +42,7 @@
 # 用法:
 #   bash scripts/registry_retry.sh -- docker build --pull -t warden-agent:sbom .
 #   bash scripts/registry_retry.sh -- docker push "$image"
+#   bash scripts/registry_retry.sh -- docker pull prom/prometheus:v2.55.0
 #   digest=$(bash scripts/registry_retry.sh -- docker buildx imagetools inspect "$image" \
 #     --format '{{.Manifest.Digest}}')
 #
@@ -103,15 +110,23 @@ sleep_for() {  # $1 = 第几次失败（从 1 开始）
 
 attempt=1
 seen=""      # 每次失败的首行都留一份：用尽时一并打印，别让前几次的现场只剩一行"第 N 次"
+# 临时文件只建一次、每轮复用（每轮都 mktemp 会让前几轮的文件落在 /tmp 里没人收）。
+# `mktemp` 失败时必须带着身份失败：拿到空字符串后 `>"$outlog"` 就成了「重定向到空文件名」，
+# 判据读到空值——那是「查不动」，不是「没问题」。
+errlog="$(mktemp)" || die "建不出临时文件（mktemp 失败），无法判定 registry 状态" 2
+outlog="$(mktemp)" || die "建不出临时文件（mktemp 失败），无法判定 registry 状态" 2
+# 退出时统一收掉：成功 / 不可重试 / 用尽 / 被中断四条路径都覆盖，不再散点 rm（散点会漏）
+trap 'rm -f "$outlog" "$errlog" 2>/dev/null || true' EXIT
 while [ "$attempt" -le "$ATTEMPTS" ]; do
-  errlog="$(mktemp)"
-  outlog="$(mktemp)"
   log "[registry_retry] 第 ${attempt}/${ATTEMPTS} 次：$*"
-  # stderr：同时进日志与屏幕（构建要跑十几分钟，不能缓冲）；stdout：先落文件，
+  # stderr 进临时文件（本次尝试结束后整体回显，见文件头第 3 条）；stdout：先落文件，
   # **只有成功那一次**才原样吐出去——失败尝试的半截 stdout 会污染上游的 $( )。
-  "$@" >"$outlog" 2> >(tee "$errlog" >&2)
+  # 同步重定向，不用 `tee` + 进程替换：进程替换是异步的，判据读 $errlog 可能读到半截。
+  # 复核 #3 提过这个风险；本机用 200KB stderr、429 收尾连跑 8 次**未复现**（8/8 判定正确），
+  # 仍改同步以去掉平台相关性。代价：构建日志不再是流式，而是本次尝试结束后整体回显到 stderr。
+  "$@" >"$outlog" 2>"$errlog"
   rc=$?
-  wait 2>/dev/null || true          # 进程替换是异步的，等 tee 把日志写完
+  cat "$errlog" >&2
   err="$(cat "$errlog" 2>/dev/null || true)"
   first_line="$(printf '%s\n' "$err" | grep -v '^[[:space:]]*$' | head -1)"
 
@@ -124,11 +139,10 @@ while [ "$attempt" -le "$ATTEMPTS" ]; do
       summary "- ✅ registry 抖动被吃掉：第 ${attempt}/${ATTEMPTS} 次成功（前 $(( attempt - 1 )) 次失败）"
     fi
     cat "$outlog"
-    rm -f "$outlog" "$errlog" 2>/dev/null || true
-    exit 0
+    exit 0      # 临时文件由 EXIT trap 统一收，这里不再单独 rm
   fi
 
-  rm -f "$outlog" "$errlog" 2>/dev/null || true   # 失败：stdout 丢掉，stderr 已在屏幕上
+  # 失败：stdout 丢弃（下一次尝试的 >"$outlog" 会截断它），stderr 已在上方回显过
   seen="${seen}${seen:+；}第${attempt}次(rc=${rc})：${first_line}"
 
   if ! printf '%s' "$err" | grep -qE "$RETRYABLE_RE"; then

@@ -293,46 +293,147 @@ def test_尝试次数非法时rc1_且不跑命令(tmp_path: Path) -> None:
 
 # --- 7. 自接线：脚本必须真被 CI 用上（否则等于没写） ---------------------------
 
+# **碰 registry 的动词**：这些命令都会因为限流（429）/5xx/超时把整个门禁标成红，所以都要走本脚本。
+#   build / buildx build / buildx imagetools / push / pull / manifest / login
+# 判据**必须先把 `\` 续行拼合成一条逻辑行**再找动词：`ci.yml:562-564` 是三行**一条**命令
+#   （`GHCR_USER=… \` ＋ `bash scripts/registry_retry.sh -- \` ＋ `bash -c '… docker login …'`），
+#   逐物理行匹配会把**已经包好**的 login 误报成没包 —— 那正是本批反复在治的那类「误伤」。
+#
+# **故意不在判据里的**（是决定，不是遗漏；每条都有理由）：
+#   - `docker run / exec / rm / logs / inspect`（容器生命期）：`docker run -d` 重试会产生**重复
+#     副作用**（多起一个容器、端口被占、`--name` 冲突），宁可一次失败让人看清现场；
+#   - `docker run <registry 镜像>` 的**隐式拉取**：确实触网，但它和「起容器」是同一条命令，
+#     没法只重试拉取那一段 ⇒ 与上一条同处理。这是本批**如实记下的已知边界**，不是漏了；
+#   - `docker buildx version`：本地能力探测，不触网（`docker manifest` 本仓当前 0 处）。
+# 「触网却不走重试」的站点不许静默放行：逐站写进 DELIBERATELY_UNWRAPPED 并带理由。
+REGISTRY_VERB_RE = re.compile(
+    r"\bdocker (?:buildx\s+(?:build|imagetools)|build|push|pull|manifest|login)\b"
+)
 
-def _docker_build_lines() -> list[tuple[str, int, str]]:
-    """仓里所有「真的要构建镜像」的行：`docker build ` 后面必须跟空格，
-    这样 `docker buildx imagetools inspect`（那不是构建）不会被算进来。"""
+DELIBERATELY_UNWRAPPED: dict[str, str] = {
+    "scripts/pin_image_digests.sh": (
+        "交付/维护脚本（`image-signing` 作业里以 `--app-image` 调用，不是门禁判据）：它的 "
+        "`imagetools inspect` 自带 `INSPECT_TIMEOUT` 与 fail-loud 报错（把「哪个 ref 解析不了、"
+        "下一步怎么办」逐条打给人看），外面再套一层重试会把这份唯一有用的信息冲淡。**本批不动**"
+        "（要治它得先定「交付面也吃抖动」这条策略）——已作为边界写进 CHANGELOG。"
+    ),
+}
+
+
+def _logical_lines(path: Path) -> list[tuple[int, str]]:
+    """按 `\\` 续行把物理行拼成逻辑行，返回 (起始行号, 拼好的文本)。
+
+    `ci.yml` 里 `GHCR_USER=… \\` / `bash scripts/registry_retry.sh -- \\` /
+    `bash -c '… docker login …'`
+    是三行**一条**命令：不拼合就会把包好的 login 当成裸命令（误报）。
+    """
+    out: list[tuple[int, str]] = []
+    buf, start = "", 0
+    for i, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not buf:
+            start = i
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1]
+            continue
+        out.append((start, buf + raw))
+        buf = ""
+    if buf:
+        out.append((start, buf))
+    return out
+
+
+def _registry_verb_lines() -> list[tuple[str, int, str]]:
+    """仓里所有「真的碰 registry」的逻辑行（`ci.yml` + `scripts/*.sh`）。"""
     targets = [REPO / ".github" / "workflows" / "ci.yml"] + sorted((REPO / "scripts").glob("*.sh"))
     hits: list[tuple[str, int, str]] = []
     for path in targets:
         rel = path.relative_to(REPO).as_posix()
-        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            # 整行注释不算：注释里提到 `docker build` 是散文，不是构建
+        for i, logical in _logical_lines(path):
+            # 整行注释不算：注释里提到 `docker build` 是散文，不是命令
             # （这条断言第一版就被自己脚本头的注释咬到了，正是本批反复在治的那类误伤）
-            if line.lstrip().startswith("#"):
+            if logical.lstrip().startswith("#"):
                 continue
-            if re.search(r"\bdocker build\s", line):
-                hits.append((rel, i, line))
+            if REGISTRY_VERB_RE.search(logical):
+                hits.append((rel, i, logical.strip()))
     return hits
 
 
-def test_每一处docker构建都走这个脚本() -> None:
+def _ci_continuation_verb_lines() -> list[tuple[int, str]]:
+    """`ci.yml` 里「动词落在 `\\` 续行上」的物理行：(行号, 内容)。
+
+    这条判据的拼合逻辑靠它才有靶子：一条都找不到，拼合就成了没人验的死代码。
+    """
+    lines = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").splitlines()
+    out: list[tuple[int, str]] = []
+    for i, line in enumerate(lines, start=1):
+        if i >= 2 and lines[i - 2].rstrip().endswith("\\") and REGISTRY_VERB_RE.search(line):
+            out.append((i, line.strip()))
+    return out
+
+
+def test_每一处碰registry的命令都走这个脚本() -> None:
     """本仓的老毛病之一：守卫写好了却没人调用（`test_每个守卫脚本都必须被_ci_真的调用`
     治的是 `check_*.py`）。这条把同一把尺子对准本脚本。
 
-    **第一版这条是假的**：它 `break` 在第一处匹配上，只钉住了 `ci.yml` 里的 `sbom` 那行，
-    把 `image-signing` 或 `container_smoke.sh` 退回裸 `docker build` 它照样绿。
-    现在改成逐行断言，并且把 `scripts/*.sh` 也纳入扫描范围。
+    **这条断言被自己的历史证伪过两次**——两次都留在这里，因为那就是它存在的理由：
+      1) 第一版 `break` 在第一处匹配上，只钉住了 `ci.yml` 里 `sbom` 那行：把 `image-signing`
+         或 `container_smoke.sh` 退回裸 `docker build`，它照样绿（靶子 M7/M8）；
+      2) 第二版只认 `docker build`：`push` / `pull` / `login` / `imagetools` 哪一处退回裸命令
+         它都照样绿。`ci.yml:85` 那处裸 `docker pull`（匿名拉 Docker Hub，与 `f5901ac` 那次红
+         同一类限流）就是这么活到今天的——本批接线（靶子 M17/M19）。
     """
-    hits = _docker_build_lines()
-    assert hits, "一处 docker build 都没扫到 —— 断言本身失效了（路径/写法变了？）"
-    unwrapped = [(rel, i, line.strip()) for rel, i, line in hits if "registry_retry.sh" not in line]
-    assert not unwrapped, f"这些 docker build 没走 registry_retry.sh：{unwrapped}"
+    hits = _registry_verb_lines()
+    assert hits, "一条 registry 命令都没扫到 —— 断言本身失效了（谓词/路径变了？）"
+
+    unwrapped = [
+        (rel, i, line)
+        for rel, i, line in hits
+        if "registry_retry.sh" not in line and rel not in DELIBERATELY_UNWRAPPED
+    ]
+    assert not unwrapped, f"这些碰 registry 的命令没走 registry_retry.sh：{unwrapped}"
+
+    # 豁免不许静默：写了「故意不包」的文件必须真的扫到了动词，理由也不许是空话
+    for rel, reason in DELIBERATELY_UNWRAPPED.items():
+        assert [h for h in hits if h[0] == rel], (
+            f"{rel} 写着「故意不包」的理由，但扫描里没有它的 registry 命令 ⇒ 这条理由过期了"
+        )
+        assert reason.strip(), f"{rel} 的豁免必须带理由"
+
+    # 谓词要有牙：**每一类**触网动词都至少有一处真的被包上。
+    # 否则「把判据从 docker build 加宽到 registry 动词」只是字面上的：删掉某类接线照样绿。
+    for label, pattern in (
+        ("docker build", r"\bdocker build\b"),
+        ("docker push", r"\bdocker push\b"),
+        ("docker pull", r"\bdocker pull\b"),
+        ("docker login", r"\bdocker login\b"),
+        ("docker buildx imagetools", r"\bdocker buildx imagetools\b"),
+    ):
+        assert any(
+            re.search(pattern, line) and "registry_retry.sh" in line for _, _, line in hits
+        ), f"没有任何一处 `{label}` 走这个脚本 —— 这一类接线的守卫是空的"
+
     ci_sites = [h for h in hits if h[0].endswith("ci.yml")]
-    assert len(ci_sites) >= 2, f"ci.yml 里至少要有两处（本批是 sbom 与 image-signing）：{ci_sites}"
+    assert len(ci_sites) >= 6, (
+        f"ci.yml 里至少要有 6 处（build ×2 / pull / login / push / imagetools）：{ci_sites}"
+    )
     # ci.yml 的 `run:` 行要写成 `bash scripts/…`（与 test_script_exec_bits.py 的可执行位规则兼容）
     for rel, i, line in ci_sites:
-        stripped = line.strip()
-        if stripped.startswith("run:"):
-            stripped = stripped[len("run:") :].strip()
-        assert stripped.startswith("bash scripts/registry_retry.sh --"), (
+        assert "bash scripts/registry_retry.sh --" in line, (
             f"{rel}:{i} 要写成 `bash scripts/registry_retry.sh -- <docker 命令…>`：{line!r}"
         )
+        if line.startswith("run:"):
+            body = line[len("run:") :].strip()
+            assert body.startswith("bash scripts/registry_retry.sh --"), (
+                f"{rel}:{i} 单行 `run:` 必须整条交给脚本（前面不许垫别的命令）：{line!r}"
+            )
+
+    # 契约：上面这段依赖「拼合续行」。若某天 ci.yml 里再没有「动词落在续行上」的写法，
+    # 拼合逻辑就成了没人验的死代码 —— 这条契约会失败，提醒人来决定删还是留。
+    assert _ci_continuation_verb_lines(), (
+        "ci.yml 里已经没有「registry 动词落在 `\\` 续行上」的写法 ⇒ 拼合逻辑失去靶子："
+        "要么删掉拼合与这条契约，要么写明为什么它不再需要"
+    )
+
     # 脚本里用相对路径调同级脚本时，必须先算好它所在目录（否则 cwd 一变就找不到）
     smoke = (REPO / "scripts" / "container_smoke.sh").read_text(encoding="utf-8")
     if "registry_retry.sh" in smoke:
