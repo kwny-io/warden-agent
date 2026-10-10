@@ -428,7 +428,7 @@ jobs:
         # 与 container job 的构建重复是有意的：SBOM 必须描述"按当前源码构建出的那个镜像"，
         # 不能描述一个可能过期的缓存产物。将来 publish 步骤落地后，
         # 这里换成按 registry 里的 digest 扫描即可（那时不必再本地 build）。
-        run: docker build --pull -t warden-agent:sbom .
+        run: bash scripts/registry_retry.sh -- docker build --pull -t warden-agent:sbom .
       - name: 生成 SBOM（syft / SPDX JSON）并上传为构建产物
         # anchore/sbom-action 底层就是 syft；用 action 而不是手写 `docker run syft`，
         # 是为了顺带处理"产物上传"（upload-artifact: true）与版本固定。
@@ -555,15 +555,19 @@ jobs:
           repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/${repo}:${RELEASE_TAG}"
           echo "IMAGE=$image" >> "$GITHUB_ENV"
-          docker build --pull -t "$image" .
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
-            -u "${{ github.actor }}" --password-stdin
-          docker push "$image"
+          bash scripts/registry_retry.sh -- docker build --pull -t "$image" .
+          # 登录也走重试：ghcr.io 同样会 5xx/超时。凭据类错误（denied/unauthorized）不在
+          # 可重试清单里 ⇒ 真凭据问题仍旧立刻失败，不会被重试掩饰。token 走环境变量而不进 argv：
+          # 脚本会把命令行写进日志，写进 argv 就等于写进日志。
+          GHCR_USER="${{ github.actor }}" GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+            bash scripts/registry_retry.sh -- \
+            bash -c 'printf "%s" "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin'
+          bash scripts/registry_retry.sh -- docker push "$image"
           # 签名对象必须是 **digest**，不是 tag：tag 可以被移动/覆盖，签名跟着 tag 走
           # 就等于"签了一个以后可能指向别的东西的名字"。digest 不可变，签名才落得实。
           # 取值走 registry（imagetools inspect）而不是本地镜像的 RepoDigests：
           # 本地那份是"我推上去的那个"，registry 那份才是"别人会拉到的那个"。
-          digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
+          digest="$(bash scripts/registry_retry.sh -- docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
           if ! printf '%s' "$digest" | grep -qE '^sha256:[0-9a-f]{64}$'; then
             echo "::error::从 registry 取回的 digest 不合法: '$digest'"
             exit 1

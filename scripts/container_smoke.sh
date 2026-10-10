@@ -18,6 +18,9 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL="*"
 
+# 同级脚本的绝对路径（照 run_local.sh 的写法）：registry_retry.sh 给纯网络操作加退避重试。
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 IMAGE="${1:-warden-agent:smoke}"
 CONTAINER="warden-smoke-$$"
 # 负向用例的容器名：同一份镜像、**去掉演示声明**跑一遍，必须起不来（见文末第 6 步）。
@@ -81,7 +84,13 @@ if [ "${SMOKE_SKIP_BUILD:-0}" = "1" ]; then
   # 把这个镜像的身份记下来：否则这份“绿”能对应到哪个镜像、什么时候建的，事后无法追溯
   docker image inspect -f '{{.Id}} 创建于 {{.Created}}' "$IMAGE" | sed 's/^/[smoke] 被测镜像 /'
 else
-  docker build $PULL_FLAG -t "$IMAGE" .
+  # 2026-10-09 事故的**第二个现场就在这里**（不是只有 sbom 那处）：container 作业的这一步死在
+  # Docker Hub 匿名拉取限流 —— `unexpected status from HEAD request to
+  # registry-1.docker.io/v2/library/node/manifests/20-slim: 429 Too Many Requests` ⇒ `failed to solve`；
+  # 同一棵树的另一个提交全绿 ⇒ 是 registry 抖动，不是代码错。
+  # 只把**构建**包进重试（纯网络操作）：**不**包起容器/探活那几步——那些失败是产品缺陷，
+  # 重试只会把红拖得更晚；也不把整个脚本包一层，那会让 429 的重试预算被别的失败吃光。
+  bash "$HERE/registry_retry.sh" -- docker build $PULL_FLAG -t "$IMAGE" .
 fi
 
 # ---- 2. 起容器（带和生产一致的加固参数）----
