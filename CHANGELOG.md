@@ -51,8 +51,21 @@
   「`SessionRegistry` 定义在 `docs/b.md` 与 `web/a.py`」⇒ 一条都不判（**漏检，不是误报**，实测配对 0/0），
   所以文档里的坐标要写成「符号 定义在 path」的单句形式；匿名幂等的跨调用者串号是**契约上允许的**行为，
   要不要收是另一批的事。
-- **远端**：本节的推送 run 与作业级/step 级结论在同批的第二次文档提交里补（见 `docs/复核索引.md`
-  第七十七批那行）。
+- **远端（实测；不看 git 的传输结果）**：`gh api repos/kwny-io/warden-agent/branches/dev --jq .commit.sha`
+  = `dd989d038dd2…` = 本地 `HEAD`（X `f5901ac` 与 Y `dd989d0` 都在远端）。
+  - **Y**：run **`38006190461`**（`event=push`）= **success**；作业级 `sbom`/`security`/`quality`/`container`/
+    `migration`/`evals-real` = success，`image-signing` 与 `变异测试（${{ matrix.shard }}）` 按 `if:` skipped
+    （`event=push` 下本就该跳）；**非 success 的 step 一条都没有**；两个文档类门禁步骤都在 `quality` 里真跑且
+    success（判据三跑在同一个 step 内，没有新增 step）。回执 `wa77/ci77.Y.out`（sha256 `b6868e88…`）。
+  - **X**：run **`37993219106`**（`event=push`，`created_at=2026-10-09T21:24:04Z`）**首轮红、第 2 次尝试 success**。
+    首轮红与代码无关：`sbom` 与 `container` 两个作业都在 `docker build --pull` 上被 Docker Hub 匿名拉取限流打红——
+    `#5 [internal] load metadata for docker.io/library/node:20-slim` ⇒
+    `unexpected status from HEAD request to registry-1.docker.io/v2/library/node/manifests/20-slim: 429 Too Many Requests`
+    ⇒ `failed to solve`（证据 `wa77/ci77.X.429.evidence.txt`，sha256 `716dfed8…`）。`gh run rerun 37993219106 --failed`
+    后的第 2 次尝试：`container`/`quality`/`migration`/`sbom`/`security`/`evals-real` = success、
+    `image-signing`/`变异测试` skipped、**非 success 的 step 零条**（回执 `wa77/ci77.X.rerun.out`，sha256 `ab990158…`）。
+    结论以同一 sha 的第 2 次尝试为准；但这条失败模式是真的（第三方限流能把已交付提交标红）⇒
+    已开第七十八批：镜像构建加重试/退避（触发点 `ci.yml:431`/`558`/`566`，`--pull` 正是那个会撞限流的 HEAD 请求）。
 
 ## 2026-10-08（第七十六批：文档里的「转义」和「行号」是两类没人看得见的错）
 
