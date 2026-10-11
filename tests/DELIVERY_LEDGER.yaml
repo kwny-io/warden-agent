@@ -1,0 +1,92 @@
+# 「已交付提交」的台账：把「回执说它验的是哪棵树」变成 CI 自己会核的东西。
+#
+# 为什么会有这个文件（第七十八批之二 / #46-3）：
+#
+#   * 第七十八批**第九处**：交付面写着「本地冻结 `wa78/freeze78h.log`、tree `e1ddf6a3…`」，
+#     而实际交付的 Z2 树是 `83891221…`（= `wa78/freeze78i.log`）——**回执指到了被作废的那次冻结**。
+#     语法正确、文件都存在、引用的提交都存在：任何文本守卫都抓不到，
+#     当时唯一的防线是「提交前逐句读 staged diff」（靠人记得，不是机制）。
+#   * 同一批承认的最大空白：冻结闸门住在仓库外 `wa78/`，**仓库里没有任何东西**能证明
+#     「我跑测试时的那棵树 == 我交付的那棵树」。`wa78/z78_finish.sh` 是原型，且只在本机跑过。
+#
+# 这份台账可核的部分只有一件，但它是硬的那件：
+#
+#     git rev-parse <sha>^{tree}  必须等于该行的 tree
+#
+# 于是「台账/回执指着另一棵树」在 CI 上就是红的，不需要有人记得去读。
+#
+# 回填规则（**这是本台账能被核的前提**）：台账**必须有 `HEAD^` 那一行**、且**不许有 `HEAD` 自己的行**。
+#   一个提交没法在自己的正文里写下自己的树——写进去，树就变了（自引用无解，第七十八批第八/九处同源）。
+#   所以：**每个已交付提交由下一个提交背书**。删掉 `HEAD^` 那行就撞红，逼人回填。
+#   口径由**事件 + ref** 分派（唯一判据在 `tests/test_delivery_ledger.py` 的 `_refill_applies`）：
+#   `push` / 本机 = 严格；`refs/tags/*` 检出与 `pull_request` 的**合并提交**检出 = 回填义务不适用
+#   （那两个父级还没有「已交付提交」的身份）——而不适用必须**两边都对上：事件 + ref 形状**：
+#   PR 检出要真的是合并提交（≥2 父级）；**发布 tag 检出的事件要真的是 `workflow_dispatch`**
+#   （本仓 `ci.yml` 的 `push` 只过筛 `branches`、不含 tag ⇒ 「检出的是 tag」这条路只可能来自手动派发；
+#   这条前提由 `tests/test_delivery_ledger.py::test_口径分派_本仓的检出形状都认得` 直接读 `ci.yml` 钉住）。
+#
+#   一句诚实话：豁免只解掉**回填义务**。「`sha` 必须是 HEAD 的祖先」与「不许有 HEAD 自己的行」
+#   无条件生效 ⇒ 拿一个指向**已登记提交**的发布 tag 去跑仍会红（tag 这条路在设计上不是一条能绿的
+#   路径，它只是「不因为回填义务而红」）。本批没修它，如实记着（外部复核提出的第二天）。
+#
+# `attestation` 两档，**不许自报数字**：
+#   * `git-only`   ：只有 tree 可核（早期的冻结回执里没有三对账行，见下）
+#   * `git+frozen` ：另有**仓库外**的冻结回执给出 shape/keys（跑前=跑后），三件必须同时给
+#     —— 三对账（tree/shape/keys）是第七十八批 `freeze78g` 起才进冻结脚本的，
+#     所以 X/Y 只有 tree 可核；**没有回执就不许写数字**，宁可留空。
+#
+# `run` 只核形状：run 号在 GitHub 上、CI 里核不到，不假装核过（见 `tests/test_delivery_ledger.py` 末尾）。
+# X 与 Y 是**同一次 push**，所以共用 run `38076347508`（该 run 的 head 是 Y，X 结构上没有独立 run）。
+#   ⚠️ 这两句是**散文**：没有任何判据覆盖它（`run` 只核「非空时是纯数字」）。外部复核点名过：
+#   这类话看上去像被核过，其实没有——要核它得用 `gh api` 查那个 run 的 head，CI 里做不到。
+#
+# 范围：从第七十八批（`7140ead`）起。更早的提交没有可核回执，不回填、不猜。
+rows:
+  - sha: 7140ead
+    tree: 028ae9c7e7f6585209d847741f6f9437b61f9b83
+    attestation: git-only
+    shape:
+    keys:
+    receipt:
+    run: 38076347508
+    note: "X = feat：重试收口 + 「谁真碰 registry」守卫加宽 + 矩阵 M17/M18/M19；与 Y 同一次 push"
+  - sha: c4ea69c
+    tree: dd9a28f4776716cb3d1209da7beb78dc67b62acd
+    attestation: git-only
+    shape:
+    keys:
+    receipt:
+    run: 38076347508
+    note: "Y = docs：CHANGELOG 小节 + 复核索引 + README 第四类（该 run 的 head 是 Y）"
+  - sha: 6ceb339
+    tree: 7bd729a5081804e9017ee05dccb9f6bacf57cb78
+    attestation: git+frozen
+    shape: 2a0407185b5fc4a0
+    keys: 53f3448c2835ac65
+    receipt: freeze78g.log
+    run: 38092795803
+    note: "Z = docs：回填实测 run 与逐 job/step 结论"
+  - sha: 5098b27
+    tree: 83891221acb84267221f500c0e3981a95abfb96b
+    attestation: git+frozen
+    shape: c90df0d60c7bdb66
+    keys: 3862afbca9678983
+    receipt: freeze78i.log
+    run: 38112192015
+    note: "Z2 = docs：订正相对指针 + 回执链四处缺陷；**曾是第九处的现场**（写 78h/e1ddf6a3…，实际是 78i/83891221…）"
+  - sha: cdde765
+    tree: 23db2b22c581c93378dc09a1bbe7cef92b76555b
+    attestation: git+frozen
+    shape: c90df0d60c7bdb66
+    keys: 2876849183f3a2c6
+    receipt: freeze78k.log
+    run: 38123440484
+    note: "Z3 = docs：订正第九/十/十一处 + 回填 Z2 的 run；提交信息曾套用上一轮模板 ⇒ --amend 只改信息后强推（同树）"
+  - sha: 152b870
+    tree: 741c484a91eb91c060fdc86e518a3a4f0cc9b7a9
+    attestation: git-only
+    shape:
+    keys:
+    receipt:
+    run:
+    note: "docs(参赛准备)：README 开篇前移「为什么需要 Warden」+ 统一测试数字口径；提交时**没有**仓库外冻结回执（三对账从 freeze78g 起）⇒ 只有 tree 可核；与 X 同一次 push（该 run 的 head 是 X）⇒ 本身没有独立 run，run 由 Y 回填"
