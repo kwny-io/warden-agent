@@ -100,3 +100,16 @@ rows:
     note: "X = feat(tests,ci)：交付台账 + 守卫 + ci.yml 接线（fetch-depth / schedule ref）；提交标题的批号曾写错
       （第七十八批）⇒ 推送前只改提交信息的 --amend（bf119d4 → 7b9a50f7，**tree 未变**，见 wa79/X-sha-note.md）；
       本提交单独推了一次 ⇒ 有独立 run，由 Y 回填"
+  - sha: d0c51402b993d5d160b425bbfc3ce96a1335d968
+    tree: 6a302584f9a8c3a3ba2645139704e63a7c28eb96
+    attestation: git+frozen
+    shape: e3b0c44298fc1c14
+    keys: c808b132c751ca76
+    receipt: freeze79y2.log
+    run: 38178553699
+    note: "Y = docs(交付面)：第七十九批 CHANGELOG 条目（含「假时序修法还有牙齿」那一节，装置是 wa79/teeth-flaky.py：
+      10/10 单独连跑全绿、删 sse_gate.release() 或 lease.stop() 都只让那一条用例红）。
+      第一版冻结 freeze79y.log **报红**：插入新条目时把第七十八批的 `## ` 标题行一起替掉了，
+      抓到它的是本仓自写的结构守卫 test_批号不新增重复与缺号（gap:78（缺号））⇒ 补回标题（**不往
+      _KNOWN_ANOMALIES 加豁免**）、重新冻结 = freeze79y2.log，tree c807fd5f → 6a302584。
+      另：提交信息里的「第七十九批」数字口径与 CHANGELOG 正文一致，不再引用被作废的那次冻结"

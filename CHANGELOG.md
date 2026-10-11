@@ -42,15 +42,21 @@ tree `e1ddf6a3…`」，实际交付的那棵树是 `83891221…`（= `freeze78i
   第三轮的结论是「**窄口径可以背书**（台账的树/祖先/回填义务确实被核）/ **宽口径不能背书**
   （`receipt` 只核文件名形状、散文不在判据内）」，并抓到下面「本批自己犯的错」里的那一处。
 
-**数字**（同一次冻结 `wa79/freeze79x.log`：跑前/跑后 tree/shape/keys 三对账一致）：
+**数字**（本批三次提交各自的冻结与 run 见 `tests/DELIVERY_LEDGER.yaml`；下面这组是**第一次交付 X** 的，
+receipt `wa79/freeze79x.log`，跑前/跑后 tree/shape/keys 三对账一致）：
 
 - 全套 `pytest`：**1919 tests / 0 failures / 0 errors / 2 skipped**（1917 passed，494.29s），
   覆盖率 **90.32%**（门槛 86）；`ruff check src tests scripts` 0 报错；
   `mypy src/warden_agent`：`no issues found in 115 source files`；
-  本批守卫 `tests/test_delivery_ledger.py` 107 passed。
-- X 的 CI run `38174573309`（按 sha 认领）：`security`/`container`/`sbom`/`migration`/`evals-real` 成功，
-  `image-signing` 与 4 个「变异测试」分片在 push 上按 `if:` **skipped**（只有 push `v*` tag 或手动派发才真跑），
-  `quality` 结论由 Z 回填（Y/Z 只改文档与两处测试，最终数字以 Z 回填的冻结为准）。
+  本批守卫 `tests/test_delivery_ledger.py` **28 passed**（pytest 自己 `--collect-only` 数出来的）。
+  这里原来写「107 passed」：我是拿 `grep -c 'def test_'` 去数 `tests/` 的**源码文本**数出来的——从源码数字测试，
+  本身就是这批在治的病，数字只能从回执里数。
+- X 的 CI run `38174573309`（按 sha 认领）：`security`/`container`/`sbom`/`migration` 成功；
+  `evals-real` 的结论也是 success，但那个 success 是**签字跳过**——artifact `eval-skip-receipt`
+  确实在该 run 上（461 字节，实测 `gh api .../artifacts`），没有真密钥就没跑真评测，只跑了机械段；
+  `image-signing` 与 4 个「变异测试」分片在 push 上按 `if:` **skipped**（只有 push `v*` tag 或手动派发才真跑）。
+  `quality` 的逐 job 结论一律拿台账 `run` 列里的 run 号去 `gh run view <run> --json jobs` 看、**不许转述**；
+  本批末次提交（`Z`）的 run 号要等下一个提交才有地方写 ⇒ 这里如实不写（无限回归的终点）。
 
 **本批自己犯的错（记在交付面，不藏）**：
 
