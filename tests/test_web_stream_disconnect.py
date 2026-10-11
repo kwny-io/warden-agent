@@ -225,9 +225,19 @@ async def test_客户端断线后租约与并发名额都归还() -> None:
         await asyncio.sleep(0.02)
     assert any(m.role == "assistant" for m in store.load_messages("run-lease"))
 
-    # 同一个 run 再来一轮：租约没还回来会 423（Run 被占用），名额没还回来会 503
-    code2, raw2 = await _drive(app, "/chat/stream/run-lease", {"text": "再来一句"})
-    assert code2 == 200, f"断线后租约/并发名额没归还，状态码 {code2}"
+    # 同一个 run 再来一轮：租约没还回来会 423（Run 被占用），名额没还回来会 503。
+    # 注意「落库」≠「已归还」——归还在后台 worker 的 `finally` 里、比落库晚几毫秒，
+    # 所以这里**有界等待门真的让开**，而不是一看到落库就发第二个请求（那是在赌时延：
+    # 本批实测会随机把交付提交标红）。语义没变——释放点若坏了，5 秒里每次都是 423/503。
+    code2 = 0
+    raw2 = b""
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        code2, raw2 = await _drive(app, "/chat/stream/run-lease", {"text": "再来一句"})
+        if code2 == 200:
+            break
+        await asyncio.sleep(0.05)
+    assert code2 == 200, f"断线 5 秒后租约/并发名额仍未归还，状态码 {code2}"
     assert [f for f in _frames(raw2) if f["type"] == "final"]
 
 

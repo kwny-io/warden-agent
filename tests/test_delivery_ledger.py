@@ -56,9 +56,16 @@ tree `e1ddf6a3…`」，而实际交付的 Z2 树是 `83891221…`（= `freeze78
     这一行的 tree」⇒ 反例：写一个不存在的 `freeze999.log` 仍是绿；有回执的行改标 `git-only`
     就能把错树洗掉（**第九处的实质仍在**）。根因是回执住在仓库外、CI 看不见，
     修法（下一批）：把回执副本搬进交付树 + 记 sha256，让「回执指的树」与「交付树」同处一棵树。
-  * 交付面**散文**里的 tree 字面量不在判据内（第九处真正坏的就是那句散文；它当时在桌面笔记里，
-    仓库里现在没有 `tree <40hex>` 字面量 ⇒ 现在写这条判据会是恒真，先不写）。
-  * 短 sha 靠唯一性：本文件加了 `rev-parse --disambiguate` 歧义检查，但仍建议将来改存 40 位全 sha。
+  * 交付面**散文**里的 tree 字面量不在判据内（第九处真正坏的就是那句散文）。实测量过：
+    `CHANGELOG.md:392/970/974` 与 `docs/复核索引.md` 共 **16 处**，形态三种（`tree <40hex>`、
+    `tree <8hex>`、`树哈希 <40hex>`），其中 2 处是**冻结中途树**（对象在，但任何提交都没有那棵树：
+    实测 `git rev-list --all` 命中为空）⇒ 判据不能简单要求「每个字面量都能在某个提交里找到」；
+    要正式覆盖它，得先把冻结回执变成仓内可核的东西（见上面那条缺口）。
+    （这句原来写的是「仓库里现在没有 `tree <40hex>` 字面量」——**是假的**，第二轮只读复核抓到：
+    我只用了一种写法 grep 就下了「没有」的结论，换形态立刻是 16 处。教训记在桌面 77 号文档。）
+  * `sha` 必须写 **40 位全 sha**：短 sha 即使唯一解析，也可能指到与本意不同的提交
+    （`rev-parse --disambiguate` 只挡「现在就有多个对象共用这个前缀」这一种情况）。
+    歧义检查与 40 位形状检查**两条都留**。
   * `yaml.safe_load` 对重复的 `rows:` 键静默取后者（没做重复键检测）。
 
 判据有牙由本文件自己的用例证明（不是「读代码看着对」）：`test_判据有牙_*` 拿**真台账**在内存里改坏
@@ -306,6 +313,12 @@ def _violations(
                 f"（`git rev-parse --verify {sha}^{{commit}}` 失败）"
             )
             continue
+        if not _HEX40.match(sha):
+            out.append(
+                f"{tag}：`sha` 不是 40 位小写十六进制（{sha!r}）⇒ 短 sha 即使唯一解析，"
+                "也可能指到与你本意不同的提交（`--disambiguate` 只挡「现在就有歧义」）"
+            )
+
         if full in seen:
             out.append(f"{tag}：`sha` 与第{seen[full]}行重复（同一个提交被写成两条交付）")
         else:
@@ -738,9 +751,14 @@ def test_口径分派_本仓的检出形状都认得() -> None:
     assert not _PR_REF.match(_DEV)
     assert _TAG_REF.match(_TAGS), _TAGS
     assert not _TAG_REF.match("refs/tags/nightly")
-    # 本机（`event is None`）无论 ref 长什么样都必须严格
-    assert _refill_applies(event=None, ref=_TAGS, parent_count=9)[0] is True
-    assert _refill_applies(event=None, ref=_PR_MERGE, parent_count=9)[0] is True
+    # 本机（`event is None`）无论 ref 长什么样都必须严格，且**一条违反项都不许多报**。
+    # 断言整元组而不是 `[0] is True`：后者只钉住「义务是否适用」一个分量，把
+    # `_refill_applies` 里 `if event is None:` 那行改坏**观测不到差异**（矩阵 G10 实测 0 红）
+    # ⇒ 本机带着 tag/PR 形状的 `GITHUB_REF` 会凭空多一条「借用口径」的
+    # 违反项（假阳）而没人拦。
+    assert _refill_applies(event=None, ref=_TAGS, parent_count=9) == (True, None)
+    assert _refill_applies(event=None, ref=_PR_MERGE, parent_count=9) == (True, None)
+    assert _refill_applies(event=None, ref=None, parent_count=1) == (True, None)
 
     doc = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
     # YAML 1.1 里裸 `on:` 会被解析成**布尔 True**（PyYAML 的经典坑）⇒ 两种键都取。

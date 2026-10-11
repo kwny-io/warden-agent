@@ -1,6 +1,6 @@
 # 「已交付提交」的台账：把「回执说它验的是哪棵树」变成 CI 自己会核的东西。
 #
-# 为什么会有这个文件（第七十八批之二 / #46-3）：
+# 为什么会有这个文件（第七十九批 / #46-3）：
 #
 #   * 第七十八批**第九处**：交付面写着「本地冻结 `wa78/freeze78h.log`、tree `e1ddf6a3…`」，
 #     而实际交付的 Z2 树是 `83891221…`（= `wa78/freeze78i.log`）——**回执指到了被作废的那次冻结**。
@@ -42,7 +42,7 @@
 #
 # 范围：从第七十八批（`7140ead`）起。更早的提交没有可核回执，不回填、不猜。
 rows:
-  - sha: 7140ead
+  - sha: 7140eadcf9252a39cebfa4da1b5a07289b9362b3
     tree: 028ae9c7e7f6585209d847741f6f9437b61f9b83
     attestation: git-only
     shape:
@@ -50,7 +50,7 @@ rows:
     receipt:
     run: 38076347508
     note: "X = feat：重试收口 + 「谁真碰 registry」守卫加宽 + 矩阵 M17/M18/M19；与 Y 同一次 push"
-  - sha: c4ea69c
+  - sha: c4ea69c5267b63b77ca5f11abee90aaffc9292d8
     tree: dd9a28f4776716cb3d1209da7beb78dc67b62acd
     attestation: git-only
     shape:
@@ -58,7 +58,7 @@ rows:
     receipt:
     run: 38076347508
     note: "Y = docs：CHANGELOG 小节 + 复核索引 + README 第四类（该 run 的 head 是 Y）"
-  - sha: 6ceb339
+  - sha: 6ceb339cae6484dad34d72a3365826c7163ab276
     tree: 7bd729a5081804e9017ee05dccb9f6bacf57cb78
     attestation: git+frozen
     shape: 2a0407185b5fc4a0
@@ -66,7 +66,7 @@ rows:
     receipt: freeze78g.log
     run: 38092795803
     note: "Z = docs：回填实测 run 与逐 job/step 结论"
-  - sha: 5098b27
+  - sha: 5098b27a8c80c0a964abd97bbaafeb42aa0102e2
     tree: 83891221acb84267221f500c0e3981a95abfb96b
     attestation: git+frozen
     shape: c90df0d60c7bdb66
@@ -74,7 +74,7 @@ rows:
     receipt: freeze78i.log
     run: 38112192015
     note: "Z2 = docs：订正相对指针 + 回执链四处缺陷；**曾是第九处的现场**（写 78h/e1ddf6a3…，实际是 78i/83891221…）"
-  - sha: cdde765
+  - sha: cdde765c291fa8a301289ab53fc821ca34c5aa70
     tree: 23db2b22c581c93378dc09a1bbe7cef92b76555b
     attestation: git+frozen
     shape: c90df0d60c7bdb66
@@ -82,7 +82,7 @@ rows:
     receipt: freeze78k.log
     run: 38123440484
     note: "Z3 = docs：订正第九/十/十一处 + 回填 Z2 的 run；提交信息曾套用上一轮模板 ⇒ --amend 只改信息后强推（同树）"
-  - sha: 152b870
+  - sha: 152b870d0dfa4e067495a9e27ace674cf7a0ed35
     tree: 741c484a91eb91c060fdc86e518a3a4f0cc9b7a9
     attestation: git-only
     shape:
@@ -90,3 +90,13 @@ rows:
     receipt:
     run:
     note: "docs(参赛准备)：README 开篇前移「为什么需要 Warden」+ 统一测试数字口径；提交时**没有**仓库外冻结回执（三对账从 freeze78g 起）⇒ 只有 tree 可核；与 X 同一次 push（该 run 的 head 是 X）⇒ 本身没有独立 run，run 由 Y 回填"
+  - sha: 7b9a50f7abaec8204515d329058b42c7f112af60
+    tree: 47dff6e47a370857f2877d2cacd74c6a94342f70
+    attestation: git+frozen
+    shape: e3b0c44298fc1c14
+    keys: 6bde3bf34e54d3c3
+    receipt: freeze79x.log
+    run: 38174573309
+    note: "X = feat(tests,ci)：交付台账 + 守卫 + ci.yml 接线（fetch-depth / schedule ref）；提交标题的批号曾写错
+      （第七十八批）⇒ 推送前只改提交信息的 --amend（bf119d4 → 7b9a50f7，**tree 未变**，见 wa79/X-sha-note.md）；
+      本提交单独推了一次 ⇒ 有独立 run，由 Y 回填"
