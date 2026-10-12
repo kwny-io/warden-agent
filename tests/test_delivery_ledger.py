@@ -17,7 +17,11 @@ tree `e1ddf6a3…`」，而实际交付的 Z2 树是 `83891221…`（= `freeze78
      —— 提交没法在自己的正文里写下自己的树（写进去，树就变了），
      所以每个已交付提交由**下一个**提交背书。
      这条义务只对「**检出的提交就是被推送的那个提交**」适用，口径由**事件 + ref** 分派
-     （`_refill_applies`，本文件唯一的口径判据）：`push` / 本机 ⇒ 严格；
+     （`_refill_applies`，本文件唯一的口径判据）：`push` 到**交付面分支**（台账头部的
+     `delivery_branch`，本仓 = `dev`）/ 本机 ⇒ 严格；`push` 到**非交付分支** ⇒ 回填义务不适用
+     （被检出的是那条分支上的在飞提交，它不欠「由下一个交付提交背书」这个账；
+     但**豁免只解掉回填这一条**，tree/sha/祖先/重复/自报数字照旧全部适用；
+     **台账没写 `delivery_branch` 时不豁免任何分支** —— 把「没写」读成「都放行」就是静默放行）；
      `refs/tags/*` 检出与 `pull_request` 的**合并提交**检出 ⇒ 不适用
      （那两个父级都还没有「已交付提交」的身份），
      而且**不适用必须两边都对上：事件 + ref 形状**——PR 检出必须真的是合并提交（≥2 个父级）；
@@ -46,7 +50,9 @@ tree `e1ddf6a3…`」，而实际交付的 Z2 树是 `83891221…`（= `freeze78
 （fail-closed，而不是静默放行）。
 
 **采集缺口（本批实测，不是猜）**：`ci.yml` 有 `schedule`（每周一 03:00 UTC），而定时跑默认检出
-**默认分支** `master`（`origin/HEAD -> origin/master`，tip `ad986393…`，落后 `dev` **149** 个提交，
+**默认分支** `master`（`origin/HEAD -> origin/master`，tip `ad986393…`，在第七十九批 X 的时点
+落后 `dev` **149** 个提交（这个数会随批次数长大 —— **别把它当判据**；要现算就
+`git rev-list --count origin/master..dev`），
 `git ls-tree -r origin/master` 里**没有**这份台账）⇒ 那条路上守卫根本没被采集（不是绿，是不存在）。
 本批在 `quality` job 的 checkout 上钉住了 `ref`（`schedule` ⇒ `dev`），并按 YAML 接线加了用例。
 
@@ -94,6 +100,7 @@ _HEX16 = re.compile(r"^[0-9a-f]{16}$")
 _ATTS = ("git-only", "git+frozen")
 _PR_REF = re.compile(r"^refs/pull/\d+/(merge|head)$")
 _TAG_REF = re.compile(r"^refs/tags/v[0-9]")  # 只有发布 tag（`v*`）会进这个工作流
+_HEAD_REF = re.compile(r"^refs/heads/(.+)$")  # 分支检出：只有**交付面分支**承担回填义务
 _GIT_TIMEOUT = 120  # 秒：git 挂住不是「没问题」，是「查不动」
 
 
@@ -157,7 +164,8 @@ def _tree_of(sha: str) -> str | None:
     return out.stdout.strip() if out.returncode == 0 else None
 
 
-def _load_rows() -> list[dict[str, Any]]:
+def _load_ledger() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """台账的（头部字段, 行）。头部字段里参与判据的只有 `delivery_branch`。"""
     raw = yaml.safe_load(LEDGER.read_text(encoding="utf-8"))
     # 输入校验用 `raise` 而不是 `assert`：`python -O` 会把 `assert` 整条剥掉，
     # 那时「空台账会是一个绿灯」这句承诺就悄悄失效了（外部复核指出）。
@@ -169,7 +177,28 @@ def _load_rows() -> list[dict[str, Any]]:
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError(f"每行必须是 mapping：{row!r}")
-    return rows
+    return raw, rows
+
+
+def _load_rows() -> list[dict[str, Any]]:
+    return _load_ledger()[1]
+
+
+def _delivery_branches() -> tuple[str, ...]:
+    """台账声明的**交付面分支**（`delivery_branch: dev`，也接受列表）。
+
+    **空 = 不豁免任何分支**：把「没写」读成「都放行」就是静默放行（fail-closed），
+    所以调用方拿到 () 时必须继续严格，而不是反过来。
+    """
+    meta, _rows = _load_ledger()
+    declared = meta.get("delivery_branch")
+    if declared is None:
+        return ()
+    if isinstance(declared, str):
+        return (declared.strip(),) if declared.strip() else ()
+    if isinstance(declared, list):
+        return tuple(str(item).strip() for item in declared if str(item).strip())
+    raise ValueError(f"`delivery_branch` 只能是字符串或列表（拿到 {type(declared).__name__}）")
 
 
 def _is_ancestor(sha: str, head: str) -> bool:
@@ -194,7 +223,11 @@ def _ambiguous_prefixes(prefix: str) -> int:
 
 
 def _refill_applies(
-    *, event: str | None, ref: str | None, parent_count: int
+    *,
+    event: str | None,
+    ref: str | None,
+    parent_count: int,
+    delivery: tuple[str, ...] = (),
 ) -> tuple[bool, str | None]:
     """回填义务**只对「检出的提交就是被推送的那个提交」适用**。
 
@@ -237,6 +270,23 @@ def _refill_applies(
         return True, (
             f"`refs/tags/*` 口径未登记：{ref!r} 不是发布 tag（`refs/tags/v*`）⇒ 不许借它跳过回填"
         )
+    branch = _HEAD_REF.match(ref or "") if event == "push" else None
+    if branch:
+        if branch.group(1) in delivery:
+            return True, None          # 交付面分支：严格 —— 回填义务本来就是为它写的
+        if not delivery:
+            # 台账没声明交付面分支 ⇒ **不豁免任何分支**（fail-closed）：
+            # 把「没写」读成「都放行」，等于给一条静默放行的后门。
+            return True, None
+        # 非交付分支：被检出的是那条分支上的在飞提交，它不欠「由下一个交付提交背书」这个账。
+        # 今天本仓只推 `dev`，所以这条路只在「真开功能分支/PR 流程」时才走到；
+        # 那时候硬撑严格口径，红的原因与被检出的改动无关 ⇒ 假阳 ⇒ 门禁变成噪音（比假阴更贵）。
+        # 真实几何的实测复现：`wa79/fb-repro.py`（仓外，只见测一次）。
+        # ⚠️ 豁免**只**解掉回填这一条：内容判据（tree/sha/祖先/重复/自报数字）照旧全部适用。
+        # ⚠️ 这条口径**只对 `push` 开放**（假阳也只发生在 push 上）：`pull_request` / `schedule` /
+        # 手动派发 / 本机带着分支形状的 ref，一律往下走原有分派（fail-closed）——
+        # 否则「伪造 PR 事件 + 分支 ref」那条被借用口径的路径会静默变成绿。
+        return False, None
     if event == "pull_request":
         if not _PR_REF.match(ref or ""):
             # fail-closed：只看事件名就能豁免 = 本机一条 `git merge --no-ff` + 一个环境变量
@@ -261,10 +311,13 @@ def _refill_violations(
     head: str,
     parents: tuple[str, ...],
     seen: dict[str, int],
+    delivery: tuple[str, ...],
 ) -> list[str]:
     """回填规则（口径由 `_refill_applies` 分派）+「不许有 HEAD 自己的行」。"""
     out: list[str] = []
-    applies, borrowed = _refill_applies(event=event, ref=ref, parent_count=len(parents))
+    applies, borrowed = _refill_applies(
+        event=event, ref=ref, parent_count=len(parents), delivery=delivery
+    )
     if borrowed is not None:
         out.append(borrowed)
     if head in seen:
@@ -291,12 +344,17 @@ def _violations(
     parents: tuple[str, ...],
     event: str | None = None,
     ref: str | None = None,
+    delivery: tuple[str, ...] | None = None,
 ) -> list[str]:
     """台账的全部判据。返回违反项（空列表 = 干净）。
 
     `event`/`ref` 是**入参**而不是从环境里现读：用例必须能钉住口径
     （CI 里这套用例也会在 PR 事件下跑）。
+    `delivery` 是交付面分支（台账头部 `delivery_branch`）；**默认 `()` = 不豁免任何分支**
+    （fail-closed：忘了传参也不会静默放行）。`_violations` 会显式传台账里声明的值。
     """
+    if delivery is None:
+        delivery = _delivery_branches()
     out: list[str] = []
     seen: dict[str, int] = {}
 
@@ -380,7 +438,11 @@ def _violations(
         if run and not run.isdigit():
             out.append(f"{tag}：`run` 只能是纯数字（这里只核形状，真伪在 GitHub 上，CI 核不到）")
 
-    out.extend(_refill_violations(event=event, ref=ref, head=head, parents=parents, seen=seen))
+    out.extend(
+        _refill_violations(
+            event=event, ref=ref, head=head, parents=parents, seen=seen, delivery=delivery
+        )
+    )
     return out
 
 
@@ -411,6 +473,95 @@ def _current() -> list[str]:
 def test_交付台账干净() -> None:
     """一条硬判据 + 五条一致性判据全过。红了先看 `HEAD^` 那一行回填了没有。"""
     assert _current() == []
+
+
+# ----------------------------------------------- 交付面分支（口径的第三条路：非交付分支）
+
+def _wip_geometry() -> tuple[str, tuple[str, ...]]:
+    """「父级还没被回填」的检出形状 —— 功能分支上就是它。
+
+    拿本仓 tip 顶替「那条分支上还没回填的在飞提交」，并把 `parents` 也指回它：
+    于是「台账里没有 HEAD^ 那一行」恰好成立，而且**不用造提交对象**（CI 里也跑得动）。
+    真实几何（真造一个 WIP 提交）的实测：`wa79/fb-repro.py`（仓外）。
+    """
+    head = _git("rev-parse", "HEAD").stdout.strip()
+    assert head not in {r.get("sha") for r in _load_rows()}, "本仓 tip 不该有台账行（回填规则）"
+    return head, (head,)
+
+
+def test_非交付分支不承担回填义务() -> None:
+    """推功能分支不该红：被检出的是那条分支上的在飞提交，它不欠这个账。"""
+    head, parents = _wip_geometry()
+    for ref in ("refs/heads/feat-x", "refs/heads/wip-试验"):
+        got = _violations(_load_rows(), head=head, parents=parents, event="push", ref=ref)
+        assert not any("HEAD^" in item for item in got), (ref, got)
+
+
+def test_交付分支必须承担回填义务() -> None:
+    """同一个检出形状，只要 ref 是交付面分支（`dev`）就必须红 —— 豁免不许漏到交付面上。"""
+    head, parents = _wip_geometry()
+    got = _violations(_load_rows(), head=head, parents=parents, event="push", ref="refs/heads/dev")
+    assert any("HEAD^" in item for item in got), got
+
+
+def test_非交付分支仍然要过内容判据() -> None:
+    """豁免**只**解掉回填这一条：功能分支上写错 tree 照样红（否则就是一条静默放行的后门）。"""
+    head, parents = _wip_geometry()
+    rows = copy.deepcopy(_load_rows())
+    rows[0]["tree"] = "0" * 40
+    got = _violations(rows, head=head, parents=parents, event="push", ref="refs/heads/feat-x")
+    assert any("不一致" in item for item in got), got
+
+
+def test_分支豁免只对_push_开放() -> None:
+    """删掉 `event == "push"` 这个门槛，就是给了一条**静默放行**的后门。
+
+    例：`event="pull_request"` + `ref="refs/heads/feat-x"` + `delivery=("dev",)`——事件名说这是 PR、
+    ref 却是分支形状。分支豁免**必须不生效**：回落原有分派后 `_PR_REF` 不认它 ⇒ 退回严格口径，
+    并给出「口径被借用」的理由。否则「伪造一个事件名 + 一条分支 ref」就能把回填义务整条关掉。
+    """
+    applies, borrowed = _refill_applies(
+        event="pull_request", ref="refs/heads/feat-x", parent_count=1, delivery=("dev",)
+    )
+    assert applies, "伪造 PR 事件不该借走分支豁免"
+    assert borrowed is not None and "pull_request" in borrowed, borrowed
+    head, parents = _wip_geometry()
+    got = _violations(
+        _load_rows(),
+        head=head,
+        parents=parents,
+        event="pull_request",
+        ref="refs/heads/feat-x",
+        delivery=("dev",),
+    )
+    assert any("HEAD^" in item for item in got), got
+
+
+def test_台账没声明交付分支时一律严格() -> None:
+    """`delivery=()`（= 台账没写 `delivery_branch`）⇒ 不豁免任何分支：缺声明不是放行证。
+
+    连**不传参**（走默认值）也必须严格 —— 将来有人加了新调用点却忘了传 `delivery`，
+    那也必须是 fail-closed，而不是静默把回填义务关掉。
+    """
+    head, parents = _wip_geometry()
+    got = _violations(
+        _load_rows(), head=head, parents=parents, event="push", ref="refs/heads/feat-x", delivery=()
+    )
+    assert any("HEAD^" in item for item in got), got
+    assert _refill_applies(event="push", ref="refs/heads/feat-x", parent_count=1) == (True, None)
+
+
+def test_本仓台账声明了交付分支且就是_dev() -> None:
+    """交付面是**声明**出来的，不是猜的：改路线时改这一行（它同时是参赛提交清单那件事的答案）。"""
+    assert _delivery_branches() == ("dev",)
+
+
+def test_怪_ref_一律严格() -> None:
+    """形状认不出来（不是 `refs/heads/<名字>`）⇒ 退回严格口径，fail-closed。"""
+    head, parents = _wip_geometry()
+    for ref in ("refs/heads/", "refs/heads", "weird", ""):
+        got = _violations(_load_rows(), head=head, parents=parents, event="push", ref=ref)
+        assert any("HEAD^" in item for item in got), (ref, got)
 
 
 def _quality_steps() -> list[dict]:
