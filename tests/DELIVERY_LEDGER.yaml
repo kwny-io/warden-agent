@@ -146,3 +146,15 @@ rows:
       未重跑，理由见 CHANGELOG）。另：本提交第一版漏记了 HEAD^（814eeb0）那一行，被变异装置的「第 0 步：
       基线必须绿」当场抓住；补行时把台账写坏过一次（引号跑到新行末尾、pyyaml 报 ParserError，而编辑器的
       js-yaml 两次都说 clean）⇒ 最终 sha 是 f6eb5871…（tree 由 781c8e7b 变为 1852877b）"
+  - sha: f238378d1289c46503874c59b99f74366aaec24f
+    tree: 27dd5984d5ba073c558c661c8b96b0b26c5c2c3b
+    attestation: git+frozen
+    shape: e3b0c44298fc1c14
+    keys: ac241b8734f899c1
+    receipt: freeze80y.log
+    run: 38195700449
+    note: "Y = 台账记入 X' 的行 + 把 CHANGELOG 换成第八十批条目。提交时逐句读过整份 staged diff；三对账
+      跑前/跑后逐项一致（tree 27dd5984、shape = 空 git status 的指纹、keys = 三个交付面文件的哈希再哈希）；
+      守卫 35 条全绿，另有 Markdown 表格、镜像 pinning、SAST 口径、文档引用四个守卫 rc=0。它的 CI
+      （run 38195700449）逐 job 实测：quality/security/container/sbom/migration/evals-real = success，
+      变异测试 4 分片与 image-signing 按 if: skipped。它自己的台账行由下一个提交回填。"
