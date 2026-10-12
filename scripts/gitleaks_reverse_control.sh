@@ -17,6 +17,14 @@
 #   这一步专门拦「对照其实没喂到扫描器」（例如挂载失败、扫了空目录）——那种情况下
 #   ① 的「通过」毫无意义，而 ② 会红。
 #
+# ③④ 是**第八十一批 F3 的修法**（假阳按字段名收窄）一起加的，专钉「按值的形状放宽」这条错路：
+#   · ③ 拿一份**没有** allowlist 的默认配置扫同一个夹具，它必须仍被报出（exit=1）——
+#     这一步专门拦「夹具的值挑得太低熵 / 被默认规则放过」：那种情况下 ④ 的通过是**空转**。
+#   · ④ 再把这份夹具压到**仓里这份配置**下，仍必须被报出 —— 证明 allowlist 锚在字段名上，
+#     而没有放宽成「16 位十六进制整类值都放过」。
+#   「放宽得够不够」（F3 那三处假阳真的被压住了）由 ci.yml 里那一步 gitleaks 全历史扫描自己证明：
+#   压不住它就是红的。两个方向合起来才是完整的证据链（本脚本只管「没放宽过头」这一半）。
+#
 # 用法：bash scripts/gitleaks_reverse_control.sh [config路径]（默认仓内 .gitleaks.toml）
 # 退出码：0=全部通过；1=对照失败（扫描器被关掉/放宽过度/对照没喂到）
 set -uo pipefail
@@ -53,9 +61,9 @@ topath() {
 
 # 跑一次扫描；退出码原样返回（0=无命中，1=有命中）
 run_scan() {
-  local cfg="$1" cfgarg=() args=(detect --no-git --source /ctl --no-banner --redact)
+  local cfg="$1" dir="${2:-$CTL_DIR/work}" cfgarg=() args=(detect --no-git --source /ctl --no-banner --redact)
   [ -n "$cfg" ] && cfgarg=(-v "$(topath "$cfg"):/cfg.toml:ro") && args+=(--config /cfg.toml)
-  docker run --rm -v "$(topath "$CTL_DIR/work"):/ctl:ro" ${cfgarg+"${cfgarg[@]}"} "$IMG" "${args[@]}" \
+  docker run --rm -v "$(topath "$dir"):/ctl:ro" ${cfgarg+"${cfgarg[@]}"} "$IMG" "${args[@]}" \
     >"$CTL_DIR/out.txt" 2>&1
 }
 
@@ -84,4 +92,33 @@ if [ "$code2" -ne 0 ]; then
 fi
 echo "   配错方向时它确实会消失（说明 ① 真的在验东西）✓"
 
-echo "反向对照全部通过 ✓"
+# ③④ 的夹具：与回执/台账里那三个被误报的值**同形状**（16 位十六进制，且 16 个字符两两不同
+# ⇒ 香农熵 = 4.0，高于 generic-api-key 的 3.5 阈值），但字段名是 `api_key` —— 真凭据的样子，
+# 不是我们的指纹字段。写死字面量而不现场随机，理由同 ①（随机值可能掉到阈值以下 ⇒ 偶发假红）。
+mkdir -p "$CTL_DIR/shape"
+printf 'api_key = "%s"\n' '3f9a1c7e5b2d8046' >"$CTL_DIR/shape/shape_fixture.py"
+printf '[extend]\nuseDefault = true\n' >"$CTL_DIR/plain.toml"
+
+run_scan "$CTL_DIR/plain.toml" "$CTL_DIR/shape"
+code3=$?
+echo "③ 夹具本身可检出（默认规则集、无 allowlist）：gitleaks exit=$code3（期望 1）"
+if [ "$code3" -ne 1 ]; then
+  echo "::error::③ 失败（exit=$code3，期望 1）——这个夹具本来就不该被报出来（值太低熵/被默认规则放过），"
+  echo "::error::那样 ④ 的「仍被报出」是空转、什么都没证明。修**夹具的值**，别改判据。"
+  tail -6 "$CTL_DIR/out.txt"
+  exit 1
+fi
+echo "   同形状夹具可检出（④ 不是空转）✓"
+
+run_scan "$CONFIG" "$CTL_DIR/shape"
+code4=$?
+echo "④ 主对照：allowlist 只放宽指纹字段、不放宽「值的形状」：gitleaks exit=$code4（期望 1）"
+if [ "$code4" -ne 1 ]; then
+  echo "::error::④ 失败（exit=$code4，期望 1）——allowlist 把「16 位十六进制」整类值放宽了："
+  echo "::error::真凭据只要长得像内容哈希就会被一起吞掉（静默失守，比红灯糟）。把正则收紧到字段名上。"
+  tail -6 "$CTL_DIR/out.txt"
+  exit 1
+fi
+echo "   字段名不在白名单里的同形状凭据仍被报出 ✓"
+
+echo "反向对照全部通过 ✓（4 条：① 主对照 / ② 负面对照自检 / ③ 夹具可检出 / ④ 未按值放宽）"

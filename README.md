@@ -5,7 +5,7 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-1988%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-1992%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
@@ -78,7 +78,7 @@ Warden 把这些空白收进一个统一运行时，并坚持一条纪律：**�
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——**1990 项测试**（最新一次完整冻结 = 第八十一批 f2：`1990 tests / 1988 passed / 2 skipped / 0 failures`，tree `60c1fe75`，回执 `receipts/05d73a2ce2e6.yaml`。**这个数会随台账增长**——每新增一份回执，回执守卫就多一组参数化用例 ⇒ 引用数字必须带冻结点，别引用裸数；以下为 2026-10-06 第六十八批明细：带真 PG **1764 passed / 4 skipped / 0 failed / 0 errors**，544.25 秒，覆盖率 90.31%，`CI=true` 口径、跑前=跑后树哈希相同=冻结点 `a317f232`；无 PG **1709 passed / 44 skipped** 是第六十五批实测、后三批都未重测）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——**1996 项测试**（最新一次**入库回执**对应的冻结 = 第八十一批 f3b：`1996 tests / 1992 passed / 4 skipped / 0 failures`，tree `72962020`，回执 `receipts/c3c6222cd962.yaml`；本次本机 4 skipped，多出的 2 条是权限下建不了符号链接。**这个数会随台账增长**——每新增一份回执，回执守卫就多一组参数化用例 ⇒ 引用数字必须带冻结点，别引用裸数；以下为 2026-10-06 第六十八批明细：带真 PG **1764 passed / 4 skipped / 0 failed / 0 errors**，544.25 秒，覆盖率 90.31%，`CI=true` 口径、跑前=跑后树哈希相同=冻结点 `a317f232`；无 PG **1709 passed / 44 skipped** 是第六十五批实测、后三批都未重测）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -590,7 +590,7 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**0 项失败**（最新一次完整冻结 = 第八十一批 f2：**1990** 项收集 / **1988 passed / 2 skipped / 0 failures**，覆盖 **90.32%**，冻结点 `05d73a2ce2e6`（tree `60c1fe75`，回执 `receipts/05d73a2ce2e6.yaml`）；以下明细为 2026-10-06 第六十八批实测，共 **1768** 项收集，`--junitxml` 口径；junit 原文 `tests=1768 failures=0 skipped=4`）。**全量数字必须带冻结点**：跑前/跑后各取一次 `git write-tree`（先 `git add -A`），两次相等才允许引用（第六十六批教训⑥：在全量跑的 9 分 15 秒里改了树，于是报出 2 条**没人写过的红**）。**而且证据脚本里每一步都要按 CI 的真实命令写**（第六十七批教训④：脚本里 mypy 那一步写错成 `mypy warden_agent`（不存的路径），CI 的真实命令是 `ci.yml:136` 的 `mypy src/warden_agent`；它响亮地报了 rc=2，但我上一批把这个数字记成了“已验证”——事实为真、证据错位）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
+- **测试**：**0 项失败**（最新一次**入库回执**对应的冻结 = 第八十一批 f3b：**1996** 项收集 / **1992 passed / 4 skipped / 0 failures**，覆盖 **90.31%**，冻结点 `c3c6222cd962`（tree `72962020`，回执 `receipts/c3c6222cd962.yaml`）；以下明细为 2026-10-06 第六十八批实测，共 **1768** 项收集，`--junitxml` 口径；junit 原文 `tests=1768 failures=0 skipped=4`）。**全量数字必须带冻结点**：跑前/跑后各取一次 `git write-tree`（先 `git add -A`），两次相等才允许引用（第六十六批教训⑥：在全量跑的 9 分 15 秒里改了树，于是报出 2 条**没人写过的红**）。**而且证据脚本里每一步都要按 CI 的真实命令写**（第六十七批教训④：脚本里 mypy 那一步写错成 `mypy warden_agent`（不存的路径），CI 的真实命令是 `ci.yml:136` 的 `mypy src/warden_agent`；它响亮地报了 rc=2，但我上一批把这个数字记成了“已验证”——事实为真、证据错位）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
   带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1764 passed / 4 skipped / 0 failed / 0 errors**（544.25 秒，覆盖 90.31%，`CI=true` 口径；冻结点 `a317f232d013c753bccc4e9b33556ef2b607215e`，跑前=跑后）；
   无 PG（**docker 引擎在跑**、只把容器 `docker stop` 掉即此口径）→ **1709 passed / 44 skipped / 0 failed / 0 errors**（537.9 秒；多跳的 40 条是需要真库的用例）【第六十五批实测；此后未再按无 PG 口径重测】。
   **跳过不是「没事」**：每条被跳过的用例都得在 `tests/SKIP_LEDGER.yaml` 里有**签字**（`scripts/check_skipped_tests.py` 读 junit 逐条核），未签字=红；签了 `allowed_in: [local]` 的条目＝一条承诺「**CI 里必须真跑**」，在 CI 里被跳也会红（本批四个方向真跑过：两份 junit × 本地 / `CI=true` 口径）。**签字只能按 CI 的观察写**（第六十六批教训：台账若用**本机** junit 建，就对 CI 是瞎的——本机装着 `ts/mcp-client/node_modules` 时那 4 条真实 MCP 用例在本机跑、在 CI 却每天跳），所以 workflow 把 CI 的 junit 传成 `pytest-junit` 产物（`if: always()`），本地复核用 `gh run download <run-id> -n pytest-junit -D /tmp/ci-junit` 拿 **CI 的真数据**喂给守卫，不必重跑测试。
@@ -703,7 +703,7 @@ python -m warden_agent.demo_e2e                                                 
   名单写错它照样绿）；`pin_image_digests.sh` 的 `imagetools` 本批故意不包（交付面也吃抖动这条策略未定）。
   本批交付面自己撞上了这条规则：远端首轮 `quality` 红在一条**时序用例**（把「最终回答落库」当成「并发名额
   已归还」的判据，而名额只在收尾的 finally 里归还）；确定性对照：延后 0s ⇒ 200、延后 1.5s ⇒ 503。
-  **「能说出机制 ＋ 本地有复现数」才允许重跑**，重跑后 `1891 tests / 0 failures`（第八十一批 f2 冻结重跑为 `1990 tests / 0 failures`）（详见 `CHANGELOG.md`
+  **「能说出机制 ＋ 本地有复现数」才允许重跑**，重跑后 `1891 tests / 0 failures`（第八十一批 f3b 冻结重跑为 `1996 tests / 0 failures`）（详见 `CHANGELOG.md`
   第七十八批）；用例侧的真缺陷（断言依赖了**未被设计保证**的时延）归「第七十八批之二」。
 - **安全基线**：密钥经 `.env` 加载不进代码；`.gitignore` 屏蔽密钥、数据库与日志文件
 - **确定性优先**：凡确定性可解的环节——多 Agent 分派、意图路由信号、离线测试替身——不交给模型自由发挥，行为可复现
