@@ -170,7 +170,7 @@ jobs:
         #     --junitxml /tmp/ci-junit/pytest-junit.xml
         # `if-no-files-found: error`：junit 是上游步骤的产物，没了就大声红，不静默降级。
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-junit
           path: /tmp/pytest-junit.xml
@@ -526,7 +526,7 @@ jobs:
 
       - name: 跳过回执（只在跳过分支产生；有它 ⇔ 真实评测没跑）
         if: steps.eval.outputs.skipped == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: eval-skip-receipt
           path: eval-skip-receipt.json
