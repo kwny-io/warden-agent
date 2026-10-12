@@ -202,6 +202,24 @@ rows:
       只能由下一个提交（F2）携带。冻结：三对账跑前/跑后逐项一致（tree 686848ee、shape = 空 git status 的
       指纹、keys = 三个交付面文件的哈希再哈希）、1982 passed + 2 skipped、覆盖 90.32%、七项 guard rc=0、
       变异矩阵 14/14 PASS（矩阵日志在仓库外：matrix81r.log sha256=1d49debf406f17ea）。"
+  - sha: 05d73a2ce2e68f05b644b40fd9b34069444b68ce
+    tree: 60c1fe75614bf5856719617be2599d92b79951b0
+    attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/05d73a2ce2e6.yaml
+    shape: e3b0c44298fc1c14
+    keys: e089f1752695cb93
+    receipt: freeze81f2.log
+    run: 38279144184        # master（主交付面）上的 run；同 sha 的 dev run = 38279132622
+    note: "F2 = 回执机制收尾 + 交付面定案：① 携带 R 的回执 receipts/5b207695af37.yaml（切点之后不许回填）；
+      ② 新增本行（R 的台账行）、并把第八十批 Z 行的 run 更正为真值 38201863372；③ ci.yml 里「149 个提交」
+      的过时注释更正；④ CHANGELOG 第八十一批条目。交付面按「先 B 后 A」：台账声明交付面为 dev，
+      同一次 push 把 master 快进到 dev（同 sha 05d73a2），两分支 CI 各自 6 success + 2 skipped 全绿
+      （dev run 38279132622 / master run 38279144184，逐 job 核过）。冻结：三对账跑前/跑后逐项一致
+      （tree 60c1fe75、shape e3b0c44298fc1c14、keys e089f1752695cb93）、1990 收集 / 1988 passed +
+      2 skipped / 0 failures、覆盖 90.32%、七项 guard rc=0、变异矩阵 14/14 PASS、浅检出 depth=1 红 22 条
+      （fetch-depth: 0 承重）（矩阵日志在仓库外：matrix81f2.log sha256=ade3f60b2fb8ae23）。
+      本提交自己的回执由下一个提交携带（机制固有的一步滞后）。"
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
 # 声明了也不是白名单——切点（第一份 backfill 之外回执的入库提交）之后的回执不许走回填。
