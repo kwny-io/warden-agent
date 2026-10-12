@@ -133,3 +133,16 @@ rows:
       会声称覆盖一棵**任何提交都没有**的树（正是这批在治的病）⇒ 重新冻结，只有 freeze79z.log 是有效回执。
       另：本行遗漏过一次——第八十批 X' 的第一个版本里没有本行，被变异装置的「第 0 步：基线必须绿」当场
       抓住（本文件主用例红：台账里没有 HEAD^（814eeb0）那一行），补上本行后 X' 已 amend"
+  - sha: f6eb58712d49af9b60826523534c211ab70398fd
+    tree: 1852877b5ab1b0887a775266eddef921ed28cb33
+    attestation: git+frozen
+    shape: e3b0c44298fc1c14
+    keys: d6cf6f1d8433a0ea
+    receipt: freeze80x.log
+    run: 38194492154
+    note: "X' = 第八十批开篇（推非交付分支的假阳）。台账头部新增 delivery_branch: dev；回填义务只对交付分支
+      成立、豁免只解回填这一条、且只对 push 开放；delivery 默认 () 保持 fail-closed。守卫 28 → 35 条用例。
+      变异矩阵 33 条全部至少红一条预期用例（27 条期望集合与实测完全一致，6 条按实测补齐并在 why 写明机制；
+      未重跑，理由见 CHANGELOG）。另：本提交第一版漏记了 HEAD^（814eeb0）那一行，被变异装置的「第 0 步：
+      基线必须绿」当场抓住；补行时把台账写坏过一次（引号跑到新行末尾、pyyaml 报 ParserError，而编辑器的
+      js-yaml 两次都说 clean）⇒ 最终 sha 是 f6eb5871…（tree 由 781c8e7b 变为 1852877b）"
