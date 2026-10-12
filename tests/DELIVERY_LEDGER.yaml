@@ -185,8 +185,23 @@ rows:
     shape: e3b0c44298fc1c14
     keys: ac241b8734f899c1
     receipt: freeze80z.log
-    run: 38195700449
+    run: 38201863372        # 第八十一批更正：原文写的是 38195700449（= 第八十批 Y 的 run），串号
     note: "Z = 台账记入第八十批 Y 的行 + CHANGELOG 数字段换成实测（本批最后一个提交；它自己的台账行由下一个提交回填）"
+  - sha: 5b207695af3799822383874caad6bcf3f4c7a19d
+    tree: 686848ee463ee56ab9e975b8a4e674b74e6c3cfe
+    attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/5b207695af37.yaml
+    shape: e3b0c44298fc1c14
+    keys: 8de40a2ab5282963
+    receipt: freeze81r.log
+    run: 38271682474
+    note: "R = 第八十一批开篇（把回执从「纸面」变成「可核」）：9 份回执入库，其中 b040ae6 那份不是回填、
+      由本提交携带；历史上才补的 8 份逐个申报进 backfill_receipts。新增守卫 tests/test_delivery_receipts.py
+      （58 条用例，与 pytest 总数 1926 → 1984 的增量逐个对上）⇒ 本提交是「切点」，它自己的回执不许回填、
+      只能由下一个提交（F2）携带。冻结：三对账跑前/跑后逐项一致（tree 686848ee、shape = 空 git status 的
+      指纹、keys = 三个交付面文件的哈希再哈希）、1982 passed + 2 skipped、覆盖 90.32%、七项 guard rc=0、
+      变异矩阵 14/14 PASS（矩阵日志在仓库外：matrix81r.log sha256=1d49debf406f17ea）。"
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
 # 声明了也不是白名单——切点（第一份 backfill 之外回执的入库提交）之后的回执不许走回填。

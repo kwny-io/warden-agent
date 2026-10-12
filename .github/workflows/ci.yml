@@ -62,9 +62,11 @@ jobs:
           # 它要用 `git rev-parse <sha>^{tree}` 去核交付台账（`tests/DELIVERY_LEDGER.yaml`）里的
           # 历史提交。默认 depth=1 是浅克隆、老提交的对象不在本地 ⇒ 守卫「查不动」时会报红。
           fetch-depth: 0
-          # 定时跑（`schedule`）默认检出**默认分支**，本仓是 `master`——它落后 `dev` 149 个提交，
-          # 而且根本没有这份台账（`git ls-tree -r origin/master` 里没有）⇒
-          # 不钉住的话，周一那一跑既测的是旧树、又根本没采集到这台守卫（不是绿，是不存在）。
+          # 定时跑（`schedule`）默认检出**默认分支**，本仓是 `master`——而这份台账住在**交付面分支**
+          # `dev` 上。历史上 `master` 曾落后 `dev` 149 个提交、树里根本没有这份台账
+          # （`git ls-tree -r origin/master` 里没有）；第八十一批已把 `master` 快进对齐，
+          # 但钉 `dev` 这件事与落后多少无关：默认分支一旦不是交付面，周一那一跑就会静默测到没有台账的树。
+          # 不钉住的话，那一跑既测的是旧树、又根本没采集到这台守卫（不是绿，是不存在）。
           # 其余事件保持 `github.sha`（push = 被推的提交、PR = 合成合并提交），与默认行为一致。
           ref: ${{ github.event_name == 'schedule' && 'dev' || github.sha }}
       # 用 uv 按 uv.lock 安装：**依赖版本可复现**。
