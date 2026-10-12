@@ -52,6 +52,7 @@ rows:
   - sha: 7140eadcf9252a39cebfa4da1b5a07289b9362b3
     tree: 028ae9c7e7f6585209d847741f6f9437b61f9b83
     attestation: git-only
+    frozen_proof: none
     shape:
     keys:
     receipt:
@@ -60,6 +61,7 @@ rows:
   - sha: c4ea69c5267b63b77ca5f11abee90aaffc9292d8
     tree: dd9a28f4776716cb3d1209da7beb78dc67b62acd
     attestation: git-only
+    frozen_proof: none
     shape:
     keys:
     receipt:
@@ -68,6 +70,8 @@ rows:
   - sha: 6ceb339cae6484dad34d72a3365826c7163ab276
     tree: 7bd729a5081804e9017ee05dccb9f6bacf57cb78
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/6ceb339cae64.yaml
     shape: 2a0407185b5fc4a0
     keys: 53f3448c2835ac65
     receipt: freeze78g.log
@@ -76,6 +80,8 @@ rows:
   - sha: 5098b27a8c80c0a964abd97bbaafeb42aa0102e2
     tree: 83891221acb84267221f500c0e3981a95abfb96b
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/5098b27a8c80.yaml
     shape: c90df0d60c7bdb66
     keys: 3862afbca9678983
     receipt: freeze78i.log
@@ -84,6 +90,8 @@ rows:
   - sha: cdde765c291fa8a301289ab53fc821ca34c5aa70
     tree: 23db2b22c581c93378dc09a1bbe7cef92b76555b
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/cdde765c291f.yaml
     shape: c90df0d60c7bdb66
     keys: 2876849183f3a2c6
     receipt: freeze78k.log
@@ -92,6 +100,7 @@ rows:
   - sha: 152b870d0dfa4e067495a9e27ace674cf7a0ed35
     tree: 741c484a91eb91c060fdc86e518a3a4f0cc9b7a9
     attestation: git-only
+    frozen_proof: none
     shape:
     keys:
     receipt:
@@ -100,6 +109,8 @@ rows:
   - sha: 7b9a50f7abaec8204515d329058b42c7f112af60
     tree: 47dff6e47a370857f2877d2cacd74c6a94342f70
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/7b9a50f7abae.yaml
     shape: e3b0c44298fc1c14
     keys: 6bde3bf34e54d3c3
     receipt: freeze79x.log
@@ -110,6 +121,8 @@ rows:
   - sha: d0c51402b993d5d160b425bbfc3ce96a1335d968
     tree: 6a302584f9a8c3a3ba2645139704e63a7c28eb96
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/d0c51402b993.yaml
     shape: e3b0c44298fc1c14
     keys: c808b132c751ca76
     receipt: freeze79y2.log
@@ -123,6 +136,8 @@ rows:
   - sha: 814eeb07974ff5ff9c5af791522632de63b08d1e
     tree: 8ab7e8e4b3891a1caee641877414fab24b348731
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/814eeb07974f.yaml
     shape: e3b0c44298fc1c14
     keys: b4c284c8859cdfa0
     receipt: freeze79z.log
@@ -136,6 +151,8 @@ rows:
   - sha: f6eb58712d49af9b60826523534c211ab70398fd
     tree: 1852877b5ab1b0887a775266eddef921ed28cb33
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/f6eb58712d49.yaml
     shape: e3b0c44298fc1c14
     keys: d6cf6f1d8433a0ea
     receipt: freeze80x.log
@@ -149,6 +166,8 @@ rows:
   - sha: f238378d1289c46503874c59b99f74366aaec24f
     tree: 27dd5984d5ba073c558c661c8b96b0b26c5c2c3b
     attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/f238378d1289.yaml
     shape: e3b0c44298fc1c14
     keys: ac241b8734f899c1
     receipt: freeze80y.log
@@ -158,3 +177,25 @@ rows:
       守卫 35 条全绿，另有 Markdown 表格、镜像 pinning、SAST 口径、文档引用四个守卫 rc=0。它的 CI
       （run 38195700449）逐 job 实测：quality/security/container/sbom/migration/evals-real = success，
       变异测试 4 分片与 image-signing 按 if: skipped。它自己的台账行由下一个提交回填。"
+  - sha: b040ae6c0b4d2d8b704f41eb93ce6aba85d1096c
+    tree: 22835ab0a7918b879e3a69273788887381180035
+    attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/b040ae6c0b4d.yaml
+    shape: e3b0c44298fc1c14
+    keys: ac241b8734f899c1
+    receipt: freeze80z.log
+    run: 38195700449
+    note: "Z = 台账记入第八十批 Y 的行 + CHANGELOG 数字段换成实测（本批最后一个提交；它自己的台账行由下一个提交回填）"
+
+# 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
+# 声明了也不是白名单——切点（第一份 backfill 之外回执的入库提交）之后的回执不许走回填。
+backfill_receipts:
+  - 5098b27a8c80c0a964abd97bbaafeb42aa0102e2
+  - 6ceb339cae6484dad34d72a3365826c7163ab276
+  - 7b9a50f7abaec8204515d329058b42c7f112af60
+  - 814eeb07974ff5ff9c5af791522632de63b08d1e
+  - cdde765c291fa8a301289ab53fc821ca34c5aa70
+  - d0c51402b993d5d160b425bbfc3ce96a1335d968
+  - f238378d1289c46503874c59b99f74366aaec24f
+  - f6eb58712d49af9b60826523534c211ab70398fd

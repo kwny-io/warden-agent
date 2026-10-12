@@ -1,0 +1,38 @@
+# 交付回执 —— 第78批 Z2 次冻结（由 wa81/gen-receipt.py 机械抽取，勿手改）
+# 背书关系：本回执由**下一个提交**携带入库；因此它对『提交之后才补写』免疫。
+sha: 5098b27a8c80c0a964abd97bbaafeb42aa0102e2
+tree: 83891221acb84267221f500c0e3981a95abfb96b
+freeze:
+  phase: Z2
+  log: freeze78i.log
+  log_sha256: da8cac3ae9b27385d4c9a984e489602ed211f8cd4e5a0986b2e665ef797aec97
+  junit: junit78i.xml
+  junit_sha256: 92372d69abbc42f5e51b89cae4f6b466c3c5883a98a1d616123c3c639356835c
+  pytest_out: pytest78i.out
+  tree_before: 83891221acb84267221f500c0e3981a95abfb96b
+  tree_after: 83891221acb84267221f500c0e3981a95abfb96b
+  shape_before: c90df0d60c7bdb66
+  shape_after: c90df0d60c7bdb66
+  keys_before: 3862afbca9678983
+  keys_after: 3862afbca9678983
+  tree_same: true
+  shape_same: true
+  keys_same: true
+pytest:
+  tests: 1891
+  failures: 0
+  errors: 0
+  skipped: 4
+  passed: 1887
+  seconds: 974.53
+  rc: 0
+coverage_percent: 90.31
+guard_rcs:
+  markdown_tables: 0
+  image_pinning: 0
+  sast_gate: 0
+  doc_refs: 0
+  ruff_ci: 0
+  mypy_ci: 0
+  lead_guards_direct: 0
+verdict: green
