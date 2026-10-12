@@ -23,7 +23,7 @@
 #    下一步，绝不静默跳过（"以为钉过了、其实没钉"比不钉更糟）。CI 在构建前调用它即可。
 
 # ---------- 阶段 1：构建 React 前端 ----------
-FROM node:20-slim AS web-build
+FROM node:26-slim AS web-build
 WORKDIR /build
 # 先拷锁文件装依赖（利用 Docker 层缓存）
 # 锁文件**不是可选的**（不再用 `package-lock.json*` 那个可选通配）：锁文件缺失必须在**构建期**
