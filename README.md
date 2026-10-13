@@ -78,7 +78,7 @@ Warden 把这些空白收进一个统一运行时，并坚持一条纪律：**�
 
 ### ④ 可测试性与评测是设计出来的，不是补出来的
 
-- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——**2008 项测试**（最新一次**入库回执**对应的冻结 = 第八十一批 f5：`2008 tests / 2004 passed / 4 skipped / 0 failures`，tree `04035757`，回执 `receipts/e689e6b3164d.yaml`；本次本机 4 skipped，多出的 2 条是权限下建不了符号链接。**这个数会随台账增长**——每新增一份回执，回执守卫就多一组参数化用例 ⇒ 引用数字必须带冻结点，别引用裸数；以下为 2026-10-06 第六十八批明细：带真 PG **1764 passed / 4 skipped / 0 failed / 0 errors**，544.25 秒，覆盖率 90.31%，`CI=true` 口径、跑前=跑后树哈希相同=冻结点 `a317f232`；无 PG **1709 passed / 44 skipped** 是第六十五批实测、后三批都未重测）零网络、零成本、
+- **离线确定性模型桩**：不配置任何 API Key 即可驱动完整链路——**2014 项测试**（最新一次**入库回执**对应的冻结 = 第八十一批 z：`2014 tests / 2010 passed / 4 skipped / 0 failures`，tree `24dab516`，回执 `receipts/72b2210a4e71.yaml`；本次本机 4 skipped，多出的 2 条是权限下建不了符号链接。**这个数会随台账增长**——每新增一份回执，回执守卫就多一组参数化用例 ⇒ 引用数字必须带冻结点，别引用裸数；以下为 2026-10-06 第六十八批明细：带真 PG **1764 passed / 4 skipped / 0 failed / 0 errors**，544.25 秒，覆盖率 90.31%，`CI=true` 口径、跑前=跑后树哈希相同=冻结点 `a317f232`；无 PG **1709 passed / 44 skipped** 是第六十五批实测、后三批都未重测）零网络、零成本、
   可重复运行，正面回应 LLM 应用"测试靠真模型又贵又不稳定"的难题
 - **Agent 评测黄金集**：意图路由（12 例）/ 技能触发（8 例）/ 端到端任务（10 例）三类黄金集，
   `python -m warden_agent.evals` 一键出报告，通过率可作 CI 质量门禁
@@ -590,7 +590,7 @@ python -m warden_agent.demo_e2e                                                 
 
 ## 工程质量
 
-- **测试**：**0 项失败**（最新一次**入库回执**对应的冻结 = 第八十一批 f5：**2008** 项收集 / **2004 passed / 4 skipped / 0 failures**，覆盖 **90.31%**，冻结点 `e689e6b3164d`（tree `04035757`，回执 `receipts/e689e6b3164d.yaml`）；以下明细为 2026-10-06 第六十八批实测，共 **1768** 项收集，`--junitxml` 口径；junit 原文 `tests=1768 failures=0 skipped=4`）。**全量数字必须带冻结点**：跑前/跑后各取一次 `git write-tree`（先 `git add -A`），两次相等才允许引用（第六十六批教训⑥：在全量跑的 9 分 15 秒里改了树，于是报出 2 条**没人写过的红**）。**而且证据脚本里每一步都要按 CI 的真实命令写**（第六十七批教训④：脚本里 mypy 那一步写错成 `mypy warden_agent`（不存的路径），CI 的真实命令是 `ci.yml:136` 的 `mypy src/warden_agent`；它响亮地报了 rc=2，但我上一批把这个数字记成了“已验证”——事实为真、证据错位）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
+- **测试**：**0 项失败**（最新一次**入库回执**对应的冻结 = 第八十一批 z：**2014** 项收集 / **2010 passed / 4 skipped / 0 failures**，覆盖 **90.31%**，冻结点 `72b2210a4e71`（tree `24dab516`，回执 `receipts/72b2210a4e71.yaml`）；以下明细为 2026-10-06 第六十八批实测，共 **1768** 项收集，`--junitxml` 口径；junit 原文 `tests=1768 failures=0 skipped=4`）。**全量数字必须带冻结点**：跑前/跑后各取一次 `git write-tree`（先 `git add -A`），两次相等才允许引用（第六十六批教训⑥：在全量跑的 9 分 15 秒里改了树，于是报出 2 条**没人写过的红**）。**而且证据脚本里每一步都要按 CI 的真实命令写**（第六十七批教训④：脚本里 mypy 那一步写错成 `mypy warden_agent`（不存的路径），CI 的真实命令是 `ci.yml:136` 的 `mypy src/warden_agent`；它响亮地报了 rc=2，但我上一批把这个数字记成了“已验证”——事实为真、证据错位）。通过/跳过数**随 PG 可用性变**，两个口径都列在这里，别只看一个：
   带真 PG（本机容器 `warden-pg-test`，与 CI 的 PG service 同口径）→ **1764 passed / 4 skipped / 0 failed / 0 errors**（544.25 秒，覆盖 90.31%，`CI=true` 口径；冻结点 `a317f232d013c753bccc4e9b33556ef2b607215e`，跑前=跑后）；
   无 PG（**docker 引擎在跑**、只把容器 `docker stop` 掉即此口径）→ **1709 passed / 44 skipped / 0 failed / 0 errors**（537.9 秒；多跳的 40 条是需要真库的用例）【第六十五批实测；此后未再按无 PG 口径重测】。
   **跳过不是「没事」**：每条被跳过的用例都得在 `tests/SKIP_LEDGER.yaml` 里有**签字**（`scripts/check_skipped_tests.py` 读 junit 逐条核），未签字=红；签了 `allowed_in: [local]` 的条目＝一条承诺「**CI 里必须真跑**」，在 CI 里被跳也会红（本批四个方向真跑过：两份 junit × 本地 / `CI=true` 口径）。**签字只能按 CI 的观察写**（第六十六批教训：台账若用**本机** junit 建，就对 CI 是瞎的——本机装着 `ts/mcp-client/node_modules` 时那 4 条真实 MCP 用例在本机跑、在 CI 却每天跳），所以 workflow 把 CI 的 junit 传成 `pytest-junit` 产物（`if: always()`），本地复核用 `gh run download <run-id> -n pytest-junit -D /tmp/ci-junit` 拿 **CI 的真数据**喂给守卫，不必重跑测试。

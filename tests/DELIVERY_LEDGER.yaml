@@ -279,6 +279,25 @@ rows:
       （dev 38348902512 / master 38348933694；逐 job：sbom、evals-real、container、migration、quality、
       security 全 success；image-signing 与变异测试 job 在 push 上本来就 skipped——变异矩阵只在
       schedule/dispatch 跑，不是缺陷）。本提交自己的回执由下一个提交携带（机制固有的一步滞后）。"
+  - sha: 72b2210a4e712451fe5ebdc986ef97b3872734d5
+    tree: 24dab516a32d13fa2a7d29d7457811f71d831baa
+    attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/72b2210a4e71.yaml
+    shape: e3b0c44298fc1c14
+    keys: f0e395a0bf77d6c2
+    receipt: freeze81z.log
+    run: 38366793417        # dev 上的 run；同 sha 的 master run = 38366837525（两个分支逐 job 核过）
+    note: "Z81 = 收口：携带 F5 的回执 receipts/e689e6b3164d.yaml + 台账记入 F5 的行 + README 钉值收敛到
+      f5 冻结点（切点之后不许回填，只能靠携带）。冻结：三对账跑前/跑后逐项一致（tree 24dab516、
+      shape e3b0c44298fc1c14、keys f0e395a0bf77d6c2）、2014 收集 / 2010 passed + 4 skipped
+      / 0 failures（1356.22s）、覆盖 90.31%、七项 guard rc=0、变异矩阵 14/14 PASS
+      （matrix81z.log sha256=2c25b13ac15130ea）、浅检出 depth=1 红 34 条（fetch-depth: 0 承重；
+      R→Z 依次 19/22/25/28/31/34，随台账行数增长）。本提交只动 4 个文件（+131−7：回执、
+      台账行、README 四处钉值），没改代码。两个分支的 CI 都全绿（dev 38366793417 / master 38366837525；逐 job：
+      sbom、evals-real、container、migration、quality、security 全 success；image-signing 与变异测试
+      job 在 push 上本来就 skipped——变异矩阵只在 schedule/dispatch 跑，不是缺陷）。本提交自己的
+      回执（receipts/72b2210a4e71.yaml）由下一个提交携带（机制固有的一步滞后：交出去时它是盘上未入库状态）。"
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
