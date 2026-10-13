@@ -1,0 +1,38 @@
+# 交付回执 —— 第81批 f5 次冻结（由 wa81/gen-receipt.py 机械抽取，勿手改）
+# 背书关系：本回执由**下一个提交**携带入库；因此它对『提交之后才补写』免疫。
+sha: e689e6b3164d0111f9b8e42888bc827634dee72a
+tree: 040357574aca3f5bd30a0e6e628e66c049ec4506
+freeze:
+  phase: f5
+  log: freeze81f5.log
+  log_sha256: 5a85a24e994a664765282cbb11b13fcf9c896bfb64657ee911e7e6c59c5386a4
+  junit: junit81f5.xml
+  junit_sha256: 4a324ad5c0f1b73a7eae55375c9f9a7637b2812f9df99b10183ae169b05a1da7
+  pytest_out: pytest81f5.out
+  tree_before: 040357574aca3f5bd30a0e6e628e66c049ec4506
+  tree_after: 040357574aca3f5bd30a0e6e628e66c049ec4506
+  shape_before: e3b0c44298fc1c14
+  shape_after: e3b0c44298fc1c14
+  keys_before: 948c32c0cf519a1c
+  keys_after: 948c32c0cf519a1c
+  tree_same: true
+  shape_same: true
+  keys_same: true
+pytest:
+  tests: 2008
+  failures: 0
+  errors: 0
+  skipped: 4
+  passed: 2004
+  seconds: 1318.77
+  rc: 0
+coverage_percent: 90.31
+guard_rcs:
+  markdown_tables: 0
+  image_pinning: 0
+  sast_gate: 0
+  doc_refs: 0
+  ruff_ci: 0
+  mypy_ci: 0
+  lead_guards_direct: 0
+verdict: green

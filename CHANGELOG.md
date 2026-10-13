@@ -59,7 +59,7 @@
 - 携带 F3 的冻结回执 `receipts/c3c6222cd962.yaml`，台账记入 F3 的行（**如实记红**）；
   README 的四处钉值收敛到 f3b 冻结点（`72962020` / 回执 `receipts/c3c6222cd962.yaml`）。
 
-### F5（本次提交）：把 F4 的回执带进来，并把 README/台账收敛到 f4 冻结点
+### F5：把 F4 的回执带进来，并把 README/台账收敛到 f4 冻结点
 
 **为什么非做不可（不是润色数字）**：F4 的回执 `receipts/0b72d9add870.yaml` 在 F4 还是 HEAD
 的窗口里就写好了，按判据 2（回执只能由 `<sha>` 的唯一子提交带入库）它只能由本次提交携带。
@@ -121,8 +121,75 @@ cd /d/warden-agent && .venv/Scripts/python.exe -m pytest tests/test_delivery_rec
 （它的真价值是「锚点命中恰好 1 次 + 未改动字节一个不动」），但理由按实测写，并且 `apply-f5.py`
 末尾加了正向判据：改完断言 CRLF 仍是 0。
 
-**声明尾巴**：本次提交（F5）携带 F4 的回执，**它自己的回执要由下一个提交携带**——这条尾巴
-只能由紧随其后的提交收掉（与 R→F2、F2→F3、F3→F4 同一机制：每一步都红一次，红过才是真的）。
+**声明尾巴**：F5 携带 F4 的回执，**它自己的回执要由下一个提交携带**——这条尾巴只能由紧随其后的提交收掉
+（与 R→F2、F2→F3、F3→F4 同一机制：每一步都红一次，红过才是真的）。
+
+### Z（本次提交）：收掉 F5 的尾巴，并把外部的两次独立复核记进交付面
+
+**为什么非做不可（不是润色数字）**：F5 的回执 `receipts/e689e6b3164d.yaml` 在 F5 还是 HEAD 的窗口里
+就写好了，按判据 2 它只能由 F5 的唯一子提交（本次提交 Z）携带。在携带之前本地实测是红的，
+原文抄自本轮实测输出（`rc=1`，`python -m pytest … -q --tb=short`；配置里 `addopts = "-q"`，
+命令再带 `-q` 就是 `-qq`，所以末尾没有计数行）：
+
+```bash
+cd /d/warden-agent && .venv/Scripts/python.exe -m pytest tests/test_delivery_receipts.py -q --tb=short
+....................................................................F..s [ 81%]
+...............F                                                         [100%]
+================================== FAILURES ===================================
+_____________________ test_回执由下一个提交带进来[e689e6b3164d.yaml] _____________________
+tests\test_delivery_receipts.py:148: in test_回执由下一个提交带进来
+    c = carrier(sha)
+        ^^^^^^^^^^^^
+tests\test_delivery_receipts.py:74: in carrier
+    assert len(parts) >= 2, f"{sha[:12]} 没有子提交 ⇒ 它还是 HEAD，回执要等新提交带进来"
+E   AssertionError: e689e6b3164d 没有子提交 ⇒ 它还是 HEAD，回执要等新提交带进来
+E   assert 1 >= 2
+E    +  where 1 = len(['e689e6b3164d0111f9b8e42888bc827634dee72a'])
+_________________________________ test_没有孤儿回执 _________________________________
+tests\test_delivery_receipts.py:227: in test_没有孤儿回执
+    assert not orphans, f"没有人认领的回执：{orphans}"
+E   AssertionError: 没有人认领的回执：['e689e6b3164d.yaml']
+E   assert not ['e689e6b3164d.yaml']
+=========================== short test summary info ===========================
+FAILED tests/test_delivery_receipts.py::test_回执由下一个提交带进来[e689e6b3164d.yaml]
+FAILED tests/test_delivery_receipts.py::test_没有孤儿回执 - AssertionError: ...
+```
+
+两组红都**不是**缺陷：① 回执没法事后补写 ⇒ 每个「携带」提交之前必然红一次——措辞就是「它还是 HEAD」，
+因为提交前 HEAD 还停在 F5；② 台账行记的是**已发生**提交的 tree，而本轮实测时台账还没写入 F5 的行，
+所以孤儿判据也一起红。等台账行落盘、提交把 HEAD 挪到 Z（F5 就成了有子提交的历史提交），
+两条都必须转绿；逐条结论记进 Z 的台账行（与 R→F2 → F2→F3 → F3→F4 → F4→F5 同一节奏：先见红，提交后核绿）。
+
+**做了什么**：
+- 携带 F5 的冻结回执 `receipts/e689e6b3164d.yaml`（`verdict: green`，`log_sha256=5a85a24e…`、
+  `junit_sha256=4a324ad5…`）；
+- 台账记入 F5 的行：tree `04035757`、shape `e3b0c44298fc1c14`、keys `948c32c0cf519a1c`、
+  `receipt: freeze81f5.log`、`run: 38348902512`（dev；同 sha 的 master run `38348933694`）；
+- README 四处钉值收敛到 **f5** 冻结点（`2008` 收集 / `2004 passed / 4 skipped / 0 failures`、
+  覆盖 `90.31%`、tree `04035757`、回执 `receipts/e689e6b3164d.yaml`、徽标 `tests-2004%20passed`）。
+
+**这批的数字交给两个独立审计器逐格核（不是我自己看一眼）**：
+- `wa81/verify81-numbers.py`：五次冻结的计数/覆盖率/tree 逐格对回执与 README、f3 那张废件的作废理由、
+  回执保管账（台账认领 13 份 vs 盘上 13 份，未入库恰好 1 份）、13 份回执的 `tree` 各自与
+  `git rev-parse <sha>^{tree}` 对账 ⇒ **rc=0**。它自己也被抓过一次：初版无论对不上一律 `exit 0`
+  （负对照实测：把 f5 的 `tests` 改成 2009，它标了 ✗ 却仍返回 0）⇒ 已补 `sys.exit(1 if bad else 0)`，
+  正对照 rc=0 / 负对照 rc=1 双向实测后才敢引用它的绿。
+- `wa81/verify-79-doc.py`：桌面笔记 58 项数字/断言逐项复算 ⇒ **58 项、对不上 0 项、rc=0**。
+
+**三处口径纠正（同类病：把工具的输出或自己的记忆当成事实，没问它到底在证什么）**：
+- `shape`（`git status --porcelain --untracked-files=all | sort | sha256sum`）在干净树上恒等于
+  `e3b0c44298fc1c14`——那是**空串的 sha256** ⇒ 它证的是「跑前跑后一样干净」，**不是**「树没被改」；
+  真正的树指纹是 `keys`（本批 `fa1e599b` → `948c32c0`）。笔记里已加脚注，别再拿 `shape` 当指纹。
+- 冻结日志里的「pytest 尾部 / 覆盖率」两节走的是回显路径，五次冻结里都是空的（真源是
+  `pytest81*.out` / `junit81*.xml`）⇒ 别把空节读成「没跑」。
+- 落盘脚本 `wa81/apply-f5z.py` 里我把「台账行数」写死成 14（按 R/f2/f3b/f4/f5 + 历史 9 **猜**的），
+  实测落盘后是 **17**——猜出来的数字当断言用，第一次跑就被它自己抓住（文件写了、然后 `rc=3` 报错退场）；
+  已改成按实测口径断言：盘上回执份数 = 带 `frozen_receipt` 的行数（1:1）。这条和本批主题是同一件事：
+  **数字要么有出处，要么就别写进断言**。
+
+**声明尾巴**：本次提交（Z）携带 F5 的回执，**Z 自己的回执要由第八十二批的第一个提交携带**——
+本批的主题句「每个交付提交都得有一份 git 自己核得动的回执」在 Z 自己身上也成立，所以 Z 的冻结点
+照跑一遍、回执照生成，只是入库要等下一个提交（与 R→F2、F2→F3、F3→F4、F4→F5 同一机制）。
 
 ---
 ## 2026-10-12（第八十批：推功能分支不该被误杀——把「什么形状算交付」钉成可核的）
