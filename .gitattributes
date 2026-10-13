@@ -1,1 +1,6 @@
 * text=auto eol=lf
+
+# 交付证据（变异矩阵日志）按**字节**哈希（回执里的 `evidence_sha256`）：一旦 git 在入库/检出时
+# 做 EOL 归一，同一份证据在 Windows 工作区与 Linux CI 上就是两个不同的 sha256 ⇒ 本地绿、CI 红，
+# 而红的信息跟真因（换行）八竿子打不着。所以显式豁免（守卫 tests/test_matrix_evidence.py 会核这条属性）。
+evidence/matrix/*.log -text

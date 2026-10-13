@@ -26,6 +26,11 @@ htmlcov/
 *.sqlite3
 local-tmp/
 *.log
+# 例外：交付证据（变异矩阵日志）**必须入库** —— 它们是「n/n = 守卫有牙」这类硬主张的唯一
+# 可复核载体。上面那条 `*.log` 会把 evidence/matrix/*.log 静默吞掉：`git add -A` 不报错、
+# 本地照绿（文件在盘上）、CI 检出后那份证据根本不存在。守卫 tests/test_matrix_evidence.py
+# 因此显式核 `git ls-files`（被忽略 = 没入库）—— 第八十二批 F2 实测撞到过。
+!evidence/matrix/*.log
 
 # 密钥——绝不能提交
 .env

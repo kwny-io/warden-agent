@@ -1,0 +1,46 @@
+# 交付回执 —— 第82批 f1 次冻结（由 wa82/gen-receipt.py 机械抽取，勿手改）
+# 背书关系：本回执由**下一个提交**携带入库；因此它对『提交之后才补写』免疫。
+sha: 12d4514fda8e26c88200bfe885171ce0370b4609
+tree: 53e8a7bcef1070ff95263b48f89bf654592cccce
+freeze:
+  phase: f1
+  log: freeze82f1.log
+  log_sha256: 774e35dd2cc9681aa0938767dc14481e43ab1301eb38b90c2ff60610fad4c108
+  junit: junit82f1.xml
+  junit_sha256: 72f7fc5429b6e5fc3541cbc18c3ff5be6975c51e4142d29949924511f2ebdf65
+  pytest_out: pytest82f1.out
+  tree_before: 53e8a7bcef1070ff95263b48f89bf654592cccce
+  tree_after: 53e8a7bcef1070ff95263b48f89bf654592cccce
+  shape_before: e3b0c44298fc1c14
+  shape_after: e3b0c44298fc1c14
+  keys_before: 4d17ee777fff12b5
+  keys_after: 4d17ee777fff12b5
+  tree_same: true
+  shape_same: true
+  keys_same: true
+pytest:
+  tests: 2020
+  failures: 0
+  errors: 0
+  skipped: 4
+  passed: 2016
+  seconds: 1370.04
+  rc: 0
+coverage_percent: 90.31
+mutation:
+  evidence: evidence/matrix/12d4514fda8e.log
+  evidence_sha256: c00404a00294de5b73cb85d543acbe012ad277b906d6787f73ff6545ad48866d
+  total: 14
+  matched: 14
+  positive: 12
+  negative: 2
+  shallow_red: 37
+guard_rcs:
+  markdown_tables: 0
+  image_pinning: 0
+  sast_gate: 0
+  doc_refs: 0
+  ruff_ci: 0
+  mypy_ci: 0
+  lead_guards_direct: 0
+verdict: green
