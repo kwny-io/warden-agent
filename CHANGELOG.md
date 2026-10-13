@@ -59,8 +59,70 @@
 - 携带 F3 的冻结回执 `receipts/c3c6222cd962.yaml`，台账记入 F3 的行（**如实记红**）；
   README 的四处钉值收敛到 f3b 冻结点（`72962020` / 回执 `receipts/c3c6222cd962.yaml`）。
 
-**声明尾巴**：本批最后一个提交（F4）携带 F3 的回执，**它自己的回执要由下一个提交携带**——这条尾巴
-只能由下一批的第一个提交收掉（与 R→F2、F2→F3 同一机制）。
+### F5（本次提交）：把 F4 的回执带进来，并把 README/台账收敛到 f4 冻结点
+
+**为什么非做不可（不是润色数字）**：F4 的回执 `receipts/0b72d9add870.yaml` 在 F4 还是 HEAD
+的窗口里就写好了，按判据 2（回执只能由 `<sha>` 的唯一子提交带入库）它只能由本次提交携带。
+在携带之前本地实测是红的，两组红都贴**真实输出**（用例名/行号/断言文本按 `python -m pytest … -q
+--tb=short` 的原样抄，不凭记忆写）：
+
+```bash
+cd /d/warden-agent && .venv/Scripts/python.exe -m pytest tests/test_delivery_receipts.py -q --tb=short
+# 配置里 `addopts = "-q"`，命令再带 -q 就是 -qq ⇒ **不打印末尾计数行**，贴的就是全部原文：
+# FAILED tests/test_delivery_receipts.py::test_回执由下一个提交带进来[0b72d9add870.yaml]
+#   tests/test_delivery_receipts.py:148: in test_回执由下一个提交带进来
+#       c = carrier(sha)
+#   tests/test_delivery_receipts.py:74: in carrier
+#       assert len(parts) >= 2, f"{sha[:12]} 没有子提交 ⇒ 它还是 HEAD，回执要等新提交带进来"
+#   E   AssertionError: 0b72d9add870 没有子提交 ⇒ 它还是 HEAD，回执要等新提交带进来
+#   E   assert 1 >= 2
+
+.venv/Scripts/python.exe -m pytest tests/test_delivery_ledger.py -q --tb=short
+# 7 条红，逐条红在同一条判据上（1 条 = test_交付台账干净；6 条 = _wip_geometry 的调用方：
+#   test_非交付分支不承担回填义务 / test_交付分支必须承担回填义务 / test_非交付分支仍然要过内容判据 /
+#   test_分支豁免只对_push_开放 / test_台账没声明交付分支时一律严格 / test_怪_ref_一律严格）：
+#   tests/test_delivery_ledger.py:475: in test_交付台账干净
+#       assert _current() == []
+#   E   AssertionError: assert ['台账里有 HEAD（0…变了）⇒ 这一行必是假的'] == []
+#   E     Left contains one more item: '台账里有 HEAD（0b72d9a）自己的行：提交没法在自己的正文里
+#       写下自己的树（写进去，树就变了）⇒ 这一行必是假的'
+#   tests/test_delivery_ledger.py:488: in _wip_geometry
+#       assert head not in {r.get("sha") for r in _load_rows()}, "本仓 tip 不该有台账行（回填规则）"
+#   E   AssertionError: 本仓 tip 不该有台账行（回填规则）
+```
+
+两组红都**不是**缺陷、也不是「顺手修了个红」，而是判据自己的牙齿：
+① 回执没法事后补写，所以每个「携带」提交之前必然红一次（判据 2：回执只能由 `<sha>` 的唯一子提交带入库）；
+② 台账行记的是**已发生**提交的 tree，而 HEAD 还没发生——把 F4 的行写进台账时它同时还是 HEAD，
+所以「HEAD 自己的行」这条判据必然报假（回填规则）。
+而且这两组红**只能靠「提交」本身收掉**：提交把 HEAD 挪到 F5，`0b72d9a` 就成了历史提交、
+回执也有了携带者 ⇒ 它们的绿必须在本次提交**之后**再核一次，逐条结论记进 F5 的台账行
+（与 R→F2 → F2→F3 → F3→F4 同一节奏：先见红，提交后核绿）。
+`README` 那四处同理：台账一记入 F4 的行，「最新一次**入库回执**对应的冻结 = f3b」就成了假话。
+（本块自身也踩过一次同类坑：初稿把用例名写成了 `test_回执必须由下一个提交携带`、还顺手引了一条
+当时并不红的 `test_没有孤儿回执` ——守卫的**名字**也得实测，不能凭印象写。）
+
+**做了什么**：
+- 携带 F4 的冻结回执 `receipts/0b72d9add870.yaml`（`verdict: green`，`log_sha256=65a00eb6…`、
+  `junit_sha256=6dc7efe4…`）；
+- 台账记入 F4 的行：tree `8a76a606`、shape `e3b0c44298fc1c14`、keys `fa1e599b2719ef32`、
+  `receipt: freeze81f4.log`、`run: 38325033043`（dev；同 sha 的 master run `38325032670`），
+  逐 job 结论写在 `note` 里；
+- README 四处钉值收敛到 **f4** 冻结点（`2002` 收集 / `1998 passed / 4 skipped / 0 failures`、
+  覆盖 `90.31%`、tree `8a76a606`、回执 `receipts/0b72d9add870.yaml`、徽标 `tests-1998%20passed`）。
+
+**顺手更正一处写错的判据（与本批主题同类：断言必须能实测）**：F4 的交接文档与 `wa81/apply-f4.py`
+的 docstring 写着「本仓全部文件是 CRLF，实测逐个数过（README 714、CHANGELOG 6226、台账 234）」，
+并把守卫说成「0 个文本文件**缺** CRLF」。实测是**反的**：本仓行尾不变量是 **LF**
+（`.gitattributes`: `* text=auto eol=lf`，本机 `core.autocrlf=false`），
+`README.md` / `CHANGELOG.md` / `tests/DELIVERY_LEDGER.yaml` 的 `CRLF` 计数都是 **0**；
+`scripts/_fix_line_endings.py --check` 的语义是「**0 个文本文件带 CRLF**」，它 `rc=0`。
+那三个数字（714/6226/234）是**行数**，不是 CR 数——把行数当成了行尾。字节级替换的写法保留
+（它的真价值是「锚点命中恰好 1 次 + 未改动字节一个不动」），但理由按实测写，并且 `apply-f5.py`
+末尾加了正向判据：改完断言 CRLF 仍是 0。
+
+**声明尾巴**：本次提交（F5）携带 F4 的回执，**它自己的回执要由下一个提交携带**——这条尾巴
+只能由紧随其后的提交收掉（与 R→F2、F2→F3、F3→F4 同一机制：每一步都红一次，红过才是真的）。
 
 ---
 ## 2026-10-12（第八十批：推功能分支不该被误杀——把「什么形状算交付」钉成可核的）

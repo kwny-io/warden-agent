@@ -241,6 +241,26 @@ rows:
       修法是前向的（回执机制不许回填），由 F4 的字段名锚定 allowlist 收掉，F4 的 CI 逐 job 核绿。
       另：f3 那次冻结（freeze81f3.log、1994 passed）在写结论行之前被启动器的 `&&` 链误杀，
       没有三对账结论 ⇒ 作废、不作回执；只有 f3b 这一次是全绿且有结论的冻结。"
+  - sha: 0b72d9add870eea6240857d484083cfe72a8dbb6
+    tree: 8a76a60661b59024f7ebde7b9f4a12a8991b9b5e
+    attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/0b72d9add870.yaml
+    shape: e3b0c44298fc1c14
+    keys: fa1e599b2719ef32
+    receipt: freeze81f4.log
+    run: 38325033043        # dev 上的 run；同 sha 的 master run = 38325032670（两个分支同一结论，逐 job 核过）
+    note: "F4 = 修掉 F3 的 security job 假阳（按字段名收窄，不放宽值的形状、不加路径白名单）+
+      携带 F3 的回执 receipts/c3c6222cd962.yaml（切点之后不许回填）。冻结：三对账跑前/跑后逐项一致
+      （tree 8a76a606、shape e3b0c44298fc1c14、keys fa1e599b2719ef32）、2002 收集 / 1998 passed +
+      4 skipped / 0 failures（1221.90s）、覆盖 90.31%、七项 guard rc=0、变异矩阵 14/14 PASS
+      （matrix81f4.log sha256=69871c47854ebcab）、浅检出 depth=1 红 28 条（fetch-depth: 0 承重）。
+      本提交两个分支的 CI 都全绿（dev 38325033043 / master 38325032670；逐 job：sbom、evals-real、
+      container、migration、quality、security 全 success；image-signing 与变异测试 job 在 push 上
+      本来就 skipped——变异矩阵只在 schedule/dispatch 跑，不是缺陷）。修法的正反对照在仓库外：
+      桌面机检目录 核验-F4-gitleaks修复.md（同一次 scan、同一个镜像 digest，只差配置文件 ⇒
+      旧配置 3 处命中 / exit 1，新配置 0 处 / exit 0；反向对照 4 条全过 ⇒ 没放宽过头）。
+      本提交自己的回执由下一个提交携带（机制固有的一步滞后）。"
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
 # 声明了也不是白名单——切点（第一份 backfill 之外回执的入库提交）之后的回执不许走回填。
