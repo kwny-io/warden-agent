@@ -17,7 +17,8 @@
   2. **自述一致**：证据文件自己写着 `HEAD=<40 位 sha>`，必须等于被证明的提交；
      终值行 `MATRIX PASS: n/n 符合预期（p 条正对照 + q 条反向对照）` 与
      `SHALLOW depth=1: rc=1 红 k 条` 必须与回执字段逐项相等；表格里的对照行数
-     （`M\\d+` / `R\\d+` 开头的行）也必须等于 `p` / `q`。
+     （`M\\d+` / `R\\d+` 开头的**非 SKIP** 行）也必须等于 `p` / `q` —— 本相位按设计不适用的
+     对照项以 `SKIP（原因）` 落在表里：不计数，但必须写明原因。
      ⇒ 光把文件哈希钉住还不够：**回执里的数字必须真是那份文件里的数字**，否则「14/14」只是自说自话。
   3. **载体同源**：证据与回执必须由**同一个提交**带进来 —— 否则「证据」可以在事后换上另一份
      （回执的载体由下一个提交背书，证据必须跟着同一个载体走）。
@@ -63,11 +64,16 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # 生成器（mutate82.py）写出来的三行格式。守卫在这里**重写**正则、并**拒绝静默**：
 # 任何一行匹配不上 ⇒ 红（格式改了就要跟着改守卫，不能悄悄少核一项）。
 HDR = re.compile(r"^=== matrix\S* \S+ HEAD=([0-9a-f]{40}) ===$", re.M)
+# 兼容历史产物：F2 那次冻结的日志在「反向对照」后还带「；共 N 条中 M 条本相位 SKIP」的说明，
+# 而那份日志已入库、sha256 被回执引用，不能重生成 ⇒ 后缀设为**可选**（新生产者已另起 SKIP 行）。
 PASS = re.compile(
-    r"^MATRIX (PASS|FAIL): (\d+)/(\d+) 符合预期（(\d+) 条正对照 \+ (\d+) 条反向对照）$", re.M)
+    r"^MATRIX (PASS|FAIL): (\d+)/(\d+) 符合预期"
+    r"（(\d+) 条正对照 \+ (\d+) 条反向对照(?:；[^）]*)?）$", re.M)
 SHALLOW = re.compile(r"^SHALLOW depth=1: rc=(\d+) 红 (\d+) 条", re.M)
-ROW_M = re.compile(r"^M\d+ ", re.M)
-ROW_R = re.compile(r"^R\d+ ", re.M)
+ROW_M = re.compile(r"^M\d+ .*$", re.M)
+ROW_R = re.compile(r"^R\d+ .*$", re.M)
+# 本相位按设计不适用时，生成器（mutate82.py）把该行判定写成 `SKIP（原因）`。
+SKIP_MARK = "SKIP（"
 
 
 def _git(*args: str) -> str:
@@ -230,14 +236,45 @@ def test_证据的终值与回执逐项一致(p: pathlib.Path):
 
 @pytest.mark.parametrize("p", with_mutation(), ids=lambda p: p.name)
 def test_证据的表格行数就是对照条数(p: pathlib.Path):
+    """计数口径：**非 SKIP** 的行数 == 回执的 positive/negative，且每一行都要有交代。
+
+    为什么不是「M 行数 == positive」（F3 落地时这条在这里红过）：矩阵是在**某个相位的树**里跑的，
+    本相位按设计不适用的对照项会以 `SKIP（原因）` 落在表里 —— 例如 F2 的树里还没有
+    `evidence/ci/<sha12>.json`（洞2 未落地），于是 7 条 CI 证据类正对照 + 1 条反向对照标 SKIP。
+    把它们按表格行数算会让回执与表格永远差着 SKIP 的条数（红得莫名其妙）；而改成「表里有行就算」
+    又会放走漏跑。所以拆成几条强判据：
+
+      1) 非 SKIP 的 M/R 行数 == 回执 `positive`/`negative`（这几行才是被证明的对照）；
+      2) 非 SKIP 的行必须以 `OK` 收尾（判定列没被截断）；
+      3) SKIP 行必须是**显式**写着原因的 `SKIP（…）`；
+      ⇒ 合起来：没有第三类行 —— 既不计数、又不说明（那就是静默少核一项）。
+    """
     m = _load(p)["mutation"]
     t = evidence_text(p)
     assert "不 OK" not in t and "INVALID" not in t, (
         f"{p.name} 的证据里有 `不 OK`/`INVALID` 行 ⇒ 矩阵没跑完或没全中，不能当「有牙」的证据")
-    assert len(ROW_M.findall(t)) == m["positive"], (
-        f"{p.name} 回执说 {m['positive']} 条正对照，证据表格里 {len(ROW_M.findall(t))} 行")
-    assert len(ROW_R.findall(t)) == m["negative"], (
-        f"{p.name} 回执说 {m['negative']} 条反向对照，证据表格里 {len(ROW_R.findall(t))} 行")
+    m_rows = ROW_M.findall(t)
+    r_rows = ROW_R.findall(t)
+    live_m = [r for r in m_rows if SKIP_MARK not in r]
+    live_r = [r for r in r_rows if SKIP_MARK not in r]
+    assert len(live_m) == m["positive"], (
+        f"{p.name} 回执说 {m['positive']} 条正对照，证据里非 SKIP 的 M 行是 {len(live_m)} 条"
+        f"（表里 M 行共 {len(m_rows)} 条，差出来的应该全部写着 `SKIP（…）`）")
+    assert len(live_r) == m["negative"], (
+        f"{p.name} 回执说 {m['negative']} 条反向对照，证据里非 SKIP 的 R 行是 {len(live_r)} 条"
+        f"（表里 R 行共 {len(r_rows)} 条，差出来的应该全部写着 `SKIP（…）`）")
+    assert len(live_m) + len(live_r) == m["matched"], (
+        f"{p.name} 回执说 matched={m['matched']}，证据里非 SKIP 的行是 "
+        f"{len(live_m) + len(live_r)} 条")
+    bad = [r for r in m_rows + r_rows if SKIP_MARK not in r and not r.rstrip().endswith("OK")]
+    assert not bad, (
+        f"{p.name} 这些行的判定既不是 OK、也没写 `SKIP（原因）` ⇒ 既不计数也不说明："
+        f"{[r[:26] for r in bad][:3]}")
+    empty_reason = [r for r in m_rows + r_rows
+                    if SKIP_MARK in r and not r.split(SKIP_MARK, 1)[1].strip().rstrip("）").strip()]
+    assert not empty_reason, (
+        f"{p.name} 有 SKIP 行没写原因（`SKIP（）`）⇒ 不适用也要说清为什么不适用："
+        f"{[r[:26] for r in empty_reason][:3]}")
 
 
 # ---------- 判据 3：载体同源 ----------

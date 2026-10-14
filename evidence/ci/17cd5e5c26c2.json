@@ -1,0 +1,115 @@
+{
+  "branches": {
+    "dev": {
+      "conclusion": "success",
+      "created_at": "2026-10-13T21:59:43Z",
+      "event": "push",
+      "head_branch": "dev",
+      "head_sha": "17cd5e5c26c2de6b7a80c610ca9b30966c9ac8d1",
+      "jobs": [
+        {
+          "conclusion": "success",
+          "name": "container",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "evals-real",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "image-signing",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "migration",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "quality",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "sbom",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "security",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "变异测试（${{ matrix.shard }}）",
+          "status": "completed"
+        }
+      ],
+      "run_id": 38474653846,
+      "status": "completed",
+      "url": "https://github.com/kwny-io/warden-agent/actions/runs/38474653846",
+      "workflow": "CI"
+    },
+    "master": {
+      "conclusion": "success",
+      "created_at": "2026-10-13T21:59:43Z",
+      "event": "push",
+      "head_branch": "master",
+      "head_sha": "17cd5e5c26c2de6b7a80c610ca9b30966c9ac8d1",
+      "jobs": [
+        {
+          "conclusion": "success",
+          "name": "container",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "evals-real",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "image-signing",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "migration",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "quality",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "sbom",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "security",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "变异测试（${{ matrix.shard }}）",
+          "status": "completed"
+        }
+      ],
+      "run_id": 38474653815,
+      "status": "completed",
+      "url": "https://github.com/kwny-io/warden-agent/actions/runs/38474653815",
+      "workflow": "CI"
+    }
+  },
+  "fetched_at": "2026-10-14T01:32:34Z",
+  "repo": "kwny-io/warden-agent",
+  "schema": "warden-ci-evidence/1",
+  "sha": "17cd5e5c26c2de6b7a80c610ca9b30966c9ac8d1",
+  "source": "gh run list/view --json 的机械摘录（勿手改；重取用 scripts/ci_evidence.py fetch）"
+}

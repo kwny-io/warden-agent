@@ -320,6 +320,25 @@ rows:
       交出去时它是盘上未入库状态）——并且自本批起，该回执带 mutation 块 + 仓内矩阵证据
       evidence/matrix/12d4514fda8e.log（由同一个后续提交带进来、逐字节核），不再是仓外日志的 sha256 转载。"
 
+  - sha: 17cd5e5c26c2de6b7a80c610ca9b30966c9ac8d1
+    tree: d29934612616a965457ea67657dddc76f5b38625
+    attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/17cd5e5c26c2.yaml
+    shape: e3b0c44298fc1c14
+    keys: fd45d6858053e8b8
+    receipt: freeze82f2.log
+    run: 38474653846        # dev 上的 run；同 sha 的 master run = 38474653815；两个分支逐 job 核过
+    ci_evidence: evidence/ci/17cd5e5c26c2.json
+    note: >-
+      
+      F2 = 第八十二批第二个提交：携带 F1 的回执 + 台账记入 F1 的行 + 「变异矩阵 n/n ⇒ 守卫有牙」的证据入库（回执 mutation 块 + 仓内 evidence/matrix 产物 + 新守卫 tests/test_matrix_evidence.py，切点判据保证此后每份回执都得带）。
+      F3 = 第八十二批第三个提交：CI 逐 job 结论入库（洞2）——从此「这个提交的 CI 全绿」由 evidence/ci/<sha12>.json 与 tests/test_ci_evidence.py 承重，不再靠台账散文；台账里的 run 号也改由证据渲染，串号在结构上不可能。
+      冻结：三对账跑前/跑后逐项一致（tree d29934612616a965457ea67657dddc76f5b38625、shape e3b0c44298fc1c14、keys fd45d6858053e8b8）、2037 收集 / 2031 passed + 6 skipped / 0 failures（1102.33s）、覆盖 90.31%、守卫 rc 全 0（7 项，见回执 guard_rcs）、变异矩阵 23/23 PASS（20 条正对照 + 3 条反向对照；证据 evidence/matrix/17cd5e5c26c2.log sha256=051760b0ae56ff71）、浅检出 depth=1 红 41 条（fetch-depth: 0 承重）。
+      本提交动 8 个文件（+405−2）。
+      两个分支的 CI 都全绿（dev 38474653846 / master 38474653815；逐 job：container、evals-real、migration、quality、sbom、security 全 success；image-signing、变异测试（${{ matrix.shard }}） 在 push 上本来就 skipped——变异矩阵只在 schedule/dispatch 跑，不是缺陷；逐 job 结论的仓内证据 = evidence/ci/17cd5e5c26c2.json，由 tests/test_ci_evidence.py 核）。
+      本提交自己的回执（receipts/17cd5e5c26c2.yaml）由下一个提交携带（机制固有的一步滞后：交出去时它是盘上未入库状态）。
+
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
