@@ -30,7 +30,11 @@
 #   * 计数走 --junitxml：本仓 pytest 在 -q 下**不**输出「N passed」摘要行（数点会读错）。
 #   * 日志固定 UTF-8（PYTHONIOENCODING/PYTHONUTF8）：否则在 cp936 控制台下 pytest 的中文输出是乱码。
 #   * 只读：只用 git worktree 临时检出，判完即删，不动当前工作树。
-#   * --self-test 不只验「红/绿判对」，还验「违反项原文精确」——污染的树能骗过前者，骗不过后者。
+#   * --self-test 不只验「红/绿判对」，还验「违反项原文精确」：污染的树/提取面太宽能骗过前者，骗不过后者。
+#     它的牙已用变异矩阵实跑验证（2026-10-15）：
+#       M1/M2 复用同一棵树（M2 连干净断言也删）⇒ 自检仍 PASS，说明「树复用」本身不是多报的来源；
+#       M3 期望违反集故意少写一个变量 ⇒ 自检 FAIL（不是无脑过）；
+#       M4 把下面「只取失败断言行」换成「grep 整份日志的 WARDEN_*」⇒ 自检 FAIL（拦得住）。
 set -u
 
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "不在 git 仓库里" >&2; exit 2; }
@@ -139,7 +143,7 @@ expect_red() { # $1=sha $2=期望违反变量（空格分隔，顺序无关）�
   want=$(printf '%s\n' $2 | sort | tr '\n' ' ')
   got=$(tr -d '\r' < "$LOGDIR/$(git rev-parse --short=12 "$1").viol" | sort | tr '\n' ' ')
   if [ "$got" != "$want" ]; then
-    echo "  ✗ $1 违反项不精确：期望 [$want] 实得 [$got]（差的那些多半是共享工作树的残留污染）"
+    echo "  ✗ $1 违反项不精确：期望 [$want] 实得 [$got]（实得里多出来的，通常是提取面太宽：把整份日志里的 WARDEN_* 提及也算成了违反项）"
     return 1
   fi
   echo "  ✓ $1 RED 且违反项精确：$got"
