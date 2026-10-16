@@ -45,7 +45,7 @@ COPY web/ ./
 RUN npm run build
 
 # ---------- 阶段 2：Python 后端 + 托管前端构建产物 ----------
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # 构建时可指定 pip 源（默认官方源；国内网络可传 --build-arg PIP_INDEX_URL=<镜像地址>）
 ARG PIP_INDEX_URL=https://pypi.org/simple
