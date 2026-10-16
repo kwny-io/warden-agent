@@ -45,6 +45,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 LEDGER = ROOT / "tests" / "DELIVERY_LEDGER.yaml"
 RECEIPTS = ROOT / "receipts"
 CI_DIR = ROOT / "evidence" / "ci"
+RECEIPTS_DIR = ROOT / "receipts"
 
 #: 第八十二批 F2 的提交（落地这条判据的那次提交）。见模块开头「切点」。
 CUT = "17cd5e5c26c2de6b7a80c610ca9b30966c9ac8d1"
@@ -105,6 +106,84 @@ def load_ci(row: dict) -> dict:
 
 # ---------- 切点与「不许漏」 ----------
 
+# 例外清单：已交付、但 **GitHub 上取不到能当证据的 run** 的历史提交（sha -> 理由）。
+#
+# 为什么必须有它：台账的回填规则（`tests/DELIVERY_LEDGER.yaml` 头部，第七十九批定下）要求
+# 「每个已交付提交由下一个提交背书」——也就是这些提交**必须有台账行**；而下面那条判据要求
+# 切点之后每一行都要带 `ci_evidence`。对它们两条要求互斥，且**不是「懒得补」而是补不出来**
+# （`gh api "repos/kwny-io/warden-agent/actions/runs?head_sha=<40 位全 sha>"` 的实测结果）：
+#
+#   * `904071e2` / `7cf9b9f7`：**一次 run 都没有**（返回空数组）。它们是多提交推送里的中间
+#     提交，Actions 只在对被推的 tip 跑 ⇒ 没有 run 可引用；
+#   * `5c0faa53`：`dev` 上有 run（`38781636407`）但 `conclusion=failure`（job `quality` 红）。
+#     拿它当证据等于自报「CI 逐 job 全绿」，判据 3 也会拒。
+#
+# 这份清单是**冻结**的：`UNPROVEN_MAX` 只许减不许增。要加一行，必须同时把 `UNPROVEN_MAX` 改大、
+# 并在理由里写清「GitHub 上为什么取不到 run」—— 也就是新交付的提交想躲证据，
+# 必须改这份代码的历史，而不是悄悄少写一个字段。防滥用靠两道已有的枪：
+# ①`test_没有孤儿_ci_证据`、②`tests/test_delivery_receipts.py::test_没有孤儿回执`
+# （拿 `git-only` 藏起一份回执或证据，会先被那两条点名）。
+UNPROVEN_ALLOWED = {
+    "904071e219f839917ebfcd1b280abe6f23b1bc9a": (
+        "多提交推送的中间提交：GitHub 上没有任何 run（只对被推的 tip 跑）"
+    ),
+    "7cf9b9f76ccaa5e11e5745fd388238db78a603e5": (
+        "同上：段尾探针入库，随多提交推送上去，取不到 run"
+    ),
+    "5c0faa53d5000c3464bc3e523313f7dfa0338584": (
+        "dev 的 run 38781636407 是 failure（job quality 红）⇒ 不能当「全绿」证据"
+    ),
+}
+UNPROVEN_MAX = 3
+
+
+def unproven_violations(
+    entries: list[dict],
+    *,
+    after_cut: set[str],
+    allowed: dict[str, str],
+    max_entries: int,
+) -> list[str]:
+    """「切点之后没有 CI 证据」的行，只许是清单里点名过的历史提交。
+
+    `entries` 每项形如 `{"sha", "has_evidence", "has_receipt", "attestation"}`（由调用方算，
+    因为算它们要读 git / 读文件）；这里是**纯函数** ⇒ 能被单元测试喂合成输入，
+    所以下面每条子规则都有牙（变异核对里有对应登记）。
+    """
+    out: list[str] = []
+    by_sha = {str(e["sha"]): e for e in entries}
+    for sha, e in by_sha.items():
+        if sha in after_cut and not e["has_evidence"] and sha not in allowed:
+            out.append(f"{sha[:12]} 在切点之后却没有 ci_evidence，也不在 UNPROVEN_ALLOWED 里")
+    for sha, reason in allowed.items():
+        e = by_sha.get(sha)
+        if e is None:
+            out.append(f"UNPROVEN_ALLOWED 里的 {sha[:12]} 在台账里没有行（例外指着一个不存在的行）")
+            continue
+        if e["has_evidence"]:
+            out.append(
+                f"{sha[:12]} 既在 UNPROVEN_ALLOWED 里又有 ci_evidence ⇒ 例外被滥用（撤掉它）"
+            )
+        if e.get("attestation") != "git-only":
+            out.append(
+                f"{sha[:12]} 在例外清单里，但 attestation={e.get('attestation')!r}"
+                f"（必须是 git-only）"
+            )
+        if e["has_receipt"]:
+            out.append(
+                f"{sha[:12]} 在例外清单里，却存在回执 receipts/{sha[:12]}.yaml ⇒ "
+                f"拿 git-only 藏回执（有回执的行必须带证据）"
+            )
+        if len(str(reason).strip()) < 20:
+            out.append(f"{sha[:12]} 的例外理由太短（要写清 GitHub 上为什么取不到 run）")
+    if len(allowed) > max_entries:
+        out.append(
+            f"例外清单涨到 {len(allowed)} 条（上限 {max_entries}）⇒ 只许减不许增："
+            f"新增等于让「切点之后必须有证据」失效"
+        )
+    return out
+
+
 def test_切点在本仓历史里():
     assert _git("rev-parse", "--verify", f"{CUT}^{{commit}}"), f"切点 {CUT[:12]} 不在本仓"
     r = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", CUT, "HEAD"],
@@ -117,11 +196,89 @@ def test_切点在本仓历史里():
 def test_切点之后每一行都必须带_ci_证据():
     rows = ledger_rows()
     assert rows, "台账一行都没有"
-    missing = [str(r.get("sha"))[:12] for r in rows
-               if _after_cut(str(r.get("sha"))) and not str(r.get("ci_evidence") or "").strip()]
-    assert not missing, (
-        f"切点 {CUT[:12]} 之后的台账行没有 ci_evidence：{missing} ⇒ "
-        f"「CI 逐 job 全绿」又变回自由文本了（切点之前的历史行按历史放行，不回填）")
+    entries = [
+        {
+            "sha": str(r.get("sha")),
+            "has_evidence": bool(str(r.get("ci_evidence") or "").strip()),
+            "has_receipt": (RECEIPTS_DIR / f"{str(r.get('sha'))[:12]}.yaml").is_file(),
+            "attestation": r.get("attestation"),
+        }
+        for r in rows
+    ]
+    after_cut = {e["sha"] for e in entries if _after_cut(e["sha"])}
+    bad = unproven_violations(
+        entries, after_cut=after_cut, allowed=UNPROVEN_ALLOWED, max_entries=UNPROVEN_MAX
+    )
+    assert not bad, (
+        "；".join(bad) + " ⇒ 「CI 逐 job 全绿」又变回自由文本了"
+        "（切点之前的历史行按历史放行，不回填；取不到 run 的历史提交只能进 UNPROVEN_ALLOWED）"
+    )
+
+
+# ---------- 判据自己的牙：用合成输入把每条子规则分别撞一遍 ----------
+# （没有这几条，上面那条判据在本仓是「恒绿」的：现实台账里恰好没有反例 ⇒ 逻辑被改坏也没人知道。）
+
+def _entry(sha: str, *, ev: bool = False, rec: bool = False) -> dict:
+    return {
+        "sha": sha,
+        "has_evidence": ev,
+        "has_receipt": rec,
+        "attestation": "git-only",
+    }
+
+
+def test_牙_切点之后没证据又不在清单里_必须被点名():
+    sha = "b" * 40
+    bad = unproven_violations([_entry(sha)], after_cut={sha}, allowed={}, max_entries=3)
+    assert bad and sha[:12] in bad[0], bad
+
+
+def test_牙_切点之前的历史行没证据_放行():
+    sha = "c" * 40
+    assert unproven_violations([_entry(sha)], after_cut=set(), allowed={}, max_entries=3) == []
+
+
+def test_牙_清单里的行有了证据_必须被点名():
+    sha = "d" * 40
+    bad = unproven_violations(
+        [_entry(sha, ev=True)], after_cut={sha}, allowed={sha: "x" * 30}, max_entries=3
+    )
+    assert bad and any("例外被滥用" in item for item in bad), bad
+
+
+def test_牙_清单里的行藏着回执_必须被点名():
+    sha = "e" * 40
+    bad = unproven_violations(
+        [_entry(sha, rec=True)], after_cut={sha}, allowed={sha: "x" * 30}, max_entries=3
+    )
+    assert bad and any("藏回执" in item for item in bad), bad
+
+
+def test_牙_清单指着一个不存在的行_必须被点名():
+    bad = unproven_violations([], after_cut=set(), allowed={"f" * 40: "x" * 30}, max_entries=3)
+    assert bad and any("没有行" in item for item in bad), bad
+
+
+def test_牙_清单里的行不是_git_only_必须被点名():
+    sha = "1" * 40
+    e = _entry(sha)
+    e["attestation"] = "git+frozen"
+    bad = unproven_violations([e], after_cut=set(), allowed={sha: "x" * 30}, max_entries=3)
+    assert bad and any("必须是 git-only" in item for item in bad), bad
+
+
+def test_牙_例外理由太短_必须被点名():
+    sha = "2" * 40
+    bad = unproven_violations([_entry(sha)], after_cut=set(), allowed={sha: "短"}, max_entries=3)
+    assert bad and any("理由太短" in item for item in bad), bad
+
+
+def test_牙_清单涨过上限_必须被点名():
+    sha = "3" * 40
+    bad = unproven_violations(
+        [_entry(sha)], after_cut=set(), allowed={sha: "x" * 30}, max_entries=0
+    )
+    assert bad and any("只许减不许增" in item for item in bad), bad
 
 
 def test_切点那一行必须在台账里_且带证据():

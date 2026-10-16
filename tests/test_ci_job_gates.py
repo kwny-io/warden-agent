@@ -362,6 +362,8 @@ _TRIGGER_KEYS = (
     "why",
     "expected_cadence_days",
     "last_observed_fire",
+    "last_checked",
+    "first_possible_fire",
     "how_to_verify",
     "review_by",
     "added",
@@ -485,6 +487,71 @@ def test_从未响过的触发器必须写明原因与解锁代价() -> None:
                     "never 的触发器必须能自证“为什么不会响”与“怎样才能响”"
                 )
     assert not bad, "\n".join(bad)
+
+
+def _trigger_rot(entries: list[dict[str, Any]], today: datetime.date) -> list[str]:
+    """触发器台账里「声明与世界对不上」的问题（纯函数：便于喂合成反例，也便于变异）。
+
+    为什么需要这一层：本文件既有的几条只查**内部自洽**（写全了 / cron 与 workflow 逐字一致 /
+    `review_by` 没过期 / `never` 必须带 root_cause 与 unblock），它们查不出
+    「台账说它永远不会响，而世界已经变了」。
+    2026-10-15 就是这个情形：默认分支上的 `ci.yml` 从 561 字节的 9 月存根变成了 42880 字节的全量
+    （含 cron 与 `mutation` job），而条目里 `root_cause` 还写着「永远不会被求值」、`unblock` 还在
+    教人去改默认分支——**这类断言没有任何本地痕迹能推翻它**（没 run、没日志、没红色），
+    所以给它一个日子：`first_possible_fire`。日子过了还写 `never`，守卫就红。
+    """
+    problems: list[str] = []
+    for entry in entries:
+        if entry.get("kind") != "schedule":
+            continue
+        where = f"{entry.get('workflow')}:{entry.get('kind')}:{entry.get('cron')}"
+        try:
+            checked = datetime.date.fromisoformat(str(entry["last_checked"]))
+            first = datetime.date.fromisoformat(str(entry["first_possible_fire"]))
+        except (KeyError, ValueError) as exc:
+            problems.append(f"{where} 的 last_checked/first_possible_fire 不是 ISO 日期：{exc!r}")
+            continue
+        if checked > today:
+            problems.append(
+                f"{where} 的 last_checked({checked}) 在未来（今天 {today}）—— 那是没发生过的复核"
+            )
+        if str(entry.get("last_observed_fire")) == "never" and first <= today:
+            problems.append(
+                f"{where} 写着 first_possible_fire={first} 且 last_observed_fire=never，"
+                f"而今天已是 {today}：第一次可能响的日子过去了，回去看它到底响没响"
+                "（gh run list --event schedule --limit 5 "
+                "--json databaseId,conclusion,createdAt），"
+                "再更新 last_observed_fire 与 review_by，或重写 root_cause 说明为什么还没轮到"
+            )
+    return problems
+
+
+def test_触发器台账的_never_不能越过第一次可能响的日子() -> None:
+    """`never` 必须是有期限的断言，不能无限期地说「还没轮到」（现场见 `_trigger_rot` 说明）。"""
+    problems = _trigger_rot(_trigger_ledger(), datetime.date.today())
+    assert not problems, "\n".join(problems)
+
+
+def test_牙_触发器腐烂判据四条都得有牙() -> None:
+    """正/反向对照：合成条目必须分别红/绿，否则上面那条就是永真判据。"""
+    today = datetime.date(2026, 10, 15)
+    ok: dict[str, Any] = {
+        "workflow": "ci.yml",
+        "kind": "schedule",
+        "cron": "0 3 * * 1",
+        "last_observed_fire": "never",
+        "last_checked": "2026-10-15",
+        "first_possible_fire": "2026-10-19",
+    }
+    assert _trigger_rot([ok], today) == [], "正对照：还没到第一次机会就不该红"
+    fired = dict(ok, last_observed_fire="2026-10-12")
+    assert _trigger_rot([fired], today) == [], "反向对照：响过了就不该红"
+    past = dict(ok, first_possible_fire="2026-10-12")
+    assert _trigger_rot([past], today), "机会过去了还写 never ⇒ 必须红"
+    future_check = dict(ok, last_checked="2026-11-01")
+    assert _trigger_rot([future_check], today), "复核日期在将来 ⇒ 必须红"
+    not_iso = dict(ok, last_checked="昨天")
+    assert _trigger_rot([not_iso], today), "日期不是 ISO ⇒ 必须红"
 
 
 def test_schedule_承诺与观察到的现实必须一致() -> None:

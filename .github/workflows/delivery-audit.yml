@@ -1,0 +1,65 @@
+name: 交付面审计
+
+# 为什么单独一个 workflow（第八十七批）：
+#
+#   * 交付面的红**不该需要有人推东西才被看见**。2026-10-15 17:57 推上 `dev` 的 `5c0faa5`
+#     到 10-16 下午，dev 的 `quality` job 一直红着（台账里没有 `HEAD^`（`7cf9b9f`）那一行），
+#     21 小时里**没有任何东西响过**：既有的判据都对着「当下这棵树」，而「已推出去的提交
+#     现在什么颜色」只有打开 Actions 页才看得见。这一跑就是那时该响的东西。
+#
+#   * **不把它挂进 ci.yml 的 `schedule`**：ci.yml 的 cron 是「每周一 03:00」，而 `变异测试`
+#     的门控正好是 schedule（`tests/CI_JOB_GATES.yaml` 里写着「放每次 push 上会把开发回环
+#     拖成小时级」）。往那个 cron 上再加一条每天触发，等于让 4 片变异测试**每天跑** ——
+#     触发器分开，成本才分得开（这是本批最主要的架构取舍）。
+#
+#   * 每天一次：默认分支的颜色按天看就够；再密只会让「喊」变成噪音。
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 每天 06:00 UTC
+  workflow_dispatch:
+
+# 最小权限，逐条给理由（多一条都要说清为什么）：
+permissions:
+  contents: read   # 只读树：核 evidence/ci/*.json 在不在、内容合不合判据
+  actions: read    # 读 run / job 的逐 job 结论（审计的事实来源）
+  issues: write    # 「会喊」的落点就是这里：红了开/更新那条 issue，绿了评论并关掉它
+
+# 同一时刻只跑一个：两轮审计同时开/关同一条 issue 会打架。
+concurrency:
+  group: delivery-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    # 显式 `if:`（不只是风格）：`tests/CI_JOB_GATES.yaml` 的触发器台账要求「被点名的 job 真能接受
+    # 唤起它的事件」，而守卫只认 `github.event_name == / != 'x'` 两种形状；没有 `if:` 的 job 会被
+    # 判成「所有事件都会跑它，不需要任何触发器唤醒」——那它就不该出现在任何 cron 的名下。
+    # 本 workflow 只有 `schedule` 与 `workflow_dispatch` 两个事件，所以把这两件都写明。
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          # 审的是**交付面**。`schedule` 默认检出默认分支（本仓 `master`），
+          # 而台账与交付历史住在 `dev` 上 —— 钉住，否则「审计」可能审到另一棵树上去。
+          ref: dev
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install (按 uv.lock 固定版本)
+        run: uv sync --frozen --extra dev
+      - name: 审交付面（红了这一步就红，同时也会开/更新 issue）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          uv run --frozen python scripts/delivery_audit.py \
+            --report "$RUNNER_TEMP/delivery-audit.md" --alert-issue | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: 报告进 job summary（红绿都留档）
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/delivery-audit.md" ]; then
+            cat "$RUNNER_TEMP/delivery-audit.md" >> "$GITHUB_STEP_SUMMARY"
+          fi

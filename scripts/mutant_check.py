@@ -10,7 +10,31 @@
 
 所以本文件是一张「存活突变体裁决表」：跑一遍，退出码非 0 就说明有缺口没堵。
 
-跑法：`./.venv/Scripts/python.exe scripts/mutant_check.py`（约 1~2 分钟）
+跑法：`./.venv/Scripts/python.exe scripts/mutant_check.py`
+解释器不用你记得选：当前不是仓内 `.venv` 时它会自己换过去重跑一遍。
+
+**成本（2026-10-15 实测；旧说法「约 1~2 分钟」与「全套 40 分钟上下」都已过期）**：全套 57 条
+**473s（7.9 分钟）**，而且**几乎全花在 `tests/test_delivery_ledger.py` 那一片**（52 条那一版：
+台账片 11 条 278s、整机 616s，其余 40 多条合计只要 7 分钟）。
+
+数字怎么来的：墙钟与每条耗时用**它自己的尺子**——`--dry` 与每条的 `[i/N] … (耗时s)` 行；
+「每条用例拉起多少次 git」用 `python scripts/count_git_spawn.py tests/test_delivery_ledger.py` 量
+（新增成本断言时要同段指名尺子，`tests/test_cost_claims.py` 钉住这条）。所以给了两个闸：
+
+  · `--dry`：只校验锚点（那条 old 在目标文件里是否恰好命中 1 次），不施加变异 → **1 秒**出结果。
+    改完 CASES 先跑它，别花 40 分钟才发现某条锚点已经过期。
+  · `--only 子串`：只跑「标签或测试文件」里含该子串的用例（快速回归，如 `--only 例外清单`）。
+
+**每条用例跑完打一行 `[i/N] 结论 基线… 标签 (耗时s)`**，并把 stdout 设成行缓冲——
+不然非 TTY 下是块缓冲：全程日志 0 字节（2026-10-15 真踩过，等了 26 分钟看不到任何进度，
+只能翻 `.mutant_check_backup/` 猜它在哪一条）。
+
+**基线取证**（2026-10-15 加，也是被真事教出来的）：只看 `pytest` 的退出码是不够的——
+任何非 0 都会被记成 KILLED，于是「基线根本跑不起来」（比如用系统 python，那里的
+cryptography 残缺 ⇒ 59 个 collection ERROR）会被伪装成「牙齿很硬」。
+所以每片测试文件在动手前先跑一次**未被变异**的基线，结论里分开写：
+`KILLED`（基线绿，强证据）／`KILLED?`（基线本就红，弱证据）／`BROKEN`（基线跑不起来，
+这一片的「杀死」不算证据，跟缺口同等待遇：退出码非 0）。
 
 **崩溃安全**（这条是被真事教出来的）：本脚本会**真的改写仓库源码**，所以：
 
@@ -21,6 +45,13 @@
     下次启动时 `_settle_previous_run()` 会检查——只有当前内容**逐字节等于我们写坏的那份**
     （sha 对得上）才自动还原文；对不上（比如你手改过）就**拒绝动手**并让你人工处理，
     绝不拿旧备份覆盖你的新改动。
+
+**跑变异期间别读仓库**（也是被真事教出来的）：本脚本会**周期性把源码留在改坏状态**，
+所以那段时间里任何「读代码 / 审代码 / 数行数 / 搜关键字」拿到的都是**假结果**
+——我自己在另一轮变异跑着的时候去读一处实现，读到的就是被改坏的那份。
+要并行干活就干**不碰仓库的**（读日志、读笔记、写文档）；真要读代码，先等这一轮
+`--restore` 跑完。
+真要读代码，先等这一轮 `--restore` 跑完。
 
 写这个的原因：一次运行被外层 60 秒超时**强杀**，恰好在「`200_000` → `200001`」这条上，
 源码被留在改坏状态；而 `git status` 因为 stat 缓存看着是干净的，很容易就这么提交进去。
@@ -61,6 +92,7 @@ import pathlib
 import signal
 import subprocess
 import sys
+import time
 
 KILL = "kill"
 EQUIV = "equiv"
@@ -78,11 +110,21 @@ T_LEASE = "tests/test_run_lease.py"
 # 否则在 test_run_lock.py 里补的断言会被漏掉（多个字段用空白分隔，下面会 split）。
 T_LOCK = "tests/test_run_lock.py tests/test_run_lease.py"
 PATCH = "src/warden_agent/git/patch.py"
+# 交付台账守卫：这一片的「源码」就是守卫本身（判据 7：覆盖连续性，2026-09 补的洞）
+LEDGER_GUARD = "tests/test_delivery_ledger.py"
+# 沙箱隔离档：源码一份，但**两个**测试文件都得跑（判据分在参数层与 broker 两侧）
+SANDBOX = "src/warden_agent/execution/sandbox.py"
+T_SANDBOX = "tests/test_sandbox_isolation.py tests/test_sandbox_isolation_gate.py"
 # 同样，patch-guard 分片选了**三个**测试文件（mutmut 逐条突变体跑的就是这三个）。
 T_PATCH = "tests/test_git.py tests/test_patch_path_guard.py tests/test_patch_parser.py"
+# 「事件会不会真的发生」那一层的守卫（triggers: 段：schedule 只从默认分支求值）
+JOB_GATES_GUARD = "tests/test_ci_job_gates.py"
 
 # 被反复引用的长字符串拎出来，免得每行都超 100 列（ruff E501）
 _PATH_DEFAULT = 'raw = str(arguments.get("path", ""))'
+# 交付面那条推前形状守卫（第八十七批新增两条变异指向它：脚本 + 它的用例）
+PUSH_SHAPE_SRC = "scripts/check_delivery_push.py"
+PUSH_SHAPE = "tests/test_delivery_push.py"
 _OS_NAME = 'if os.name == "nt":'
 _RANK = "{Decision.ALLOW: 0, Decision.ASK: 1, Decision.DENY: 2}"
 _READ_OLD = 'abs_path.read_text(encoding="utf-8") if abs_path.exists() else ""'
@@ -90,6 +132,15 @@ _WRITE_NEW = 'abs_path.write_text("\\n".join(new_lines), encoding="utf-8", newli
 
 # (期望, 理由, 文件, 原文, 变异, 测试文件)
 CASES: list[tuple[str, str, str, str, str, str]] = [
+    # ---- scripts/check_delivery_push.py：「起点不在树里」的第四种结局（第八十七批）----
+    (KILL, "起点核不动时整条收摊（第八十六批 CI 上真实发生过的行为：rc=2）",
+     PUSH_SHAPE_SRC,
+     '            base_sha = fallback',
+     '            raise GitFailed(f"{tip[:7]} 起点核不动") from exc', PUSH_SHAPE),
+    (KILL, "退回说了但不说没核到什么（静默：读者会以为形状已经核完了）",
+     PUSH_SHAPE_SRC,
+     '            f"  没核到的是：这次 push 到底推了几个提交——改写历史后树里没有可比的起点。"',
+     '            f"  已退回核第一父提交。"', PUSH_SHAPE),
     # ---- core/redaction.py：4 条存活，全部等价 ----
     (EQUIV, "sha256 的 utf-8 换成 UTF-8（codec 别名，编码结果逐字节相同）",
      REDACTION,
@@ -171,6 +222,57 @@ CASES: list[tuple[str, str, str, str, str, str]] = [
      T_LOCK),
     (KILL, "回落告警的类型名取成 NoneType（拿到的是 None 类型，仍然是在说瞎话）",
      LOCKING, "            type(store).__name__,", "            type(None).__name__,", T_LOCK),
+    # === 触发器台账的「never 必须有期限」（第七十六批）===
+    (KILL, "承认「还没轮到」的日子被改成过去（never 就不再是有期限的断言）",
+     "tests/CI_JOB_GATES.yaml",
+     "    first_possible_fire: 2026-10-19", "    first_possible_fire: 2026-10-12", JOB_GATES_GUARD),
+    (KILL, "永远不响这条规则整个摘掉（台账可以无限期地宣称「它就是不响」）",
+     JOB_GATES_GUARD,
+     '        if str(entry.get("last_observed_fire")) == "never" and first <= today:',
+     "        if False:", JOB_GATES_GUARD),
+    (KILL, "只认 kind=schedule 的过滤反过来（真台账那条 schedule 反而被跳过）",
+     JOB_GATES_GUARD,
+     '    for entry in entries:\n        if entry.get("kind") != "schedule":',
+     '    for entry in entries:\n        if entry.get("kind") == "schedule":', JOB_GATES_GUARD),
+    (KILL, "复核日期在将来不再报（可以写一个没发生过的复核）",
+     JOB_GATES_GUARD,
+     "        if checked > today:", "        if False:", JOB_GATES_GUARD),
+    (KILL, "日期边界从 > 改成 >=（今天复核过的条目会立刻红）",
+     JOB_GATES_GUARD,
+     "        if checked > today:", "        if checked >= today:", JOB_GATES_GUARD),
+]
+
+# ---- 成本断言的尺子与判据（第八十六批补：新判据当时没有变异登记，等于没人证明它有牙）----
+# 两条判据只核「有没有指名尺子」与「N 条用例是否等于实测」；而尺子本身会不会量、判据会不会空转，
+# 各自也得有变异体撞一次——`变异测试` job 在 push 上本来就 skipped，没人会替你抓。
+COST_GUARD = "tests/test_cost_claims.py"
+COST_RULER = "scripts/count_git_spawn.py"
+CASES += [
+    (KILL, "「成本数字必须同段指名尺子」被短路 ⇒ 数字又能不指名尺子（成本断言不可重放）",
+     COST_GUARD,
+     "and _RULER not in para:", "and False:", COST_GUARD),
+    (KILL, "树锚豁免被拆 ⇒ 带日期的历史数字被当成当下事实（判据开始说假红）",
+     COST_GUARD,
+     '            if "本文件" in para and not _TREE_ANCHOR.search(para):',
+     '            if "本文件" in para:', COST_GUARD),
+    (KILL, "条数核对被短路 ⇒ 「本文件 N 条用例」写错也没人管（本批第一步抓到的就是这个）",
+     COST_GUARD,
+     "                    if actual is not None and int(claim) != actual:",
+     "                    if False:", COST_GUARD),
+    (KILL, "命中统计恒 0 ⇒ 「判据不是空转」那条自己变成空转",
+     COST_GUARD,
+     "            if _SPAWN_WORD.search(para) and _SPAWN_CLAIM.search(para):\n"
+     "                spawn_hits += 1",
+     "            if False:\n"
+     "                spawn_hits += 1", COST_GUARD),
+    (KILL, "尺子失聪：计数点被拆掉 ⇒ 「N 次」永远回到没人数过的状态（尺子自己会量的那两条钉住）",
+     COST_RULER,
+     '        if "git" in flat:', "        if False:", COST_GUARD),
+    (EQUIV, "成本数字本身改错 ⇒ 判据不管量级（它只管引用与条数，量级由尺子重放来核）；"
+            "登记这一条是为了把边界写清楚，免得下一个人以为「改了数字会被判据抓到」",
+     "tests/test_delivery_ledger.py",
+     "整文件 **416 次**（每条 76.5 → 9.5 次）",
+     "整文件 **616 次**（每条 76.5 → 9.5 次）", COST_GUARD),
 ]
 
 # ---- git/patch.py（patch-guard 分片，2026-10-01 第三、四轮）----
@@ -202,6 +304,140 @@ CASES += [
     (KILL, "写回省掉 newline（跟随平台换行符）",
      PATCH, _WRITE_NEW, 'abs_path.write_text("\\n".join(new_lines), encoding="utf-8", )',
      T_PATCH),
+]
+
+# ---- 沙箱隔离档的注入断层（2026-10 修的：注入只作用一半路径）----
+# 缺陷形状：`probe`/`platform` 在 `detect_isolation_tier`/`isolation_tier_from_env` 上能注入，
+# 但 `resolve_isolation_tier` 与 `SandboxedExecutionBroker.__init__` 把参数吞掉了 ⇒ 「注入说
+# 给不了内核档」在真有内核档的机器上不报错、「注入说能给」在没内核档的机器上无效。
+# 下面三条各断一层，都要求测试变红（断言写成两态对比，所以两类机器上都带电）。
+CASES += [
+    (KILL, "参数层直连真实探测（resolve_isolation_tier 吞掉注入）",
+     SANDBOX,
+     # 锚点必须先带一行文档串：`    detected = detect_isolation_tier(platform=platform,
+     # probe=probe)` 在 `resolve_isolation_tier` 与 `isolation_tier_from_env` 里**各有一份**，
+     # 只给这一行会撞上「原文不唯一」而 SKIP（变异核对会以 exit=1 报出来——这是故意的）。
+     '    """\n    detected = detect_isolation_tier(platform=platform, probe=probe)',
+     '    """\n    detected = detect_isolation_tier()', T_SANDBOX),
+    (KILL, "合并层只给部署级声明注入（参数层那半边被吞）",
+     SANDBOX,
+     "    spec_tier = resolve_isolation_tier(spec_isolation, probe=probe, platform=platform)",
+     "    spec_tier = resolve_isolation_tier(spec_isolation)", T_SANDBOX),
+    (KILL, "broker 吞掉注入（静默退回真实探测：测试看到的是本机能力）",
+     SANDBOX,
+     "        self.tier = resolve_enforced_isolation(\n"
+     "            self.spec.isolation, probe=probe, platform=platform,\n"
+     "        )",
+     "        self.tier = resolve_enforced_isolation(self.spec.isolation)", T_SANDBOX),
+]
+
+# ---- 交付回执 ↔ 台账 的对账（第八十二批补：keys/log/tree 三项此前无人核）----
+# 缺陷形状：`tests/test_delivery_receipts.py` 的交叉核只比 sha/tree/shape，而 `shape` 在干净树上
+# 恒等于空指纹（CHANGELOG.md:226-228 自己写了「真正的树指纹是 keys」）⇒ 行抄错 keys 也照绿。
+RECEIPT_GUARD = "tests/test_delivery_receipts.py"
+CASES += [
+    (KILL, "台账行与回执的 keys/tree 不对账（真正的树指纹没人核）",
+     RECEIPT_GUARD,
+     "            if row.get(k) and before != row.get(k):",
+     "            if False:", RECEIPT_GUARD),
+    (KILL, "仓外日志名不对账（行上写另一个 log 也放行）",
+     RECEIPT_GUARD,
+     '        if row.get("receipt") and fz.get("log") != row.get("receipt"):',
+     "        if False:", RECEIPT_GUARD),
+    (KILL, "回执路径不设限（绝对路径与 .. 能把手伸到仓外）",
+     RECEIPT_GUARD,
+     '        if rel.startswith("/") or ".." in rel.split("/") or not rel.startswith("receipts/"):',
+     "        if False:", RECEIPT_GUARD),
+    (KILL, "git-only 允许自报数字（回退到「没有回执也能写 shape/keys/receipt」）",
+     RECEIPT_GUARD,
+     '            if row.get("frozen_proof") != "none" or claimed:',
+     "            if False:", RECEIPT_GUARD),
+]
+
+# ---- 推前形状守卫（第八十三批：一次推 3 个提交让台账不可取证，发现时已经不可逆）----
+# 缺陷形状：`scripts/check_delivery_push.py` 三条判据任意一条被弱化 ⇒ 推送前不再拦。
+# 现场：GitHub 只为 push 的 tip 建 run（`gh api …?head_sha=<sha>` 实测 0/0/1），
+# 而台账要求链上每个提交都有行 + 每行都有 `evidence/ci/<sha12>.json` ⇒ 中间提交永远拿不到。
+# 判据分两层（纯函数构造数据 + 临时 git 仓走真路径），这 3 条都必须被杀。
+PUSH_CHECK = "scripts/check_delivery_push.py"
+PUSH_GUARD = "tests/test_delivery_push.py"
+CASES += [
+    (KILL, "多提交判据整个没接进去（一次推 N 个照样放行——本批的现场就是这样漏的）",
+     PUSH_CHECK,
+     "    if len(commits) > 1:",
+     "    if False:", PUSH_GUARD),
+    (KILL, "中间提交与 tip 不分（中间那条「永远拿不到 run」不再单独说）",
+     PUSH_CHECK,
+     "        if index == len(commits) - 1:",
+     "        if True:", PUSH_GUARD),
+    (KILL, "缺行判定反过来（携带了也接着往下报 ⇒ 正对照立刻变红）",
+     PUSH_CHECK,
+     "        if facts.first_parent in rows_at.get(facts.sha, set()):",
+     "        if False:", PUSH_GUARD),
+]
+
+# ---- 交付台账守卫（覆盖连续性，2026-09 补洞那一批）----
+# 背景：只核 `HEAD^` 那一行时，`dev` 上连着攒两个本地交付提交就会在台账里留洞，
+# 且**从第二个洞开始没有任何判据看得见**（实测：`7cf9b9f`+`904071e` 两条都缺行，守卫只报前者）。
+CASES += [
+    (KILL, "覆盖连续性判据整个没接进 _violations（链中间的洞重新变得没有任何判据）",
+     LEDGER_GUARD,
+     "        out.extend(\n"
+     "            _coverage_violations(parents=parents, seen=seen, coverage_from=coverage_from)\n"
+     "        )",
+     "        pass", LEDGER_GUARD),
+    (KILL, "缺 coverage_from 声明时 fail-open（「没写」被读成「都放行」）",
+     LEDGER_GUARD, "    if not coverage_from:", '    if "":', LEDGER_GUARD),
+    (KILL, "只核 HEAD^ 那一跳（判据 7 就是为了修这个洞而补的）",
+     LEDGER_GUARD,
+     "    holes = [sha for sha in chain[: at + 1] if sha not in seen]",
+     "    holes = [sha for sha in chain[:1] if sha not in seen]", LEDGER_GUARD),
+    (KILL, "范围外的行不报（抬高 coverage_from 就能把范围偷偷往上缩）",
+     LEDGER_GUARD,
+     "    beyond = sorted(sha[:7] for sha in seen if sha in set(chain[at + 1 :]))",
+     "    beyond: list[str] = []", LEDGER_GUARD),
+]
+
+# 第八十四批：给「结论分档」本身登记变异（装置的装置）。基线取证那段逻辑要是被改回去，
+# 报告就会重新把「基线跑不起来」说成「牙齿很硬」——假证据，必须能被自己抓住。
+# 注意：这两条变异的是**本文件自己**；真正跑的是 tests/test_mutant_check_verdicts.py，
+# 它是另起一个进程 import 源码的，所以当前进程不受影响（模块早 import 完了），且改完立即还原。
+CASES += [
+    # 注意 2：这两条的 old 必须**带上下文**（多行）。因为 CASES 列表里就写着这两个字面量本身，
+    # 单行写法会在整个文件里匹配到 2 处 ⇒ 装置只能判 SKIP（本批真踩过：v9 首跑这 2 条全 SKIP）。
+    (KILL, "基线跑不起来时不再算 BROKEN（假证据：collection ERROR 被读成强杀死）",
+     "scripts/mutant_check.py",
+     '    if baseline_broken:\n        return "BROKEN"\n',
+     '    if baseline_broken:\n        return "KILLED"\n',
+     "tests/test_mutant_check_verdicts.py"),
+    (KILL, "基线本来就红时不再降档（弱证据被抬成强证据）",
+     "scripts/mutant_check.py",
+     '        return "BROKEN"\n    return "KILLED" if baseline_green else "KILLED?"',
+     '        return "BROKEN"\n    return "KILLED"',
+     "tests/test_mutant_check_verdicts.py"),
+]
+
+CI_EVIDENCE_GUARD = "tests/test_ci_evidence.py"
+CASES += [
+    # 第八十四批续：例外清单（`UNPROVEN_ALLOWED`）的四条子规则逐条撞一遍。
+    # 为什么必须登记：本仓现实台账里恰好**没有反例** ⇒ 那条判据在真数据上是恒绿的，
+    # 逻辑被改坏也没人知道；这几条由同文件里的合成输入测试（`test_牙_*`）负责杀掉。
+    (KILL, "例外清单的豁免被放宽成「任何行都可以没证据」（切点之后的证据要求空转）",
+     CI_EVIDENCE_GUARD,
+     '        if sha in after_cut and not e["has_evidence"] and sha not in allowed:',
+     "        if False:", CI_EVIDENCE_GUARD),
+    (KILL, "例外行藏回执不再被点名（拿 git-only 盖住一份回执）",
+     CI_EVIDENCE_GUARD,
+     '        if e["has_receipt"]:',
+     "        if False:", CI_EVIDENCE_GUARD),
+    (KILL, "例外清单涨过上限不再报（新交付的提交可以永久躲证据）",
+     CI_EVIDENCE_GUARD,
+     "    if len(allowed) > max_entries:",
+     "    if False:", CI_EVIDENCE_GUARD),
+    (KILL, "例外行已经有了证据还留在清单里不再报（例外被滥用没人管）",
+     CI_EVIDENCE_GUARD,
+     '        if e["has_evidence"]:',
+     "        if False:", CI_EVIDENCE_GUARD),
 ]
 
 # patch-guard 剩下的等价变异（**不补测试**，只留记录）：
@@ -311,11 +547,131 @@ def _settle_previous_run(entries: list[dict[str, str]]) -> int:
     return 0
 
 
+_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_VENV_PYTHON = _ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _reexec_in_venv(argv: list[str]) -> int | None:
+    """仓里有 .venv 而当前不是它在跑，就换成它重跑一遍（返回它的退出码）。
+
+    为什么要这一条：本装置只看 `pytest` 的退出码，**任何**非 0 都记 KILLED。
+    于是「用系统 python 跑，基线根本收集不起来」会被伪装成「牙齿很硬」——那是假证据。
+    2026-10-15 真踩过：系统 python 里 cryptography 是残缺的 namespace 包 ⇒ 59 个
+    collection ERROR；本文件顶部的 docstring 早写了要用 `./.venv/Scripts/python.exe`，
+    但「记得手工选解释器」这种事靠不住，写进代码里才靠得住。
+    """
+    if not _VENV_PYTHON.exists() or pathlib.Path(sys.executable) == _VENV_PYTHON:
+        return None
+    print(f"（当前解释器 {sys.executable} 不是仓内 .venv，改成 {_VENV_PYTHON} 重跑）")
+    proc = subprocess.run([str(_VENV_PYTHON), str(pathlib.Path(__file__).resolve()), *argv])
+    return proc.returncode
+
+
+_BASELINES: dict[str, tuple[bool, bool, str]] = {}
+
+
+def _baseline(test_file: str, env: dict[str, str]) -> tuple[bool, bool, str]:
+    """跑一次**未被变异**的基线，返回 (基线绿?, 是收集失败而不是红测试?, 一行摘要)。
+
+    没有这一步，KILLED 就只是「pytest 退出码非 0」，分不清「测试真的抓住了变异」
+    和「这个文件本来就跑不起来」。基线不绿的片，它的 KILLED 只能算弱证据，
+    所以要把「弱」写在纸上，而不是靠跑的人记得。
+    """
+    if test_file not in _BASELINES:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", *test_file.split(), "-x", "-q",
+             "-p", "no:cacheprovider"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+        )
+        out = proc.stdout or ""
+        broken = "errors during collection" in out or proc.returncode in (2, 3, 4)
+        last = next((ln.strip() for ln in reversed(out.splitlines()) if ln.strip()), "")
+        state = "绿" if proc.returncode == 0 else ("收集失败" if broken else "红")
+        _BASELINES[test_file] = (proc.returncode == 0, broken, last[:90] or f"rc={proc.returncode}")
+        print(f"基线 {test_file}: {state} —— {_BASELINES[test_file][2]}")
+    return _BASELINES[test_file]
+
+
+def _verdict(mutation_failed: bool, baseline_green: bool, baseline_broken: bool) -> str:
+    """一片变异的结论分档：基线状态决定「杀死」这个词有多硬。
+
+    · 变异后测试仍全绿 ⇒ `SURVIVED`（真缺口还是等价变异，看 expect）；
+    · 变异后变红、且基线绿 ⇒ `KILLED`（强证据）；
+    · 变异后变红、但基线本来就红 ⇒ `KILLED?`（弱证据；本仓已知一例：台账守卫的基线本来红）；
+    · 基线压根跑不起来（收集失败）⇒ `BROKEN`：这片的所有「杀死」**都不算证据**。
+
+    没有最后一档，坏环境会被伪装成高杀死率（判据见 tests/test_mutant_check_verdicts.py）。
+    """
+    if not mutation_failed:
+        return "SURVIVED"
+    if baseline_broken:
+        return "BROKEN"
+    return "KILLED" if baseline_green else "KILLED?"
+
+
+def _problem(rows: list[tuple[str, str, str]]) -> bool:
+    """有这些就不给绿：真缺口、原文没匹配上（源码变了？）、基线不可用。"""
+    return any(
+        verdict in ("SKIP", "BROKEN") or (verdict == "SURVIVED" and expect == KILL)
+        for verdict, expect, _ in rows
+    )
+
+
+def _selected(argv: list[str]) -> list[tuple[str, str, str, str, str, str]]:
+    """`--only 子串` 只挑标签/测试文件里含该子串的用例；不给就全跑。"""
+    if "--only" not in argv:
+        return list(CASES)
+    at = argv.index("--only")
+    needle = argv[at + 1] if len(argv) > at + 1 else ""
+    picked = [c for c in CASES if needle in c[1] or needle in c[5]]
+    print(f"--only {needle!r}：选中 {len(picked)}/{len(CASES)} 条", flush=True)
+    if not picked:
+        print(
+            f"--only {needle!r} 一条都没选中 ⇒ **这不是「全绿」，是没跑**。\n"
+            "        匹配范围只有标签（第 2 字段）与测试文件（第 6 字段）；"
+            "拿源码文件名当子串是最常见的踩法"
+            "（源码路径不在匹配范围内，如 `--only check_delivery_push`）。",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(2)
+    return picked
+
+
+def _dry_run(cases: list[tuple[str, str, str, str, str, str]]) -> int:
+    """只校验锚点：每条的 old 必须在目标文件里**恰好命中 1 次**：
+
+    0 次 = 锚点过期（源码改过，这条变异已经施加不上去了）⇒ 装置会判 SKIP；
+    >1 次 = 不加区分（会把别处的同样代码也改坏）⇒ 装置也会判 SKIP。
+    判据必须**与装置真实判据一致**，否则这个预检就预测不准它承诺预测的东西。
+    列里那个「变异体×N」只是参考：N>0 不代表这条有问题——我们是在 `old` 处替换 1 次，
+    别处早就有同样的代码片段（如 `return "KILLED"`）很正常。
+    """
+    bad = 0
+    print("锚点检查（old 必须恰好命中 1 次 = 装置不会判 SKIP）：")
+    for index, (_expect, label, rel, old, new, _test) in enumerate(cases):
+        text = _source_text(_read_raw(pathlib.Path(rel)))
+        hit, hit_new = text.count(old), text.count(new)
+        ok = hit == 1
+        flag = "OK  " if ok else "!!  "
+        print(f"{flag}[{index + 1}/{len(cases)}] {rel}  old×{hit} 变异体×{hit_new}  {label[:40]}")
+        bad += 0 if ok else 1
+    print(f"\n锚点检查：{len(cases) - bad}/{len(cases)} 条可用", flush=True)
+    return 1 if bad else 0
+
+
 def main() -> int:
+    sys.stdout.reconfigure(line_buffering=True)  # 非 TTY 下默认块缓冲 ⇒ 长跑日志全程 0 字节
     argv = sys.argv[1:]
+    reexec = _reexec_in_venv(argv)
+    if reexec is not None:
+        return reexec
     entries = _load_manifest()
     if "--restore" in argv:
         return _settle_previous_run(entries)
+    cases = _selected(argv)
+    if "--dry" in argv:
+        return _dry_run(cases)
     leftover = _settle_previous_run(entries)
     if leftover:
         return leftover
@@ -326,13 +682,18 @@ def main() -> int:
     rows: list[tuple[str, str, str]] = []
     suspect: list[str] = []
     backups: list[dict[str, str]] = []
-    for index, (expect, label, rel, old, new, test_file) in enumerate(CASES):
+    for index, (expect, label, rel, old, new, test_file) in enumerate(cases):
+        t_case = time.monotonic()
         path = pathlib.Path(rel)
         raw = _read_raw(path)
         crlf = _is_crlf(raw)
         text = _source_text(raw)
         if text.count(old) != 1:
             rows.append(("SKIP", expect, label))
+            print(
+                f"[{index + 1}/{len(cases)}] SKIP  锚点命中 {text.count(old)} 次  {label[:30]}",
+                flush=True,
+            )
             if text.count(new) == 1 and not text.count(old):
                 suspect.append(label)
             continue
@@ -355,20 +716,36 @@ def main() -> int:
             _put_back(rel)
             backups = [b for b in backups if b["bak"] != bak]
             _write_manifest(backups)
-        rows.append(("KILLED" if proc.returncode != 0 else "SURVIVED", expect, label))
+        green, broken, _ = _baseline(test_file, env)
+        verdict = _verdict(proc.returncode != 0, green, broken)
+        rows.append((verdict, expect, label))
+        print(
+            f"[{index + 1}/{len(cases)}] {verdict:<9}"
+            f"基线{'绿' if green else ('跑不起来' if broken else '红')}  "
+            f"{label[:40]}  ({time.monotonic() - t_case:.1f}s)",
+            flush=True,
+        )
     _clear_backups()
 
-    print("结果  期望   变异")
+    print("结果  期望   变异（KILLED? = 基线本身红，弱证据；BROKEN = 基线跑不起来，证据无效）")
     for verdict, expect, label in rows:
-        want = "KILLED" if expect == KILL else "SURVIVED"
-        print(f"{'OK  ' if verdict == want else '!!  '}{verdict:<9}{expect:<6}{label}")
+        want = verdict in ("KILLED", "KILLED?") if expect == KILL else verdict == "SURVIVED"
+        print(f"{'OK  ' if want else '!!  '}{verdict:<9}{expect:<6}{label}")
 
     skipped = [r for r in rows if r[0] == "SKIP"]
     gaps = [r for r in rows if r[0] == "SURVIVED" and r[1] == KILL]
+    broken_rows = [r for r in rows if r[0] == "BROKEN"]
     killed = sum(1 for r in rows if r[0] == "KILLED" and r[1] == KILL)
+    weak = sum(1 for r in rows if r[0] == "KILLED?" and r[1] == KILL)
     equiv = sum(1 for r in rows if r[1] == EQUIV)
     print()
-    print(f"共 {len(CASES)} 条：期望杀死且已杀死 {killed}，等价变异 {equiv}，跳过 {len(skipped)}")
+    print(
+        f"共 {len(cases)} 条：期望杀死且已杀死 {killed + weak}"
+        f"（强证据 {killed} / 弱证据（基线红）{weak}），"
+        f"等价变异 {equiv}，跳过 {len(skipped)}，基线不可用 {len(broken_rows)}"
+    )
+    for r in broken_rows:
+        print("  基线跑不起来（不是缺口，是环境/收集问题；它的『杀死』不算证据）：", r[2])
     for r in gaps:
         print("  缺口（该补测试或让它可测）：", r[2])
     for r in skipped:
@@ -376,7 +753,7 @@ def main() -> int:
     for label in suspect:
         print("  !! 该处当前内容**正是变异体本身**，源码可能残留着上次被强杀留下的变异：", label)
         print("     还原：`python scripts/mutant_check.py --restore`，或用 git 恢复那个文件")
-    return 1 if (gaps or skipped) else 0
+    return 1 if _problem(rows) else 0
 
 
 if __name__ == "__main__":

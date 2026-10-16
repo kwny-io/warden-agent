@@ -41,6 +41,9 @@
 #   这类话看上去像被核过，其实没有——要核它得用 `gh api` 查那个 run 的 head，CI 里做不到。
 #
 # 范围：从第七十八批（`7140ead`）起。更早的提交没有可核回执，不回填、不猜。
+#   （这个起点现在是**机器可读**的：头部 `coverage_from` —— 守卫会核「`HEAD^` 到它之间不许有洞」。
+#    实测教训：只核 `HEAD^` 那一行时，`dev` 上连着攒两个本地交付提交就会在台账里留洞，
+#    而 `HEAD^^` 那个洞在 2026-09 之前**没有任何判据看得见**。）
 # **交付面分支（`delivery_branch`）**：回填义务只对**交付面**上的检出成立。推一个功能分支时，
 #   被检出的提交（`HEAD`）是那条分支上的在飞提交，它不欠「由下一个交付提交背书」这个账；
 #   而**内容判据（tree/sha/祖先/重复/自报数字）照旧全部适用** —— 豁免只解掉回填这一条。
@@ -48,6 +51,11 @@
 #   这一行同时是「交付面到底是哪个分支」的**机器可读答案** —— 参赛提交清单指 `master`、
 #   判据全长在 `dev` 那件事，改路线时改的就是这一行（见桌面 77 号文档的下一批候选）。
 delivery_branch: dev
+# 连续覆盖起点（含）：从 `HEAD^` 沿 first-parent 链走到这一跳的每一跳都必须有台账行
+#（判据 7，守卫：`tests/test_delivery_ledger.py::_coverage_violations`）。
+# 要扩大范围就改这一行声明并说明理由；**删掉这一行 = 连续性核不动 = 红**（fail-closed，
+# 与 `delivery_branch` 同一条口径：「没写」不许读成「都放行」）；往范围外加行也会红。
+coverage_from: 7140eadcf9252a39cebfa4da1b5a07289b9362b3
 rows:
   - sha: 7140eadcf9252a39cebfa4da1b5a07289b9362b3
     tree: 028ae9c7e7f6585209d847741f6f9437b61f9b83
@@ -140,12 +148,12 @@ rows:
     frozen_receipt: receipts/814eeb07974f.yaml
     shape: e3b0c44298fc1c14
     keys: b4c284c8859cdfa0
-    receipt: freeze79z.log
+    receipt: freeze79Z.log            # 第八十二批更正：主源文件名是大写 Z（原写小写 —— Windows 上同名、Linux 上是另一个名字）
     run: 38180184956
     note: "Z = 第七十九批末次提交（台账记入 Y 的行 + 交付面 CHANGELOG 三处改正：107 → 28（取数改成
       pytest --collect-only）、`evals-real` 的 success 注明是签字跳过、删掉「quality 结论由 Z 回填」那句
       无法核的话）。冻结前 amend 过一次：冻结 Z 的第一版（b9d0e1b99）跑到 2m22s 被误 kill，它的回执若留着
-      会声称覆盖一棵**任何提交都没有**的树（正是这批在治的病）⇒ 重新冻结，只有 freeze79z.log 是有效回执。
+      会声称覆盖一棵**任何提交都没有**的树（正是这批在治的病）⇒ 重新冻结，只有 freeze79Z.log 是有效回执（第八十二批更正：日志名大小写按主源）。
       另：本行遗漏过一次——第八十批 X' 的第一个版本里没有本行，被变异装置的「第 0 步：基线必须绿」当场
       抓住（本文件主用例红：台账里没有 HEAD^（814eeb0）那一行），补上本行后 X' 已 amend"
   - sha: f6eb58712d49af9b60826523534c211ab70398fd
@@ -183,7 +191,10 @@ rows:
     frozen_proof: ci
     frozen_receipt: receipts/b040ae6c0b4d.yaml
     shape: e3b0c44298fc1c14
-    keys: ac241b8734f899c1
+    # 第八十二批更正：keys 原写 ac241b8734f899c1（= 上一条 f238378d 的 keys，相邻行抄串了）。
+    # 回执 receipts/b040ae6c0b4d.yaml 与仓外主源 wa79/freeze80z.log（log_sha256 对得上）的
+    # 跑前/跑后行都是下面这个值。`keys` 才是真正的树指纹（shape 在干净树上恒为空指纹）。
+    keys: d0c37c0a4b8dcc20
     receipt: freeze80z.log
     run: 38201863372        # 第八十一批更正：原文写的是 38195700449（= 第八十批 Y 的 run），串号
     note: "Z = 台账记入第八十批 Y 的行 + CHANGELOG 数字段换成实测（本批最后一个提交；它自己的台账行由下一个提交回填）"
@@ -338,6 +349,46 @@ rows:
       本提交动 8 个文件（+405−2）。
       两个分支的 CI 都全绿（dev 38474653846 / master 38474653815；逐 job：container、evals-real、migration、quality、sbom、security 全 success；image-signing、变异测试（${{ matrix.shard }}） 在 push 上本来就 skipped——变异矩阵只在 schedule/dispatch 跑，不是缺陷；逐 job 结论的仓内证据 = evidence/ci/17cd5e5c26c2.json，由 tests/test_ci_evidence.py 核）。
       本提交自己的回执（receipts/17cd5e5c26c2.yaml）由下一个提交携带（机制固有的一步滞后：交出去时它是盘上未入库状态）。
+  # 第八十四批补登记（判据 7 实测出来的两个洞）：下面三行都不是新交付，是**回填**——
+  # 它们本来该由「下一个提交」背书而没人写。补登记一律 `git-only` + 三件留空：这三份
+  # 提交根本没有回执文件（探针 / F3 都不是交付提交），所以一个数字也不许自报。
+  - sha: 904071e219f839917ebfcd1b280abe6f23b1bc9a
+    tree: 47ada1c54a402e76fb62d5ce9b6bb63db4e1c52b
+    attestation: git-only
+    frozen_proof: none
+    shape:
+    keys:
+    note: >-
+      第八十二批 F3。出去时它是那批的 tip，按机制它自己的行该由「下一个提交」背书；
+      下一个提交是 7cf9b9f（段尾探针）而它没写 ⇒ 洞（判据 7 实测的现场之一）。
+      补登记只能是 git-only：仓里根本没有它的回执（`receipts/904071e219f.yaml` 不存在），
+      所以 shape/keys/receipt 全留空 —— 宁可留空，不编造数字。
+      GitHub 上也取不到 run（实测 `gh api "…/actions/runs?head_sha=904071e2…全 sha"` 返回空数组：
+      它是多提交推送里的中间提交，Actions 只对被推的 tip 跑）⇒ 它进了
+      `tests/test_ci_evidence.py` 的 `UNPROVEN_ALLOWED` 例外清单（冻结，只许减不许增）。
+  - sha: 7cf9b9f76ccaa5e11e5745fd388238db78a603e5
+    tree: c822d36aa277eb1e85a94ea0955f81c881047a74
+    attestation: git-only
+    frozen_proof: none
+    shape:
+    keys:
+    note: >-
+      段尾探针入库（每 sha 一棵新树 + 违反项原文精确的自检）。探针提交不是交付提交，没有回执可背 ⇒
+      git-only、三件留空。它的行本该由 5c0faa5 背书，而 5c0faa5 也没写 ⇒ 这个洞连着两个提交，
+      正是「只核 HEAD^」看不见第二个洞的那个现场。
+      GitHub 同样取不到 run（同一次多提交推送的中间提交）⇒ 也在 `UNPROVEN_ALLOWED` 里。
+  - sha: 5c0faa53d5000c3464bc3e523313f7dfa0338584
+    tree: ec28e00e8de0ef31de891f953d637583518a8df5
+    attestation: git-only
+    frozen_proof: none
+    shape:
+    keys:
+    note: >-
+      段尾探针自检提示语订正 + 变异矩阵实测记录（M1/M2 不该红、M3/M4 必须红）。
+      它是本提交之前的 tip ⇒ 它的行本该由本提交（第八十三～八十五批那一次合成交付）背书，现在补上了；探针无回执 ⇒ git-only、三件留空。
+      **但这个提交在 GitHub 上是红的**：`dev` 的 run `38781636407` `conclusion=failure`（job `quality`
+      红，红的就是台账那条「没有 HEAD^ 那一行」，CI 原文 `1 failed, 2059 passed, 2 skipped`）⇒
+      它拿不出 `conclusion=success` 的证据（判据 3 会拒）⇒ 也在 `UNPROVEN_ALLOWED` 里。
 
 
 

@@ -151,6 +151,36 @@ jobs:
         run: uv run --frozen ruff check src tests scripts
       - name: Mypy (strict)
         run: uv run --frozen mypy src/warden_agent
+      - name: 推前形状守卫（这次交付范围的形状）
+        # 为什么这一条也要在 CI 里跑：`scripts/check_delivery_push.py`（第八十三批）原本**只活在本地**
+        # ——仓库自己的 `tests/test_ci_job_gates.py::test_每个守卫脚本都必须被_ci_真的调用` 把它
+        # 当孤儿拓了出来（第八十四批实录）。它守的失败模式很贵：一次推多个提交 ⇒ 中间提交永远
+        # 拿不到 run；提交没携带父提交的台账行 ⇒ 它自己那棵树在 CI 里就是红的。
+        # 在 CI 里它只能**事后报警**（推出去就不可逆了），但报警仍然值：第八十三批那次一次推三个，
+        # 是到下一个提交才发现台账拿不到证据的；推完立刻看到这条红，还来得及在**再推之前**改写历史。
+        # 为何不加 `if:`（只跑 push）：判据要的是「一段提交范围」，而每种事件都给得出——
+        # push = `before..sha`；PR = `base.sha..head.sha`（判这个 PR 自己的提交，不去判合成合并提交）；
+        # 手动/定时没有「一次 push」这个概念，就判 **tip 自己**（`sha^..sha`）——那仍在判
+        # 「这个提交有没有携带它父提交的台账行」。无条件跑，也就避免了「条件步骤 + 静默跳过签字」那一套。
+        # 入参走 `env:` 而不是直接写进脚本，避免把事件载荷拼进 shell。
+        env:
+          WARDEN_PUSH_BASE: ${{ github.event.before }}
+          WARDEN_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          WARDEN_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          base="${WARDEN_PUSH_BASE}"
+          tip="${GITHUB_SHA}"
+          if [ -n "${WARDEN_PR_HEAD}" ]; then
+            base="${WARDEN_PR_BASE}"
+            tip="${WARDEN_PR_HEAD}"
+          elif [ -z "${base}" ] || [ "${base}" = "0000000000000000000000000000000000000000" ]; then
+            # 手动/定时/新建分支：没有可算的 push 范围，退回 tip 的父提交。
+            # 连父提交都定位不到（根提交）就直接红——缺席要看得见，不静默放过。
+            base="$(git rev-parse "${GITHUB_SHA}^")"
+          fi
+          echo "推前形状判据范围：${base}..${tip}"
+          uv run --frozen python scripts/check_delivery_push.py --base "${base}" --tip "${tip}"
       - name: Pytest（含覆盖率门槛）
         # `-rs` 让跳过原因也打进日志：CI 里"跳过"和"通过"看起来一样绿，
         # 不写原因就没法判断是不是该跑的被静默跳过了。

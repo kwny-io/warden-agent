@@ -196,13 +196,24 @@ class IsolationUnavailableError(RuntimeError):
     """要求内核级隔离，但当前平台提供不了。"""
 
 
-def resolve_isolation_tier(isolation: str) -> IsolationTier:
+def resolve_isolation_tier(
+    isolation: str,
+    *,
+    probe: Callable[[list[str]], bool] | None = None,
+    platform: str | None = None,
+) -> IsolationTier:
     """把 `SandboxSpec.isolation` 配置解析成实际生效的隔离档。
 
     要求内核档但平台给不了时**报错，而不是静默降级**——静默降级会让人以为"隔离了"，
     比明说"做不到"危险得多。
+
+    `probe`/`platform` 在这里也必须能注入（与 `detect_isolation_tier` /
+    `isolation_tier_from_env` 同款）：这条路径过去直连真实探测，于是
+    `resolve_enforced_isolation` 上挂着的注入点只作用于一半路径——部署级声明
+    那半边能注入、参数层这半边不能，表现为「注入说给不了内核档」在真有
+    内核档的机器上**不报错**（参数层的要求被真实探测顶掉了）。
     """
-    detected = detect_isolation_tier()
+    detected = detect_isolation_tier(platform=platform, probe=probe)
     if isolation == "auto":
         return detected
     if isolation in ("linux-net-namespace", "os", "kernel"):
@@ -309,7 +320,7 @@ def resolve_enforced_isolation(
     env_tier = isolation_tier_from_env(env, probe=probe, platform=platform)
     if spec_isolation in ("", "auto"):
         return env_tier
-    spec_tier = resolve_isolation_tier(spec_isolation)
+    spec_tier = resolve_isolation_tier(spec_isolation, probe=probe, platform=platform)
     if spec_tier.available:
         return spec_tier
     return env_tier
@@ -361,12 +372,19 @@ class SandboxedExecutionBroker:
         self,
         spec: SandboxSpec | None = None,
         inner: ExecutionBroker | None = None,
+        *,
+        probe: Callable[[list[str]], bool] | None = None,
+        platform: str | None = None,
     ) -> None:
         self.spec = spec or SandboxSpec()
         self.inner = inner or ExecutionBroker(self.spec.budget)
         self.policy = NetworkPolicy(allow_network=self.spec.allow_network)
-        # 参数层与部署级声明取更严的那个（见 resolve_enforced_isolation）
-        self.tier = resolve_enforced_isolation(self.spec.isolation)
+        # 参数层与部署级声明取更严的那个（见 resolve_enforced_isolation）。
+        # `probe`/`platform` 一路透传：不透明的话测试只能靠 monkeypatch 内部符号，
+        # 而「本机给不给内核档」会被静默当成被测逻辑的一部分。
+        self.tier = resolve_enforced_isolation(
+            self.spec.isolation, probe=probe, platform=platform,
+        )
 
     def isolation_note(self) -> str:
         """当前隔离档的可读说明 —— 对外汇报时请直接引用它，别自己措辞。"""

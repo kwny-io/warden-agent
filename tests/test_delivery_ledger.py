@@ -28,6 +28,18 @@ tree `e1ddf6a3…`」，而实际交付的 Z2 树是 `83891221…`（= `freeze78
      发布 tag 检出的事件必须真的是 `workflow_dispatch`（本仓 `ci.yml` 的 `push` 只过筛 `branches`、
      不含 tag ⇒ 能产出「检出的是 tag」这条路的只有手动派发），否则报「口径被借用」；
   6. `run` **只核形状**（纯数字）：run 号在 GitHub 上，CI 里核不到——不假装核过，如实写在台账注释里。
+  7. **覆盖连续性**：台账头部 `coverage_from`（本仓 = 第七十八批的 `7140ead…`）声明**连续覆盖的
+     起点（含）**。从 `HEAD^` 沿 **first-parent 链**走到 `coverage_from` 的每一跳都必须有台账行；
+     `coverage_from` **之前**不许有行（要扩大范围就改这一行声明，别往范围外偷偷加行）；
+     没声明 ⇒ 连续性核不动 ⇒ 红（fail-closed）。与回填规则**同一口径分派**（`_refill_applies`）：
+     只有「检出的提交就是被推送的那个提交」才欠这个账。
+
+     **这条判据是本批（缺行现场）补的**：判据 5 只核 `HEAD^` 那一行，于是「连着攒两个、三个本地交付
+     提交」时**从第二个洞开始没有任何判据**。实测：`dev` 的 tip 是 `5c0faa5`、`HEAD^` = `7cf9b9f`、
+     `HEAD^^` = `904071e`，两条都没有台账行，而守卫只报了 `HEAD^` 那一条（`HEAD^^` 那一条在补判据
+     之前是不可见的）。补行也不是本机能一次做完的：两个 sha 都在 `tests/test_ci_evidence.py` 的切点
+     （`17cd5e5c`）之后 ⇒ 每行都必须带 `evidence/ci/<sha12>.json` 绑到**该 sha 自己**的一次成功 push
+     运行上 ⇒ 顺序只能是「先推、等 CI 绿、`scripts/ci_evidence.py fetch`、再由下一个提交带行进来」。
 
 口径分派不是凭空假设：`actions/checkout` 在 `pull_request` 事件下检出的**不是** PR 的头提交，
 而是「PR 头合并进 base」的**合成合并提交**（父级 = `[base tip, PR head]`）。
@@ -222,6 +234,127 @@ def _ambiguous_prefixes(prefix: str) -> int:
     return len(_git("rev-parse", f"--disambiguate={prefix}").stdout.split())
 
 
+# ---------------------------------------------------------------- 批量取证（成本）
+# 为什么要有这一层（数字用 `python scripts/count_git_spawn.py tests/test_delivery_ledger.py` 量）：
+# 重构前（树 `5c0faa5`，当时本文件是 35 条用例）整文件 **2676 次** git spawn、整文件 4.5 分钟
+# （单条最慢 25.28s）——而变异矩阵要在它上面跑 41 次，就是 3 小时。重构后（本树）本文件 44 条用例、
+# 整文件 **416 次**（每条 76.5 → 9.5 次）、单条 `test_交付台账干净` **8 次**、墙钟 **44.18s**。
+# 单条口径也量了两侧：同一条用例在 `5c0faa5` 上是 **84 次**、本树 **8 次**（**10.5×**）。
+#
+# **形状很关键**：批量路径只在「拿到完整权威表」时才作答，拿不到就原路回退；
+# 而且它必须与逐次版逐条给同一个答案（有 `test_批量取证与逐次取证答案逐条一致` 钉住）。
+# 一个「更快但偶尔不一样」的台账门禁，比 4.5 分钟更贵。
+_ANCESTRIES: dict[str, dict[str, str]] = {}
+_OBJECT_TYPES: dict[str, str] | None = None
+
+
+def _ancestry_table(head: str) -> dict[str, str] | None:
+    """`head` 的祖先 → 它的树（一次 `git log --format=%H %T`）。拿不到就 None，让调用方回退。"""
+    if head in _ANCESTRIES:
+        return _ANCESTRIES[head]
+    out = _git("log", "--format=%H %T", head)
+    if out.returncode != 0:
+        return None
+    table: dict[str, str] = {}
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and _HEX40.match(parts[0]):
+            table[parts[0]] = parts[1]
+    if not table:
+        return None
+    _ANCESTRIES[head] = table
+    return table
+
+
+def _object_table() -> dict[str, str] | None:
+    """仓里**所有**对象的名字 → 类型（一次 `git cat-file --batch-check --batch-all-objects`）。
+
+    取「所有对象」而不是只查那几个前缀，是因为 `--disambiguate=<前缀>` 数的正是
+    「所有对象里以它开头的有几个」——换成一次调用，判据必须一模一样。
+    """
+    global _OBJECT_TYPES
+    if _OBJECT_TYPES is None:
+        out = _git("cat-file", "--batch-check", "--batch-all-objects")
+        if out.returncode != 0:
+            return None
+        table: dict[str, str] = {}
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                table[parts[0]] = parts[1]
+        if not table:
+            return None
+        _OBJECT_TYPES = table
+    return _OBJECT_TYPES
+
+
+def _resolve_cached(sha: str) -> str | None:
+    """`_resolve` 的批量版，语义逐条对齐 `git rev-parse --verify <sha>^{commit}`：
+
+      * 40 位全 sha：对象在且是 commit ⇒ 它自己；对象不在 ⇒ None；是 tree/blob/tag ⇒ 回退（不猜）。
+      * 短 sha：拿**全表**看以它开头的对象；恰好一个且是 commit ⇒ 它自己；
+        恰好一个但不是提交（tree/blob）⇒ None（跟 `^{commit}` 失败一致）；
+        0 个 / 多个 / 是 tag ⇒ 回退。
+      * 短于 7 位：git 自己就不认这种缩写，直接回退。
+    """
+    if len(sha) < 7:
+        return _resolve(sha)
+    objects = _object_table()
+    if objects is None:
+        return _resolve(sha)
+    if _HEX40.match(sha):
+        kind = objects.get(sha)
+        if kind == "commit":
+            return sha
+        return None if kind is None else _resolve(sha)
+    matches = [name for name in objects if name.startswith(sha)]
+    if len(matches) == 1:
+        kind = objects[matches[0]]
+        if kind == "commit":
+            return matches[0]
+        if kind != "tag":
+            return None
+    # 0 个 / 多个 / tag：只有 git 自己知道该不该剥，交给逐次路径
+    return _resolve(sha)
+
+
+def _tree_cached(*, sha: str, full: str, head: str) -> str | None:
+    """`_tree_of` 的批量版：`head` 的祖先表里查得到就用表里的树，否则逐次回退。
+
+    （非祖先提交——比如别的分支上的——走原路，包括「拿不到该提交的树」那种报错语义。）
+    """
+    table = _ancestry_table(head)
+    if table is not None and full in table:
+        return table[full]
+    return _tree_of(sha)
+
+
+def _is_ancestor_cached(sha: str, head: str) -> bool:
+    """`_is_ancestor` 的批量版：祖先表里命中就是祖先；否则逐次回退。
+
+    `merge-base --is-ancestor` 那句 rc>1 ⇒ GitUnusable 的语义**只在回退路径里**，原样保留：
+    「查不动」永远不许被渲染成「不是祖先」。
+    """
+    table = _ancestry_table(head)
+    if table is not None and sha in table:
+        return True
+    return _is_ancestor(sha, head)
+
+
+def _ambiguous_prefixes_cached(prefix: str) -> int:
+    """`_ambiguous_prefixes` 的批量版：在对象表上数前缀（与 `--disambiguate` 的口径一致）。
+
+    短于 4 位的回退：git 自己就不认这么短的 `--disambiguate`（实测 `ab` ⇒ 0 个），
+    而在全表上数得到 8 个 —— 差分用例 `test_批量取证与逐次取证答案逐条一致` 当场拓到的。
+    """
+    if len(prefix) < 4:
+        return _ambiguous_prefixes(prefix)
+    objects = _object_table()
+    if objects is None:
+        return _ambiguous_prefixes(prefix)
+    return sum(1 for name in objects if name.startswith(prefix))
+
+
 def _refill_applies(
     *,
     event: str | None,
@@ -312,8 +445,12 @@ def _refill_violations(
     parents: tuple[str, ...],
     seen: dict[str, int],
     delivery: tuple[str, ...],
-) -> list[str]:
-    """回填规则（口径由 `_refill_applies` 分派）+「不许有 HEAD 自己的行」。"""
+) -> tuple[list[str], bool]:
+    """回填规则（口径由 `_refill_applies` 分派）+「不许有 HEAD 自己的行」。
+
+    返回 `(违反项, 回填义务是否适用)`：**适用与否同时决定「覆盖连续性」判据要不要跑**
+    —— 同一件检出的几何，不许一个判据一个口径。
+    """
     out: list[str] = []
     applies, borrowed = _refill_applies(
         event=event, ref=ref, parent_count=len(parents), delivery=delivery
@@ -334,6 +471,79 @@ def _refill_violations(
                 "**每个已交付提交必须由下一个提交背书**，"
                 "删掉它这里就红——这是逼人回填的机制"
             )
+    return out, applies
+
+
+def _coverage_from() -> str:
+    """台账头部的 `coverage_from`：**连续覆盖的起点（含）**。
+
+    没写 ⇒ 空串（fail-closed 交给调用方：不许读成「都放行」）。
+    """
+    meta, _rows = _load_ledger()
+    value = meta.get("coverage_from")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"`coverage_from` 只能是字符串（拿到 {type(value).__name__}）")
+    return value.strip()
+
+
+def _first_parent_chain(rev: str) -> list[str] | None:
+    """`git rev-list --first-parent <rev>`（含 `rev` 自己在内，从新到旧）。
+
+    查不动（rev 是伪造的 sha 等）⇒ `None`：调用方只能报「核不动」，**不许**把它读成「没有洞」。
+    """
+    out = _git("rev-list", "--first-parent", rev)
+    if out.returncode != 0:
+        return None
+    return out.stdout.split()
+
+
+def _coverage_violations(
+    *, parents: tuple[str, ...], seen: dict[str, int], coverage_from: str
+) -> list[str]:
+    """覆盖**连续性**：`HEAD^` 到 `coverage_from`（含）之间不许有洞，范围外不许有行。
+
+    只核 `HEAD^`（判据 5）在「连着攒交付提交」时是瞎的：第二个洞开始没人看得见，台账就悄悄与
+    交付史脱节——第九处之后最贵的那种失败（文件都在、语法都对、没有判据）。
+    """
+    if not parents or not _HEX40.match(parents[0]):
+        # 父级不是真提交（合成的 PR 检出、用例编的 sha）⇒ 让回填那条判据去报，这里不叠假红。
+        return []
+    if not coverage_from:
+        return [
+            "台账没声明覆盖起点（头部 `coverage_from: <40位sha>`）⇒ 连续性核不动："
+            "**「没写」不许读成「都放行」**（fail-closed）"
+        ]
+    boundary = _resolve(coverage_from)
+    if boundary is None:
+        return [f"`coverage_from`（{coverage_from[:12]}）不在本仓历史里 ⇒ 连续性核不动"]
+    chain = _first_parent_chain(parents[0])
+    if chain is None:
+        return [
+            f"覆盖连续性核不动：`git rev-list --first-parent {parents[0][:7]}` 失败 ⇒"
+            "链上有没有洞无从得知（那不是「没有洞」）"
+        ]
+    if boundary not in chain:
+        return [
+            f"`coverage_from`（{coverage_from[:12]}）不在 HEAD^ 的 first-parent 链上 ⇒"
+            "覆盖范围与这张历史对不上，连续性核不动"
+        ]
+    out: list[str] = []
+    at = chain.index(boundary)
+    holes = [sha for sha in chain[: at + 1] if sha not in seen]
+    if holes:
+        out.append(
+            f"覆盖范围内有洞：first-parent 链上这些提交没有台账行 {[sha[:7] for sha in holes]}"
+            f"（共 {len(holes)} 个）⇒ 每个已交付提交必须由下一个提交背书；"
+            "只核 HEAD^ 时，第二个洞开始就没有判据（判据 7：本批实测的现场）"
+        )
+    beyond = sorted(sha[:7] for sha in seen if sha in set(chain[at + 1 :]))
+    if beyond:
+        out.append(
+            f"`coverage_from` 之前（范围外）还有台账行 {beyond} ⇒"
+            "要扩大范围就改头部这一行声明并说明理由，别往范围外偷偷加行"
+        )
     return out
 
 
@@ -345,6 +555,7 @@ def _violations(
     event: str | None = None,
     ref: str | None = None,
     delivery: tuple[str, ...] | None = None,
+    coverage_from: str | None = None,
 ) -> list[str]:
     """台账的全部判据。返回违反项（空列表 = 干净）。
 
@@ -352,6 +563,8 @@ def _violations(
     （CI 里这套用例也会在 PR 事件下跑）。
     `delivery` 是交付面分支（台账头部 `delivery_branch`）；**默认 `()` = 不豁免任何分支**
     （fail-closed：忘了传参也不会静默放行）。`_violations` 会显式传台账里声明的值。
+    `coverage_from` 是连续覆盖起点（台账头部 `coverage_from`）：`None` = 现读台账，
+    传空串 = 模拟「没声明」（用例用）。
     """
     if delivery is None:
         delivery = _delivery_branches()
@@ -364,11 +577,11 @@ def _violations(
         if not sha:
             out.append(f"{tag}：缺 `sha`")
             continue
-        full = _resolve(sha)
+        full = _resolve_cached(sha)
         if full is None:
             out.append(
                 f"{tag}：这个 sha 不在本仓历史里"
-                f"（`git rev-parse --verify {sha}^{{commit}}` 失败）"
+                f"（仓内对象表与 `git rev-parse --verify {sha}^{{commit}}` 都查不到）"
             )
             continue
         if not _HEX40.match(sha):
@@ -386,7 +599,7 @@ def _violations(
         if not _HEX40.match(tree):
             out.append(f"{tag}：`tree` 不是 40 位小写十六进制（{tree!r}）")
         else:
-            real = _tree_of(sha)
+            real = _tree_cached(sha=sha, full=full, head=head)
             if real is None:
                 out.append(f"{tag}：拿不到该提交的树")
             elif real != tree:
@@ -396,10 +609,10 @@ def _violations(
                     f"台账 {tree} / git {real}"
                 )
 
-        if not _is_ancestor(full, head):
+        if not _is_ancestor_cached(full, head):
             out.append(f"{tag}：不是 HEAD 的祖先（不许给别的分支/游离提交背书）")
 
-        ambiguous = _ambiguous_prefixes(sha)
+        ambiguous = _ambiguous_prefixes_cached(sha)
         if ambiguous > 1:
             out.append(
                 f"{tag}：这个 sha 前缀有歧义（仓里有 {ambiguous} 个对象以它开头）⇒"
@@ -438,11 +651,17 @@ def _violations(
         if run and not run.isdigit():
             out.append(f"{tag}：`run` 只能是纯数字（这里只核形状，真伪在 GitHub 上，CI 核不到）")
 
-    out.extend(
-        _refill_violations(
-            event=event, ref=ref, head=head, parents=parents, seen=seen, delivery=delivery
-        )
+    refill, refill_applies = _refill_violations(
+        event=event, ref=ref, head=head, parents=parents, seen=seen, delivery=delivery
     )
+    out.extend(refill)
+    if refill_applies:
+        # 连续性只在「检出的提交就是被推送的那个提交」时欠（功能分支上的在飞提交不欠这个账）
+        if coverage_from is None:
+            coverage_from = _coverage_from()
+        out.extend(
+            _coverage_violations(parents=parents, seen=seen, coverage_from=coverage_from)
+        )
     return out
 
 
@@ -704,6 +923,80 @@ def test_判据有牙_不是_HEAD_祖先的行会被抓() -> None:
     assert any("不是 HEAD 的祖先" in item for item in violations), violations
 
 
+# ------------------------------------------------- 覆盖连续性（判据 7：本批补的洞）
+
+def test_本仓台账声明了覆盖起点且就是第七十八批() -> None:
+    """覆盖范围是**声明**出来的（头部 `coverage_from`），不是从「哪一行有值」反推的：
+    反推有逃生口 —— 把范围最早的那一行删掉，范围就自己往上缩了。"""
+    assert _coverage_from() == "7140eadcf9252a39cebfa4da1b5a07289b9362b3"
+
+
+def test_覆盖连续性也只对交付面的检出适用() -> None:
+    """在飞的功能分支提交不欠「下面全都有行」这个账（与回填规则同一条口径分派）。"""
+    head, parents = _wip_geometry()
+    got = _violations(
+        _load_rows(), head=head, parents=parents, event="push", ref="refs/heads/feat-x"
+    )
+    assert not any("覆盖范围内有洞" in item for item in got), got
+
+
+def test_判据有牙_链中间挖一个洞会被抓() -> None:
+    """**本批实测的现场形状**：只核 `HEAD^` 时，链中间少一行是看不见的。"""
+    rows, head, parents = _mutated()
+    victim = str(rows[5]["sha"])
+    rows = [row for row in rows if str(row["sha"]) != victim]
+    violations = _violations_strict(rows, head, parents)
+    assert any("覆盖范围内有洞" in item and victim[:7] in item for item in violations), violations
+
+
+def test_判据有牙_连着两个洞会被逐个点名() -> None:
+    """洞不是一个：本地连着攒交付提交时是连着几个，所以这条判据要**点名**每一个。"""
+    rows, head, parents = _mutated()
+    gone = [str(rows[4]["sha"]), str(rows[5]["sha"])]
+    rows = [row for row in rows if str(row["sha"]) not in gone]
+    violations = _violations_strict(rows, head, parents)
+    line = next((item for item in violations if "覆盖范围内有洞" in item), None)
+    assert line is not None, violations
+    assert all(sha[:7] in line for sha in gone), line
+
+
+def test_判据有牙_边界行缺失会被抓() -> None:
+    """`coverage_from` 那一行（含）也在范围内：删掉它是洞，不是「范围从下一行开始」。"""
+    rows, head, parents = _mutated()
+    assert str(rows[0]["sha"]) == _coverage_from(), "台账第一行本该是覆盖起点"
+    violations = _violations_strict(rows[1:], head, parents)
+    assert any("覆盖范围内有洞" in item for item in violations), violations
+
+
+def test_判据有牙_覆盖起点被抬高会被抓() -> None:
+    """范围**不能**靠改声明往上缩：抬高 `coverage_from` ⇒ 下面那些行立刻成了范围外的行。"""
+    rows, head, parents = _mutated()
+    later = _resolve(str(rows[3]["sha"]))
+    assert later is not None
+    violations = _violations(
+        rows, head=head, parents=parents, event="push", ref="refs/heads/dev", coverage_from=later
+    )
+    assert any("范围外" in item for item in violations), violations
+
+
+def test_判据有牙_没声明覆盖起点会被抓() -> None:
+    """缺声明 = 连续性核不动 ⇒ 红（**「没写」不是「都放行」**，与 `delivery_branch` 同一口径）。"""
+    rows, head, parents = _mutated()
+    violations = _violations(
+        rows, head=head, parents=parents, event="push", ref="refs/heads/dev", coverage_from=""
+    )
+    assert any("没声明覆盖起点" in item for item in violations), violations
+
+
+def test_判据有牙_覆盖起点不在这条链上会被抓() -> None:
+    """拿 `HEAD` 自己当覆盖起点（它不在 `HEAD^` 的 first-parent 链上）⇒ 核不动就报红。"""
+    rows, head, parents = _mutated()
+    violations = _violations(
+        rows, head=head, parents=parents, event="push", ref="refs/heads/dev", coverage_from=head
+    )
+    assert any("不在 HEAD^ 的 first-parent 链上" in item for item in violations), violations
+
+
 def test_查不动必须报红_不许静默放过() -> None:
     """浅克隆 / 拿不到 HEAD：与「没问题」分开（否则守卫失效时也是一个绿灯）。"""
     shallow = _usability_error(shallow=True, head_ok=True)
@@ -815,18 +1108,59 @@ def test_查不动_不许渲染成_不是祖先(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_判据有牙_短sha有歧义会被抓(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`--disambiguate` 只要返回 >1 个对象就报：现在指对了不代表以后指得对。"""
+    """只要「有 >1 个对象以这个前缀开头」就报：现在指对了不代表以后指得对。
+
+    取证现在是一次 `cat-file --batch-check --batch-all-objects` 拿全表（口径与逐次
+    `rev-parse --disambiguate=<前缀>` 一致），所以伪造要造在**对象表**这个缝上：真表 + 一个兄弟
+    对象（不能整表换掉：那会先报「不在本仓历史里」、判据根本到不了）。
+
+    而且这一行必须改成**短 sha**：台账里存的是 40 位全 sha，而全 sha 在对象表里按定义只有自己
+    一个兄弟 ⇒ 「全 sha 的歧义数 = 1」是结构性的，拿它证明不了任何事（旧版伪造
+    `--disambiguate` 对任意前缀都返回 2，证明的是一个现实中不会发生的事）。
+    """
     rows, head, _parents = _mutated()
+    rows[0]["sha"] = str(rows[0]["sha"])[:12]
     real = _git
+    first = str(rows[0]["sha"])
 
     def fake(*args: str) -> subprocess.CompletedProcess[str]:
-        if args[:1] == ("rev-parse",) and args[1].startswith("--disambiguate="):
-            return subprocess.CompletedProcess(["git", *args], 0, f"{'a' * 40}\n{'b' * 40}\n", "")
+        if args[:1] == ("cat-file",):
+            base = real(*args)
+            sibling = f"{first}{'f' * (40 - len(first))}"
+            return subprocess.CompletedProcess(
+                ["git", *args], base.returncode, f"{base.stdout}{sibling} blob 1\n", base.stderr
+            )
         return real(*args)
 
     monkeypatch.setattr(sys.modules[__name__], "_git", fake)
+    monkeypatch.setattr(sys.modules[__name__], "_OBJECT_TYPES", None)  # 让伪造那张表真的被重建
     bad = _violations(rows, head=head, parents=("0" * 40,), event="push", ref=_DEV)
     assert any("歧义" in item for item in bad), bad
+
+
+def test_批量取证与逐次取证答案逐条一致() -> None:
+    """重构（整文件 2676 次 git spawn → 416 次；量法
+    `python scripts/count_git_spawn.py tests/test_delivery_ledger.py`）不许改变任何一个答案：
+    批量版与逐次版逐条对。
+
+    为什么这条必须有：批量版只在「拿到完整权威表」时才作答、否则回退，两边判据只要有一丝不齐
+    （例如「前缀恰好命中一个 blob/tree」到底算不算解析不出来），台账就变成「更快但偶尔不一样」
+    —— 那比 4.5 分钟贵得多。
+    """
+    head, _parents, _event, _ref = _context()
+    rows = _load_rows()
+    probes = [str(row["sha"]) for row in rows[:3]]
+    probes += [str(rows[0]["tree"]), str(rows[0]["tree"])[:12]]
+    probes += [head, head[:12], "0" * 40, "deadbeef", "ab", "ff" * 20]
+    for sha in probes:
+        assert _resolve_cached(sha) == _resolve(sha), f"_resolve 不一致：{sha}"
+        assert _ambiguous_prefixes_cached(sha) == _ambiguous_prefixes(sha), f"歧义数不一致：{sha}"
+        full = _resolve(sha)
+        if full is not None:
+            assert _is_ancestor_cached(full, head) == _is_ancestor(full, head), (
+                f"祖先判定不一致：{full}"
+            )
+            assert _tree_cached(sha=sha, full=full, head=head) == _tree_of(sha), f"树不一致：{full}"
 
 
 # ------------------------------------------------- 口径分派（回填义务在哪些检出上适用）

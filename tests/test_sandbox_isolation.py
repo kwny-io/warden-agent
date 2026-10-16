@@ -155,10 +155,38 @@ def test_语义层拦不住_socket_一句话就绕过去() -> None:
     assert NetworkPolicy(allow_network=False).allows(bypass) is True  # 没拦住
 
 
-def test_broker会如实报出当前档位() -> None:
-    broker = SandboxedExecutionBroker(spec=SandboxSpec(isolation="semantic"))
-    assert "semantic-only" in broker.isolation_note()
-    assert "不是" in broker.isolation_note()
+def test_broker报出的档位跟着注入走() -> None:
+    """**两态对比：broker 报的是生效档，而且注入真的透传到了它这一层。**
+
+    broker 报的是**生效档**（参数层与环境声明取更严的那个），不是参数层原文；
+    所以这里必须注入「本机给不给内核档」：不注入的话，这条断言就变成了在测
+    「跑测试的机器有没有内核档」——在 `--privileged` 容器里 `isolation="semantic"`
+    会被更严的环境档顶掉、note 里报的是内核档，断言假红（行为其实是对的）。
+
+    反过来，只注入「给不了」也不够：那样「broker 没把注入透传下去、静默退回
+    真实探测」这个缺陷在上面那条里仍然绿。两态一起才逼出透传。
+    """
+    # ① 注入说给不了 ⇒ 语义档
+    denied = SandboxedExecutionBroker(
+        spec=SandboxSpec(isolation="semantic"),
+        probe=lambda _prefix: False,
+        platform="linux",
+    )
+    assert "semantic-only" in denied.isolation_note()
+    assert "不是" in denied.isolation_note()
+    assert denied.tier.available is False
+
+
+def test_broker报注入给足时的内核档(monkeypatch: pytest.MonkeyPatch) -> None:
+    """② 同一个调用、只把注入换成「能给」 ⇒ 必须变成内核档。"""
+    monkeypatch.setenv("WARDEN_ISOLATION_PREFIX", "unshare -rn")
+    granted = SandboxedExecutionBroker(
+        spec=SandboxSpec(isolation="kernel"),
+        probe=lambda _prefix: True,
+        platform="linux",
+    )
+    assert granted.tier.available is True
+    assert "linux-net-namespace" in granted.isolation_note()
 
 
 # ---------------- 实证：内核档真的把网络关掉了（仅 Linux） ----------------

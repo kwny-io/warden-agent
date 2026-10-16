@@ -57,6 +57,11 @@ Thumbs.db
 .zcode/
 .mimosa/
 
+# pi/coding-agent 跑后台任务时会在 CWD 建 `.pi/tasks/`（本地工具产物，不是仓库内容）
+.pi/
+# Windows 上把 `>nul` 当 /dev/null 用会真的建出一个名为 nul 的文件（bash 工具里更常见）
+nul
+
 # 测试/覆盖率产物（本地跑 pytest/mypy/vitest 都会生成；CI 自己算，不靠提交产物）
 .vitest/
 coverage.json
