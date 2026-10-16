@@ -297,7 +297,7 @@ warden restore <备份文件> --force               # 目标库已存在 → 显
 | 抓取只有去标签粗提取 | 拿不到 SPA / 正文抽取 | 需要 headless 浏览器 |
 | ~~没有告警规则库 / SLO / 链路追踪 / 灰度~~ | **已补齐**（规则库+SLO、traceparent 链路、健康门控灰度） | 见第九～十一节；~~span 送后端仍需接 OTel exporter~~ **已补（2026-09-23）**：`core/otel.py` 零依赖 OTLP 导出，配 `OTEL_EXPORTER_OTLP_ENDPOINT` 即送收集器 |
 | `warden_stuck_runs` 抓取时现算 | ~~每次抓取对存储做一次只读扫描~~ **已加 15s TTL 缓存**（与默认抓取间隔一致） | 刷新失败时保留上次值、**绝不写 0**（写 0 会把告警悄悄消掉） |
-| **漏洞扫描的有效性取决于基镜像新鲜度** | 用陈旧缓存的基镜像扫会命中"其实已修"的 CVE（实测 13 条 → 拉新后 0 条） | 冒烟脚本构建已加 `--pull`（受限网络可 `SMOKE_NO_PULL=1`）；dependabot 盯基镜像；CI 的**每周定时**（`schedule: 0 3 * * 1`）**当前实际不响**——`schedule` 只从默认分支求值，而 cron 写在 `dev`、默认分支是 `master`（详见 `tests/CI_JOB_GATES.yaml` 的 `triggers:` 段，`review_by` 2026-11-07） |
+| **漏洞扫描的有效性取决于基镜像新鲜度** | 用陈旧缓存的基镜像扫会命中"其实已修"的 CVE（实测 13 条 → 拉新后 0 条） | 冒烟脚本构建已加 `--pull`（受限网络可 `SMOKE_NO_PULL=1`）；dependabot 盯基镜像；CI 的**每周定时**（`schedule: 0 3 * * 1`）**2026-10-15 起会响**（第八十五批订正：原话是「当前实际不响」，因为当时默认分支 `master` 上的 `ci.yml` 还是 561 字节的 9 月存根；2026-10-12/13 的批次推送已把全量 `ci.yml`（含 cron 与 `mutation` job）带到 `master`，实测 42880 字节 / 635 行 ⇒ 第一次求值 = 2026-10-19 03:00 UTC，详见 `tests/CI_JOB_GATES.yaml` 的 `triggers:` 段） |
 | 进程内事件总线保留上限 | 超 `WARDEN_EVENT_KEEP`（默认 500）会丢最早事件 | 只影响进度展示；丢弃有警告、消费者能收到「存在缺口」提示 |
 | 熔断/出站并发/`InProcessRunLock` 的**进程内语义** | 每副本各一份 | 已文档化（多副本须用共享实现） |
 | **记忆按 `owner` 隔离**（2026-09-22 起） | 升级前写入的记忆 `owner` 为空串，**用户在 `/memory/{scope}` 与召回里看不到** | 空串 = 部署级共享；需要保留的旧数据应补写 `owner`（`UPDATE memories SET owner=? WHERE uid=?`） |
@@ -471,3 +471,43 @@ WARDEN_ADMIN_PRINCIPALS=ops,oncall      # 逗号分隔的 principal id（= 用�
 其余未带凭证必须 401，登记为管理员的普通用户必须 403、管理员必须通过。
 写这条守卫时它当场抓出一处真缺口：`/docs` 公开但 `/docs/oauth2-redirect` 却要凭证
 （Swagger 的 Authorize 流程会跳到那个子页），已一并修正。
+
+## 十四、交付节奏（一次 push 只有 tip 有 CI：怎么推、怎么改写历史）
+
+**为什么单列一节**：`dev` 的 `quality` 曾在 2026-10-15～16 之间红着没人知道，而且不是某条判据坏了——
+是**交付这个动作本身没有节奏**：一次推多个提交时，除 tip 外的提交在 CI 里**根本没跑过**，
+而台账又要求每个提交都携带 first parent 的行 ⇒ 「红」可以静默存在很久。
+真正的发现时刻应该是 CI，不是第二天的人眼。
+
+### 一句话契约
+
+**一次 push 只带一个交付提交**（tip 的 parent 必须是上一个已在 `tests/DELIVERY_LEDGER.yaml` 里登记过的交付提交）。
+
+### 标准节奏（照拄）
+
+1. 干活、验证（本地总闸 `scripts/verify_local.py`：逐阶段跑、退出码累计，并对着 `ci.yml` 的 quality job 双向对账）。
+2. 推前自检范围形状：`./.venv/Scripts/python.exe scripts/check_delivery_push.py --base <上一个交付提交>`，
+   `rc=0` 才推。它核三条：①一次推多个提交 ⇒ 除 tip 外拿不到 run；②提交没携带 first parent 的台账行
+   ⇒ 它自己那棵树在 CI 里红（判据 7「覆盖范围内有洞」）；③tip 携带的父行若声明了 `ci_evidence`，
+   该文件必须真在 tip 的 `attestation` 提交里。
+3. `git push`。**一个交付提交 = 一个 push run**（`--force-with-lease` 仅用于改写历史，见下）。
+4. 等**这次 push 自己的** run 绿：用 `gh run list --json headSha` 核 sha，用 `gh run view <id> --json jobs`
+   **逐 job** 看结论——run 级 `conclusion` 不算权威，`skipped` 与 `success` 是两件事。
+5. 把证据文件 `evidence/ci/<sha12>.json`（run id、event、conclusion、逐 job 结论）放进**下一个**交付提交的
+   `attestation` 分支，并在台账里补上指它的 `ci_evidence`。
+6. **台账的行属于「下一个」提交**：提交 N 的行写在提交 N+1 里。改写历史产生的孤儿行必须按 `reason=` 口径留下，不能删。
+
+### 要改写历史时（本仓做过两次，原因相同）
+
+- **触发条件**：tip 必须携带父行的 `ci_evidence`，而父提交的那次 push run 是红的（例如被当时还没修的判据判红），
+  于是它**永远无法满足证据判据**；而 `UNPROVEN_ALLOWED` 是**冻结名单**（只许减不许增）。
+- **做法**：`git reset --soft <上一个已登记的交付提交>` → 一个提交 → 确认树没意外增删 →
+  **重跑第 2 步的预检** → `--force-with-lease`。
+- **注意**：force-push 后 GitHub 会把被废弃的 sha 当 push 事件的 `before` 发过来，而它**不在你的检出里**
+  ⇒ 形状守卫会降级只核 `tip^..tip`，并**明说没核到什么**（这是设计，不是失败）。
+
+### 别做的事
+
+- 别用 `a & b & c` 串联验证命令：退出码只等于**最后一条**（真踩过：中间 pytest 红着，整串退 0，据此报过「全绿」）。
+- 别在 CI 里一次推多个提交再期待每个都有 run：**只有 tip 有**。
+- 别把「本机全绿」当交付判据：交付判据是那次 push **自己的** run 结论。

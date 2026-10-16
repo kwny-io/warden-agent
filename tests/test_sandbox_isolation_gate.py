@@ -155,16 +155,38 @@ def test_参数层auto不会把部署声明当空气() -> None:
         )
 
 
-def test_参数层写死内核档时同样拒绝() -> None:
+def test_参数层写死内核档时同样拒绝(monkeypatch: pytest.MonkeyPatch) -> None:
+    """两态对比，刻意放在一条里：同一个调用只换探针，一个必须报错、一个必须拿到内核档。
+
+    为什么必须两态：参数层写 `kernel` 走的是 `resolve_isolation_tier`，它过去直连
+    真实探测、把 `probe`/`platform` 丢掉了。只测「注入说给不了要报错」这半边是
+    不够的——它在没内核档的机器上一直绿（真实探测本来也给不了），而在真有内核档
+    的机器上才暴露；反过来另外半边（注入说能给）只在没内核档的机器上暴露。
+    两态写在一起，两类机器上都带电。
+    """
+    monkeypatch.setenv("WARDEN_ISOLATION_PREFIX", "unshare -rn")
     with pytest.raises(IsolationUnavailableError):
-        resolve_enforced_isolation("kernel", {}, probe=_kernel_probe_no, platform="linux")
+        resolve_enforced_isolation(
+            "kernel", {}, probe=_kernel_probe_no, platform="linux"
+        )
+    yes = resolve_enforced_isolation(
+        "kernel", {}, probe=_kernel_probe_yes, platform="linux"
+    )
+    assert yes.available is True, "注入说能给，就必须拿得到内核档（否则注入被吞了）"
+    assert yes.name == "linux-net-namespace"
 
 
 def test_真实平台探测如实报告而且不抛异常() -> None:
-    """Windows 上必须老老实实说"没有网络命名空间原语"。"""
+    """真实探测只要求两件事：不抛异常、名字落在已知集合里。
+
+    **不能**在这里断言 `available is False`——那等于把「跑测试的这台机器恰好
+    没有内核档」当成被测逻辑；换一台有内核档的机器（`--privileged` 容器）就会
+    假红，而且红得毫无意义（被测行为其实是对的）。「非 Linux 必须说没内核档」
+    由 `test_非linux平台如实报告没有内核档` 用注入 platform 保证。
+    """
     tier = detect_isolation_tier()
-    assert tier.available is False
-    assert tier.name == "semantic-only"
+    assert tier.name in ("linux-net-namespace", "semantic-only")
+    assert tier.reason, "理由不能为空——空理由等于没解释「隔离边界到底在哪」"
 
 
 def test_构建期就按声明解析档位(monkeypatch: pytest.MonkeyPatch) -> None:

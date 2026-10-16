@@ -186,14 +186,35 @@ def test_回执是绿的(p: pathlib.Path):
 
 # ---------- 与台账交叉核 ----------
 
-def test_台账每一行与回执一致():
-    by_sha = {load(p)["sha"]: load(p) for p in receipt_paths()}
+def reconcile_rows(rows_in: list[dict], root: pathlib.Path) -> list[str]:
+    """把「台账行 ⇄ 它指向的回执」对账，返回所有不一致。**纯读**：不碰 git，可在构造数据上跑。
+
+    为什么抽成函数（第八十二批补，原先是内联在用例里）：内联时用例读的是真台账，
+    它只能报「没问题」；检查器本身被弱化（少对一类账）时真台账照样绿 —— 没有牙。
+    抽出来后用 `test_对账检查器认得五类坏行` 拿构造数据把每一类钉死。
+
+    对账四项（前两项本来就有，后三项是这一批补的）：
+      · sha/tree 绑定；shape_after = 行里的 shape；
+      · `keys` —— **真正的树指纹**（CHANGELOG.md:226-228：`shape` 只是 `git status` 空指纹，
+        干净树上恒等于 `e3b0c44298fc1c14`，拿它当指纹等于白对）；
+      · `freeze.tree_before/tree_after` 必须与行里的 tree 相等（回执指向的树不能是另一棵）；
+      · `receipt`（仓外日志名）必须与回执里记的 `freeze.log` **大小写敏感**一致。
+    回执里那四个 hex 是冻结日志的机械抽取，且回执记着日志的 `log_sha256` ⇒ 回执权威；
+    行对不上就是行抄错（第八十二批实测两例：`b040ae6c` 的 keys、`814eeb07` 的 receipt 大小写）。
+    """
+    paths = sorted((root / "receipts").glob("*.yaml"))
+    by_sha = {load(p)["sha"]: load(p) for p in paths}
     problems = []
-    for row in rows():
+    for row in rows_in:
         sha, tree = row["sha"], row["tree"]
         if row.get("attestation") == "git-only":
-            if row.get("frozen_proof") != "none" or row.get("frozen_receipt"):
-                problems.append(f"{sha[:12]} git-only 行不该有 frozen_proof/frozen_receipt")
+            # git-only 行只准有 sha/tree/attestation/frozen_proof/说明 —— 没回执就没有任何东西
+            # 能证 shape/keys/receipt 这几个数（自己报的数就是自己报的数）；None 不算自报。
+            claimed = [k for k in ("shape", "keys", "receipt", "frozen_receipt") if row.get(k)]
+            if row.get("frozen_proof") != "none" or claimed:
+                problems.append(
+                    f"{sha[:12]} git-only 行不许自报数字/回执（frozen_proof="
+                    f"{row.get('frozen_proof')!r}，自报 {claimed}）")
             continue
         if row.get("frozen_proof") != "ci":
             problems.append(f"{sha[:12]} attestation={row.get('attestation')} 但 frozen_proof≠ci")
@@ -201,20 +222,116 @@ def test_台账每一行与回执一致():
         if not ref:
             problems.append(f"{sha[:12]} 缺 frozen_receipt:")
             continue
-        p = ROOT / ref
+        rel = str(ref).replace("\\", "/")
+        # 路径必须限定在 receipts/ 下（不只是一句「文件存在」）：绝对路径与 `..` 能把手伸到仓外
+        if rel.startswith("/") or ".." in rel.split("/") or not rel.startswith("receipts/"):
+            problems.append(f"{sha[:12]} frozen_receipt={rel!r} 不是 receipts/ 下的仓内相对路径")
+            continue
+        p = root / rel
         if not p.is_file():
-            problems.append(f"{sha[:12]} receipt: {ref} 不存在")
+            problems.append(f"{sha[:12]} receipt: {rel} 不存在")
             continue
         d = load(p)
         if d["sha"] != sha or d["tree"] != tree:
-            problems.append(f"{sha[:12]} 与 {ref} 的 sha/tree 不一致")
-        # 行里已经记着的 shape（冻结前后必须一致的那个签）必须等于回执里的 shape_after
-        shape_row, shape_rec = row.get("shape"), d["freeze"].get("shape_after")
-        if shape_row and shape_rec and shape_row != shape_rec:
-            problems.append(f"{sha[:12]} 行的 shape={shape_row} 但回执 shape_after={shape_rec}")
+            problems.append(f"{sha[:12]} 与 {rel} 的 sha/tree 不一致")
+        fz = d.get("freeze") or {}
+        # 三对账：跑前/跑后逐项相等（回执自己的用例也查一遍），且都等于行里记的值
+        for k in ("tree", "shape", "keys"):
+            before, after = fz.get(f"{k}_before"), fz.get(f"{k}_after")
+            if before != after:
+                problems.append(
+                    f"{sha[:12]} 回执 {rel} 的 freeze.{k}_before≠{k}_after ⇒ 冻结期间树动过")
+            if row.get(k) and before != row.get(k):
+                problems.append(f"{sha[:12]} 行的 {k}={row.get(k)} 但回执 {k}_before={before}")
+        if row.get("receipt") and fz.get("log") != row.get("receipt"):
+            problems.append(
+                f"{sha[:12]} 行写 receipt={row.get('receipt')!r}，"
+                f"但回执记的日志是 {fz.get('log')!r}"
+            )
         if sha not in by_sha:
             problems.append(f"{sha[:12]} 有 receipt 字段但那份回执不在 receipts/")
+    return problems
+
+
+def test_台账每一行与回执一致():
+    problems = reconcile_rows(rows(), ROOT)
     assert not problems, "台账与回执不一致：\n  " + "\n  ".join(problems)
+
+
+def test_对账检查器认得五类坏行(tmp_path: pathlib.Path):
+    """判据有牙：五类坏行喂给检查器，每一类都必须被指出；正对照（好行）必须一句不说。
+
+    为什么必须有这条：真台账用例只能报「没问题」，检查器被弱化时它照样绿。
+    没有这条，下面五类账的对账全部是「看起来在核」—— 本仓刚在沙箱注入上栽过同一个跟头
+    （变异装置的「原文不唯一 ⇒ SKIP」被当成通过）。
+    """
+    sha = "a" * 40
+    receipt_rel = f"receipts/{sha[:12]}.yaml"
+    (tmp_path / "receipts").mkdir()
+
+    def good_doc() -> dict:
+        return {
+            "sha": sha,
+            "tree": "b" * 40,
+            "freeze": {
+                "log": "freeze80z.log",
+                "tree_before": "b" * 40, "tree_after": "b" * 40, "tree_same": True,
+                "shape_before": "c" * 16, "shape_after": "c" * 16, "shape_same": True,
+                "keys_before": "d" * 16, "keys_after": "d" * 16, "keys_same": True,
+            },
+        }
+
+    def good_row() -> dict:
+        return {
+            "sha": sha, "tree": "b" * 40, "attestation": "git+frozen", "frozen_proof": "ci",
+            "frozen_receipt": receipt_rel, "shape": "c" * 16, "keys": "d" * 16,
+            "receipt": "freeze80z.log",
+        }
+
+    def check(doc: dict, row: dict) -> list[str]:
+        (tmp_path / receipt_rel).write_text(yaml.safe_dump(doc), encoding="utf-8")
+        return reconcile_rows([row], tmp_path)
+
+    assert check(good_doc(), good_row()) == [], "正对照：好行不该被挑出任何问题"
+
+    d = good_doc()
+    d["freeze"]["keys_before"] = d["freeze"]["keys_after"] = "e" * 16
+    assert check(d, good_row()), "keys 对不上（真正的树指纹）必须被指出来"
+
+    d = good_doc()
+    d["freeze"]["log"] = "freeze80Z.log"
+    assert check(d, good_row()), "仓外日志名大小写不一致必须被指出来（CI 在 Linux 上跑）"
+
+    d = good_doc()
+    d["freeze"]["tree_before"] = d["freeze"]["tree_after"] = "f" * 40
+    assert check(d, good_row()), "回执指向另一棵树必须被指出来"
+
+    d = good_doc()
+    d["freeze"]["keys_after"] = "0" * 16
+    assert check(d, good_row()), "跑前/跑后 keys 不相等（冻结期间树动过）必须被指出来"
+
+    row = good_row()
+    row["frozen_receipt"] = "../../etc/passwd"
+    # 只断言「不是空的」不够：仓外路径本来就不存在，去掉路径限定后仍会被「不存在」这句揩下去
+    # （变异装置实测：这一条曾 SURVIVED）。必须断言报出来的是**路径越狱**这个理由。
+    probs = check(good_doc(), row)
+    assert any("不是 receipts/ 下的仓内相对路径" in p for p in probs), (
+        f"回执路径越狱必须被当成越狱报出来（而不是含混的「不存在」），实得：{probs}")
+    row = good_row()
+    row["frozen_receipt"] = "receipts/../tests/DELIVERY_LEDGER.yaml"
+    probs = check(good_doc(), row)
+    assert any("不是 receipts/ 下的仓内相对路径" in p for p in probs), (
+        f"`..` 走到仓内其它文件也必须被当成越狱，实得：{probs}")
+
+    # git-only 行：正对照不能报（否则「git-only 也得有回执」这种回退不被发现），
+    # 而它要是自报 shape/keys/receipt（没回执就没有任何东西能证这四个数字）就必须报。
+    git_only = {"sha": sha, "tree": "b" * 40, "attestation": "git-only",
+                "frozen_proof": "none"}
+    assert check(good_doc(), git_only) == [], "正对照：干净的 git-only 行不该被挑出问题"
+    for field, value in (("frozen_receipt", receipt_rel), ("shape", "c" * 16),
+                         ("keys", "d" * 16), ("receipt", "freeze80z.log")):
+        dirty = dict(git_only, **{field: value})
+        assert check(good_doc(), dirty), f"git-only 行自报 {field} 必须被指出来（没回执也敢写）"
 
 
 def test_没有孤儿回执():

@@ -99,6 +99,31 @@ entries:
       run 37568118099（push：skipped，与 not_run_on 逐字一致；同一 run 里另外 6 个 job 全 success）——
       这条门已从「存在但从未运行」变成「跑过且通过」
 
+  - workflow: delivery-audit.yml
+    job: audit
+    gate: "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+    runs_on: [workflow_dispatch]
+    runs_on_note: >
+      这个 `if:` 是**把本 workflow 已有的两个事件写明**，不是为了排除谁：本 workflow 只在
+      `schedule` 与 `workflow_dispatch` 上触发（没有 push/PR）。但 `schedule` 的口径与 `ci.yml`
+      那条一致——cron 只从默认分支求值，而本文件还没进 master ⇒ 事实口径只有 `workflow_dispatch`，
+      而它在文件进默认分支之前**同样用不了**。所以第八十七批的实测走的是本地
+      （`python scripts/delivery_audit.py --branch dev`，结果见末尾 `triggers` 段那条 `never` 条目）。
+    not_run_on: [push, pull_request]
+    why: >
+      审计跑的是 GitHub API（取 tip 那次 push run 的逐 job 结论），不需要跟着谁的提交跑：
+      放 push/PR 上只会白跑 API，并在无关的 PR 上留红点。代价必须写明白：**它自己红不红，
+      取决于有没有人看 Actions 页**——而那正是它要消灭的状态，所以本批把它本身也纳入了台账
+      （触发器和门控两处签字，三次被现有守卫拦下才写全）。
+    run_it_now: gh workflow run delivery-audit.yml --ref master   # 前提：本文件已在默认分支上（见 runs_on_note）
+    added: 2026-10-16
+    evidence: >
+      **零 run**（文件还没进默认分支，所以 `schedule` 与 `dispatch` 都不可能发生过）。
+      本地实测（真 API，这是它当下唯一的证据）：`--branch dev` ⇒ 2 项红、RC=1
+      （`dev@5c0faa5` run 38781636407：整个 run 不绿 + `quality conclusion='failure'`）；
+      `--branch fix/batches-83-86` ⇒ 2 项红（run 38881109481）。
+      下一次回报的口径：`gh run list --workflow=delivery-audit.yml --limit 5` 不再是 0 条。
+
 # ─────────────────────────────────────────────────────────────────────────────
 # step 级门控（第七十批）：**run 结论看不见它们**，所以只能靠“登记 + 签字 + 回执”。
 #
@@ -161,23 +186,34 @@ triggers:
       那句错话的实质危害是——它会让人以为“签名链路现在每周自己验一次了”。
     expected_cadence_days: 7
     last_observed_fire: never
+    last_checked: 2026-10-15
+    first_possible_fire: 2026-10-19
     root_cause: >
-      `schedule` 只从**默认分支**的 workflow 文件求值。本仓默认分支是 `master`（HEAD `ad98639`，
-      2026-09-07 之后无提交），而 cron 写在工作分支 `dev` 的 `ci.yml` 里（`2760bd6` 2026-09-22 加入；
-      `dev` 已领先 `master` 122 提交）；`master` 上的 `ci.yml` 只有 `push: [master]` 与 `pull_request`，
-      **没有** `schedule:`。⇒ 这份 cron 永远不会被求值，而不是“这次没轮到”。
+      第八十五批订正（2026-10-15 实测）：**原来那句「永远不会被求值」已不成立，不要照着它动手。**
+      原判断基于 2026-10-08 的实测：当时默认分支 `master` 上的 `ci.yml` 只有 **561 字节**（`on: push: [master]`
+      + `pull_request`，steps 只有 ruff/mypy/pytest），cron 只存在于工作分支 `dev`（`2760bd6`，2026-09-22
+      加入），`dev` 领先 master **122** 个提交 ⇒ 那天它确实求值不到。
+      而 2026-10-12/13 的批次推送把 **dev 的整份 `ci.yml` 搬到了 master**（master tip = `17cd5e5c`，第82批 F2）：
+      默认分支现在那份是 **42880 字节 / 635 行**，含 `schedule: - cron: "0 3 * * 1"`（第 19-20 行）、
+      `mutation:` job（第 345 行）与分片 matrix（365-366）；`git rev-list --count origin/master..dev` = **4**（不再是 122）。
+      ⇒ **这条 cron 会被求值**：第一次机会就是 2026-10-19（周一）03:00 UTC。
+      这也说明「一个事件会不会发生」这类断言没有本地痕迹能推翻它——所以本层新增了 `first_possible_fire`：
+      声明「还没轮到」必须带一个日子，日子过了守卫就红（见 `tests/test_ci_job_gates.py::test_触发器台账的_never_不能越过第一次可能响的日子`）。
     unblock: >
-      两条路，都要**仓库所有者**决定（所以这条 trigger 现在带着 `review_by` 期限）：
-      (1) 把默认分支改成 `dev`（`gh repo edit --default-branch dev`）：本仓开发全在 `dev`、`master` 已停
-      122 个提交，改完 cron 立刻生效、且默认分支上的 workflow 就是最新版；代价是仓库首页/PR 基线/新克隆的
-      默认分支都变。
-      (2) 保持 `master` 为默认分支，把 `schedule:`（以及它要跑的 job）同步到 `master` 的 `ci.yml`：
-      代价是定时跑的是 `master` 的**旧代码**——等于体检一个月前的仓库。
-      两条路都没走之前，这条 trigger 的诚实状态就是“声明的、从未发生”。
+      原来的两条路（改默认分支为 `dev` / 手工把 `schedule:` 同步到 master）**都已经不需要了**：默认分支上
+      现在就是最新版 CI（只差 4 个提交，都是台账/文档层的改动），两个分支也无分叉。
+      第一次求值 = **2026-10-19（周一）03:00 UTC**。从那一刻起要盯的是两件**新**事：
+      (1) 它到底响没响（`gh run list --event schedule --limit 5`）——响过之后本条目要把 `last_observed_fire`
+      从 `never` 改掉，并把 `mutation` 的 `runs_on` 加回 `schedule`；
+      (2) **四个分片的 `min_score` 从未在 CI 上验过**（依据是 2026-09-29/30 的本机/容器实测基线）。
+      响了但分数不达标 = 变异门禁第一次运行就红，而本仓 CI 注释自己写着「没人等的门禁最后一定会被关掉」
+      ⇒ 那才是真风险，不是「它不会响」。
     how_to_verify: >-
-      gh run list --event schedule --limit 5 --json databaseId,conclusion,createdAt（空数组 ＝ 从未响过）
-      ；gh repo view --json defaultBranchRef --jq .defaultBranchRef.name（默认分支是否就是 cron 所在分支）
-    review_by: 2026-11-07
+      gh run list --event schedule --limit 5 --json databaseId,conclusion,createdAt（空数组 ⇒ 还没响过）
+      ；git grep -n "cron" origin/master -- .github/workflows/ci.yml（默认分支那份现在带 cron）
+      ；gh api "repos/kwny-io/warden-agent/contents/.github/workflows/ci.yml?ref=master"（看默认分支那份的
+      size 与内容：2026-10-08 是 561 字节的 9 月存根，2026-10-15 是 42880 字节的全量）
+    review_by: 2026-10-26
     added: 2026-09-22
     evidence: >
       2026-10-07 实测（全部命令可复现）：全仓 run 按事件分组 = {dynamic: 1, push: 66, workflow_dispatch: 2}
@@ -196,3 +232,52 @@ triggers:
       `gh run list --event workflow_dispatch --json databaseId,headBranch,conclusion` ⇒ 两次都在 `dev`
       （`37464309137` failure，两个根因已在第六十九批修掉 / `37540647177` success）
       ⇒ 手动入口**是通的**：机制上文件只需在默认分支上*存在*，内容取自被 dispatch 的 ref。
+      第八十五批复核（2026-10-15 实测，命令可复现）：
+      `gh api "repos/kwny-io/warden-agent/contents/.github/workflows/ci.yml?ref=master"` ⇒ **42880 字节 / 635 行**
+      （同一命令在 2026-10-08 是 **561 字节**），base64 还原后含 `schedule: - cron: "0 3 * * 1"`（19-20 行）、
+      `mutation:`（345）、`matrix: shard:`（365-366）、`scripts/mutation.sh --shard=`（388）
+      ⇒ **默认分支上的 CI 已经不是 9 月存根，也不是“落后版”**；
+      `git grep -n "event_name == 'schedule'" origin/master -- .github/workflows/ci.yml` ⇒ 命中（变异门还在，且只接受 schedule/dispatch）；
+      `git rev-list --count origin/master..dev` ⇒ **4**（2026-10-08 是 122）；
+      `gh run list --limit 60 --json event` 的事件分布 = {dynamic, push} ⇒ `schedule` 仍 0 次（本仓 2026-10-12 才起步，
+      第一次机会是 2026-10-19 ⇒ 这**不是**缺陷，只是还没轮到）。
+      另：本机 `git ls-remote origin` 这次失败（`schannel: server closed abruptly`），所以 master 的 sha 取自
+      更早一次成功的 ls-remote（`17cd5e5c…`）与 `gh api` 的内容复核。
+
+  - workflow: delivery-audit.yml
+    kind: schedule
+    cron: "0 6 * * *"
+    evaluated_from: 默认分支（master）
+    fires_jobs: [audit]
+    why: >
+      交付面红着 21 小时没人喊：`dev@5c0faa5`（2026-10-15T17:57 那次 push）起 `quality` 就红着
+      （台账缺 `HEAD^` 那一行），直到 2026-10-16 人肉才发现。三条机制叠在一起才能解释「为什么会漏」：
+      run 练≠交付链绿（`skipped` 长得像成功）、`gh run list` 的结论是 run 级而不是 job 级、
+      而「最近一次 completed run」还可能取到**别的提交、别的事件**（周一 03:00 那条 `schedule`）。
+      这条 cron 是目前唯一会**主动**把交付面的红说出来的东西（开/更新 issue，`issues: write`）。
+    expected_cadence_days: 1
+    last_observed_fire: never
+    last_checked: 2026-10-16
+    first_possible_fire: 2026-10-17
+    root_cause: >
+      它一次还没响过，而这不是缺陷而是还没轮到：`schedule` 只从**默认分支**求值，
+      而这个文件现在只在工作分支 `fix/batches-83-86`（PR #19 待合）。
+      同一个坑 `ci.yml` 那条周一定时在第七十五批吃过（当时 cron 只存在于 dev，master 上那份只有 561 字节）。
+      最早可能首响 = 本分支进 `master` 之后的第一个 06:00 UTC ⇒ 这里取「明天」当下界
+      （日子一过而它仍然 `never`，守卫就会红——这正是要的提醒）。
+      原先这里照抄了 `ci.yml` 那条的 2026-10-19：第 85 批那条变异锚点立刻因为「同一日期出现两次」
+      变成不可用，才把它戳出来——**照搬别人的日期，本身就是这条守卫要治的病**。
+    unblock: >
+      把 PR #19 合进 `dev`，再在下一次交付里跟到 `master`；到那时它会每天 06:00 UTC 自己跑。
+      代价（重要）：在那之前**连 `workflow_dispatch` 也用不了**——dispatch 同样要求文件已在默认分支上
+      ⇒ 想立刻验证只能本地跑（已实测：`python scripts/delivery_audit.py --branch <分支>`）。
+    how_to_verify: >
+      `gh run list --workflow=delivery-audit.yml --limit 5`（0 条 = 还没响过）；
+      再 `gh workflow list --all` 看它在不在默认分支上（不在就不可能响）。
+    review_by: 2026-11-16
+    added: 2026-10-16
+    evidence: >
+      2026-10-16 对本机工作树实跑（真 API，非模拟）：`--branch dev` ⇒ 2 项红
+      （`dev@5c0faa5` run 38781636407：整个 run 不绿 + `quality conclusion='failure'`）、RC=1；
+      `--branch fix/batches-83-86` ⇒ 2 项红（run 38881109481，就是那条 `核不动` 的形状步骤）。
+      ⇒ 正反两面都被真数据走过：它确实会在交付面红时喊，也会把红的**具体 job**说出来。
