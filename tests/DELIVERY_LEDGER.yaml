@@ -389,7 +389,22 @@ rows:
       **但这个提交在 GitHub 上是红的**：`dev` 的 run `38781636407` `conclusion=failure`（job `quality`
       红，红的就是台账那条「没有 HEAD^ 那一行」，CI 原文 `1 failed, 2059 passed, 2 skipped`）⇒
       它拿不出 `conclusion=success` 的证据（判据 3 会拒）⇒ 也在 `UNPROVEN_ALLOWED` 里。
-
+  - sha: 10738df39d1bb0a9758435bcae4934f1abc348f3
+    tree: 250a0231a40f03de00264552fc0a77d9769731b7
+    attestation: git-only
+    frozen_proof: none
+    shape:
+    keys:
+    run: 38943772832        # dev 上的 push run（event=push、head=本 sha）；run 级 conclusion=success，逐 job 核过 = 6 success + 2 skipped
+    note: >-
+      PR #19 的 squash 提交（2026-10-16T17:58:37Z，标题带 `(#19)`）＝第83~87批的合并落地：
+      它取代了 `ab8160e`（第88批：交付节奏进文档）/`5c0faa5`（探针订正）/`7cf9b9f`（探针入库）三个提交，
+      前者的内容完整落在这棵树里（`docs/operations.md` 的「交付节奏」节 + `scripts/mutant_check.py` 的「期间别读仓库」）。
+      **本条是 `git-only`，代价如实说**：只有 sha/tree 与 dev 的绿 run 可核；没有回执 ⇒ 没有 shape/keys 两端对账，
+      也不写任何自报数字。`master` 当时仍停在 `17cd5e5`（FF 前提成立：`git merge-base --is-ancestor origin/master <本 sha>` ✓；
+      差的 4 个提交＝本 sha 与那三个探针提交），所以它在 master 上还没有 run ⇒ 不写 `ci_evidence`
+      （口径：那份证据要 dev 与 master 两条 push run 都指向同一个 sha）。
+      下一个落在 `dev` 上的交付提交要背的就是这一行。
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。

@@ -186,7 +186,7 @@ triggers:
       那句错话的实质危害是——它会让人以为“签名链路现在每周自己验一次了”。
     expected_cadence_days: 7
     last_observed_fire: never
-    last_checked: 2026-10-15
+    last_checked: 2026-10-17
     first_possible_fire: 2026-10-19
     root_cause: >
       第八十五批订正（2026-10-15 实测）：**原来那句「永远不会被求值」已不成立，不要照着它动手。**
@@ -257,18 +257,23 @@ triggers:
       这条 cron 是目前唯一会**主动**把交付面的红说出来的东西（开/更新 issue，`issues: write`）。
     expected_cadence_days: 1
     last_observed_fire: never
-    last_checked: 2026-10-16
-    first_possible_fire: 2026-10-17
+    last_checked: 2026-10-17
+    first_possible_fire: 2026-10-18
     root_cause: >
-      它一次还没响过，而这不是缺陷而是还没轮到：`schedule` 只从**默认分支**求值，
-      而这个文件现在只在工作分支 `fix/batches-83-86`（PR #19 待合）。
-      同一个坑 `ci.yml` 那条周一定时在第七十五批吃过（当时 cron 只存在于 dev，master 上那份只有 561 字节）。
-      最早可能首响 = 本分支进 `master` 之后的第一个 06:00 UTC ⇒ 这里取「明天」当下界
-      （日子一过而它仍然 `never`，守卫就会红——这正是要的提醒）。
-      原先这里照抄了 `ci.yml` 那条的 2026-10-19：第 85 批那条变异锚点立刻因为「同一日期出现两次」
-      变成不可用，才把它戳出来——**照搬别人的日期，本身就是这条守卫要治的病**。
+      2026-10-17 实测：**它一次都没响过，而且现在仍然响不了**——决定性证据是「默认分支上注册了哪些 workflow」：
+      `gh api repos/kwny-io/warden-agent/actions/workflows` 只有 3 条（`ci.yml` + Dependabot ×2），
+      `gh api repos/kwny-io/warden-agent/contents/.github/workflows?ref=master` 只有 `ci.yml`，
+      `gh run list --event schedule` **0 条**。`schedule` 只从默认分支（`master`）求值
+      ⇒ 文件不在 `master` 上，这条 cron 连注册都没有。
+      上一批写的 `first_possible_fire=2026-10-17` 是**过期判断**：当时这个文件只在 `fix/batches-83-86`（PR #19 待合）。
+      现在 PR #19 已合进 `dev`（squash 提交 `10738df`，2026-10-16T17:58:37Z），但 `master` 仍停在 `17cd5e5`
+      （落后的 4 个提交＝合并提交与那三个探针提交）⇒ 首响条件改成「`master` 前进之后的第一个 06:00 UTC」，
+      这里取下界 2026-10-18。
+      ⚠️ **别靠改日期了事**：日子只是提醒。真正的 unblock 是让 `master` 前进，而这一步同时是台账口径的硬前提
+      （每一行的绿 run 必须同时来自 `dev` 与 `master` 两条 push run，例外清单 `UNPROVEN_ALLOWED` 冻结在三条、只许减不许增）。
     unblock: >
-      把 PR #19 合进 `dev`，再在下一次交付里跟到 `master`；到那时它会每天 06:00 UTC 自己跑。
+      PR #19 已合进 `dev`（2026-10-16T17:58:37Z，squash 提交 `10738df`）。剩下的一步是让 `master` 前进到含本文件的提交——
+      这一步同时也是台账的硬前提（见 `root_cause`）。到那时它会每天 06:00 UTC 自己跑。
       代价（重要）：在那之前**连 `workflow_dispatch` 也用不了**——dispatch 同样要求文件已在默认分支上
       ⇒ 想立刻验证只能本地跑（已实测：`python scripts/delivery_audit.py --branch <分支>`）。
     how_to_verify: >
@@ -281,3 +286,6 @@ triggers:
       （`dev@5c0faa5` run 38781636407：整个 run 不绿 + `quality conclusion='failure'`）、RC=1；
       `--branch fix/batches-83-86` ⇒ 2 项红（run 38881109481，就是那条 `核不动` 的形状步骤）。
       ⇒ 正反两面都被真数据走过：它确实会在交付面红时喊，也会把红的**具体 job**说出来。
+      2026-10-17 复核「还没轮到」这个说法：默认分支上注册的 workflow 只有 3 条（`ci.yml` + Dependabot ×2），
+      `master` 的 `.github/workflows/` 里只有 `ci.yml`，`gh run list --event schedule` 0 条
+      ⇒ 当时它确实不可能响，且原因不在 cron 本身而在「文件不在默认分支上」。

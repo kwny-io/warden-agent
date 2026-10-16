@@ -3,6 +3,35 @@
 > 本文件按**时间戳**记录每次提交改动的内容,以及**尚未实现**的待办(未实现/路线图)。
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
+## 2026-10-17（第八十八批：账要有人背 —— 合并提交的那一行，以及一条「响不了」被实测钉住）
+
+> 2026-10-16T17:58:37Z，PR #19 以 squash 形式合进 `dev`（提交 `10738df`，树 `250a0231`），
+> 台账里因此欠下一行。这一批就是把这笔账写清，并用**今天的实测**订正一条「还没轮到」的断言。
+
+1. **台账记入 `10738df` 的行**（`attestation: git-only`）：`run: 38943772832` —— dev 上的 push run，
+   run 级 `conclusion=success`，逐 job 核过 = 6 success + 2 skipped。它是 PR #19 的 squash 提交，
+   取代了 `ab8160e`（第88批：交付节奏进文档）/ `5c0faa5`（探针订正）/ `7cf9b9f`（探针入库），
+   前者的内容完整落在这棵树里。**没写回执 ⇒ 没有任何自报数字、没有 shape/keys 两端对账**，
+   代价如实记在该行的 `note` 里。`master` 当时仍停在 `17cd5e5` ⇒ 它在 master 上还没有 run，
+   所以也不写 `ci_evidence`（那份证据要 dev 与 master 两条 push run 都指向同一个 sha）。
+2. **`delivery-audit.yml` 的触发器台账按实测订正**：上一批写的 `first_possible_fire=2026-10-17` 是过期判断
+   （当时文件只在待合的分支上）。今天查清了两件事：`schedule` 只从**默认分支**求值；而默认分支 `master` 上
+   **注册的 workflow 只有 `ci.yml`**（`gh api repos/kwny-io/warden-agent/actions/workflows` 只回 3 条 =
+   CI + Dependabot ×2，`gh api repos/kwny-io/warden-agent/contents/.github/workflows?ref=master` 只有 `ci.yml`），
+   `gh run list --event schedule` **0 条** ⇒ 它连注册都没有、一次都不可能响。
+   首响条件改成「`master` 前进之后的第一个 06:00 UTC」，并把「**别靠改日期了事**」写进 `root_cause`。
+3. **`ci.yml` 那条周一定时（变异分片）复核通过**：CI workflow 在默认分支上处于 `active`，
+   cron 就在 master 的那份 `ci.yml` 里 ⇒ 首响仍是 2026-10-19（周一）03:00 UTC（`last_checked` 刷到今天）。
+4. **顺带把一条口径写实**：台账行的绿 run 必须**同时**来自 `dev` 与 `master` 两条 push run，
+   而例外清单 `UNPROVEN_ALLOWED` 冻结在三条、只许减不许增 ⇒ **推进 `master` 不是可选项**，
+   它是「这个交付的账能结」的硬前提。这条已写进触发器台账的 `unblock` 字段。
+5. **本批自己的行也要有人背**：下一个落在 `dev` 上的交付提交必须携带本提交的行——同一枚硬币的另一面。
+
+未实现/路线图（承前）：交付证据的**生产端**（冻结脚本、变异矩阵驱动、回执生成、单写者锁、守护进程共五件、
+上千行）仍住在仓库外 `C:/Users/g1534/wa82/`，仓内零实现。这五件一丢，台账就**再也加不了行**
+（孤儿回执会直接判红），而且会有人开始手写回执。待裁决：最小生产链入库并参数化 / 只把风险与备份写进仓 /
+只入库回执生成器与单写者锁。
+
 ## 2026-10-16（第八十七批：交付面红着 21 小时没人喊 —— 让「红」自己会喊）
 
 > 第八十五批推上 `dev` 的 `5c0faa5`（2026-10-15T17:57 那次 push）起，`dev` 的 `quality` 就红着
