@@ -56,7 +56,7 @@ jobs:
     steps:
       # 第三方 action 一律钉到**不可变的 commit SHA**（tag 可被移动，SHA 不会），
       # 行尾注释给出对应版本，便于人工升级时知道钉的是哪一版。
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # `fetch-depth: 0`（**不是默认的 1**）：本 job 跑 `tests/test_delivery_ledger.py`，
           # 它要用 `git rev-parse <sha>^{tree}` 去核交付台账（`tests/DELIVERY_LEDGER.yaml`）里的
@@ -265,7 +265,7 @@ jobs:
     # 它此前真的抓到过 bug：依赖用未加引号的 $(...) 展开，被 pywin32 的环境标记（含空格）
     # 切出一个 `==` 依赖名，pip 直接失败——镜像一直构建不出来而无人知晓。
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: 容器构建冒烟（build + run + 健康探针 + 鉴权 fail-closed）
         run: bash scripts/container_smoke.sh warden-agent:ci
       - name: 校验 Prometheus 规则语法（promtool）
@@ -299,7 +299,7 @@ jobs:
     # 为什么单独一个 job、而不是塞进 quality：它跟"代码质量"是两条独立的信号
     # （代码全绿但依赖爆了 CVE 是完全可能的），分开跑能让红的是哪一类一眼看清。
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
         with:
           python-version: "3.12"
@@ -401,7 +401,7 @@ jobs:
     # push / PR 上跳过，只在定时（每周一 03:00 UTC）和手动触发时跑。
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
         with:
           python-version: "3.12"
@@ -449,7 +449,7 @@ jobs:
       WARDEN_TEST_PG_USER: postgres
       WARDEN_TEST_PG_PASSWORD: ""
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
         with:
           python-version: "3.12"
@@ -470,7 +470,7 @@ jobs:
     # 它让"某天爆出一个新 CVE、我受不受影响"变成一次本地查询，而不是重建镜像再扫。
     # 扫的是**真镜像**（不是源码树）：交付出去的是镜像，OS 层的包只有镜像里才有。
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: 构建镜像（SBOM 的扫描对象就是交付镜像本身）
         # 与 container job 的构建重复是有意的：SBOM 必须描述"按当前源码构建出的那个镜像"，
         # 不能描述一个可能过期的缓存产物。将来 publish 步骤落地后，
@@ -499,7 +499,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
         with:
           python-version: "3.12"
@@ -585,7 +585,7 @@ jobs:
       # 手动入口的入参在 workflow 层声明为 required，所以这里不会是空值。
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: 发布 tag 合法性（fail-closed）
         # 分支名或任意字符串不能被当成发布版本：容器 tag 与签名身份都以它为锚，
         # 事后审计"这一版是什么"必须一眼可读。
