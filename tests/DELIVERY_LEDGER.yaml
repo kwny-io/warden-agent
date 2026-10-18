@@ -421,7 +421,7 @@ rows:
       本行之所以没有 `ci_evidence`：**master 上从来没有这个 sha 的 run**（master 当时已前进到
       `10738df`，本 sha 只在 dev 上），而口径要求 dev 与 master 两条 push run 指向同一个 sha ⇒
       这个提交结构上不可能有证据。所以修法只能是「下一个交付提交把它修绿并背它的账」，不是补证据。
-    fixed_by: 未修             # 下一个交付提交落了地，就要改成那个提交的 sha（否则判据红）
+    fixed_by: c299ef6d3c6f0ddbe17804d0a2dc6defc89b67c3   # 第97 批结清：下一个交付提交落了地
     review_by: 2026-10-24      # 红账也是洞：没期限的洞就是永久的洞（其它空洞一律要期限，这里不例外）
     note: >-
       第八十八批的落地提交（账要有人背）。它自己是红的，原因见 `red_why`；结论不变：
@@ -429,6 +429,35 @@ rows:
       规则写在 `tests/test_ci_evidence.py::test_切点之后每一行都必须带_ci_证据` 的 `verdict: red` 分支：
       red 行不许带证据、不许带回执，`fixed_by` 必须由**下一个交付提交**结清
       （`未修` 只允许它是台账最后一行）。
+
+
+# 第九十七批：回执不再由人抄数字——由脚本跑全套并从产物取数（作者不写数字）。
+# 它是 c299ef6 的唯一子提交，因此也就是那一行的“背书人”。
+  - sha: c299ef6d3c6f0ddbe17804d0a2dc6defc89b67c3
+    tree: e51e53d34c7fda34c08e81072e0a31cd1ae2529c
+    attestation: git+frozen
+    frozen_proof: ci
+    frozen_receipt: receipts/c299ef6d3c6f.yaml
+    receipt: freeze-c299ef6d3c6f.log
+    shape: 1235dee8252522c6
+    keys: 97bedc17bd252a50
+    run: 39158300154        # dev 的 push run；同 sha 的 master 绿 run = 39159913460
+    ci_evidence: evidence/ci/c299ef6d3c6f.json
+    note: >-
+      第89～96 批的落地提交（八批合一）。本条接走 f6bcd5026dd5：它那两条 quality 红分别由
+      「日期只用 UTC」那一批和「10738df 的 evidence 落库」结清（见它自己的 red_why）。
+      本条之所以能写出来，是因为回执第一次是**机器算的**：
+      `scripts/freeze_receipt.py --run` 自己跑全套、自己取 junit、自己算 tree/shape/keys 三对账、
+      自己把日志 sha256 写进回执——作者不写任何一个数字，所以它对“事后补写”免疫。
+      实测：2198 收集 / 2154 passed + 44 skipped / 0 failures / 覆盖 **87.16%**（门槛 86）；
+      三对账 tree/shape/keys 冻结前后逐项一致（tree e51e53d34c7fda34c08e81072e0a31cd1ae2529c）。
+      回执如实写了 `workspace_untracked: [scripts/freeze_receipt.py, tests/test_freeze_receipt.py]`
+      ——冻结时这两个文件还没入 git，而不是静默放过（否则报的就不是这棵树的书）。
+      **同 sha 的红 run 点名**：master 上还有一条 run `39158319866`（红），原因是我把 master
+      从 10738df 一次性快进到本 sha，带了 2 个提交（f6bcd50 + c299ef6），而 GitHub 只为 push 的
+      tip 建 run ⇒ 中间那条永远拿不到 head_sha == 自己的 run。按台账里 10738df 那行的先例补救：
+      退到中间提交（run 39159904481）再单步重推（run 39159913460 绿）。
+      那条红不是用过就删的——它留在 `evidence/ci/c299ef6d3c6f.json` 的 `runs` 里，本条点名。
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
