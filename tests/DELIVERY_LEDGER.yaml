@@ -435,12 +435,13 @@ rows:
 # 它是 c299ef6 的唯一子提交，因此也就是那一行的“背书人”。
   - sha: c299ef6d3c6f0ddbe17804d0a2dc6defc89b67c3
     tree: e51e53d34c7fda34c08e81072e0a31cd1ae2529c
-    attestation: git+frozen
-    frozen_proof: ci
-    frozen_receipt: receipts/c299ef6d3c6f.yaml
-    receipt: freeze-c299ef6d3c6f.log
-    shape: 1235dee8252522c6
-    keys: 97bedc17bd252a50
+    attestation: git-only
+    frozen_proof: none
+    # 冻结与回执确实跑过（receipts/c299ef6d3c6f.yaml 未被删在仓外），但那份回执**缺矩阵证据**，
+    # 而「回执与证据必须同车」意味着现在补一份已经来不及（回执由 cafc6d9 带进来）⇒ 回执不许回填
+    # ⇒ 本条不主张冻结回执，只主张 CI 证据（见 ci_evidence）。回执机制与矩阵的接续在第98 批。
+    shape:
+    keys:
     run: 39158300154        # dev 的 push run；同 sha 的 master 绿 run = 39159913460
     ci_evidence: evidence/ci/c299ef6d3c6f.json
     note: >-
@@ -458,6 +459,29 @@ rows:
       tip 建 run ⇒ 中间那条永远拿不到 head_sha == 自己的 run。按台账里 10738df 那行的先例补救：
       退到中间提交（run 39159904481）再单步重推（run 39159913460 绿）。
       那条红不是用过就删的——它留在 `evidence/ci/c299ef6d3c6f.json` 的 `runs` 里，本条点名。
+
+
+# 第九十七批的落地树（cafc6d9）自己的一行：它红了两次，账在这里结。
+  - sha: cafc6d9d8ddc5ed714d1e84220278b87abf2eef0
+    tree: 2aef92cfa0cadd30d80ae05859354b16d883c8c4
+    attestation: git-only
+    frozen_proof: none
+    run: 39164557787        # dev 上的 push run（红）；同 sha 的 master run = 39164560158（也红）
+    verdict: red
+    red_why: >-
+      两条 CI 红，都是判据在尽职责：
+      ① `tests/test_matrix_evidence.py`：切点之后的回执必须带矩阵证据（仓内
+      `evidence/matrix/<sha12>.log` + `positive`/`negative`/`matched` 与表里非 SKIP 行数对等），
+      而 c299ef6 那份回执只有 pytest 的数字 ⇒「守卫有牙」在它身上退化成自说自话；
+      ② security job 的 gitleaks 假阳：测试夹具的字典键写法（`"keys_before": "0123…"`）与
+      函数 kwarg 写法（`receipt(keys_after="fedc…")`）都绕过了第八十一批「按字段名锚定」的旧正则。
+      修法：c299ef6 那行降为 `git-only`（回执不许回填，保住它真有的那一层：dev+master 两条同 sha
+      的 run）；gitleaks 锚点收紧为「可选引号 + 冒号或等号 + 可选引号」，仍不放宽路径。
+      补救过程中我自己又踩了第三下：修复提交 4c462de 没有携带父提交的台账行 ⇒ 推前形状守卫判红
+      （run 39168984711），那个提交因此在 `dev` 上被强制替换掉（未取证、不算交付）；
+      它那条红 run 不删、在此点名。
+    fixed_by: 未修          # 修复提交的 sha 要等它自己落地后才知道 ⇒ 下一个提交回来改这一行
+    review_by: 2026-10-25  # 红账要有期限：到期必须要么结清、要么续期并重写理由
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。

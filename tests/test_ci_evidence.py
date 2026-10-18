@@ -163,6 +163,10 @@ UNPROVEN_MAX = 3
 # 就等于允许「下一个提交把它修绿」永久往后推，交付面会变成一串红账。上限 1 ⇒ 红账是「在途」，
 # 不是「常态」。
 RED_MAX = 1
+# 第九十八批补：上限只管**在途**的红账。已被后续提交结清的红账（`fixed_by` 指向真提交，且
+# 那个提交把这一行接走了）是历史记录，不再占额度——否则上限的实际含义会变成
+# 「本仓历史上只允许红一次」，与「红要记在账上」自相矛盾（第九十七批就撞上了这个矛盾：
+# `f6bcd50` 的红已由 `c299ef6` 结清，却还占着唯一的名额）。
 
 
 def unproven_violations(
@@ -259,7 +263,11 @@ def unproven_violations(
             f"例外清单涨到 {len(allowed)} 条（上限 {max_entries}）⇒ 只许减不许增："
             f"新增等于让「切点之后必须有证据」失效"
         )
-    reds = [e for e in entries if e.get("verdict") == "red"]
+    reds = [
+        e
+        for e in entries
+        if e.get("verdict") == "red" and str(e.get("fixed_by") or "") in ("", "未修")
+    ]
     if len(reds) > RED_MAX:
         out.append(
             f"同一时刻最多 {RED_MAX} 行红账，现在 {len(reds)} 行 ⇒ 红账成了常态："
@@ -673,3 +681,26 @@ def test_牙_红账成常态_必须被点名():
     bad = unproven_violations(rows, after_cut={r["sha"] for r in rows}, allowed={},
                               max_entries=3)
     assert bad and any("红账成了常态" in i for i in bad), bad
+
+
+def test_牙_已结清的红账不占额度_但在途的仍然占():
+    """上限的语义是「在途的红账最多一行」。
+
+    两个方向都要锁：
+    ① 一行红账已结清（`fixed_by` 是真提交、且那个提交把它接走了）+ 一行在途 ⇒ **不**该报「常态」；
+    ② 两行都在途 ⇒ 必须报（防止有人靠把 `fixed_by` 写成一串 40 个 0 来蹭这条宽松）。
+    """
+    a, b, fix = "a" * 40, "b" * 40, "f" * 40
+    closed = _entry(a, verdict="red", red_why="x", fixed_by=fix, is_last=False,
+                    fixed_by_exists=True, fixed_by_carries_row=True)
+    fix_row = _entry(fix, ev=True, is_last=False)
+    open_one = _entry(b, verdict="red", red_why="x", fixed_by="未修", is_last=True)
+    ok = unproven_violations([closed, fix_row, open_one], after_cut={a, b}, allowed={},
+                             max_entries=3)
+    assert not any("红账成了常态" in i for i in ok), ok
+
+    # 反向对照：两行都在途 ⇒ 仍然要红（否则「不占额度」就成了绕过上限的后门）
+    open_two = _entry(a, verdict="red", red_why="x", fixed_by="未修", is_last=False)
+    bad = unproven_violations([open_two, open_one], after_cut={a, b}, allowed={},
+                              max_entries=3)
+    assert any("红账成了常态" in i for i in bad), bad
