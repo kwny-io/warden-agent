@@ -53,6 +53,19 @@ from typing import Any
 import pytest
 import yaml
 
+
+def _utc_today() -> datetime.date:
+    """判据里的「今天」一律取 **UTC** 日期，不取本机日期。
+
+    为什么：CI（GitHub 的 runner）与 workflow 的 cron 都按 UTC 算，而这台开发机在 UTC+8
+    ⇒ 取本机日期会让**同一个提交在本地绿、在 CI 红**。2026-10-17 实测：本地已是 10-17、
+    UTC 还是 10-16，台账里写 10-17 的那一行在 CI 上被判成「在未来」而红（第八十九批现场：
+    修 master 推送那三次红里，有两次就是这一条）。
+
+    口径：台账 `last_checked` / `first_possible_fire` 也按这个 UTC 口径写。
+    """
+    return datetime.datetime.now(datetime.UTC).date()
+
 REPO = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO / ".github" / "workflows"
 LEDGER = REPO / "tests" / "CI_JOB_GATES.yaml"
@@ -452,7 +465,7 @@ def test_触发器台账的复核期限没过期() -> None:
     这是**故意**与日历耦合的判据：一个从未响过的触发器没有别的强制力，
     只有期限能让它不能“安静地一直是假的”。
     """
-    today = datetime.date.today()
+    today = _utc_today()
     bad: list[str] = []
     for entry in _trigger_ledger():
         where = f"{entry.get('workflow')}:{entry.get('kind')}:{entry.get('cron')}"
@@ -528,8 +541,41 @@ def _trigger_rot(entries: list[dict[str, Any]], today: datetime.date) -> list[st
 
 def test_触发器台账的_never_不能越过第一次可能响的日子() -> None:
     """`never` 必须是有期限的断言，不能无限期地说「还没轮到」（现场见 `_trigger_rot` 说明）。"""
-    problems = _trigger_rot(_trigger_ledger(), datetime.date.today())
+    problems = _trigger_rot(_trigger_ledger(), _utc_today())
     assert not problems, "\n".join(problems)
+
+
+#: 允许取本机日期的位置（空 = 一处都不许）。与 `tests/SKIP_LEDGER.yaml` 同一个哲学：
+#: 要留一个洞，必须在这里写清「为什么本机日期在这一处是对的」，而不是悄悄多出一处。
+LOCAL_DATE_ALLOWED: dict[str, str] = {}
+
+
+def test_判据与脚本里的今天必须按UTC取() -> None:
+    """判据/脚本里的「今天」一律 UTC：取本机日期会让**同一提交在本地绿、在 CI 红**。
+
+    为什么扫全仓而不只扫本文件：这个坑在 2026-10-17 一天内出现两处 ——
+    触发器腐烂判据（本文件）与镜像过期天数（`scripts/check_pinned_images.py`），
+    而两处在本机都「看起来完全正常」：只有 CI（UTC）与开发机（UTC+8）对不上时才暴露
+    （实测：本地 10-17 / UTC 10-16，台账写 10-17 的那一行在 CI 上被判成「在未来」而红）。
+
+    怎么证明有牙：把任一处换回取本机日期，这条立刻红；`LOCAL_DATE_ALLOWED` 里多一个文件也红。
+    """
+    needle = "date." + "today()"  # 拼出来，免得这条判据命中自己的源码
+    root = Path(__file__).resolve().parents[1]
+    hits: list[str] = []
+    for base in ("tests", "scripts"):
+        for p in sorted((root / base).rglob("*.py")):
+            rel = p.relative_to(root).as_posix()
+            if rel in LOCAL_DATE_ALLOWED:
+                continue
+            if needle in p.read_text(encoding="utf-8"):
+                hits.append(rel)
+    assert not hits, (
+        f"这些文件取本机日期：{hits} ⇒ 判据的「今天」跟着开发机时区走，"
+        "而 CI 与 workflow 的 cron 按 UTC：同一个提交会有两种真值。"
+        "（要用 UTC 就写 `datetime.now(timezone.utc).date()`；真要取本机日期，"
+        "就在 `LOCAL_DATE_ALLOWED` 里写清为什么。）"
+    )
 
 
 def test_牙_触发器腐烂判据四条都得有牙() -> None:

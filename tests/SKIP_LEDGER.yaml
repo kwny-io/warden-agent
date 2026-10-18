@@ -49,13 +49,6 @@ entries:
       本机没预热镜像时跳过是合理的；但 **CI 里不许跳**——
       `.github/workflows/ci.yml` 在 Pytest 之前有一步「预热规则求值镜像」专门拉它。
       如果那一步被删掉，这条守卫会在 CI 里红：那正是它要拦的事（这条回归在门禁里变空）。
-  - id: tests/test_web.py::test_t10_react_spa_服务和资源
-    allowed_in: [local]
-    added: 2026-10-05
-    reason: >
-      后端 SPA 服务要 `web/dist`（构建产物、不入库）。本地没构建时跳过；CI 里前端门禁
-      那一步会 `npm run build` 产出它（那一步的注释里就写着「让 tests/test_web.py::test_t10
-      能真跑」）⇒ CI 不许跳。
   - id: tests/test_backup_retention.py::test_pg备份端到端_产物可校验
     allowed_in: [local]
     added: 2026-10-05

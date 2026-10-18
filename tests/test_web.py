@@ -3,7 +3,6 @@
 FastAPI 应用是标准的，用 httpx.AsyncClient + ASGITransport 驱动（测试专用，
 不真开端口）。用 pytest-asyncio 跑异步测试。
 """
-import os
 import tempfile
 from pathlib import Path
 
@@ -277,17 +276,26 @@ async def test_chat_stream_返回SSE事件流() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t10_react_spa_服务和资源() -> None:
-    """/ 应返回 React 构建产物 index.html（含 root 挂载点 + 绝对路径 /assets），
+async def test_t10_react_spa_服务和资源(tmp_path, monkeypatch) -> None:
+    """/ 应返回 SPA 构建产物 index.html（含 root 挂载点 + 绝对路径 /assets），
     且 /assets 下的静态资源能被同源加载（单端口部署）。
 
-    web/dist 是构建产物（不入库）：缺失时跳过（与 Postgres/MCP 集成测试的
-    环境约定一致）；执行 `cd web && npm install && npm run build` 后可测。
+    **产物自己造**（跟同文件下面那条「开启鉴权时 SPA 外壳仍可匿名加载」一致）：`web/dist`
+    是构建产物、不入库，直接读它会让这条判据在冻结树/裸 clone 上**跳过**（= 报告里长得像成功），
+    或者红在「环境没产物」上。这里要验的是**服务契约**：index.html 经 `/` 返回、
+    它引用的 `/assets/*` 同源可取。**真实**构建产物的完整性归前端门禁（`npm run build`）
+    与真浏览器 e2e（`web/e2e/`）管——那才是真正需要产物的地方。
     """
-    dist_dir = os.environ.get("WARDEN_WEB_DIST") or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
-    if not os.path.isfile(os.path.join(dist_dir, "index.html")):
-        pytest.skip("React 前端未构建（web/dist 缺失），SPA 服务测试跳过")
+    dist_dir = tmp_path / "dist"
+    (dist_dir / "assets").mkdir(parents=True)
+    (dist_dir / "index.html").write_text(
+        '<!doctype html><html><body><div id="root"></div>'
+        '<script type="module" src="/assets/index-abc123.js"></script></body></html>',
+        encoding="utf-8",
+    )
+    (dist_dir / "assets" / "index-abc123.js").write_text(
+        "console.log('react')\n", encoding="utf-8")
+    monkeypatch.setenv("WARDEN_WEB_DIST", str(dist_dir))
     client = await _client_with(
         [ChatResponse(content="ok", finish_reason="stop")], PolicyEngine())
     resp = await client.get("/")

@@ -325,6 +325,44 @@ def ensure_listen_is_safe(host: str, auth_mode: str) -> None:
         )
 
 
+class SharedStateRefusedError(RuntimeError):
+    """单副本存储（SQLite）配上了多副本协调开关。"""
+
+
+def ensure_shared_state_matches_backend(store: object, env: Mapping[str, str]) -> None:
+    """`WARDEN_SHARED_STATE=1` + SQLite ⇒ 拒绝启动（fail-closed）。
+
+    这条约束**文档里早就有**（`docs/deployment-boundaries.md:101`、`deploy/k8s/README.md:16`：
+    “SQLite 是单机文件，跨主机共享文件系统跑多副本不受支持——多副本请用 PostgreSQL”），
+    但代码从不拦。于是它属于最难查的一类配置事故：**文档禁止、代码放行、运行时几乎正常**。
+
+    打开 `WARDEN_SHARED_STATE` 后，`coordination_for` 发现 store 具备
+    `get_idempotent / append_event / hit_rate_limit` 就会把协调状态老老实实放进 sqlite，
+    看起来“全都配对了”。但其中两个能力在跨进程时是错的：
+
+      1. ``SqliteStore.hit_rate_limit`` 是“先 SELECT 再 UPSERT”的读-改-写（只靠进程内锁），
+         两个进程共用一个文件时**限流计数会丢** ⇒ 额度静默变宽，无报错、无指标；
+      2. 写竞争会让 sqlite 抛 ``database is locked`` ⇒ 表现为随机 500，不是可解释的失败。
+
+    为什么宁可起不来：换成 PostgreSQL 是一次部署配置改动（运维 5 分钟能做），
+    而“限流比配置的宽”在发现之前一直是个**没人会去查**的静默缺口。
+    """
+    from warden_agent.store.sqlite import SqliteStore
+
+    if not env_bool("WARDEN_SHARED_STATE", False, env):
+        return
+    if not isinstance(store, SqliteStore):
+        return
+    raise SharedStateRefusedError(
+        "WARDEN_SHARED_STATE=1（多副本协调状态）配的是 SQLite —— 拒绝启动（fail-closed）。\n"
+        "SQLite 是单机文件，多副本下限流计数会静默丢失、写竞争会随机报 database is locked；"
+        "这两件都不会自己宣告。\n"
+        "二选一：\n"
+        "  · 真要多副本：设 WARDEN_PG_HOST 改用 PostgreSQL（审计与记忆仍各自一份，见运维手册）；\n"
+        "  · 确实单副本：去掉 WARDEN_SHARED_STATE（进程内实现更快，且不需要它）。"
+    )
+
+
 class DemoModelRefusedError(RuntimeError):
     """非本机开发场景却要拿假模型对外服务。"""
 
@@ -574,6 +612,15 @@ def main() -> None:
         )
     # 生效配置全量清单（敏感值已打码），排查问题时开 DEBUG 即可看到
     logger.debug("生效配置：\n%s", "\n".join(describe(os.environ)))
+
+    # 存储组合校验（fail-fast）：`WARDEN_SHARED_STATE=1` + SQLite 是文档里明令禁止、
+    # 代码里却放行的组合（限流计数跨进程会静默丢）。放在鉴权校验之前：
+    # 这是“部署形状本身就错了”，比“谁能进来”更早一层。
+    try:
+        ensure_shared_state_matches_backend(store, os.environ)
+    except SharedStateRefusedError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
 
     # 鉴权（fail-closed）。监听地址与鉴权要一起决定：对外监听却不鉴权 = 直接拒绝启动。
     host = env_str("WARDEN_HOST", "127.0.0.1")

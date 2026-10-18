@@ -363,3 +363,30 @@ def test_main_拼错的变量会告警_且告警指的路真能走通(
 
     created["store"].close()
     created["memory_repository"].close()
+
+
+# ---------------------------------------------------------------------------
+# 单机存储 × 多副本开关：文档禁止的组合必须起不来
+# ---------------------------------------------------------------------------
+
+
+def test_main_sqlite配多副本开关_拒绝启动(tmp_path: Path, monkeypatch) -> None:
+    """真入口也拦得住——单测绿而入口没接线，是最常见的"守卫不接线"缺口。"""
+    _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setenv("WARDEN_SHARED_STATE", "1")
+
+    with pytest.raises(SystemExit) as e:
+        run_server.main()
+    assert e.value.code == 2
+
+
+def test_main_单副本时sqlite照常启动(tmp_path: Path, monkeypatch) -> None:
+    """反向对照：不许因为新守卫把最常用的部署方式挡在门外。"""
+    captured, created = _patch_common(monkeypatch, tmp_path)
+    monkeypatch.delenv("WARDEN_SHARED_STATE", raising=False)
+
+    run_server.main()
+
+    assert "app" in captured
+    created["store"].close()
+    created["memory_repository"].close()

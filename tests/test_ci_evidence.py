@@ -37,6 +37,7 @@ import json
 import pathlib
 import re
 import subprocess
+from datetime import UTC, date, datetime
 
 import pytest
 import yaml
@@ -56,9 +57,24 @@ BRANCHES = ("dev", "master")
 CORE = {"container", "evals-real", "migration", "quality", "sbom", "security"}
 EXPECT_SKIP = ("变异测试", "image-signing")
 REQUIRED_TOP = {"schema", "repo", "sha", "fetched_at", "source", "branches"}
-REQUIRED_BRANCH = {"run_id", "url", "event", "head_branch", "head_sha", "status",
-                   "conclusion", "created_at", "jobs"}
+REQUIRED_BRANCH = {"run_id", "picked_run_id", "runs", "url", "event", "head_branch",
+                   "head_sha", "status", "conclusion", "created_at", "jobs"}
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+def _utc_today() -> date:
+    """「今天」一律取 UTC（第八十九批的教训：拿本地日期判会造出「本地绿、CI 红」）。"""
+    return datetime.now(UTC).date()
+
+
+def _is_iso_date(s: str) -> bool:
+    if len(s) != 10:
+        return False
+    try:
+        date.fromisoformat(s)
+    except ValueError:
+        return False
+    return True
+
+
 MASTER_RUN_IN_PROSE = re.compile(r"master run\s*=\s*(\d+)")
 
 
@@ -71,6 +87,13 @@ def _git(*args: str) -> str:
 
 def _added_by(path: str) -> str:
     return _git("log", "--diff-filter=A", "--format=%H", "-1", "--", path)
+
+
+def _introduced_by(needle: str) -> str:
+    """引入这段文本的那个提交（`-S` 按增删计数；取最早的一次＝第一次引入）。"""
+    out = _git("log", "--format=%H", "-S", needle, "--", "tests/DELIVERY_LEDGER.yaml")
+    lines = out.splitlines()
+    return lines[-1] if lines else ""
 
 
 def _after_cut(sha: str) -> bool:
@@ -135,6 +158,11 @@ UNPROVEN_ALLOWED = {
     ),
 }
 UNPROVEN_MAX = 3
+# 红账上限：同一时刻最多允许几行 `verdict: red`。
+# 为什么要有上限：`verdict: red` 是诚实记录，也是一个**便宜的出口**——允许它无限增长，
+# 就等于允许「下一个提交把它修绿」永久往后推，交付面会变成一串红账。上限 1 ⇒ 红账是「在途」，
+# 不是「常态」。
+RED_MAX = 1
 
 
 def unproven_violations(
@@ -153,7 +181,57 @@ def unproven_violations(
     out: list[str] = []
     by_sha = {str(e["sha"]): e for e in entries}
     for sha, e in by_sha.items():
-        if sha in after_cut and not e["has_evidence"] and sha not in allowed:
+        is_red = e.get("verdict") == "red"
+        if sha in after_cut and is_red:
+            # 红账：结构上可能真的取不到证据（本提交只在 dev 上跑过、master 上没有它的 run），
+            # 所以允许没证据——但必须点名为什么红、由谁结清。这是本仓唯一允许「红着落地」的口子，
+            # 所以它自己的前提也要被检查：不许同时有证据、不许有回执、不许堆成一串。
+            if e["has_evidence"]:
+                out.append(
+                    f"{sha[:12]} 是 verdict: red 却有 ci_evidence ⇒ 自相矛盾："
+                    f"那份证据本身要求 dev 与 master 两条 push run 全绿"
+                )
+            if not str(e.get("red_why") or "").strip():
+                out.append(
+                    f"{sha[:12]} 是 verdict: red，但没写 red_why（红要说出原因，不是形容词）"
+                )
+            if e.get("has_receipt"):
+                out.append(
+                    f"{sha[:12]} 是 verdict: red，却有回执 receipts/{sha[:12]}.yaml ⇒ "
+                    f"红的交付不能留交付回执"
+                )
+            fx = str(e.get("fixed_by") or "")
+            if not fx or fx == "未修":
+                if not e.get("is_last"):
+                    out.append(
+                        f"{sha[:12]} 是 verdict: red 且 fixed_by=未修，但它不是台账最后一行 ⇒ "
+                        f"红账只能挂在最新一处（旧红账必须已经被下一个提交结清）"
+                    )
+            elif not e.get("fixed_by_exists"):
+                out.append(
+                    f"{sha[:12]} 的 fixed_by={fx[:12]} 在台账里没有行（结清者必须是真提交）"
+                )
+            elif not e.get("fixed_by_carries_row"):
+                out.append(
+                    f"{sha[:12]} 的 fixed_by={fx[:12]} 没有把这一行接走"
+                    f"（它的块里没有这个 sha 的 ledger_row）⇒ 结清要落在台账上，不是口头提一句"
+                )
+            # 空洞必须带期限：本仓对「允许留的洞」一律要求 review_by（跳过签字、触发器台账都是），
+            # 红账是**最后一个**没期限的口子 ⇒ 不约束期限，它就会从「在途」变成「永久」。
+            rb = str(e.get("review_by") or "").strip()
+            if not rb:
+                out.append(
+                    f"{sha[:12]} 是 verdict: red，但没写 review_by ⇒ 红账没有期限"
+                    f"（其它空洞都要期限，这里不能例外）"
+                )
+            elif not _is_iso_date(rb):
+                out.append(f"{sha[:12]} 的 review_by 不是 YYYY-MM-DD：{rb!r}")
+            elif rb < _utc_today().isoformat():
+                out.append(
+                    f"{sha[:12]} 的 review_by={rb} 已过期 ⇒ 这一行红账必须重新表态"
+                    f"（要么结清 fixed_by，要么续期并写清新理由）"
+                )
+        elif sha in after_cut and not e["has_evidence"] and sha not in allowed:
             out.append(f"{sha[:12]} 在切点之后却没有 ci_evidence，也不在 UNPROVEN_ALLOWED 里")
     for sha, reason in allowed.items():
         e = by_sha.get(sha)
@@ -181,6 +259,12 @@ def unproven_violations(
             f"例外清单涨到 {len(allowed)} 条（上限 {max_entries}）⇒ 只许减不许增："
             f"新增等于让「切点之后必须有证据」失效"
         )
+    reds = [e for e in entries if e.get("verdict") == "red"]
+    if len(reds) > RED_MAX:
+        out.append(
+            f"同一时刻最多 {RED_MAX} 行红账，现在 {len(reds)} 行 ⇒ 红账成了常态："
+            f"说明「下一个提交把它修绿」一直没发生"
+        )
     return out
 
 
@@ -196,14 +280,27 @@ def test_切点在本仓历史里():
 def test_切点之后每一行都必须带_ci_证据():
     rows = ledger_rows()
     assert rows, "台账一行都没有"
+    all_shas = {str(r.get("sha")) for r in rows}
     entries = [
         {
             "sha": str(r.get("sha")),
             "has_evidence": bool(str(r.get("ci_evidence") or "").strip()),
             "has_receipt": (RECEIPTS_DIR / f"{str(r.get('sha'))[:12]}.yaml").is_file(),
             "attestation": r.get("attestation"),
+            # 红账三件套（判据见 unproven_violations 的 is_red 分支）
+            "verdict": r.get("verdict"),
+            "red_why": r.get("red_why"),
+            "fixed_by": r.get("fixed_by"),
+            "review_by": r.get("review_by"),
+            "is_last": i == len(rows) - 1,
+            "fixed_by_exists": str(r.get("fixed_by") or "") in all_shas,
+            "fixed_by_carries_row": (
+                str(r.get("sha"))[:12] in row_block(str(r.get("fixed_by")))
+                if str(r.get("fixed_by") or "") in all_shas
+                else False
+            ),
         }
-        for r in rows
+        for i, r in enumerate(rows)
     ]
     after_cut = {e["sha"] for e in entries if _after_cut(e["sha"])}
     bad = unproven_violations(
@@ -218,13 +315,19 @@ def test_切点之后每一行都必须带_ci_证据():
 # ---------- 判据自己的牙：用合成输入把每条子规则分别撞一遍 ----------
 # （没有这几条，上面那条判据在本仓是「恒绿」的：现实台账里恰好没有反例 ⇒ 逻辑被改坏也没人知道。）
 
-def _entry(sha: str, *, ev: bool = False, rec: bool = False) -> dict:
-    return {
+def _entry(sha: str, *, ev: bool = False, rec: bool = False, **extra: object) -> dict:
+    d = {
         "sha": sha,
         "has_evidence": ev,
         "has_receipt": rec,
         "attestation": "git-only",
     }
+    d.update(extra)
+    if d.get("verdict") == "red" and "review_by" not in d:
+        # 合成输入默认给一个未来期限：期限规则有自己的牙（`test_牙_红账必须带期限`），
+        # 否则每条红账合成用例都要复述一遍 review_by。
+        d["review_by"] = "2999-01-01"
+    return d
 
 
 def test_牙_切点之后没证据又不在清单里_必须被点名():
@@ -413,13 +516,160 @@ def test_每个_job_都_success_或登记为_skip_且没有未登记的_job(row:
 
 @pytest.mark.parametrize("row", rows_with_ci(), ids=lambda r: str(r.get("sha"))[:12])
 def test_ci_证据与回执由同一个提交带进来(row: dict):
+    """载体同源（第八十九批按**交付等级**分开写）。
+
+    此前这里只写死了「必须有回执」，于是 `git-only` 的行永远红——而仓库同时又要求
+    「切点之后每一行都必须带 CI 证据」。两条判据对 `git-only` 的行**结构上互斥**
+    （没做本地冻结就不可能有回执）。分别是：
+
+    * `git+frozen`：回执必须存在，且回执与 CI 证据由**同一个**提交带进来；
+    * `git-only`：**不许**有回执（有就说明冻结等级是伪造的）；CI 证据必须与「台账里那行
+      `ci_evidence:` 文本」由同一个提交引入 ⇒ 证据与它的主张仍然同车。
+    """
     sha = str(row["sha"])
     rel = str(row["ci_evidence"])
     rec = f"receipts/{sha[:12]}.yaml"
-    assert (ROOT / rec).is_file(), f"{sha[:12]} 没有回执 {rec}（CI 证据必须与回执同一个载体）"
+    att = str(row.get("attestation") or "")
     a_ci = _added_by(rel)
-    a_rec = _added_by(rec)
     assert a_ci, f"{sha[:12]} 的 CI 证据不在历史里（还没提交？）"
+    if att == "git-only":
+        assert not (ROOT / rec).is_file(), (
+            f"{sha[:12]} 声明 git-only（没做本地冻结），却有回执 {rec} ⇒ 等级自相矛盾："
+            f"回执里那些 shape/keys/pytest 数字不可能来自一次没发生的冻结")
+        a_row = _introduced_by(f"ci_evidence: {rel}")
+        assert a_row, f"{sha[:12]} 的 ci_evidence 这一行不在历史里"
+        assert a_row == a_ci, (
+            f"{sha[:12]} 的 CI 证据由 {a_ci[:12]} 带进来，而台账那一行由 {a_row[:12]} 引入 ⇒ "
+            f"证据与它的主张不同车（可以事后换一份证据再指过去）")
+        return
+    assert (ROOT / rec).is_file(), f"{sha[:12]} 没有回执 {rec}（CI 证据必须与回执同一个载体）"
+    a_rec = _added_by(rec)
     assert a_ci == a_rec, (
         f"{sha[:12]} 的 CI 证据由 {a_ci[:12]} 带进来，回执由 {a_rec[:12]} 带进来 ⇒ 不同源："
         f"证据可以在事后换成另一份（载体必须跟着回执走）")
+
+
+# ---------- 判据 6：同 sha 的红 run 不许被绿 run 盖掉 ----------
+
+def superseded_unmentioned(doc: dict, prose: str) -> list[int]:
+    """同 sha 里**非 success** 的 run，必须在台账散文里被点名。
+
+    第八十九批实测口子：`10738df` 的 master 上有两条跑完的 push run——`38957513542`（红，
+    推前形状守卫判的几何）与重推后的 `38958907685`（绿）。生产端此前只摘最新一条，
+    产物里搜不到那条红（`grep -c 38957513542 evidence/ci/*.json` ⇒ 0）⇒ 「拿一条绿盖掉
+    同 sha 的红」在审计看来与真的全绿**同形**。现在：全部 run 落进 `runs`，且红的那条
+    必须在台账散文里被点名（点名 = 有人对它负过责）。
+    """
+    out: list[int] = []
+    for info in (doc.get("branches") or {}).values():
+        for r in info.get("runs") or []:
+            if r.get("run_id") == info.get("run_id"):
+                continue
+            if str(r.get("conclusion") or "") == "success":
+                continue
+            if str(r.get("run_id")) not in prose:
+                out.append(int(r["run_id"]))
+    return out
+
+
+def test_牙_没说出口的红_run_必须被抓住():
+    """正/反向对照：判据得真能分辨「点了名」与「被盖掉」。"""
+    doc = {"branches": {"master": {"run_id": 2, "runs": [
+        {"run_id": 1, "conclusion": "failure"},
+        {"run_id": 2, "conclusion": "success"}]}}}
+    assert superseded_unmentioned(doc, "只有绿的那条") == [1]
+    assert superseded_unmentioned(doc, "master 的 run 1 因几何红，重推后 2 绿") == []
+    all_green = {"branches": {"dev": {"run_id": 3, "runs": [
+        {"run_id": 3, "conclusion": "success"}]}}}
+    assert superseded_unmentioned(all_green, "") == []
+
+
+@pytest.mark.parametrize("row", rows_with_ci(), ids=lambda r: str(r.get("sha"))[:12])
+def test_同_sha_的红_run_必须在台账里点名(row: dict):
+    sha = str(row["sha"])
+    unseen = superseded_unmentioned(load_ci(row), row_block(sha))
+    assert not unseen, (
+        f"{sha[:12]} 的 CI 证据记着同 sha 的非 success run {unseen}，而台账那一行一个字都没提 ⇒ "
+        f"拿绿盖红（删 run 是洗证据，不点名也是）")
+
+
+# ---------- 红账（verdict: red）的四条子规则，各自单独撞一遍 ----------
+
+def test_牙_红账没写原因_必须被点名():
+    sha = "a1" * 20
+    bad = unproven_violations([_entry(sha, verdict="red", is_last=True, fixed_by="未修")],
+                              after_cut={sha}, allowed={}, max_entries=3)
+    assert bad and any("没写 red_why" in i for i in bad), bad
+
+
+def test_牙_红账带证据或带回执_都必须被点名():
+    sha = "a2" * 20
+    bad = unproven_violations(
+        [_entry(sha, ev=True, verdict="red", red_why="x", is_last=True, fixed_by="未修")],
+        after_cut={sha}, allowed={}, max_entries=3)
+    assert bad and any("自相矛盾" in i for i in bad), bad
+    bad2 = unproven_violations(
+        [_entry(sha, rec=True, verdict="red", red_why="x", is_last=True, fixed_by="未修")],
+        after_cut={sha}, allowed={}, max_entries=3)
+    assert bad2 and any("不能留交付回执" in i for i in bad2), bad2
+
+
+def test_牙_旧红账不在最后一行_必须被点名():
+    a, b = "a3" * 20, "a4" * 20
+    bad = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="未修", is_last=False),
+         _entry(b, ev=True)],
+        after_cut={a, b}, allowed={}, max_entries=3)
+    assert bad and any("不是台账最后一行" in i for i in bad), bad
+
+
+def test_牙_结清者必须是真提交且真的接走这一行():
+    a = "a5" * 20
+    bad = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="f" * 40, fixed_by_exists=False)],
+        after_cut={a}, allowed={}, max_entries=3)
+    assert bad and any("结清者必须是真提交" in i for i in bad), bad
+    bad2 = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="f" * 40,
+                fixed_by_exists=True, fixed_by_carries_row=False)],
+        after_cut={a}, allowed={}, max_entries=3)
+    assert bad2 and any("没有把这一行接走" in i for i in bad2), bad2
+    ok = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="f" * 40,
+                fixed_by_exists=True, fixed_by_carries_row=True)],
+        after_cut={a}, allowed={}, max_entries=3)
+    assert ok == [], ok
+
+
+def test_牙_红账必须带期限_且期限过期就要重新表态():
+    a = "d7" * 20
+    # 1) 没写 review_by：红账就成了没有期限的洞
+    bad = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="未修", is_last=True, review_by=None)],
+        after_cut={a}, allowed={}, max_entries=3)
+    assert bad and any("没写 review_by" in i for i in bad), bad
+    # 2) 不是日期：写「下周再看」这种话不算期限
+    bad2 = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="未修", is_last=True, review_by="下周")],
+        after_cut={a}, allowed={}, max_entries=3)
+    assert bad2 and any("不是 YYYY-MM-DD" in i for i in bad2), bad2
+    # 3) 日期已过期：红账变永久，必须重新表态（结清或续期）
+    bad3 = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="未修", is_last=True,
+                review_by="2000-01-01")],
+        after_cut={a}, allowed={}, max_entries=3)
+    assert bad3 and any("已过期" in i for i in bad3), bad3
+    # 4) 未来日期：不报
+    ok = unproven_violations(
+        [_entry(a, verdict="red", red_why="x", fixed_by="未修", is_last=True,
+                review_by="2999-01-01")],
+        after_cut={a}, allowed={}, max_entries=3)
+    assert ok == [], ok
+
+
+def test_牙_红账成常态_必须被点名():
+    rows = [_entry(f"c{i}" + "0" * 38, verdict="red", red_why="x", fixed_by="未修",
+                   is_last=(i == 2)) for i in (1, 2)]
+    bad = unproven_violations(rows, after_cut={r["sha"] for r in rows}, allowed={},
+                              max_entries=3)
+    assert bad and any("红账成了常态" in i for i in bad), bad

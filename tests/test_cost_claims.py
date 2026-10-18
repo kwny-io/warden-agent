@@ -203,3 +203,49 @@ def test_尺子自己会量_有_git_的目标必须量出非零() -> None:
 def test_尺子自己会量_没有_git_的目标必须量出零() -> None:
     """反面对照：不碰 git 的用例量出来必须是 0——证明它不是「每次都报一堆」。"""
     assert _run_ruler(_NO_GIT_TARGET) == 0
+
+
+# ---------------------------------------------------------------------------
+# 「全套 N 条」这种自报条数，跟「本文件 N 条用例」是同一类病：
+# 数字会漂，而漂了的数字正是下一批人估工期/定预算的依据。
+# 2026-10-17 它就真漂了一次：docstring 写着 57，CASES 里已经是 73。
+# ---------------------------------------------------------------------------
+
+_MUTANT_SRC = "scripts/mutant_check.py"
+_ALL_MUTANTS_CLAIM = re.compile(r"全套\s*(\d+)\s*条")
+_MUTANT_CASE = re.compile(r"(?m)^    \((?:KILL|EQUIV),")
+
+
+def _count_mutant_cases(text: str) -> int:
+    """数 CASES 里登记了几条——**不去 import** 那个模块（它是脚本，import 会带副作用）。"""
+    return len(_MUTANT_CASE.findall(text))
+
+
+def _mutant_count_problems(text: str) -> list[str]:
+    actual = _count_mutant_cases(text)
+    problems = []
+    for claim in _ALL_MUTANTS_CLAIM.finditer(text):
+        if int(claim.group(1)) != actual:
+            problems.append(
+                f"「全套 {claim.group(1)} 条」与实际登记的 {actual} 条不一致 —— "
+                "改完 CASES 记得同批改这个数字（或者干脆别写绝对条数）"
+            )
+    return problems
+
+
+def test_变异全套条数与登记表一致() -> None:
+    text = (_ROOT / _MUTANT_SRC).read_text(encoding="utf-8")
+    assert _mutant_count_problems(text) == []
+
+
+def test_变异条数判据不是空转() -> None:
+    """反面对照：判据的两端都得真命中，否则它随时可以「永远绿」。"""
+    text = (_ROOT / _MUTANT_SRC).read_text(encoding="utf-8")
+    assert _ALL_MUTANTS_CLAIM.search(text), "docstring 里已经没有「全套 N 条」，判据要重瞄"
+    assert _count_mutant_cases(text) > 0, "CASES 一条都没数到，判据要重瞄"
+
+
+def test_变异条数写错会被抓() -> None:
+    text = (_ROOT / _MUTANT_SRC).read_text(encoding="utf-8")
+    bad = _ALL_MUTANTS_CLAIM.sub("全套 7 条", text, count=1)
+    assert _mutant_count_problems(bad), "条数写错却没人报 —— 判据是空转的"

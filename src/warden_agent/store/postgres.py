@@ -21,6 +21,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Concatenate, cast
 
+from warden_agent.core.metrics import note
 from warden_agent.core.redaction import redact_arguments
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.credential.vault import (
@@ -30,6 +31,7 @@ from warden_agent.credential.vault import (
     encode_fields,
 )
 from warden_agent.model.model import Message, ToolCall
+from warden_agent.store.base import PAYLOAD_DROPPED_METRIC, SchemaTooNewError
 from warden_agent.store.codec import (
     decode_versioned,
     encode_versioned,
@@ -377,6 +379,16 @@ class PostgresStore:
             """)
             # 单行表（先清再写，避免历史多行）。这个 DELETE 与下面的 INSERT 现在同属
             # 上面那个事务、且已被 advisory lock 串行化，不再有“两个副本各写一行/撞主键”的窗口。
+            # 降级守卫：库比代码新 ⇒ 拒绝启动（抛在事务里 ⇒ 连同下面的版本写入一起回滚，
+            # 版本号不会被旧代码改写）。理由同 sqlite 后端，详见 `store/base.py:SchemaTooNewError`。
+            cur.execute("SELECT MAX(version) FROM __schema_version__")
+            _ver = cur.fetchone()
+            _existing = int(_ver[0]) if _ver and _ver[0] is not None else 0
+            if _existing > self._SCHEMA_VERSION:
+                raise SchemaTooNewError(
+                    f"数据库 schema 版本 {_existing} 比当前代码的 {self._SCHEMA_VERSION} 更新："
+                    "这只能是回滚/降级（新库给了老代码）。拒绝启动，请把服务升回新版本或从备份恢复。"
+                )
             cur.execute("DELETE FROM __schema_version__")
             cur.execute(
                 "INSERT INTO __schema_version__ (version, applied_at) VALUES (%s, %s) "
@@ -596,6 +608,11 @@ class PostgresStore:
                     tool_call = ToolCall.from_dict(obj) if isinstance(obj, dict) else None
                 except (json.JSONDecodeError, KeyError):
                     # KeyError：未知版本；单行坏数据不能拖垮整次加载。
+                    # 但必须留下计数：回滚降级后的数据损失只能靠它被发现。
+                    note(
+                        PAYLOAD_DROPPED_METRIC,
+                        "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
+                    )
                     tool_call = None
             out.append(Message(role=role, content=content, tool_call=tool_call))
         return out
@@ -655,6 +672,10 @@ class PostgresStore:
         try:
             args = decode_versioned(str(row[2]))
         except (json.JSONDecodeError, IndexError, KeyError):
+            note(
+                PAYLOAD_DROPPED_METRIC,
+                "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
+            )
             args = {}
         return row[0], row[1], args if isinstance(args, dict) else {}, row[3]
 
@@ -706,6 +727,10 @@ class PostgresStore:
         try:
             obj = decode_versioned(str(raw))
         except (json.JSONDecodeError, KeyError):
+            note(
+                PAYLOAD_DROPPED_METRIC,
+                "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
+            )
             return None
         return Checkpoint.from_dict(obj) if isinstance(obj, dict) else None
 

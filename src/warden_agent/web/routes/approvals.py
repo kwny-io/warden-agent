@@ -48,15 +48,10 @@ def register(
                 continue
             pending = sess.pending_approval()
             if pending is not None:
-                result.append(
-                    {
-                        "run_id": run_id,
-                        "approval_id": pending.approval_id,
-                        "tool_name": pending.tool_name,
-                        "arguments": pending.arguments,
-                        "reason": pending.reason,
-                    }
-                )
+                # 形状与 `/chat` 响应体、总线事件同源（`ApprovalRequest.to_dict`）：
+                # 这里修前是手写字典，与 to_dict “恰好长得一样”——
+                # to_dict 多一个字段，队列就少一个，而前端两份数据喂给同一个面板。
+                result.append({"run_id": run_id, **pending.to_dict()})
         return result
 
     @app.get("/approvals/history")
@@ -141,17 +136,15 @@ def register(
             # 拿到 NeedsApproval 只回响应、不发事件，/events 订阅方永远等不到它。
             bus.publish(
                 run_id,
-                {"event": "needs_approval", "approval": outcome.approval.tool_name},
+                # 形状与 `/chat` 响应体同源（`ApprovalRequest.to_dict`），
+                # 别把 `tool_name` 字符串塞进来。
+                {"event": "needs_approval", "approval": outcome.approval.to_dict()},
             )
             return ChatResponseOut(
                 run_id=run_id,
                 status=sess.status().name,
                 kind="needs_approval",
-                approval={
-                    "approval_id": outcome.approval.approval_id,
-                    "tool_name": outcome.approval.tool_name,
-                    "arguments": outcome.approval.arguments,
-                    "reason": outcome.approval.reason,
-                },
+                # 同一个领域对象的对外形状只能有一处定义。
+                approval=outcome.approval.to_dict(),
             )
         raise HTTPException(status_code=500, detail="未知结果类型")

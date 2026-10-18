@@ -180,10 +180,28 @@ def test_登记表内部不含重复项() -> None:
     assert len(keys) == len(set(keys)), f"登记表有重复：{keys}"
 
 
-def test_静态资源挂载排在所有路由之后() -> None:
-    """顺序类问题很隐蔽：挂载若排到前面，会把同前缀的 API 路由整段遮住。"""
+def test_静态资源挂载排在所有路由之后(tmp_path, monkeypatch) -> None:  # noqa: ANN001 - pytest 夹具
+    """顺序类问题很隐蔽：挂载若排到前面，会把同前缀的 API 路由整段遮住。
+
+    **这条判据的前置条件是产物，而产物不是被测对象**。`web/dist` 是构建产物（不入库），
+    以前这里直接 `build_app()` 然后硬断言 `/assets` 在路由表里 ⇒ 在没有产物的树上
+    （冻结树、裸 worktree、刚 clone 的仓库）红在「环境没产物」上，而**同一事实在
+    `tests/test_web.py` 里是 skip** ⇒ 同一事实两套口径，必有一个在说假话；
+    而若改成 skip，它又变成一条「报告里长得像成功」的空洞。
+    两边都不对 ⇒ 正确做法是**把前置条件自己造出来**：写一个最小 `index.html` 到临时目录，
+    用产品代码认的那同一个环境变量（`WARDEN_WEB_DIST`）指过去。这样这条判据不依赖 npm 构建、
+    在冻结树和 CI 上都真跑（实测：本地不构建也能跑，`WARDEN_WEB_DIST` 指向不存在目录时仍然能跑）。
+    """
+    # 最小产物：产品代码的挂载条件是「`<dist>/assets` 是个目录」（`web/server.py:874-876`），
+    # 首页条件是「`<dist>/index.html` 能读」——两处都造出来，否则测的不是挂载顺序而是环境。
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "index-dummy.js").write_text("export default 1;\n", encoding="utf-8")
+    (tmp_path / "index.html").write_text("<!doctype html><div id='root'></div>", encoding="utf-8")
+    monkeypatch.setenv("WARDEN_WEB_DIST", str(tmp_path))
     paths = [getattr(r, "path", "") for r in _app().routes]
-    assert STATIC_MOUNT in paths
+    assert STATIC_MOUNT in paths, (
+        f"有产物却没挂载 {STATIC_MOUNT}：静态资源会 404（产物在 {tmp_path}）"
+    )
     assert paths[-1] == STATIC_MOUNT, f"静态挂载不在最后：{paths[-3:]}"
 
 

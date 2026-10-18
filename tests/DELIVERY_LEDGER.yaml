@@ -396,6 +396,7 @@ rows:
     shape:
     keys:
     run: 38943772832        # dev 上的 push run（event=push、head=本 sha）；run 级 conclusion=success，逐 job 核过 = 6 success + 2 skipped
+    ci_evidence: evidence/ci/10738df39d1b.json   # 加上了 master 的那一条：master 的 run 38957513542 曾因「多提交推送」几何判据红（真红，见 CHANGELOG 第八十九批）；按同一几何补救重推后 master 的 run 38958907685 全绿 ⇒ dev+master 两条都是 success。master run = 38958907685
     note: >-
       PR #19 的 squash 提交（2026-10-16T17:58:37Z，标题带 `(#19)`）＝第83~87批的合并落地：
       它取代了 `ab8160e`（第88批：交付节奏进文档）/`5c0faa5`（探针订正）/`7cf9b9f`（探针入库）三个提交，
@@ -405,6 +406,29 @@ rows:
       差的 4 个提交＝本 sha 与那三个探针提交），所以它在 master 上还没有 run ⇒ 不写 `ci_evidence`
       （口径：那份证据要 dev 与 master 两条 push run 都指向同一个 sha）。
       下一个落在 `dev` 上的交付提交要背的就是这一行。
+
+  - sha: f6bcd5026dd5ff6a783f2c758e8e87b40545c86a
+    tree: 62a6cfa9a43b3253644511193d0a092d41bed08f
+    attestation: git-only
+    frozen_proof: none
+    run: 38955093147        # dev 上的 push run（event=push、head=本 sha）；run 级 conclusion=failure
+    verdict: red            # ← 交付面**红**的一行。见 red_why / fixed_by（判据：tests/test_ci_evidence.py）
+    red_why: >-
+      dev 的 run 38955093147（2026-10-16T19:27:48Z）**红**：quality job 里两条判据失败——
+      ① `tests/test_ci_job_gates.py` 报「last_checked(2026-10-17) 在未来（今天 2026-10-16）」：
+      我按本地日期（Asia/Shanghai 已到 17 日）写，而 CI 按 UTC 算 ⇒ 那是没发生过的复核；
+      ② `tests/test_ci_evidence.py` 报「10738df39d1b 在切点之后却没有 ci_evidence」。
+      本行之所以没有 `ci_evidence`：**master 上从来没有这个 sha 的 run**（master 当时已前进到
+      `10738df`，本 sha 只在 dev 上），而口径要求 dev 与 master 两条 push run 指向同一个 sha ⇒
+      这个提交结构上不可能有证据。所以修法只能是「下一个交付提交把它修绿并背它的账」，不是补证据。
+    fixed_by: 未修             # 下一个交付提交落了地，就要改成那个提交的 sha（否则判据红）
+    review_by: 2026-10-24      # 红账也是洞：没期限的洞就是永久的洞（其它空洞一律要期限，这里不例外）
+    note: >-
+      第八十八批的落地提交（账要有人背）。它自己是红的，原因见 `red_why`；结论不变：
+      **红的提交不能被当成已交付**。这一行是仓库第一次显式记下「红账」，
+      规则写在 `tests/test_ci_evidence.py::test_切点之后每一行都必须带_ci_证据` 的 `verdict: red` 分支：
+      red 行不许带证据、不许带回执，`fixed_by` 必须由**下一个交付提交**结清
+      （`未修` 只允许它是台账最后一行）。
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。

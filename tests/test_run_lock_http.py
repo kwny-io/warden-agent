@@ -122,7 +122,7 @@ async def test_失败的请求也会释放锁() -> None:
         run_lock=lock,
     )
     async with _client(app) as c:
-        assert (await c.post("/chat/run-1", json={"text": "x"})).status_code == 400
+        assert (await c.post("/chat/run-1", json={"text": "x"})).status_code == 500
     assert lock.owner_of("run-1") is None, "异常路径把锁漏掉了：这个会话要等 TTL 才能再用"
 
 

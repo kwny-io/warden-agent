@@ -57,6 +57,7 @@ def fetch(sha: str, force: bool, out: pathlib.Path) -> int:
     runs = json.loads(gh("run", "list", "--repo", REPO, "--commit", sha, "--limit", "20",
                          "--json", RUN_LIST_JSON))
     picked: dict[str, dict] = {}
+    all_runs: dict[str, list[dict]] = {}
     for b in BRANCHES:
         cand = [r for r in runs if r["headBranch"] == b and r["event"] == "push"]
         done = [r for r in cand if r["status"] == "completed"]
@@ -64,11 +65,22 @@ def fetch(sha: str, force: bool, out: pathlib.Path) -> int:
             print(f"✗ {b} 上这个提交还没有跑完的 push run（候选 {len(cand)} 个）："
                   f"{[(r['databaseId'], r['status']) for r in cand]}", file=sys.stderr)
             return 2
-        if len(done) > 1:
-            print(f"✗ {b} 上有 {len(done)} 个跑完的 push run ⇒ 语义不唯一，拒绝猜："
-                  f"{[r['databaseId'] for r in done]}", file=sys.stderr)
-            return 2
-        picked[b] = done[0]
+        # 多条跑完的 run 是**合法**情形，不是歧义：ref 的几何被补救过（例如 master 落后多个提交
+        # 被一次性快进 ⇒ 「推前形状守卫」判红 ⇒ 退到上一跳再单步重推），同一个 sha 上就会既有
+        # 那条红的、又有重推后那条绿的。此时**摘最新**的一条：它对应的才是 ref 现在这份历史。
+        # 但同 sha 的每一条都**必须落进产物**（第八十九批订正：此前只取最新、其余只打到 stderr
+        # ⇒ 「拿一条绿盖掉同 sha 那条红」在产物里根本看不出来，那就是洗证据的口子）。
+        ordered = sorted(done, key=lambda r: (str(r.get("createdAt") or ""), r["databaseId"]))
+        all_runs[b] = [{"run_id": r["databaseId"], "url": r.get("url"),
+                        "event": r.get("event"), "status": r.get("status"),
+                        "conclusion": r.get("conclusion"),
+                        "created_at": r.get("createdAt")} for r in ordered]
+        picked[b] = ordered[-1]
+        if len(ordered) > 1:
+            older = [(r["databaseId"], r.get("conclusion")) for r in ordered[:-1]]
+            print(f"· {b} 上这个提交有 {len(ordered)} 条跑完的 push run ⇒ 摘最新 "
+                  f"{picked[b]['databaseId']}（{picked[b].get('conclusion')}）；"
+                  f"更早的同 sha 候选全部记进产物 runs：{older}", file=sys.stderr)
 
     doc: dict = {
         "schema": SCHEMA,
@@ -88,6 +100,8 @@ def fetch(sha: str, force: bool, out: pathlib.Path) -> int:
                       key=lambda j: j["name"])
         doc["branches"][b] = {
             "run_id": run["databaseId"],
+            "picked_run_id": run["databaseId"],
+            "runs": all_runs[b],
             "url": run["url"],
             "event": run["event"],
             "head_branch": view.get("headBranch"),
@@ -153,6 +167,24 @@ def check(paths: list[pathlib.Path]) -> int:
                 problems.append(f"{tag}：{b} 的记录里 head_branch={info.get('head_branch')!r}")
             if not isinstance(info.get("run_id"), int) or info["run_id"] <= 0:
                 problems.append(f"{tag}：{b} 的 run_id={info.get('run_id')!r} 不是正整数")
+            listed = info.get("runs")
+            if not isinstance(listed, list) or not listed:
+                problems.append(f"{tag}：{b} 缺 runs（同 sha 的**全部** push run 必须一条不藏）")
+            else:
+                ids = [r.get("run_id") for r in listed if isinstance(r, dict)]
+                if info.get("run_id") not in ids:
+                    problems.append(f"{tag}：{b} 摘的 run_id={info.get('run_id')!r} 不在 runs 里")
+                newest = max(listed, key=lambda r: (str(r.get("created_at") or ""),
+                                                    r.get("run_id") or 0))
+                if newest.get("run_id") != info.get("run_id"):
+                    problems.append(
+                        f"{tag}：{b} 摘的是 {info.get('run_id')}，而同 sha 还有更晚的 "
+                        f"{newest.get('run_id')} ⇒ 不许挑旧的那条（挑旧的就是洗证据）")
+                for r in listed:
+                    if isinstance(r, dict) and r.get("run_id") != info.get("run_id") \
+                            and r.get("conclusion") != "success":
+                        print(f"· {tag}：{b} 同 sha 还有一条 {r.get('conclusion')} 的 run "
+                              f"{r.get('run_id')} ⇒ 台账里必须点名它（不点名就是拿绿盖红）")
             jobs = info.get("jobs")
             if not isinstance(jobs, list) or not jobs:
                 problems.append(f"{tag}：{b} 的 jobs 是空的 ⇒ 没核到任何 job")

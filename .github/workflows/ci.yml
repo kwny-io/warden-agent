@@ -100,8 +100,8 @@ jobs:
       #   判据与全部边界见 tests/test_registry_retry.py 第 7 节。）
       - name: 预热规则求值镜像（让 promtool 真值求值真的跑）
         run: bash scripts/registry_retry.sh -- docker pull prom/prometheus:v2.55.0
-      # SPA 测试（tests/test_web.py::test_t10）在 web/dist 缺失时跳过。
-      # 之前 CI 从不构建前端 → 它**每次都在跳过**。这里显式构建，让它真的执行。
+      # 前端构建（第九十批起不再是 `tests/test_web.py::test_t10` 的前提：那条判据自己造产物、零跳过）。
+      # 这里仍然显式构建，因为真浏览器 e2e（web/e2e/）与「构建产物本身」需要真产物。
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: "20"
@@ -115,8 +115,8 @@ jobs:
         #    不做类型检查**，所以此前 TS 类型错误能让 CI 全绿（类型门禁形同虚设）。
         #  · `npm run test:coverage`（vitest）：前端此前**零测试**；现在 11 个文件 /
         #    129 个用例，并带覆盖率下限（vite.config.ts 里 thresholds）。
-        #  · `npm run build`：产出 `web/dist`，让后端 SPA 服务测试（tests/test_web.py::test_t10）
-        #    不再因产物缺失而静默跳过。
+        #  · `npm run build`：产出 `web/dist`（真浏览器 e2e `web/e2e/` 要用它；后端那条 SPA
+        #    判据已自造产物、不再依赖它——第九十批）。
         working-directory: web
         run: |
           npm ci

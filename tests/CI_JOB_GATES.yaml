@@ -102,13 +102,13 @@ entries:
   - workflow: delivery-audit.yml
     job: audit
     gate: "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
-    runs_on: [workflow_dispatch]
+    runs_on: [schedule, workflow_dispatch]
     runs_on_note: >
-      这个 `if:` 是**把本 workflow 已有的两个事件写明**，不是为了排除谁：本 workflow 只在
-      `schedule` 与 `workflow_dispatch` 上触发（没有 push/PR）。但 `schedule` 的口径与 `ci.yml`
-      那条一致——cron 只从默认分支求值，而本文件还没进 master ⇒ 事实口径只有 `workflow_dispatch`，
-      而它在文件进默认分支之前**同样用不了**。所以第八十七批的实测走的是本地
-      （`python scripts/delivery_audit.py --branch dev`，结果见末尾 `triggers` 段那条 `never` 条目）。
+      2026-10-17 起这个 `if:` 的两个事件**都是真的**了：本文件随 PR #19（`10738df`）进了默认分支，
+      cron 当天就来值并唤醒过一次（run `39023515046`，见末尾 `triggers` 段那条）。
+      此前这里写的是「事实口径只有 `workflow_dispatch`，而它在文件进默认分支之前同样用不了」——
+      那是当时（2026-10-16）的实测，现已作废，但留着说明这条注释为什么会是现在这个样子：
+      口径跟着事实走，不跟着愿望走；而「现在不可能响」的断言，是会被明天的推送推翻的。
     not_run_on: [push, pull_request]
     why: >
       审计跑的是 GitHub API（取 tip 那次 push run 的逐 job 结论），不需要跟着谁的提交跑：
@@ -118,11 +118,12 @@ entries:
     run_it_now: gh workflow run delivery-audit.yml --ref master   # 前提：本文件已在默认分支上（见 runs_on_note）
     added: 2026-10-16
     evidence: >
-      **零 run**（文件还没进默认分支，所以 `schedule` 与 `dispatch` 都不可能发生过）。
-      本地实测（真 API，这是它当下唯一的证据）：`--branch dev` ⇒ 2 项红、RC=1
-      （`dev@5c0faa5` run 38781636407：整个 run 不绿 + `quality conclusion='failure'`）；
-      `--branch fix/batches-83-86` ⇒ 2 项红（run 38881109481）。
-      下一次回报的口径：`gh run list --workflow=delivery-audit.yml --limit 5` 不再是 0 条。
+      首次真响（已不再是承诺）：run `39023515046`，`schedule`、`master@10738df`、2026-10-17T10:04:32Z、
+      conclusion=`failure`。它红是因为**交付面当时真红**（`dev@f6bcd50` 的 push run `38955093147` 红），
+      审计装置如实报出并按 `issues: write` 自动开了 issue ⇒ `if:` 的 schedule 分支已被真实事件走过。
+      更早的本地实测（真 API）：`--branch dev` ⇒ 2 项红、RC=1（run `38781636407` 整个 run 不绿 +
+      `quality conclusion='failure'`）；`--branch fix/batches-83-86` ⇒ 2 项红（run `38881109481`）。
+      下一次回报的口径：`gh run list --workflow=delivery-audit.yml --limit 5` 应该每天多一条。
 
 # ─────────────────────────────────────────────────────────────────────────────
 # step 级门控（第七十批）：**run 结论看不见它们**，所以只能靠“登记 + 签字 + 回执”。
@@ -186,7 +187,7 @@ triggers:
       那句错话的实质危害是——它会让人以为“签名链路现在每周自己验一次了”。
     expected_cadence_days: 7
     last_observed_fire: never
-    last_checked: 2026-10-17
+    last_checked: 2026-10-16
     first_possible_fire: 2026-10-19
     root_cause: >
       第八十五批订正（2026-10-15 实测）：**原来那句「永远不会被求值」已不成立，不要照着它动手。**
@@ -256,9 +257,9 @@ triggers:
       而「最近一次 completed run」还可能取到**别的提交、别的事件**（周一 03:00 那条 `schedule`）。
       这条 cron 是目前唯一会**主动**把交付面的红说出来的东西（开/更新 issue，`issues: write`）。
     expected_cadence_days: 1
-    last_observed_fire: never
+    last_observed_fire: 2026-10-17
     last_checked: 2026-10-17
-    first_possible_fire: 2026-10-18
+    first_possible_fire: 2026-10-17
     root_cause: >
       2026-10-17 实测：**它一次都没响过，而且现在仍然响不了**——决定性证据是「默认分支上注册了哪些 workflow」：
       `gh api repos/kwny-io/warden-agent/actions/workflows` 只有 3 条（`ci.yml` + Dependabot ×2），
@@ -268,12 +269,21 @@ triggers:
       上一批写的 `first_possible_fire=2026-10-17` 是**过期判断**：当时这个文件只在 `fix/batches-83-86`（PR #19 待合）。
       现在 PR #19 已合进 `dev`（squash 提交 `10738df`，2026-10-16T17:58:37Z），但 `master` 仍停在 `17cd5e5`
       （落后的 4 个提交＝合并提交与那三个探针提交）⇒ 首响条件改成「`master` 前进之后的第一个 06:00 UTC」，
-      这里取下界 2026-10-18。
+      这里取下界 2026-10-18。（**已被现实推翻**：首响的边界是「`master` 前进之后的第一个 06:00 UTC」，
+      而 `master` 在这之后就已前进到 `10738df` ⇒ 首个边界是 **2026-10-17T06:00Z**，不是 10-18。
+      多算一天的机制跟 `date.today()` 那处是同一个：拿本地日期当 UTC 日期用。）
+      2026-10-17 复核结论（三条前提里两条已经过期）：
+      ① `master` 已前进到 `10738df`（含本文件）⇒ 上面「master 仍停在 17cd5e5」已过期；
+      ② 它当天就按 cron 响了：run `39023515046`（`schedule`、`master@10738df`、创建于 2026-10-17T10:04:32Z）；
+      ③ 它的审计结论是**红**：`dev@f6bcd50`（dev 的 tip）整个 run 与 `quality` job 双红，而 `master@10738df` 绿
+      ⇒ 交付面当时确实是红的，它喊对了，并按 `issues: write` 自动开了 issue——这正是它存在的意义。
+      ④ 剩下的不是 unblock，而是「别让 `dev` 的 tip 红着」（那是交付面本身的问题，见 `10738df` 那一行）。
       ⚠️ **别靠改日期了事**：日子只是提醒。真正的 unblock 是让 `master` 前进，而这一步同时是台账口径的硬前提
       （每一行的绿 run 必须同时来自 `dev` 与 `master` 两条 push run，例外清单 `UNPROVEN_ALLOWED` 冻结在三条、只许减不许增）。
     unblock: >
-      PR #19 已合进 `dev`（2026-10-16T17:58:37Z，squash 提交 `10738df`）。剩下的一步是让 `master` 前进到含本文件的提交——
-      这一步同时也是台账的硬前提（见 `root_cause`）。到那时它会每天 06:00 UTC 自己跑。
+      **已 unblock（2026-10-17 复核）**：`master` 已前进到 `10738df`，它当天就按 cron 响了（run `39023515046`），
+      此后每天 06:00 UTC 自己跑。原先写的「让 `master` 前进」这一步已完成；而这一步同时是台账口径的硬前提
+      （见 `root_cause`）⇒ 它也解掉了台账口径的一半。
       代价（重要）：在那之前**连 `workflow_dispatch` 也用不了**——dispatch 同样要求文件已在默认分支上
       ⇒ 想立刻验证只能本地跑（已实测：`python scripts/delivery_audit.py --branch <分支>`）。
     how_to_verify: >
@@ -289,3 +299,9 @@ triggers:
       2026-10-17 复核「还没轮到」这个说法：默认分支上注册的 workflow 只有 3 条（`ci.yml` + Dependabot ×2），
       `master` 的 `.github/workflows/` 里只有 `ci.yml`，`gh run list --event schedule` 0 条
       ⇒ 当时它确实不可能响，且原因不在 cron 本身而在「文件不在默认分支上」。
+      **这段是同一天早先的观察，当天下午就被推翻了**（`master` 前进之后它就自己注册了）：
+      `gh run list --workflow=delivery-audit.yml` ⇒ run `39023515046`，`schedule`、`master@10738df`、
+      `2026-10-17T10:04:32Z`、conclusion=`failure`；逐 job 看是 `audit` 红，而红的原因不是脚本坏了，
+      是它如实报出交付面是红的（`dev@f6bcd50` 红）——审计装置首次真响就命中真问题。
+      教训（值得写成判据）：`gh run list` 说「0 条」只能证明「到那一刻为止没响过」，
+      不能证明「不可能响」；把「不可能」写进台账前，先复核它的前提条件是否当天已经变了。

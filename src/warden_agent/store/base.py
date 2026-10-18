@@ -16,6 +16,23 @@ from warden_agent.core.run.status import AgentRun
 from warden_agent.model.model import Message
 
 
+class SchemaTooNewError(RuntimeError):
+    """库里的 schema 版本比当前代码更新——只可能发生在"回滚/降级"或"新库给了老代码"。
+
+    为什么必须响亮失败，而不是"能读就继续跑"：
+      ① `_init_migrations` 结尾会把版本号写成自己的版本 ⇒ 「这套库更新过」这个
+         **唯一证据被旧代码擦掉**，事后没人能证明库曾经是新的；
+      ② 旧代码遇到不认识的 payload 版本（如新版写的 `v2:`）只会整条丢弃，
+         只靠 `warden_store_payload_dropped_total` 计数才能被发现；
+      ③ 两个后果叠在一起，就是「回滚后健康检查全绿、数据在几小时后才发现少了」。
+    所以：版本比代码新就拒绝启动（且抛之前不许改版本号），把选择权交回值班人。
+    """
+
+
+# 「payload 解不开被丢掉」的计数名（两个后端共用同一个名字，否则面板上会出现两个指标）。
+PAYLOAD_DROPPED_METRIC = "warden_store_payload_dropped_total"
+
+
 class RunStore(Protocol):
     """任何"能存 Run 状态 + 对话 + 待审批"的存储都要实现这个接口。"""
 

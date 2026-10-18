@@ -69,6 +69,21 @@ class ApprovalRequest:
     arguments: dict[str, Any]
     reason: str
 
+    def to_dict(self) -> dict[str, Any]:
+        """对外形状的**唯一**来源（总线事件与 HTTP 响应体都用它）。
+
+        为什么必须唯一：同一个前端组件会把"审批"从两条路拿到——非流式响应体，
+        和断线续读的 `/events` 总线事件。第九十二批前，总线那边发的是
+        `tool_name` 字符串、响应体那边发的是完整字典：于是断线后卡片上的工具名、参数、
+        原因全是空白，而页面不报任何错（`as` 强转把形状差异吞了）。
+        """
+        return {
+            "approval_id": self.approval_id,
+            "tool_name": self.tool_name,
+            "arguments": self.arguments,
+            "reason": self.reason,
+        }
+
 
 # ---- 会话对外返回的两种结果 ----
 @dataclass
@@ -781,12 +796,8 @@ class AgentSession:
 
     @staticmethod
     def _approval_dict(approval: ApprovalRequest) -> dict[str, Any]:
-        return {
-            "approval_id": approval.approval_id,
-            "tool_name": approval.tool_name,
-            "arguments": approval.arguments,
-            "reason": approval.reason,
-        }
+        # 形状只在 `ApprovalRequest.to_dict` 定义一次（总线事件与响应体必须同源）。
+        return approval.to_dict()
 
 
     def _hold_for_approval(

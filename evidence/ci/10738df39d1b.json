@@ -1,0 +1,145 @@
+{
+  "branches": {
+    "dev": {
+      "conclusion": "success",
+      "created_at": "2026-10-16T17:58:40Z",
+      "event": "push",
+      "head_branch": "dev",
+      "head_sha": "10738df39d1bb0a9758435bcae4934f1abc348f3",
+      "jobs": [
+        {
+          "conclusion": "success",
+          "name": "container",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "evals-real",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "image-signing",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "migration",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "quality",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "sbom",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "security",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "变异测试（${{ matrix.shard }}）",
+          "status": "completed"
+        }
+      ],
+      "picked_run_id": 38943772832,
+      "run_id": 38943772832,
+      "runs": [
+        {
+          "conclusion": "success",
+          "created_at": "2026-10-16T17:58:40Z",
+          "event": "push",
+          "run_id": 38943772832,
+          "status": "completed",
+          "url": "https://github.com/kwny-io/warden-agent/actions/runs/38943772832"
+        }
+      ],
+      "status": "completed",
+      "url": "https://github.com/kwny-io/warden-agent/actions/runs/38943772832",
+      "workflow": "CI"
+    },
+    "master": {
+      "conclusion": "success",
+      "created_at": "2026-10-16T19:59:12Z",
+      "event": "push",
+      "head_branch": "master",
+      "head_sha": "10738df39d1bb0a9758435bcae4934f1abc348f3",
+      "jobs": [
+        {
+          "conclusion": "success",
+          "name": "container",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "evals-real",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "image-signing",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "migration",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "quality",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "sbom",
+          "status": "completed"
+        },
+        {
+          "conclusion": "success",
+          "name": "security",
+          "status": "completed"
+        },
+        {
+          "conclusion": "skipped",
+          "name": "变异测试（${{ matrix.shard }}）",
+          "status": "completed"
+        }
+      ],
+      "picked_run_id": 38958907685,
+      "run_id": 38958907685,
+      "runs": [
+        {
+          "conclusion": "failure",
+          "created_at": "2026-10-16T19:47:35Z",
+          "event": "push",
+          "run_id": 38957513542,
+          "status": "completed",
+          "url": "https://github.com/kwny-io/warden-agent/actions/runs/38957513542"
+        },
+        {
+          "conclusion": "success",
+          "created_at": "2026-10-16T19:59:12Z",
+          "event": "push",
+          "run_id": 38958907685,
+          "status": "completed",
+          "url": "https://github.com/kwny-io/warden-agent/actions/runs/38958907685"
+        }
+      ],
+      "status": "completed",
+      "url": "https://github.com/kwny-io/warden-agent/actions/runs/38958907685",
+      "workflow": "CI"
+    }
+  },
+  "fetched_at": "2026-10-17T21:03:45Z",
+  "repo": "kwny-io/warden-agent",
+  "schema": "warden-ci-evidence/1",
+  "sha": "10738df39d1bb0a9758435bcae4934f1abc348f3",
+  "source": "gh run list/view --json 的机械摘录（勿手改；重取用 scripts/ci_evidence.py fetch）"
+}

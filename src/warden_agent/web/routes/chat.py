@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import queue
@@ -24,8 +25,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
+from warden_agent.core.metrics import metrics
+from warden_agent.model.deepseek import ModelCallError
+from warden_agent.policy.policy import PolicyDenied
 from warden_agent.runtime.locking import RunLease
 from warden_agent.runtime.session import FinalReply, NeedsApproval
+from warden_agent.tool.catalog import ToolArgumentError
 from warden_agent.web.coordination import EventBus
 from warden_agent.web.http_kit import (
     SseConcurrencyGate,
@@ -68,10 +73,12 @@ def register(
             response.headers.update(_model_kind_headers(sess.model))
             try:
                 outcome = sess.start(body.text)
-            except Exception as e:  # 工具未注册 / 被 DENY 等
+            except Exception as e:  # 工具未注册 / 被 DENY / 上游挂了…
                 logger.exception("chat 失败 run=%s", run_id)
                 bus.publish(run_id, {"event": "error", "message": str(e)})
-                raise HTTPException(status_code=400, detail=str(e)) from e
+                status = _failure_status(e)
+                _count_failure(status)
+                raise HTTPException(status_code=status, detail=str(e)) from e
 
             if isinstance(outcome, FinalReply):
                 bus.publish(run_id, {"event": "final", "text": outcome.text})
@@ -85,22 +92,55 @@ def register(
             if isinstance(outcome, NeedsApproval):
                 bus.publish(
                     run_id,
-                    {"event": "needs_approval", "approval": outcome.approval.tool_name},
+                    {
+                        "event": "needs_approval",
+                        # 必须是**完整字典**，不是 `tool_name` 字符串：断线续读时前端从这里
+                        # 重建审批卡片，拿字符串去读 `.tool_name/.arguments` 会全是
+                        # `undefined`（页面不报错，只给一张空卡片）。
+                        "approval": outcome.approval.to_dict(),
+                    },
                 )
                 return ChatResponseOut(
                     run_id=run_id,
                     status=sess.status().name,
                     kind="needs_approval",
-                    approval={
-                        "approval_id": outcome.approval.approval_id,
-                        "tool_name": outcome.approval.tool_name,
-                        "arguments": outcome.approval.arguments,
-                        "reason": outcome.approval.reason,
-                    },
+                    # 与总线事件同源（`ApprovalRequest.to_dict`）：两份字典早晚会漂移。
+                    approval=outcome.approval.to_dict(),
                 )
             raise HTTPException(status_code=500, detail="未知结果类型")
         finally:
             lease.stop()
+
+
+_CHAT_FAILURE_METRIC = "warden_chat_failures_total"
+_CHAT_FAILURE_HELP = (
+    "一轮对话以失败告终的次数，按状态桶分开：5xx 是我们的锅（可重试/该告警），400 是请求的锅。"
+)
+
+
+def _failure_status(exc: BaseException) -> int:
+    """一轮对话的异常 → HTTP 状态码。**谁的错就说谁的错。**
+
+    修前这里一律 400，于是两件事故同时发生：
+      1. 供应商 503 被报成用户的错——客户端按 400 处理就不会重试（400 的语义是“重试没用”）；
+      2. 告警永不响——`warden_http_errors_total` 只统计 >=500，而 `WardenHighErrorRate` 只读它，
+         所以模型供应商整体不可用时错误率面板恒为 0。
+    """
+    if isinstance(exc, ModelCallError):
+        return 502  # 上游模型供应商的锅：换时间/换供应商就能好，客户端该重试
+    if isinstance(exc, TimeoutError):
+        return 504  # 含 loop.LoopTimeout（子类）：轮到我们没把结果拿回来
+    if isinstance(exc, (PolicyDenied, ToolArgumentError)):
+        return 400  # 请求的锅：同一条请求重试一百次也一样
+    return 500  # 没料到：不许假装成“用户输错了”
+
+
+def _count_failure(status: int) -> None:
+    """失败必须留下计数（流式路径尤其：那里 200 已经发出去，状态码改不了了）。"""
+    with contextlib.suppress(Exception):  # 埋点不能拖垮业务路径
+        metrics().counter(_CHAT_FAILURE_METRIC, _CHAT_FAILURE_HELP, labels=("status",)).inc(
+            1, labels=(str(status),)
+        )
 
 
 def _heartbeat_window(seconds: float) -> float | None:
@@ -204,10 +244,12 @@ def register_streaming(
                         )
                     # SSE 格式：每条事件以 "data: <json>\n\n" 结尾
                     offer(f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
-            except Exception as e:  # DENY / 工具错误等，以 error 事件结束
+            except Exception as e:  # DENY / 工具错误 / 上游挂了，以 error 事件结束
                 logger.exception("流式 chat 失败 run=%s", run_id)
+                status = _failure_status(e)
+                _count_failure(status)
                 bus.publish(run_id, {"event": "error", "message": str(e)})
-                err = {"type": "error", "message": str(e)}
+                err = {"type": "error", "message": str(e), "status": status}
                 offer(f"data: {json.dumps(err, ensure_ascii=False)}\n\n")
             finally:
                 # 整段流式期间都在驱动这个 run，直到这里才释放：提前释放等于开门让人并发写。

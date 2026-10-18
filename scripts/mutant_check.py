@@ -13,7 +13,8 @@
 跑法：`./.venv/Scripts/python.exe scripts/mutant_check.py`
 解释器不用你记得选：当前不是仓内 `.venv` 时它会自己换过去重跑一遍。
 
-**成本（2026-10-15 实测；旧说法「约 1~2 分钟」与「全套 40 分钟上下」都已过期）**：全套 57 条
+**成本（2026-10-15 实测；旧说法「约 1~2 分钟」与「全套 40 分钟上下」都已过期）**：
+全套 75 条（63 KILL + 12 EQUIV）
 **473s（7.9 分钟）**，而且**几乎全花在 `tests/test_delivery_ledger.py` 那一片**（52 条那一版：
 台账片 11 条 278s、整机 616s，其余 40 多条合计只要 7 分钟）。
 
@@ -119,6 +120,16 @@ T_SANDBOX = "tests/test_sandbox_isolation.py tests/test_sandbox_isolation_gate.p
 T_PATCH = "tests/test_git.py tests/test_patch_path_guard.py tests/test_patch_parser.py"
 # 「事件会不会真的发生」那一层的守卫（triggers: 段：schedule 只从默认分支求值）
 JOB_GATES_GUARD = "tests/test_ci_job_gates.py"
+# 第93 批：单机存储 × 多副本开关（启动即拒）
+RUN_SERVER = "src/warden_agent/web/run_server.py"
+T_SHARED_GUARD = "tests/test_shared_state_guard.py"
+# 第91/92 批的两族静默失真（第九十四批补登记）
+CHAT_ROUTES = "src/warden_agent/web/routes/chat.py"
+T_CHAT_FAIL = "tests/test_chat_failure_status.py"
+SQLITE_STORE = "src/warden_agent/store/sqlite.py"
+T_SCHEMA = "tests/test_schema_downgrade.py"
+APPROVAL_ROUTES = "src/warden_agent/web/routes/approvals.py"
+T_APPROVAL = "tests/test_approval_event_shape.py"
 
 # 被反复引用的长字符串拎出来，免得每行都超 100 列（ruff E501）
 _PATH_DEFAULT = 'raw = str(arguments.get("path", ""))'
@@ -424,8 +435,8 @@ CASES += [
     # 逻辑被改坏也没人知道；这几条由同文件里的合成输入测试（`test_牙_*`）负责杀掉。
     (KILL, "例外清单的豁免被放宽成「任何行都可以没证据」（切点之后的证据要求空转）",
      CI_EVIDENCE_GUARD,
-     '        if sha in after_cut and not e["has_evidence"] and sha not in allowed:',
-     "        if False:", CI_EVIDENCE_GUARD),
+     '        elif sha in after_cut and not e["has_evidence"] and sha not in allowed:',
+     "        elif False:", CI_EVIDENCE_GUARD),
     (KILL, "例外行藏回执不再被点名（拿 git-only 盖住一份回执）",
      CI_EVIDENCE_GUARD,
      '        if e["has_receipt"]:',
@@ -436,8 +447,76 @@ CASES += [
      "    if False:", CI_EVIDENCE_GUARD),
     (KILL, "例外行已经有了证据还留在清单里不再报（例外被滥用没人管）",
      CI_EVIDENCE_GUARD,
-     '        if e["has_evidence"]:',
-     "        if False:", CI_EVIDENCE_GUARD),
+     # 锚点必须带上下文：这个字面量在同一个文件里有第二处（红账分支也问 has_evidence），
+     # 单行锚点会变成「old×2 ⇒ 不知道改哪一处 ⇒ 静默跳过」。
+     '        if e["has_evidence"]:\n'
+     '            out.append(\n'
+     '                f"{sha[:12]} 既在 UNPROVEN_ALLOWED 里又有 ci_evidence'
+     ' ⇒ 例外被滥用（撤掉它）"',
+     '        if False:\n'
+     '            out.append(\n'
+     '                f"{sha[:12]} 既在 UNPROVEN_ALLOWED 里又有 ci_evidence'
+     ' ⇒ 例外被滥用（撤掉它）"',
+     CI_EVIDENCE_GUARD),
+    # 第九十批：红账也必须有期限（没期限的洞就是永久的洞）。
+    (KILL, "红账可以不写期限（空洞从「在途」变成「永久」）",
+     CI_EVIDENCE_GUARD,
+     '            if not rb:',
+     '            if False:', CI_EVIDENCE_GUARD),
+    (KILL, "红账期限已过期不再报（空洞过期了没人重新表态）",
+     CI_EVIDENCE_GUARD,
+     '            elif rb < _utc_today().isoformat():',
+     '            elif False:', CI_EVIDENCE_GUARD),
+]
+
+CASES += [
+    # 第九十三批：文档里写着的禁止（SQLite 不得配多副本）从这批判起由代码强制。
+    # 两条都必须是 KILL——它们是“这条禁令到底管不管用”的全部证据；
+    # 第一条杀不掉 = 守卫根本不触发；第二条杀不掉 = 反向对照没被钉住
+    # （会把最常用的单副本部署挡在门外）。
+    (KILL, "共享状态开关的判定被短路 => 启动即拒永不触发（文档禁令又回到只写在文档里）",
+     RUN_SERVER,
+     '    if not env_bool("WARDEN_SHARED_STATE", False, env):',
+     '    if True:', T_SHARED_GUARD),
+    (KILL, "存储类型判定被短路 => 任何存储都拒（PostgreSQL 也被拦，多副本彻底不可用）",
+     RUN_SERVER,
+     '    if not isinstance(store, SqliteStore):',
+     '    if False:', T_SHARED_GUARD),
+]
+
+CASES += [
+    # 第九十四批：把第91/92 批新增的判据也撞一遍。
+    # 为什么必须登记：这三族的共同点是“改了也不报错”——超时被报成用户输错、
+    # 库比代码新时继续跑、审批事件退化成 tool_name 字符串。
+    # 只有变异能证明测试真的在守它们（否则测试可能只走了 happy path）。
+    (KILL, "超时不再算 504（供应商没回结果又被报成用户输错）",
+     CHAT_ROUTES,
+     '    if isinstance(exc, TimeoutError):',
+     '    if False:', T_CHAT_FAIL),
+    (KILL, "没料到的异常退回 400（第四十七批之前的老毛病：错误率面板又能恒为 0）",
+     CHAT_ROUTES,
+     '    return 500  # 没料到：不许假装成“用户输错了”',
+     '    return 400  # 没料到：不许假装成“用户输错了”', T_CHAT_FAIL),
+    (KILL, "降级守卫恒假 => 库比代码新时继续跑（版本号被改写、payload 静默丢弃）",
+     SQLITE_STORE,
+     '        if existing > self._SCHEMA_VERSION:',
+     '        if False:', T_SCHEMA),
+    (KILL, "审批事件退回 tool_name 字符串（断线续读的卡片全空，而页面不报错）",
+     APPROVAL_ROUTES,
+     '                approval=outcome.approval.to_dict(),',
+     '                approval={"tool_name": outcome.approval.tool_name},', T_APPROVAL),
+    # 第九十六批：第三个出口（`GET /approvals` 审批队列）也曾手写审批字段。
+    # 只撞行为判据还不够——手写字典与 to_dict
+    # “恰好长得一样”时行为判据是绿的，能抓住它的只有源码级那条。
+    (KILL, "审批队列退回手写五个字段（与 to_dict 只是碰巧一样；源码级判据必须报）",
+     APPROVAL_ROUTES,
+     '                result.append({"run_id": run_id, **pending.to_dict()})',
+     '                result.append({"run_id": run_id, "approval_id": pending.approval_id})',
+     T_APPROVAL),
+    (KILL, "审批队列不供 to_dict（队列形状与 `/chat` 不同源，前端静默少一层信息）",
+     APPROVAL_ROUTES,
+     '{"run_id": run_id, **pending.to_dict()}',
+     '{"run_id": run_id}', T_APPROVAL),
 ]
 
 # patch-guard 剩下的等价变异（**不补测试**，只留记录）：

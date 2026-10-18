@@ -162,7 +162,9 @@ def load_ledger(root: Path) -> tuple[dict[str, dict[str, Any]], list[Finding], b
     if not isinstance(entries, list):
         return {}, [Finding("error", LEDGER_NAME, "", "台账缺少 `entries:` 列表")], True
     ledger: dict[str, dict[str, Any]] = {}
-    today = _dt.date.today()
+    # 「今天」按 **UTC** 取：CI 与 workflow 的 cron 都按 UTC 算，本机在 UTC+8 ⇒ 取本机日期会让
+    # 同一个提交在本地与 CI 算出不同的「已过期多少天」（口径与 tests/test_ci_job_gates.py 一致）。
+    today = _dt.datetime.now(_dt.UTC).date()
     for idx, entry in enumerate(entries):
         at = f"entries[{idx}]"
         if not isinstance(entry, dict):

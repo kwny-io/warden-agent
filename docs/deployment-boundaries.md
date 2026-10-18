@@ -99,6 +99,10 @@ WARDEN_TRUSTED_PROXIES=10.0.0.0/8,172.17.0.1     # 取值 = 代理自己的地�
 1. **存储换 PostgreSQL**：`pip install "psycopg[binary]"`，用 `PostgresStore`（定义在 `store/postgres.py`）
    （与 `SqliteStore` 同接口；`docker-compose.yml` 里的 `db` 服务是显式 opt-in）。
    ⚠️ SQLite 是**单机文件**，跨主机共享文件系统跑多副本不受支持——多副本请用 PostgreSQL。
+   **这一条从第93 批起由代码强制**：`WARDEN_SHARED_STATE=1` + SQLite ⇒ 启动即拒
+   （`run_server.ensure_shared_state_matches_backend`，退出码 2）。理由：
+   `SqliteStore.hit_rate_limit` 是读-改-写（只靠进程内锁），跨进程时**限流计数会丢**、
+   写竞争会随机报 `database is locked`——两者都不会自己宣告。
 2. **开共享协调状态**：`WARDEN_SHARED_STATE=1`。
 3. **凭证密钥统一**：所有副本配同一个 `WARDEN_CREDENTIAL_KEY`。凭证密文与租约已经落库
    （`credentials` / `credential_leases` 表），所以多副本天然共享；但**密钥材料必须一致**，

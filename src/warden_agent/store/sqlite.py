@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Concatenate, cast
 
+from warden_agent.core.metrics import note
 from warden_agent.core.redaction import redact_arguments
 from warden_agent.core.run.status import AgentRun, RunStatus
 from warden_agent.credential.vault import (
@@ -35,6 +36,7 @@ from warden_agent.credential.vault import (
     encode_fields,
 )
 from warden_agent.model.model import Message, ToolCall
+from warden_agent.store.base import PAYLOAD_DROPPED_METRIC, SchemaTooNewError
 from warden_agent.store.codec import (
     DEFAULT_CODEC_REGISTRY,
     VersionedCodecRegistry,
@@ -229,6 +231,19 @@ class SqliteStore:
         )
         self.conn.commit()
 
+        # 降级守卫：库比代码新 ⇒ 拒绝启动，而且**抛之前不许改版本号**。
+        # 为什么不只是警告：继续跑会把版本号改写成 5（下面那句 DELETE + INSERT）⇒ 「这套库更新过」
+        # 这个唯一证据被旧代码擦掉，随后新版 payload 被当"不认识"静默丢弃（见下面三处 note(...)）。
+        # 回滚场景（`kubectl rollout undo`）会正好能撞上这条路：健康检查全绿、数据慢慢少。
+        _ver = self.conn.execute("SELECT MAX(version) FROM __schema_version__").fetchone()
+        existing = int(_ver[0]) if _ver and _ver[0] is not None else 0
+        if existing > self._SCHEMA_VERSION:
+            raise SchemaTooNewError(
+                f"数据库 schema 版本 {existing} 比当前代码的 {self._SCHEMA_VERSION} 更新："
+                "这只能是回滚/降级（新库给了老代码）。拒绝启动——旧代码会把版本号改写回去，"
+                "并把新版写下的数据当「不认识」静默丢弃。请把服务升回新版本，或用升级前的备份恢复数据库。"
+            )
+
         # v2：runs 加 updated_at（会话列表展示"最后活跃时间"）
         if not self._has_column("runs", "updated_at"):
             self.conn.execute("ALTER TABLE runs ADD COLUMN updated_at TEXT")
@@ -345,6 +360,11 @@ class SqliteStore:
                     tool_call = self._decode_tool_call(tool_json)
                 except (json.JSONDecodeError, KeyError):
                     # KeyError：未知版本（如未来写下的 v2）。单行坏数据不能拖垮整次加载。
+                    # 但**不能丢得无声无息**：回滚降级后的数据损失全靠这个计数才能被发现。
+                    note(
+                        PAYLOAD_DROPPED_METRIC,
+                        "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
+                    )
                     tool_call = None
             out.append(Message(role=role, content=content, tool_call=tool_call))
         return out
@@ -539,6 +559,10 @@ class SqliteStore:
         try:
             args = decode_versioned(raw_args, self._codec)
         except (json.JSONDecodeError, IndexError, KeyError):
+            note(
+                PAYLOAD_DROPPED_METRIC,
+                "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
+            )
             args = {}
         if not isinstance(args, dict):
             args = {}
@@ -600,6 +624,10 @@ class SqliteStore:
         try:
             obj = decode_versioned(raw, self._codec)
         except (json.JSONDecodeError, KeyError):
+            note(
+                PAYLOAD_DROPPED_METRIC,
+                "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
+            )
             return None
         if isinstance(obj, dict):
             return Checkpoint.from_dict(obj)
