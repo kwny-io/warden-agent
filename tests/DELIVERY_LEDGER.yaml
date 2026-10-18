@@ -443,6 +443,10 @@ rows:
     shape:
     keys:
     run: 39158300154        # dev 的 push run；同 sha 的 master 绿 run = 39159913460
+    # master run = 39159913460（绿，同 sha）—— 这句不是散文，是给
+    # `test_散文里写的_master_run_号也必须是真的` 核的：写了就必须等于证据里的 master run。
+    # （第九十八批补：以前只在 note 里写“run 39159913460 绿”，那条判据的锚短语没命中 ⇒
+    #  它一直是 skip；skip 本身又没签字 ⇒ 跳签守卫在 CI 里真红了。可核的声明不能靠跳。）
     ci_evidence: evidence/ci/c299ef6d3c6f.json
     note: >-
       第89～96 批的落地提交（八批合一）。本条接走 f6bcd5026dd5：它那两条 quality 红分别由
@@ -480,8 +484,27 @@ rows:
       补救过程中我自己又踩了第三下：修复提交 4c462de 没有携带父提交的台账行 ⇒ 推前形状守卫判红
       （run 39168984711），那个提交因此在 `dev` 上被强制替换掉（未取证、不算交付）；
       它那条红 run 不删、在此点名。
-    fixed_by: 未修          # 修复提交的 sha 要等它自己落地后才知道 ⇒ 下一个提交回来改这一行
+    fixed_by: 6c8bd4d1d6685f3d66fcd541cdd065f1ce4db75a
     review_by: 2026-10-25  # 红账要有期限：到期必须要么结清、要么续期并重写理由
+
+
+# 第九十八批的落地树（6c8bd4d）：它自己被跳签守卫判红——鬼是上一批留下的，账记在这里。
+  - sha: 6c8bd4d1d6685f3d66fcd541cdd065f1ce4db75a
+    tree: ab66ac1d4081817726a70c94cf91e0593ad9ca5b
+    attestation: git-only
+    frozen_proof: none
+    run: 39171853222        # dev 的 push run（红）；同 sha 的 master run = 39171856982（也红）
+    verdict: red
+    red_why: >-
+      本条结清 cafc6d9d8ddc 的两条红（矩阵证据缺失 → 那行降为 git-only；gitleaks 假阳 → 锚点按字段名收紧），
+      但自己又红了一条：跳签守卫（断言被跳过的用例都有人签字）报
+      「未签字的跳过：tests.test_ci_evidence::test_散文里写的_master_run_号也必须是真的[c299ef6d3c6f]」。
+      真因是我自己的账写得不够严：那条判据的锚短语是 master run = <数字>，而我在 c299ef6 那行的 note 里
+      写的是「run 39159913460 绿」⇒ 锚短语没命中 ⇒ 判据一直是 skip；skip 又没签字 ⇒ CI 真红。
+      修法不是给它签字（那是把可核的声明变成不核），而是把声明写成它认得的形状（见 f32eed5）。
+      matrix_evidence 与 gitleaks 两项已在这棵树上转绿（本地实跑：跳签判据由 skipped 变 passed）。
+    review_by: 2026-10-25
+    fixed_by: 未修          # 结清它的是下一个交付提交；它的行由再下一个提交带进来
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
