@@ -498,6 +498,8 @@ WARDEN_ADMIN_PRINCIPALS=ops,oncall      # 逗号分隔的 principal id（= 用�
    `rc=0` 才推。它核三条：①一次推多个提交 ⇒ 除 tip 外拿不到 run；②提交没携带 first parent 的台账行
    ⇒ 它自己那棵树在 CI 里红（判据 7「覆盖范围内有洞」）；③tip 携带的父行若声明了 `ci_evidence`，
    该文件必须真在 tip 的 `attestation` 提交里。
+   **这道自检已经接到 git 自己身上**：仓库带 `.githooks/pre-push`（一次性启用 `git config core.hooksPath .githooks`），
+   形状不对时 `git push` 会被直接拦下。忘了跑 = 推不出去；只剩 `--no-verify` 一条逃生门，而它必须在回执里写明理由。
 3. `git push`。**一个交付提交 = 一个 push run**（`--force-with-lease` 仅用于改写历史，见下）。
 4. 等**这次 push 自己的** run 绿：用 `gh run list --json headSha` 核 sha，用 `gh run view <id> --json jobs`
    **逐 job** 看结论——run 级 `conclusion` 不算权威，`skipped` 与 `success` 是两件事。
