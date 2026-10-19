@@ -27,11 +27,53 @@ SHA_B = "b" * 40
 
 
 def _shell() -> str:
+    r"""找一个真能跑 POSIX 脚本的 sh/bash。
+
+    为什么不能只用 `shutil.which("sh"|"bash")`（2026-10-19 实测）：在 **cmd.exe** 环境下，
+    `C:\Windows\System32\bash.exe` 排在 PATH 前面，它是 **WSL 的转接桩**——直接跑只会报
+    `WSL ... execvpe(/bin/bash) failed: No such file or directory`。后果不是跳过，而是三条用例
+    全红，而且红在「钩子拦了但没印出『推送被拦住』」这种**误导**的地方：
+    本机从 git-bash 跑全绿、从 cmd 跑全红 —— 判据变成了「你从哪个 shell 启动 pytest」的函数。
+
+    所以：优先用 Git for Windows 自带的那份（由 `git --exec-path` 反推），再用 PATH 里的，
+    但**排除 System32 下的 WSL 桩**。
+    """
+    candidates: list[str] = []
+    if os.environ.get("WARDEN_SH"):
+        candidates.append(os.environ["WARDEN_SH"])
+    try:
+        exec_path = subprocess.run(
+            ["git", "--exec-path"], capture_output=True, text=True, encoding="utf-8", timeout=30
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        exec_path = ""
+    if exec_path:
+        # <Git>\mingw64\libexec\git-core → <Git>\bin\bash.exe / <Git>\usr\bin\sh.exe
+        git_root = Path(exec_path).parents[2]
+        candidates += [
+            str(git_root / "bin" / "bash.exe"),
+            str(git_root / "usr" / "bin" / "sh.exe"),
+            str(git_root / "usr" / "bin" / "bash.exe"),
+        ]
+    candidates += [r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\sh.exe"]
     for name in ("sh", "bash"):
         found = shutil.which(name)
         if found:
-            return found
-    pytest.skip("没有 sh/bash，无法验证 pre-push 钩子（CI 上必须跑这条）")
+            candidates.append(found)
+
+    for cand in candidates:
+        if not cand or not Path(cand).exists():
+            continue
+        # System32 下的是 WSL 转接桩，不是 Git 的 bash：跑任何脚本都会报 execvpe(/bin/bash)
+        normalized = cand.replace("/", "\\").lower()
+        if "\\windows\\system32\\" in normalized:
+            continue
+        probe = subprocess.run(
+            [cand, "-c", "echo ok"], capture_output=True, text=True, timeout=60
+        )
+        if probe.returncode == 0 and "ok" in probe.stdout:
+            return cand
+    pytest.skip("没有能跑 POSIX 脚本的 sh/bash（System32\\bash.exe 是 WSL 桩，不算）")
 
 
 def _run_hook(tmp_path: Path, stdin: str, guard: Path) -> subprocess.CompletedProcess[str]:

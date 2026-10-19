@@ -16,6 +16,7 @@ import type {
   MemoryCandidate,
   MemoryItem,
   ModelInfo,
+  ModelProbe,
   ModelsInfo,
   RunInfo,
   UserInfo,
@@ -178,8 +179,23 @@ export function toModelsInfo(v: unknown): ModelsInfo | null {
     name: str(m.name),
     needs_key: bool(m.needs_key),
     configured: bool(m.configured),
+    last_probe: toModelProbe(m.last_probe),
   }));
   return { current: str(v.current), models };
+}
+
+/** 探测结论：形状不对就当“没探过”（null），而不是编一个 ok 出来。 */
+export function toModelProbe(v: unknown): ModelProbe | null {
+  if (!isRecord(v)) return null;
+  if (typeof v.ok !== "boolean") return null;
+  return {
+    id: str(v.id),
+    ok: v.ok,
+    reason: typeof v.reason === "string" ? v.reason : null,
+    latency_ms: typeof v.latency_ms === "number" ? v.latency_ms : undefined,
+    checked_at: typeof v.checked_at === "string" ? v.checked_at : undefined,
+    cached: typeof v.cached === "boolean" ? v.cached : undefined,
+  };
 }
 
 /** GET /users → UserInfo[]（丢掉没有 user_id 的项）。 */

@@ -704,3 +704,68 @@ def test_牙_已结清的红账不占额度_但在途的仍然占():
     bad = unproven_violations([open_two, open_one], after_cut={a, b}, allowed={},
                               max_entries=3)
     assert any("红账成了常态" in i for i in bad), bad
+
+
+# ---------- 判据 6：job 到底跑没跑（「结论是 failure 但根本没启动」）----------
+
+@pytest.mark.parametrize("row", rows_with_ci(), ids=lambda r: str(r.get("sha"))[:12])
+def test_每个_job_真的跑过_没跑起来的不能当证据(row: dict):
+    """2026-10-19 实锤：`conclusion` 会撒谎，`steps` 不会。
+
+    dev 上 `4c21333` 的两个绿 run 之后，`ff3329a` 的 run 每个 job 都标 `failure`，而 GitHub 的
+    annotation 原文是「The job was not started because recent account payments have failed」——
+    job 的 `steps` 是**空的**。只核 `conclusion` 的守卫会把「根本没跑」记成「代码跑挂了」：
+    既冤枉代码，也让一个从未执行过的 run 有机会靠 `conclusion: success` 混成证据。
+    所以：`steps` 键在就必须 ≥ 1（登记为 skip 的那两个 job 本来就该 0 步）。
+    """
+    sha = str(row["sha"])
+    d = load_ci(row)
+    for b in BRANCHES:
+        info = d["branches"][b]
+        if "started" in info:
+            assert info["started"] is True, (
+                f"{sha[:12]}：{b} 的 CI 根本没跑起来（not_started_reason="
+                f"{info.get('not_started_reason')!r}）⇒ 这份证据不成立")
+        for j in info.get("jobs") or []:
+            if j.get("steps") is None:
+                continue  # 老产物没这个键：按历史放行，不回填
+            if any(str(j.get("name")).startswith(pre) for pre in EXPECT_SKIP):
+                continue
+            assert int(j["steps"]) >= 1, (
+                f"{sha[:12]}：{b} 的 {j.get('name')} 一个 step 都没执行"
+                f"（conclusion={j.get('conclusion')!r}）⇒ 没跑起来不等于通过，也不等于失败")
+
+
+def test_牙_没跑起来的证据必须被_check_点名(tmp_path):
+    """反向对照：造一份「schema 全对、只有 job 没跑」的证据，`check` 必须红且说出原因。
+
+    只核 `conclusion` 的那一版会放行它（`conclusion: success` 照样对），这条就是那颗牙。
+    """
+    import sys
+
+    sha = "d" * 40
+    jobs_ok = [{"name": n, "conclusion": "success", "status": "completed", "steps": 7,
+                "databaseId": i} for i, n in enumerate(sorted(CORE))]
+    jobs_ok[0] = {**jobs_ok[0], "steps": 0}  # 一个 job 一次都没跑
+    run = {"run_id": 123, "created_at": "2026-10-19T00:00:00Z", "conclusion": "success"}
+    doc = {
+        "schema": SCHEMA, "repo": REPO, "sha": sha,
+        "fetched_at": "2026-10-19T00:00:00Z", "source": "gh",
+        "branches": {b: {"run_id": 123, "picked_run_id": 123, "runs": [run],
+                         "url": "u", "event": "push", "head_branch": b, "head_sha": sha,
+                         "status": "completed", "conclusion": "success",
+                         "created_at": "2026-10-19T00:00:00Z", "workflow": "CI",
+                         "jobs": jobs_ok, "started": False,
+                         "not_started_reason": "The job was not started because recent "
+                                               "account payments have failed"}
+                    for b in BRANCHES},
+    }
+    p = tmp_path / f"{sha[:12]}.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "ci_evidence.py"), "check", str(p)],
+        capture_output=True, text=True, encoding="utf-8", timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    assert r.returncode != 0, f"没跑起来的证据竟然核过了：\n{out}"
+    assert "一个 step 都没执行" in out, f"红了但没说清原因：\n{out}"
+    assert "recent account payments have failed" in out, f"没把账单原因带出来：\n{out}"

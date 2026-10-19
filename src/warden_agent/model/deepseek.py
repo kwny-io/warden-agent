@@ -84,6 +84,20 @@ class OpenAiCompatibleModel(AgentChatModel):
         self.temperature = temperature
         self.max_tokens = max_tokens
 
+    def probe(self, timeout: float = 5.0) -> None:
+        """探一次「这个 provider 到底通不通」，失败就抛。
+
+        只调 `GET /models`（列模型目录，不消耗 token，也不走对话配额）：
+        它验证的正是网关里最容易单独坏掉的那一环——鉴权 + 网络 + base_url。
+
+        为什么需要它：`/models` 曾经只用「有没有 key」回答「能不能用」，
+        于是界面上写「可用」、用户发出第一条消息才被告知 provider 挂了（笔记 95）。
+        """
+        try:
+            self._client.with_options(timeout=timeout, max_retries=0).models.list()
+        except Exception as e:  # noqa: BLE001 —— 任何失败都是「探不通」，原因要原样带出去
+            raise ModelCallError(f"探测失败：{type(e).__name__}: {e}") from e
+
     # ================= 统一接口入口 =================
     def chat(self, request: ChatRequest) -> ChatResponse:
         kwargs = self._build_kwargs(request)

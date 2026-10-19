@@ -71,6 +71,8 @@ ROUTES: tuple[Route, ...] = (
     # ---- 认证即可（数据按调用者收敛）----
     Route("GET", "/models", Access.AUTHENTICATED, "看自己可选模型"),
     Route("POST", "/models/select", Access.AUTHENTICATED, "默认只切自己的（scope=self）"),
+    Route("POST", "/models/probe", Access.AUTHENTICATED,
+          "实测自己配置的上游通不通（只调上游 GET /models，不烧 token）；只探自己的 key"),
     Route("POST", "/chat/{run_id}", Access.AUTHENTICATED, "发起/续跑对话"),
     Route("POST", "/chat/stream/{run_id}", Access.AUTHENTICATED, "流式对话"),
     Route("GET", "/events/{run_id}", Access.AUTHENTICATED, "SSE 事件流"),
@@ -109,7 +111,6 @@ ADMIN_BRANCHES: tuple[tuple[str, str, dict[str, object]], ...] = (
         {"id": "fake", "scope": "deployment"},
     ),
 )
-
 # 静态资源挂载（SPA）。它不是 API 路由，但必须排在最后：否则会遮住 API 路径。
 STATIC_MOUNT = "/assets"
 

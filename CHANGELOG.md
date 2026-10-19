@@ -3,6 +3,83 @@
 > 本文件按**时间戳**记录每次提交改动的内容,以及**尚未实现**的待办(未实现/路线图)。
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
+## 2026-10-19（第103 批：`/models` 不再把「有 key」说成「能用」；探不通必须说得清）
+
+- **缺陷（笔记 95 的标题）**：provider 宕机 / 网络不通 / `base_url` 写错 / key 被吐销——
+  这四种在「有没有 key」这件事上长得一模一样，而界面把「有 key」显示成「可用」，
+  用户发出第一条消息才被告知 provider 挂了。根因不是 UI bug，是**契约里少了一个字段**：
+  「有凭据」与「连得上」本来就是两件事。
+- **`POST /models/probe`**：只调上游 `GET /models`（列模型目录，不消耗 token）——它验证的正是
+  网关里最容易单独坏掉的那一环：鉴权 + 网络 + `base_url`。结果带 `latency_ms` / `checked_at`，
+  失败时把原因**原样**带出（先过 redactor：某些 SDK 会把请求头拼进异常）；
+  缓存 60s（界面 5s 轮询，不缓存等于每 5s 打一次厂商），`force=true` 才重探。
+- **`/models` 新增 `last_probe`**（没探过就是 `null`，不许编一个「可用」出来）：
+  `configured` 与 `last_probe` 分开报，不合并。
+- **前端**：切换成功后自动探一次（不让用户等到发消息才发现挂了）；卡片上给
+  「测一下」/「实测连通」/「探不通」三种态，探不通时把原因写在卡片里。
+- **反向对照**：`tests/test_models_probe.py` 4 条（没 key 不假装探过→400；
+  通与不通都带原因；缓存生效且 `force` 能绕过；`configured` 与 `last_probe` 不混、
+  没探过的模型不许有结论）；`ModelPanel.test.tsx` +3 条（探不通写原因、点「测一下」真调、
+  切换后自动探）。
+- **已知局限（不隐）**：缓存是进程内 dict（多副本各自为政）；`GET /models` 只能证明
+  「鉴权+网络+base_url 通」，证明不了「这个模型名可用」（那是 chat 时的错）。
+- **顺手堵一个静默放行（真验出来的）**：证伪第102 批钩子时发现，
+  `scripts/check_delivery_push.py` 把**空 push 范围**一律当成功，还印「本次 push 只推一个
+  交付提交」——**0 个提交却说推了一个**。而空范围有两种截然不同的含义：
+  `noop`（起点就是 tip，真没东西推）与非快进（`force`/回退，**会丢弃远端已有提交及其台账行与
+  CI 证据**）。后者恰恰是最该喊的一种，却被当成「形状对」放行。现改为：
+  `empty_range_verdict(base, tip)` 分开判，`force` ⇒ **核不动（rc=2）**并说清丢掉的是什么。
+  反向对照：`tests/test_delivery_push.py` +2 条（纯判据两种含义；真仓里 `a..a` 放行、
+  `b..a`（起点比 tip 新）必须 rc=2）；真钩子实跑极性反向也当场拦住。
+- **推前体检又抓出两个“红得误导”的判据（都是本机环境把绿变成红的）**：
+  ① `tests/test_pre_push_hook.py` 只 `shutil.which("sh")`——在 **cmd.exe** 下排第一的是
+  `C:\Windows\System32\bash.exe`（WSL 转接桩），跑任何脚本都报 `execvpe(/bin/bash) failed`，
+  于是一条本该绿的钩子测量变成“钩子没拦住”的假失败。修法：优先由 `git --exec-path` 反推
+  Git for Windows 自带那份，**显式排除 System32 的 WSL 桩**，并对候选先跑 `sh -c 'echo ok'`
+  探活（cmd 环境下也 4 passed；此前从 git-bash 跑绿、从 cmd 跑红——判据不能是“你从哪个
+  shell 启动 pytest”的函数）。
+  ② `scripts/ci_evidence.py` 只记 `conclusion`：而“job 根本没启动”在 GitHub 上也写作
+  `failure`（annotation 原文 `The job was not started because recent account payments have
+  failed…`）。只核 `conclusion` 会把“账单没交”记成“代码跑挂了”，还会让一个从未执行的 run
+  有机会靠 `conclusion: success` 混成证据。现改为：产物里对每个分支记 `started` +
+  `not_started_reason`（GET `check-runs/<job>/annotations`）、对每个 job 记 `steps` **条数**
+  （这才是“到底跑没跑”的可机械事实）；`fetch` 遇到“一个 step 都没跑”⇒ **rc=3**（既不是绿
+  也不是代码红，拒绝当证据）；`check` 与 `tests/test_ci_evidence.py` 各写一遍同名判据
+  （判据 6），并加反向对照：造一份 schema 全对、只有 job 0 步的证据，`check` 必须红且把
+  账单原因带出来。
+- **又抓到第三个「假绿」（这个最刺眼，因为它已在远端）**：本地跑 `ruff check src tests scripts`
+  （= CI quality job 的**原句**）当前是 **5 条 E501**，全在 `scripts/mutant_check.py`
+  （`:796` `:800` `:837` `:961`）与 `scripts/freeze_receipt.py`（`:253`）—— 由已推上去的
+  `7c22ae3`（第99 批）与 `4c21333`（第100 批）引入。为什么一直没被发现：那两次 push 之后 CI
+  **根本没跑**（账单），而我在本地只跑过收窄范围的 ruff（`src tests`），于是“绿”是**没求值**
+  的绿。实测量法（值得记住）：Ruff 的 E501 算的是**显示宽度**，CJK/全角字符算 2 列——
+  一行 84 个字符的中文报 105，所以“字数不够短”不能靠肉眼判。现已折行修完，
+  `uv run --frozen ruff check src tests scripts` ⇒ **All checks passed**，`mypy` ⇒
+  `Success: no issues found in 115 source files`。
+- **探针的真实现终于被测了（之前四条用例都把 `probe()` 整个换掉——真实现等于没验）**：
+  新增三条，并逐个做**反向对照**（变异后必须红）：
+  1. `test_真探针只发_GET_models_且不碰对话端点`：用 `httpx.MockTransport` 挑战请求轨迹，
+     断言恰好是 `GET /v1/models` 且没碰到任何 `chat` 路径（这就是「不烧 token」的可执行版本）；
+  2. `test_真探针失败只尝试一次_不重试_反向对照`：让上游回 500，断言**请求数恰为 1**
+     （`probe()` 里的 `max_retries=0` 若被删，同一条用例会数到 3）；
+  3. `test_探测原因里不许带出自己的_key`：key 绕过 `/models/select`、直接 `broker.register`
+     进 vault（即启动时恢复的现场），此时进程级 redactor 并不知道它 —— 异常里拼进
+     `Authorization: Bearer ...` 时，明文必须被当场抹掉而 `ConnectionError` 这类有用信息保留。
+  顺带修了一个真泄漏：`models_probe` 原来只调进程级 `redactor`（它只知道部署级 key 与
+  `/models/select` 当场导入的那把），从 vault 恢复的 key 会经 `reason` 明文回给浏览器。
+- 过程存档（写在提交里，免得下次再自我感觉良好）：上面三条**第一版有两条是假牙**——
+  用 401 测不出「少写 `max_retries=0`」（401 本就不重试）；走 `/models/select` 测不出抹密钥
+  （那条路径自己会 `redactor.add`）。是反向对照把这两条假绿打出来的，不是读代码读出来的。
+- **变异矩阵在 Windows 重定向下会死于打印**（本次真踩，且它恰好卡在“产出证据”这条路上）：
+  `python scripts/mutant_check.py > evidence/matrix/<sha12>.log` 是本装置的**正常用法**，
+  但重定向时 sys.stdout 默认是 **gbk**，跑到第一个 `⇒` 就
+  `UnicodeEncodeError: 'gbk' codec can't encode character '\u21d2'` ⇒ 矩阵在 `#[34/75]`
+  死掉、源码已自动还原但**台账最需要的那份产物恰恰生成不了**。子进程那边早注了
+  `PYTHONIOENCODING=utf-8`，父进程自己没人管。现新增 `_force_utf8_stdio()`（stdout/stderr
+  都 reconfigure 成 utf-8 + `errors="replace"`：宁可打出一个 `?`，也不能让测量装置死于打印），
+  并给 `_reexec_in_venv` 的子进程显式传环境。回归用例用**子进程 + 强制 gbk** 复现现场
+  （进程内 reconfigure 骗不过），反向对照已验证：拿掉修复，它就红在原始那句错误上。
+
 ## 2026-10-19（第102 批：推前形状守卫接到 git 身上；台账自指死锁的账算在历史上）
 
 - **`.githooks/pre-push`：把“一次只推一个提交”从「人得记得跑」变成「推不出去」**。

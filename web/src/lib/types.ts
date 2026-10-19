@@ -113,11 +113,23 @@ export interface RunInfo {
 }
 
 // GET /models 模型信息
+export interface ModelProbe {
+  id: string;
+  ok: boolean;
+  reason: string | null;
+  latency_ms?: number;
+  checked_at?: string;
+  cached?: boolean;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
   needs_key: boolean;
+  /** 有 key（不等于能用：provider 可能宕机/网络不通/key 被吐回） */
   configured: boolean;
+  /** 上次主动探测的结论；从没探过就是 null（不许编一个“可用”出来） */
+  last_probe?: ModelProbe | null;
 }
 
 export interface ModelsInfo {

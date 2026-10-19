@@ -86,6 +86,7 @@ cryptography 残缺 ⇒ 59 个 collection ERROR）会被伪装成「牙齿很硬
          必须直接钉 kwargs 这个契约（`tests/test_patch_parser.py` 里那条 kwargs 用例）。
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -632,6 +633,26 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _VENV_PYTHON = _ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+def _force_utf8_stdio() -> None:
+    """把自己和子进程的 stdout/stderr 全钉成 UTF-8。
+
+    为什么必须有这一条（2026-10-19 真踩）：本文件的正常用法就是
+    `python scripts/mutant_check.py > evidence/matrix/<sha12>.log`——**重定向时**
+    Windows 下 sys.stdout 默认是 **gbk**，跑到第一个 `⇒` 就
+    `UnicodeEncodeError: 'gbk' codec can't encode character '\u21d2'`，
+    于是矩阵在 #[34/75] 直接死掉、日志变成台账最需要的那份产物**恰恰生成不了**。
+    子进程那边虽然注了 `PYTHONIOENCODING=utf-8`，父进程自己却没人管。
+    设 `errors="replace"` 而不只是换编码：宁可打出一个 `?`，也不能让测量装置死于打印。
+    """
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        # 被替换过的流（如 capsys）不接受 reconfigure——这是预期内的事，不是错。
+        with contextlib.suppress(OSError, ValueError):
+            reconfigure(encoding="utf-8", errors="replace")
+
 def _reexec_in_venv(argv: list[str]) -> int | None:
     """仓里有 .venv 而当前不是它在跑，就换成它重跑一遍（返回它的退出码）。
 
@@ -644,7 +665,10 @@ def _reexec_in_venv(argv: list[str]) -> int | None:
     if not _VENV_PYTHON.exists() or pathlib.Path(sys.executable) == _VENV_PYTHON:
         return None
     print(f"（当前解释器 {sys.executable} 不是仓内 .venv，改成 {_VENV_PYTHON} 重跑）")
-    proc = subprocess.run([str(_VENV_PYTHON), str(pathlib.Path(__file__).resolve()), *argv])
+    child_env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run(
+        [str(_VENV_PYTHON), str(pathlib.Path(__file__).resolve()), *argv], env=child_env
+    )
     return proc.returncode
 
 
@@ -793,11 +817,13 @@ def _shallow_probe(sha: str) -> tuple[int, int]:
         counted = re.search(r"(\d+) failed", out)
         red = len(detail) if detail else (int(counted.group(1)) if counted else 0)
         if counted and detail and int(counted.group(1)) != len(detail):
-            print(f"浅检出探针：汇总说 {counted.group(1)} 条红，明细只有 {len(detail)} 行（以明细为准）",
+            print(f"浅检出探针：汇总说 {counted.group(1)} 条红，"
+                  f"明细只有 {len(detail)} 行（以明细为准）",
                   file=sys.stderr, flush=True)
         if proc.returncode != 0 and red == 0:
             tail = "\n".join((out or proc.stderr or "").splitlines()[-6:])
-            print(f"浅检出探针：rc={proc.returncode} 但没数出红条数（多半是收集/环境问题，不是判据变强）：\n{tail}",
+            print(f"浅检出探针：rc={proc.returncode} 但没数出红条数"
+                  f"（多半是收集/环境问题，不是判据变强）：\n{tail}",
                   file=sys.stderr, flush=True)
         return proc.returncode, red
 
@@ -834,7 +860,8 @@ def _write_evidence(out: pathlib.Path, sha: str, rows: list[tuple[str, str, str]
     live = sum(1 for v, _e, _l in rows if v != "SKIP")
     lines.append(f"MATRIX PASS: {live}/{live} 符合预期（{pos} 条正对照 + {neg} 条反向对照）")
     lines.append(f"SHALLOW depth=1: rc={shallow_rc} 红 {shallow_red} 条"
-                 f"（在只抓一个提交的克隆里跑 {'、'.join(p.split('/')[-1] for p in _SHALLOW_GUARDS)}"
+                 f"（在只抓一个提交的克隆里跑 "
+                 f"{'、'.join(p.split('/')[-1] for p in _SHALLOW_GUARDS)}"
                  f" —— 抓不到历史就必须红，fetch-depth: 0 才算承重）")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
@@ -844,6 +871,7 @@ def _write_evidence(out: pathlib.Path, sha: str, rows: list[tuple[str, str, str]
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)  # 非 TTY 下默认块缓冲 ⇒ 长跑日志全程 0 字节
     argv = sys.argv[1:]
+    _force_utf8_stdio()
     reexec = _reexec_in_venv(argv)
     if reexec is not None:
         return reexec
@@ -958,7 +986,8 @@ def main() -> int:
         print(f"  被证明的提交 {sha[:12]} / 对照 {total} 条（正 {pos} + 反 {neg}）"
               f"/ 浅检出 rc={sh_rc} 红 {sh_red} 条")
         if sh_rc == 0:
-            print("  !! 浅检出里居然全绿 ⇒ 它没证明「fetch-depth: 0 承重」，守卫会拒（rc=0 判假洞察）",
+            print("  !! 浅检出里居然全绿 ⇒ 它没证明「fetch-depth: 0 承重」，"
+                  "守卫会拒（rc=0 判假洞察）",
                   file=sys.stderr, flush=True)
             return 3
     return 1 if _problem(rows) else 0

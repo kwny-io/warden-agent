@@ -64,3 +64,38 @@ def test_基线跑不起来时那片变异的杀死不算证据() -> None:
 def test_哪些情况算问题(row: tuple[str, str, str], is_problem: bool) -> None:
     """BROKEN 必须算问题——否则「环境坏了」会以退出码 0 混过去，那正是假证据的入口。"""
     assert mutant_check._problem([row]) is is_problem
+
+
+# ---------------------------------------------------------------------------
+# 「重定向到文件」这条路必须活着（2026-10-19 真踩）
+#
+# 本装置的正常用法就是 `python scripts/mutant_check.py > evidence/matrix/<sha12>.log`,
+# 而 Windows 下重定向时 sys.stdout 默认是 **gbk**：跑到第一个 `⇒` 就
+# `UnicodeEncodeError: 'gbk' codec can't encode character '\u21d2'`，矩阵在
+# #[34/75] 死掉，日志变成台账最需要的那份产物**恰恰生成不了**。
+# 下面这条用子进程 + 强制 gbk 复现那个环境（进程内 reconfigure 骗不过去）。
+
+
+def test_重定向到文件时不许死于字符编码(tmp_path: Path) -> None:
+    """`PYTHONIOENCODING=gbk` + 重定向 ⇒ 必须 rc=0，且输出里不许有 UnicodeEncodeError。
+
+    反向对照（真做过）：去掉 `_force_utf8_stdio()` 后这条立刻变红，
+    报的正是 `'gbk' codec can't encode character '\u21d2'`。
+    """
+    import os
+    import subprocess
+
+    out = tmp_path / "dry.log"
+    env = dict(os.environ, PYTHONIOENCODING="gbk")
+    with out.open("w", encoding="utf-8") as fh:
+        proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "mutant_check.py"), "--dry"],
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(REPO_ROOT),
+        )
+    text = out.read_text(encoding="utf-8", errors="replace")
+    assert "UnicodeEncodeError" not in text, text[-800:]
+    assert proc.returncode == 0, text[-800:]
+    assert "锚点检查" in text

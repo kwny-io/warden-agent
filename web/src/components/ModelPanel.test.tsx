@@ -19,6 +19,12 @@ const info: ModelsInfo = {
 beforeEach(() => {
   vi.spyOn(api, "models").mockResolvedValue(info);
   vi.spyOn(api, "selectModel").mockResolvedValue({ ok: true, current: "x" });
+  vi.spyOn(api, "probeModel").mockResolvedValue({
+    id: "gpt-4o",
+    ok: true,
+    reason: null,
+    latency_ms: 120,
+  });
 });
 
 afterEach(() => vi.restoreAllMocks());
@@ -41,6 +47,59 @@ describe("ModelPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "重试" }));
     expect(await screen.findByText("GPT-4o")).toBeInTheDocument();
     expect(screen.queryByText(/加载模型列表失败/)).toBeNull();
+  });
+
+  it("有 Key 但探不通：把原因写在卡片里，不把「configured」当成「可用」", async () => {
+    vi.spyOn(api, "models").mockResolvedValue({
+      current: "a",
+      models: [
+        {
+          id: "b",
+          name: "B",
+          needs_key: true,
+          configured: true,
+          last_probe: { id: "b", ok: false, reason: "APIConnectionError: 连不上" },
+        },
+      ],
+    });
+    render(<ModelPanel />);
+    expect(await screen.findByText("探不通")).toBeInTheDocument();
+    expect(screen.getByText(/有 Key，但探测失败：APIConnectionError/)).toBeInTheDocument();
+  });
+
+  it("点「测一下」会真的去探，并把实测结论显示出来", async () => {
+    vi.spyOn(api, "models").mockResolvedValue({
+      current: "a",
+      models: [{ id: "b", name: "B", needs_key: true, configured: true }],
+    });
+    const probe = vi.spyOn(api, "probeModel").mockResolvedValue({
+      id: "b",
+      ok: true,
+      reason: null,
+      latency_ms: 88,
+    });
+    render(<ModelPanel />);
+    await userEvent.click(await screen.findByRole("button", { name: "测一下" }));
+    expect(probe).toHaveBeenCalledWith("b", true);
+    expect(await screen.findByText("实测连通")).toBeInTheDocument();
+  });
+
+  it("切换成功后自动探一次（不让用户等到发消息才知道 provider 挂了）", async () => {
+    vi.spyOn(api, "models").mockResolvedValue({
+      current: "a",
+      models: [
+        { id: "a", name: "A", needs_key: false, configured: true },
+        { id: "b", name: "B", needs_key: false, configured: true },
+      ],
+    });
+    const probe = vi.spyOn(api, "probeModel").mockResolvedValue({
+      id: "b",
+      ok: true,
+      reason: null,
+    });
+    render(<ModelPanel />);
+    await userEvent.click(await screen.findByRole("button", { name: "切换" }));
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledWith("b", true));
   });
 
   it("列出所有模型，当前模型标记「使用中」且不给切换按钮", async () => {

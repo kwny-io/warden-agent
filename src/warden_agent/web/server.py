@@ -411,26 +411,32 @@ def build_app(
             "name": "离线假模型（免费）",
             "needs_key": False,
             "make": lambda key=None: FakeModel(),
+            # 离线假模型不联网，「探通」= 永远通（它自己就是替代品）
+            "probe": lambda key=None: None,
         },
         "deepseek": {
             "name": "DeepSeek",
             "needs_key": True,
             "make": lambda key: _ds.DeepSeekModel(api_key=key),
+            "probe": lambda key: _ds.DeepSeekModel(api_key=key).probe(),
         },
         "openai": {
             "name": "OpenAI",
             "needs_key": True,
             "make": lambda key: _ds.OpenAIModel(api_key=key),
+            "probe": lambda key: _ds.OpenAIModel(api_key=key).probe(),
         },
         "zhipu": {
             "name": "智谱 GLM",
             "needs_key": True,
             "make": lambda key: _ds.ZhipuModel(api_key=key),
+            "probe": lambda key: _ds.ZhipuModel(api_key=key).probe(),
         },
         "bailian": {
             "name": "阿里百炼",
             "needs_key": True,
             "make": lambda key: _ds.BailianModel(api_key=key),
+            "probe": lambda key: _ds.BailianModel(api_key=key).probe(),
         },
     }
     # 已导入的模型 API Key 由凭证 broker 保管：**加密落库 + 短租约**，不再明文躺在

@@ -250,7 +250,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mutation-evidence",
         default="",
-        help="矩阵证据日志（evidence/matrix/<sha12>.log）；给了就写进回执的 mutation 字段，不合格则拒写",
+        help=("矩阵证据日志（evidence/matrix/<sha12>.log）；"
+              "给了就写进回执的 mutation 字段，不合格则拒写"),
     )
     args = parser.parse_args(argv)
 

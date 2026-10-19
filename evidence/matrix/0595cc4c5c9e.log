@@ -1,0 +1,47 @@
+基线 tests/test_delivery_push.py: 绿 —— ..................                                                       [100%]
+[1/75] KILLED   基线绿  起点核不动时整条收摊（第八十六批 CI 上真实发生过的行为：rc=2）  (31.9s)
+[2/75] KILLED   基线绿  退回说了但不说没核到什么（静默：读者会以为形状已经核完了）  (12.6s)
+基线 tests/test_redaction.py: 绿 —— ..............................................................           [100%]
+[3/75] SURVIVED 基线绿  sha256 的 utf-8 换成 UTF-8（codec 别名，编码结果逐字节  (2.6s)
+[4/75] SURVIVED 基线绿  bytes 解码的 utf-8 换成 UTF-8（同上）  (1.4s)
+[5/75] SURVIVED 基线绿  redact_text 的 group == 0 换成 == 1（_sub 未传  (1.4s)
+[6/75] SURVIVED 基线绿  str 键判定恒假（str(k) == k，两分支结果一样）  (1.4s)
+基线 tests/test_policy.py: 绿 —— .........................                                                [100%]
+[7/75] SURVIVED 基线绿  path 默认值换成 None（str(None) 不在任何受保护前缀下，仍然不  (2.7s)
+[8/75] SURVIVED 基线绿  path 默认值直接省掉（同上，默认 None）  (1.3s)
+[9/75] SURVIVED 基线绿  path 默认值换成 XXXX（同样不落在受保护前缀下）  (1.3s)
+[10/75] SURVIVED 基线绿  pure 置成 None（None 也是假值，仍走 ASK，fail-close  (1.3s)
+[11/75] SURVIVED 基线绿  DENY 的排序权重 2 换成 3（仍是最严，取最大值的结果不变）  (1.3s)
+[12/75] KILLED   基线绿  os.name 换成永远不等的字符串（Windows 大小写不敏感失效）  (1.6s)
+[13/75] KILLED   基线绿  os.name 的 nt 写成大写 NT（同上，Windows 语义失效）  (1.5s)
+基线 tests/test_ratelimit.py: 绿 —— ...............................                                          [100%]
+[14/75] SURVIVED 基线绿  报错文案加 XX 前后缀（断言的是“文案含关键词”，加前后缀不改变契约）  (6.7s)
+[15/75] SURVIVED 基线绿  partition 换成 rpartition（≥2 个 / 时两侧必有一侧含   (3.2s)
+基线 tests/test_run_lock.py tests/test_run_lease.py: 绿 —— ................................                                         [100%]
+[16/75] KILLED   基线绿  随机后缀 4 字节换成 5 字节（后缀长度变了——owner 格式是排查契约）  (12.9s)
+[17/75] KILLED   基线绿  随机后缀 4 换成 None（token_hex(None) 直接抛错，取锁路径  (1.8s)
+[18/75] KILLED   基线绿  过期判定 > 换成 >=（恰好到期的那一刻别人就抢不到，多占一个 TTL）  (1.8s)
+[19/75] KILLED   基线绿  续租判定 <= 换成 <（恰好到期的那一刻还以为能续）  (1.8s)
+[20/75] KILLED   基线绿  stop 里不看心跳线程（不 join）——可观测差异=stop 是否等心跳让开  (9.8s)
+[21/75] KILLED   基线绿  丢锁告警加 XX 前后缀（日志/告警规则按子串匹配→以前抓不到，现在按首尾断言）  (11.9s)
+[22/75] KILLED   基线绿  丢锁告警里 Run 变小写（同一条告警的**逐字**首尾也是运维契约）  (11.7s)
+[23/75] KILLED   基线绿  回落锁不把 store 交下去（SqlRunLock(None)：多副本下等于锁  (3.0s)
+[24/75] KILLED   基线绿  回落告警不带存储类型（看到告警也不知道该换哪个存储）  (3.0s)
+[25/75] KILLED   基线绿  回落告警直接省掉类型参数（%s 没东西可填，格式化直接报错）  (3.2s)
+[26/75] KILLED   基线绿  回落告警打在 root logger 上（按模块名过滤告警就失效了）  (2.9s)
+[27/75] KILLED   基线绿  回落告警加 XX 前后缀（同丢锁告警：首尾逐字是契约）  (2.8s)
+[28/75] KILLED   基线绿  回落告警的类型名取成 NoneType（拿到的是 None 类型，仍然是在说瞎话  (3.0s)
+基线 tests/test_ci_job_gates.py: 绿 —— .............................                                            [100%]
+[29/75] KILLED   基线绿  承认「还没轮到」的日子被改成过去（never 就不再是有期限的断言）  (4.5s)
+[30/75] KILLED   基线绿  永远不响这条规则整个摘掉（台账可以无限期地宣称「它就是不响」）  (2.1s)
+[31/75] KILLED   基线绿  只认 kind=schedule 的过滤反过来（真台账那条 schedule 反  (2.0s)
+[32/75] KILLED   基线绿  复核日期在将来不再报（可以写一个没发生过的复核）  (2.1s)
+[33/75] KILLED   基线绿  日期边界从 > 改成 >=（今天复核过的条目会立刻红）  (2.0s)
+基线 tests/test_cost_claims.py: 绿 —— ..........                                                               [100%]
+Traceback (most recent call last):
+  File "D:\warden-agent\scripts\mutant_check.py", line 972, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "D:\warden-agent\scripts\mutant_check.py", line 906, in main
+    print(
+UnicodeEncodeError: 'gbk' codec can't encode character '\u21d2' in position 40: illegal multibyte sequence

@@ -10,6 +10,7 @@ import type {
   HealthResult,
   MemoryCandidate,
   MemoryItem,
+  ModelProbe,
   ModelsInfo,
   RunInfo,
   StreamEvent,
@@ -379,6 +380,15 @@ export const api = {
     return request(
       "/models/select",
       { method: "POST", body: JSON.stringify({ id, api_key: apiKey || null }) },
+      opts,
+    );
+  },
+
+  /** 主动探一次 provider 通不通：POST /models/probe（只调 GET /models，不花 token） */
+  probeModel(id: string, force = false, opts?: RequestOpts): Promise<ModelProbe> {
+    return request(
+      "/models/probe",
+      { method: "POST", body: JSON.stringify({ id, force }) },
       opts,
     );
   },

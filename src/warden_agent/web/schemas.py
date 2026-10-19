@@ -12,6 +12,16 @@ class ChatRequestIn(BaseModel):
     text: str
 
 
+class ModelProbeIn(BaseModel):
+    """POST /models/probe 的请求体：主动探一次「这个 provider 到底通不通」。
+
+    `force=True` 才绕过 60 秒缓存重探——界面不该因为轮询就把厂商打爆。
+    """
+
+    id: str
+    force: bool = False
+
+
 class ModelSelectIn(BaseModel):
     """POST /models/select 的请求体（模型切换 / 导入 API Key）。"""
 
