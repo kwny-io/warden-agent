@@ -32,7 +32,9 @@ from warden_agent.embodiment import (
     ReflexLoop,
     SafetySupervisor,
 )
+from warden_agent.embodiment.report import ReportMeta, write_timeline
 from warden_agent.embodiment.sim import SimAdapter
+from warden_agent.embodiment.types import Event
 from warden_agent.model.model import ChatResponse, ToolCall
 
 SCRIPT_PREFIX = "[脚本模型]"
@@ -112,11 +114,26 @@ def _make_adapter(force_sim: bool, use_serial: bool = False) -> tuple[Any, str, 
     return sim, "sim（手写二阶系统：无重力/摩擦/延迟）", sim.now
 
 
+def _report_target(args: list[str]) -> str | None:
+    """`--report [PATH]`：给了路径就写，给了旗标但没给路径就用默认文件名。"""
+    if "--report" not in args:
+        return None
+    idx = args.index("--report")
+    if idx + 1 < len(args) and not args[idx + 1].startswith("--"):
+        return args[idx + 1]
+    return "robot-timeline.html"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     force_sim = "--sim" in args
     use_serial = "--serial" in args
     events: list[str] = []
+    timeline: list[Event] = []          # 同一批事件的**带时间戳原样**，报告要用
+
+    def _record(event: Event) -> None:
+        timeline.append(event)
+        events.append(f"{event.kind}/{event.code}")
 
     print("=" * 78)
     print("第 1 步：装配（设备 → 安全裁决 → 200Hz 反射环 → 工具卡）")
@@ -127,10 +144,10 @@ def main(argv: list[str] | None = None) -> int:
         adapter.joint_count,
         max_rate_hz=1000.0,
         mode="deny",
-        on_event=lambda e: events.append(f"{e.kind}/{e.code}"),
+        clock=clock,       # 事件时间戳必须与反射环同一个时钟，否则报告上的横轴会劈成两截
+        on_event=_record,
     )
-    loop = ReflexLoop(adapter, supervisor, hz=200.0, clock=clock,
-                      on_event=lambda e: events.append(f"{e.kind}/{e.code}"))
+    loop = ReflexLoop(adapter, supervisor, hz=200.0, clock=clock, on_event=_record)
     stack = EmbodimentStack(adapter=adapter, supervisor=supervisor, loop=loop)
     print(f"  后端：{backend}")
     print(f"  关节数：{adapter.joint_count}   限位：{supervisor.joint_count} 维，"
@@ -189,6 +206,33 @@ def main(argv: list[str] | None = None) -> int:
     counters = getattr(adapter, "counters", None)
     if counters is not None:
         print(f"  总线计数：{counters.as_text()}")
+    report_path = _report_target(args)
+    if report_path is not None:
+        write_timeline(
+            report_path,
+            timeline,
+            ReportMeta(
+                title="具身运行：一次拒绝的全过程",
+                backend=backend,
+                joint_count=adapter.joint_count,
+                metrics={
+                    "拍数": str(metrics.ticks),
+                    "下发": str(metrics.sends),
+                    "拒绝": str(len(denials)),
+                    "饱和": str(metrics.saturations),
+                    "超时拍": str(metrics.deadline_misses),
+                    "单拍 p99": f"{metrics.p99_ms * 1000:.0f}µs",
+                    "急停": "是" if supervisor.stopped else "否",
+                },
+                note=(
+                    "这张图里每个红点都是一次**没有到达设备**的动作：拒绝发生在下发之前，"
+                    "理由留在 detail 列。横轴是设备时钟；同一列多个点表示同一拍内因果同时发生。"
+                    "脚本模型负责「提出请求」，因此这里证明的不是模型聪明，而是链路可控。"
+                ),
+            ),
+        )
+        print(f"  时间线报告：{report_path}（单个 HTML，无外链、无脚本，双击就能看）")
+
     print()
     print("结论：越界与急停中的动作都没有到达设备——拒绝发生在下发之前，")
     print("      并且留在了事件流里。模型可以提出任何目标，能落地的只有过了裁决的那些。")
