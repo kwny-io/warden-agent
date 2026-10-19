@@ -3,6 +3,37 @@
 > 本文件按**时间戳**记录每次提交改动的内容,以及**尚未实现**的待办(未实现/路线图)。
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
+## 2026-10-19（第117 批：MCP 服务端——把工具反方向暴露出去，且不绕开门禁）
+
+> 仓里一直只有 `mcp/client.py`：Warden 能**用**别人的 MCP 工具，但不能被别的 Agent **用**。
+> 这条腿缺失的代价很具体——Claude Desktop / Cursor 想把 `fs.read`、`shell.run`、`knowledge.search`
+> 当工具用，只能自己再包一层 HTTP，于是**审批、审计、沙箱边界在跨进程使用时全部失效**，
+> 对方拿到的是一个裸函数。本批补上服务端，并且刻意**不绕开门禁**。
+
+- **新增 `mcp/server.py`**：stdio + 换行分隔 JSON-RPC 2.0，最小可用集
+  `initialize` / `notifications/initialized` / `tools/list` / `tools/call` / `ping`。
+  `PROTOCOL_VERSION = "2024-11-05"`，与 `mcp/client.py` 握手口径同源；
+  客户端报别的版本时**回我们自己的版本**，不照抄回去假装同意。
+- **三条安全语义（测试逐条钉住，不是注释自证）**：
+  · 每次 `tools/call` 先过 `PolicyEngine`：**DENY 在执行前就拦住**（测试断言工具函数一次都没被调用）；
+  · **ASK 在 stdio 上按拒绝处理**并说明"没有审批通道"——静默放行等于把 ASK 降级成 ALLOW，是最危险的失真；
+  · 工具执行失败（未知工具 / 参数不合法 / 工具自己抛异常）一律返回 **`isError: true` 的工具结果**，
+    不是 JSON-RPC 协议错误：协议错误会让客户端当成断连或触发重试，而"工具跑失败"是正常业务结果。
+- **连接韧性**：坏 JSON 回 `PARSE_ERROR` 但**不断连**（stdio 是长连接，一行脏数据不该废掉整条通道）；
+  未知**通知**（如 `notifications/cancelled`）静默丢弃，未知**请求**才回 `METHOD_NOT_FOUND`；
+  批处理请求明确拒绝（`INVALID_REQUEST`）——半支持的批处理会让顺序语义变含糊。
+- **`on_event` 审计钩子**：每条请求回调 `(method, params, ok)`，钩子自身抛异常不影响主流程
+  （`contextlib.suppress`），但也不会被用来掩盖请求失败。
+- **`--list` 自检入口**：`python -m warden_agent.mcp.server --list` 打印工具清单后退出；
+  默认目录只暴露**只读 + 沙箱 shell**（这个进程的 stdin/stdout 被别的 Agent 占着，没有人工审批通道）。
+- **新增 `tests/test_mcp_server.py`（17 条）**：握手版本不被照抄、`tools/list` 形状、
+  文本/结构体返回（dict 走 JSON 而非 Python `repr`）、未知工具/异常/参数错三种 `isError`、
+  DENY 未执行、ASK 未降级、通知不回复、未知方法码、缺工具名码、坏 JSON 后续仍可用、
+  批处理被拒、空行忽略、审计钩子成功/异常两条路径。
+- **明确不做**：`resources/*`、`prompts/*`、`sampling`、SSE 传输、断线重连、并发批处理。
+  不做的理由写在模块抬头：这些各需一套独立语义（例如 resources 的 URI 生命周期），
+  半吊子实现比不实现更容易误导使用者。
+
 ## 2026-10-19（第116 批：成本账——"这一跑花了多少"从黑箱变成可断言的事实）
 
 > 上一批把规划默认开，理由是"代价可量化"。这一批补上量化的**另一半**：
