@@ -124,13 +124,21 @@ def main(argv: list[str] | None = None) -> int:
     print("第 2 步：反射环真跑 1 秒（目标 0.3 rad，看它是不是真的动起来）")
     print("=" * 78)
     loop.set_target((0.3, 0.0, 0.0), why="演示：先让环自己把关节顶上去")
-    loop.start()
-    time.sleep(1.0)
-    loop.stop()
+    if backend.startswith("sim"):
+        # 手写仿真的时间轴由**步进**决定（dt=0.005），配墙钟等待会变成忙转：
+        # 实测开线程跑 1 秒墙钟 = 9 万拍 = 451 秒仿真时间，数字看着漂亮但毫无意义。
+        for _ in range(200):
+            loop.step()
+        print("  手工步进 200 拍（= 1.0 秒**仿真时间**；这套仿真的时间不由墙钟决定）")
+    else:
+        loop.start()
+        time.sleep(1.0)
+        loop.stop()
     metrics = loop.metrics()
     print(f"  位置：{[round(p, 3) for p in adapter.positions]}")
     print(f"  拍数 {metrics.ticks} / 下发 {metrics.sends} / 拒绝 {metrics.denies} / "
-          f"超时拍 {metrics.deadline_misses} / 单拍 p99 {metrics.p99_ms * 1000:.0f}µs")
+          f"力矩饱和 {metrics.saturations} / 超时拍 {metrics.deadline_misses} / "
+          f"单拍 p99 {metrics.p99_ms * 1000:.0f}µs")
     print("  注意：只有关节 0 有目标；其余关节在重力下自然下垂——这正是真物理与"
           "手写仿真的区别，也是为什么不能拿漂亮的位置曲线当能力证明。")
 

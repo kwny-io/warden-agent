@@ -65,6 +65,18 @@ class JointLimits:
         lo, hi = self.position
         return tuple(min(hi, max(lo, float(x))) for x in target)
 
+    def torque_violation(self, target: Sequence[float]) -> str | None:
+        """力矩越界描述。力矩没有"贴边合法"的说法，超了就是超了。"""
+        limit = self.max_torque
+        for i, x in enumerate(target):
+            if abs(x) > limit + 1e-9:
+                return f"关节 {i} 力矩 {x:.4f} 超出 ±{limit}"
+        return None
+
+    def clamp_torque(self, target: Sequence[float]) -> tuple[float, ...]:
+        limit = self.max_torque
+        return tuple(min(limit, max(-limit, float(x))) for x in target)
+
     def axis_violation(self, target: Sequence[float]) -> str | None:
         """方向无关的越界描述（"贴边"不算越界：夹到边界是合法目标）。"""
         lo, hi = self.position

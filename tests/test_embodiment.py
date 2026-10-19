@@ -333,7 +333,10 @@ def test_单拍超时能被记成_deadline_miss() -> None:
     slow = SlowAdapter(clock, 2)
     sup = SafetySupervisor(LIMITS, 2, clock=clock, watchdog_s=10.0)
     events: list[str] = []
-    loop = ReflexLoop(slow, sup, hz=200.0, clock=clock, on_event=lambda e: events.append(e.code))
+    loop = ReflexLoop(
+        slow, sup, hz=200.0, clock=clock, work_clock=clock,
+        on_event=lambda e: events.append(e.code),
+    )
     loop.step()
     assert loop.metrics().deadline_misses == 1
     assert events == ["deadline_miss"]

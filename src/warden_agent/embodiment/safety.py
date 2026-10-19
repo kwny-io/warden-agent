@@ -32,6 +32,10 @@ from warden_agent.embodiment.types import (
 
 EventSink = Callable[[Event], None]
 
+# 观测容差：编码器量化/积分噪声会让"刚好在边界"的值看起来越界一点点。
+# 这里只放过噪声量级，不放"明显越界"——后者是设备真的出事了。
+OBS_TOLERANCE = 1e-3
+
 
 class SafetySupervisor:
     """把"能不能动"变成可判、可查、可复盘的裁决。"""
@@ -44,6 +48,7 @@ class SafetySupervisor:
         max_rate_hz: float = 20.0,
         watchdog_s: float = 0.5,
         mode: str = "deny",
+        observe_limits: frozenset[str] | None = None,
         clock: Callable[[], float] = time.monotonic,
         on_event: EventSink | None = None,
     ) -> None:
@@ -55,6 +60,12 @@ class SafetySupervisor:
             raise ValueError(f"max_rate_hz 必须为正，得到 {max_rate_hz!r}")
         if watchdog_s <= 0:
             raise ValueError(f"watchdog_s 必须为正，得到 {watchdog_s!r}")
+        armed = frozenset({"position"}) if observe_limits is None else frozenset(observe_limits)
+        unknown = armed - {"position", "velocity", "torque"}
+        if unknown:
+            raise ValueError(
+                f"observe_limits 只认 position/velocity/torque，得到 {sorted(unknown)}"
+            )
         self._limits = limits
         self._joints = joint_count
         self._max_rate = max_rate_hz
@@ -62,6 +73,10 @@ class SafetySupervisor:
         self._mode = mode
         self._clock = clock
         self._on_event = on_event
+        # 观测侧要查哪几维**必须显式选**：不同适配器报的 torques 语义不一样
+        # （有的是指令力矩、有的是测量力矩），默认只查位置——位置超范围
+        # 在任何语义下都说明"出事了"，力矩/速度则可能只是控制器的瞬时指令。
+        self._observe_limits = armed
         self._stop: tuple[Code, str, str] | None = None   # (码, 理由, 谁锁的)
         self._last_target: tuple[float, ...] | None = None
         # 最近一次 observe 到的位姿。跳变检查需要一个"从哪儿跳"的参照：
@@ -76,6 +91,11 @@ class SafetySupervisor:
     def joint_count(self) -> int:
         """受管的关节数。装配期就能核对「设备与裁决是不是同一台机器」。"""
         return self._joints
+
+    @property
+    def limits(self) -> JointLimits:
+        """限位的**唯一来源**。反射环要按 max_torque 饱和，就得从这里取，不能自己再编一套。"""
+        return self._limits
 
     @property
     def stopped(self) -> bool:
@@ -134,6 +154,19 @@ class SafetySupervisor:
                         return self._emit(t, command, Verdict(False, Code.STEP, step_detail))
                     target = self._clamp_step(target)
                     detail = step_detail + "（已按 max_step 限幅）"
+            elif command.kind is CommandKind.TORQUES:
+                # 力矩以前只过 shape/NaN：一个 1000 N·m 的目标能被原样下发，
+                # 而 max_torque 就写在 JointLimits 里却从未参与裁决。
+                torque_bad = self._limits.torque_violation(target)
+                if torque_bad is not None:
+                    if self._mode == "deny":
+                        return self._emit(
+                            t,
+                            command,
+                            Verdict(False, Code.LIMIT, torque_bad + "（deny 模式：不夹取）"),
+                        )
+                    target = self._limits.clamp_torque(target)
+                    detail = torque_bad + "（已夹到 ±max_torque）"
         self._trim_rate(t)
         if not internal and len(self._accepted) >= self._max_rate:
             return self._emit(
@@ -161,12 +194,47 @@ class SafetySupervisor:
         if state.fault:
             return self._trip(t, Code.FAULT, f"适配器报告故障：{state.fault}", "watchdog")
         self._last_pose = tuple(float(x) for x in state.positions)
+        overrun = self._observed_violation(state)
+        if overrun is not None:
+            code, detail = overrun
+            return self._trip(t, code, detail, "observer")
         age = t - state.t
         if age > self._watchdog:
             return self._trip(
                 t, Code.STALE, f"状态过期 {age:.3f}s > 看门狗 {self._watchdog:.3f}s", "watchdog"
             )
         return Verdict(True, Code.OK, "")
+
+    def _observed_violation(self, state: DeviceState) -> tuple[Code, str] | None:
+        """设备**自己报回来**的越界。命令侧查的是"你想干什么"，这里查的是"它到底怎么了"。
+
+        真机上这三类是同一场事故的不同阶段：撞到限位（位置越界）、被外力打飞（超速）、
+        电机堵转还在出力（超力矩）。它们都不该等下一个命令才被发现——所以观测到就锁存。
+        """
+        lo, hi = self._limits.position
+        if "position" in self._observe_limits:
+            for i, x in enumerate(state.positions):
+                if x < lo - OBS_TOLERANCE or x > hi + OBS_TOLERANCE:
+                    return (
+                        Code.LIMIT,
+                        f"观测到关节 {i} 位置 {x:.4f} 超出硬限 [{lo}, {hi}]："
+                        "设备自己越界（撞限位/编码器漂移），已锁存",
+                    )
+        for i, v in (enumerate(state.velocities) if "velocity" in self._observe_limits else ()):
+            if abs(v) > self._limits.max_speed + OBS_TOLERANCE:
+                return (
+                    Code.LIMIT,
+                    f"观测到关节 {i} 速度 {abs(v):.4f} 超过 max_speed "
+                    f"{self._limits.max_speed:g}：已锁存",
+                )
+        for i, tau in (enumerate(state.torques) if "torque" in self._observe_limits else ()):
+            if abs(tau) > self._limits.max_torque + OBS_TOLERANCE:
+                return (
+                    Code.LIMIT,
+                    f"观测到关节 {i} 力矩 {abs(tau):.4f} 超过 max_torque "
+                    f"{self._limits.max_torque:g}：疑似堵转/过载，已锁存",
+                )
+        return None
 
     def estop(self, reason: str, *, by: str, now: float | None = None) -> None:
         """人工/程序急停。**锁存**：不调用 `reset()` 不会自己好。"""
