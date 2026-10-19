@@ -20,6 +20,7 @@ from warden_agent.embodiment.device import DeviceAdapter
 from warden_agent.embodiment.reflex import LoopMetrics, ReflexLoop
 from warden_agent.embodiment.safety import SafetySupervisor
 from warden_agent.embodiment.sim import SimAdapter
+from warden_agent.embodiment.tools import EmbodimentStack, build_embodiment_tools
 from warden_agent.embodiment.types import (
     Code,
     Command,
@@ -36,6 +37,7 @@ __all__ = [
     "CommandKind",
     "DeviceAdapter",
     "DeviceState",
+    "EmbodimentStack",
     "Event",
     "JointLimits",
     "LoopMetrics",
@@ -43,4 +45,5 @@ __all__ = [
     "SafetySupervisor",
     "SimAdapter",
     "Verdict",
+    "build_embodiment_tools",
 ]

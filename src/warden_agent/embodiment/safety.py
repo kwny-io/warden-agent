@@ -64,10 +64,19 @@ class SafetySupervisor:
         self._on_event = on_event
         self._stop: tuple[Code, str, str] | None = None   # (码, 理由, 谁锁的)
         self._last_target: tuple[float, ...] | None = None
+        # 最近一次 observe 到的位姿。跳变检查需要一个"从哪儿跳"的参照：
+        # 只有 _last_target 时，**下发第一条命令**这一路完全没有约束——
+        # 而"从静止一下跳到极限位置"正是最该被拦住的那一次。
+        self._last_pose: tuple[float, ...] | None = None
         self._accepted: deque[float] = deque()
         self._seen: dict[str, Code] = {}
 
     # ---- 只读视图（给运维/时间线用）----
+    @property
+    def joint_count(self) -> int:
+        """受管的关节数。装配期就能核对「设备与裁决是不是同一台机器」。"""
+        return self._joints
+
     @property
     def stopped(self) -> bool:
         return self._stop is not None
@@ -151,6 +160,7 @@ class SafetySupervisor:
             return self._trip(t, Code.DISCONNECTED, "适配器报告断连：进入安全态", "watchdog")
         if state.fault:
             return self._trip(t, Code.FAULT, f"适配器报告故障：{state.fault}", "watchdog")
+        self._last_pose = tuple(float(x) for x in state.positions)
         age = t - state.t
         if age > self._watchdog:
             return self._trip(
@@ -195,10 +205,21 @@ class SafetySupervisor:
             )
         return None
 
+    def _step_reference(self) -> tuple[float, ...] | None:
+        """跳变的参照：优先上一个目标；没有目标就用最近观测到的位姿。
+
+        两者都没有（既没 observe 过、也没下发过目标）说明我们对"现在在哪儿"
+        一无所知——那时不做跳变判断，但也不假装检查过。
+        """
+        if self._last_target is not None:
+            return self._last_target
+        return self._last_pose
+
     def _step_violation(self, target: Sequence[float]) -> str | None:
-        if self._last_target is None:
+        reference = self._step_reference()
+        if reference is None:
             return None
-        for i, (now_x, last_x) in enumerate(zip(target, self._last_target, strict=True)):
+        for i, (now_x, last_x) in enumerate(zip(target, reference, strict=True)):
             if abs(now_x - last_x) > self._limits.max_step:
                 return (
                     f"关节 {i} 单 tick 跳变 {abs(now_x - last_x):.4f} > max_step "
@@ -207,11 +228,12 @@ class SafetySupervisor:
         return None
 
     def _clamp_step(self, target: Sequence[float]) -> tuple[float, ...]:
-        assert self._last_target is not None
+        reference = self._step_reference()
+        assert reference is not None
         step = self._limits.max_step
         return tuple(
             last + min(step, max(-step, x - last))
-            for x, last in zip(target, self._last_target, strict=True)
+            for x, last in zip(target, reference, strict=True)
         )
 
     def _trim_rate(self, now: float) -> None:
