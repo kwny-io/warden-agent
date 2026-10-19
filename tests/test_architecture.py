@@ -30,7 +30,7 @@ TIER: dict[str, int] = {
     "core": 0,
     "model": 1, "tool": 1, "policy": 1,
     "store": 2, "loop": 2, "runtime": 2, "memory": 2, "skill": 2,
-    "credential": 2, "rag": 2, "execution": 2, "multiagent": 2,
+    "credential": 2, "rag": 2, "execution": 2, "multiagent": 2, "embodiment": 2,
     "mcp": 3, "web": 3, "agent": 3,
     "demo": 4, "evals": 4,
 }

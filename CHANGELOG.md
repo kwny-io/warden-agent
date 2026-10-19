@@ -3,6 +3,39 @@
 > 本文件按**时间戳**记录每次提交改动的内容,以及**尚未实现**的待办(未实现/路线图)。
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
+## 2026-10-19（第104 批：具身接入层——让「拒绝」和「停住」成为一等公民）
+
+> 声明：本批**没有真机**。真机与串口适配器尚未接入，下面每条结论都限定在
+> 「确定性可判」的部分：裁决、锁存、时限。仿真适配器只证明管线通，不证明站得住。
+
+- **缺陷（结构性空白）**：仓库里没有任何硬件接入层（grep 无 ros2/serial/socketcan/mujoco/
+  gpio/estop/watchdog）。这不只是"少个驱动"：LLM 单次工具调用几百毫秒，而控制周期是 5 毫秒，
+  把"模型决定 → 直接下发"接上去，等于让一个每 5ms 就可能说出不同答案的过程去驱动关节。
+  更贵的是**静默夹取**——把越界目标默默夹到边界再下发，会在审计里留下"执行成功"的假记录。
+- **本批新增 `src/warden_agent/embodiment/`（5 个模块）**：
+  - `types.py`：`Command`/`CommandKind`(positions|torques|idle)/`DeviceState`(带时间戳)/
+    `JointLimits`(pos 区间 + max_speed/max_torque/max_step)/`Verdict`/`Code`(12 个机器可判码)/
+    `Event`。**被拒绝的命令走 `Verdict` 而不是抛异常**：物理世界里"没做"和"做了"一样是证据，
+    异常只会把证据压成一行栈，落不进审计链。
+  - `device.py`：`DeviceAdapter` 协议（connect/read_state/send/safe_state/close）。
+    刻意**不放**"设频率/PID"——那属于反射环与控制律，放进适配器会让每个新硬件都要重写控制语义。
+  - `safety.py`：`SafetySupervisor` 按 **ESTOP → 幂等(request_id) → 形状 → NaN → 限位 →
+    单拍跳变 → 频率** 的顺序裁决，默认 **deny 而不是 clamp**；`observe()` 把断连/故障/
+    看门狗过期**锁存**成急停；`reset()` 只清锁存、**不恢复运动**（下一个目标仍要过全部检查）。
+  - `reflex.py`：200Hz 反射环（读→看门狗→PD→裁决→下发），单拍超 `jitter_ratio×周期` 记
+    `deadline_miss`；读/写异常一律降级为"停"，不抛栈；落后**不补跑**（补跑会让关节拿到过期目标）。
+  - `sim.py`：最小仿真适配器（位置命令折成 P 力矩、力矩直给、安全态零力矩），
+    docstring 明写它不含重力/摩擦/延迟。
+- **反向对照（`tests/test_embodiment.py`，26 条）**：越界在 deny 下必拒、在 clamp 下必夹且
+  **回执里写清夹了多少**；同一 `request_id` 第二次必拒；急停锁存后复位**不清**上一次目标
+  （复位不等于恢复运动）；单拍超时被记成 `deadline_miss`；读失败/写失败都进安全态且
+  **持续**停在安全态；PD 先证明在收敛、再证明收敛到容差内。
+- **口径修正**：`tests/test_architecture.py` 的 `TIER` 增加 `embodiment: 2`（与 execution/
+  runtime 同层）——否则新包会被当成未知层，层级守卫形同虚设。
+- **已知局限（不隐）**：① 无串口/CAN 适配器，真机未接；② `JointLimits.max_torque` 目前
+  未参与裁决（力矩上限属于控制律，监督层不知道电机符号约定），`Code.LIMIT` 只覆盖位置；
+  ③ 仿真无重力/摩擦/延迟，**不证明站得住**；④ 未见真机上的 jitter 与总线重试数据。
+
 ## 2026-10-19（第103 批：`/models` 不再把「有 key」说成「能用」；探不通必须说得清）
 
 - **缺陷（笔记 95 的标题）**：provider 宕机 / 网络不通 / `base_url` 写错 / key 被吐销——
