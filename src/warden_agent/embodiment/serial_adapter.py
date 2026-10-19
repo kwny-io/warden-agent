@@ -106,6 +106,8 @@ class LoopbackDevice:
     limits: JointLimits = field(default_factory=lambda: JointLimits(position=(-1.4, 1.4)))
     dt: float = 0.005
     damping: float = 0.8
+    kp: float = 8.0            # 位置命令下的小 P 控制器：让"下发位置"真的能推动关节
+    # 注：这是阻尼二阶系统，damping ≈ 2√kp 才临界阻尼；默认值偏小，会振铃（演示里能看见摆动）。
     drop_every: int = 0        # >0：每第 n 个收到的帧直接不回
     corrupt_every: int = 0     # >0：每第 n 个回帧把 CRC 写坏
     deaf: bool = False         # True：彻底不回（模拟设备死掉/线掉了）
@@ -119,6 +121,7 @@ class LoopbackDevice:
     dropped: int = 0
     corrupted: int = 0
     last_command: tuple[int, tuple[float, ...]] | None = None
+    target: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.positions:
@@ -154,10 +157,21 @@ class LoopbackDevice:
             except FrameError:
                 return
             self.last_command = (kind, values)
-            if kind == 1 and len(values) == self.joint_count:      # TORQUES
+            full = len(values) == self.joint_count
+            if kind == 0 and full:
+                # POSITIONS：记住目标，由下面的 P 控制器出力
+                self.target = values
+            elif kind == 1 and full:      # TORQUES：直接给力矩，撤掉位置目标
+                self.target = None
                 self.torques = values
             elif kind == 2:                                        # IDLE：松劲
+                self.target = None
                 self.torques = tuple(0.0 for _ in range(self.joint_count))
+        if self.target is not None:
+            self.torques = tuple(
+                self.kp * (goal - pos)
+                for goal, pos in zip(self.target, self.positions, strict=True)
+            )
         acc = tuple(
             tau - self.damping * v for tau, v in zip(self.torques, self.velocities, strict=True)
         )
@@ -194,6 +208,7 @@ class SerialAdapter:
         timeout: float = 0.05,
         max_retries: int = 2,
         clock: Callable[[], float] = time.monotonic,
+        wait_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if joint_count <= 0:
             raise ValueError(f"joint_count 必须为正，得到 {joint_count!r}")
@@ -207,6 +222,9 @@ class SerialAdapter:
         self._timeout = timeout
         self._max_retries = max_retries
         self._clock = clock
+        # 超时必须用**墙钟**：设备时钟可能因为"设备不回帧"而完全停住，
+        # 拿它当 deadline 会让"超时"永远不到（这个坑在 --serial 演示里真踩到了，见 CHANGELOG）。
+        self._wait_clock = wait_clock
         self._parser = FrameParser()
         self._seq = 0
         self._sent = 0
@@ -214,6 +232,7 @@ class SerialAdapter:
         self._retries = 0
         self._timeouts = 0
         self._last_t: float | None = None
+        self._last_positions: tuple[float, ...] = ()
         self._connected = False
 
     # ---- 契约 ----
@@ -226,8 +245,15 @@ class SerialAdapter:
         return self._limits
 
     @property
+    def positions(self) -> tuple[float, ...]:
+        """最后一次读到的关节位置。**只是缓存给展示用**，控制决策不许读它——那正是"拿旧状态算新力矩"。"""
+        return self._last_positions
+
     def now(self) -> float:
-        """时间基准：设备回帧带的是**设备时钟**，看门狗必须用它，不能用主机墙钟。"""
+        """时间基准：设备回帧带的是**设备时钟**，看门狗必须用它，不能用主机墙钟。
+
+        是**方法**而不是属性——与 `SimAdapter.now()` 一致，可以直接 `clock=adapter.now` 传给反射环。
+        """
         return self._last_t if self._last_t is not None else self._clock()
 
     @property
@@ -258,8 +284,8 @@ class SerialAdapter:
                 self._retries += 1
             seq = self._next_seq()
             self._write(Frame(seq=seq, kind=KIND_POLL))
-            deadline = self._clock() + self._timeout
-            while self._clock() < deadline:
+            deadline = self._wait_clock() + self._timeout
+            while self._wait_clock() < deadline:
                 chunk = self._transport.read(4096)
                 if not chunk:
                     continue
@@ -273,6 +299,7 @@ class SerialAdapter:
                     t, positions, velocities, torques = decode_state(frame.payload)
                     self._recv += 1
                     self._last_t = t
+                    self._last_positions = positions
                     if len(positions) != self._joints:
                         raise OSError(
                             f"设备报 {len(positions)} 个关节，适配器按 {self._joints} 装配"
@@ -320,3 +347,39 @@ class SerialAdapter:
     def _write(self, frame: Frame) -> None:
         self._transport.write(encode_frame(frame))
         self._sent += 1
+
+
+class PyserialTransport:
+    """真串口（pyserial）。**本机没有串口，所以这条路径没有被真机验证过。**
+
+    它只保证两件事：① 没装 pyserial 时报一条"照着做就能解决"的错，而不是 ImportError；
+    ② 装了之后参数与适配器的假设一致——特别是 `timeout=0`：
+    适配器自己用 deadline 轮询，驱动层再阻塞就会让"超时"变成"卡住"。
+    """
+
+    def __init__(self, port: str, *, baudrate: int = 115200, read_timeout: float = 0.0) -> None:
+        try:
+            # 可选依赖：不装也能用 Loopback 跑完所有测试；也不需要为它装 stubs。
+            import serial  # type: ignore[import-untyped]  # noqa: PLC0415
+        except ImportError as exc:  # pragma: no cover - 只在缺依赖时触发
+            raise RuntimeError(
+                "要连真串口需要 pyserial：python -m pip install pyserial；"
+                "不装也能用 --serial 走环回设备（LoopbackDevice）跑完整条链路"
+            ) from exc
+        self._serial = serial.Serial(
+            port=port, baudrate=baudrate, timeout=read_timeout, write_timeout=1.0
+        )
+
+    def read(self, size: int) -> bytes:
+        return self._serial.read(size) or b""
+
+    def write(self, data: bytes) -> None:
+        self._serial.write(data)
+        self._serial.flush()
+
+    def flush_input(self) -> None:
+        self._serial.reset_input_buffer()
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._serial.close()

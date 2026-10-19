@@ -19,6 +19,13 @@
 from warden_agent.embodiment.device import DeviceAdapter
 from warden_agent.embodiment.reflex import LoopMetrics, ReflexLoop
 from warden_agent.embodiment.safety import SafetySupervisor
+from warden_agent.embodiment.serial_adapter import (
+    BusCounters,
+    LoopbackDevice,
+    LoopbackTransport,
+    PyserialTransport,
+    SerialAdapter,
+)
 from warden_agent.embodiment.sim import SimAdapter
 from warden_agent.embodiment.tools import EmbodimentStack, build_embodiment_tools
 from warden_agent.embodiment.types import (
@@ -32,6 +39,7 @@ from warden_agent.embodiment.types import (
 )
 
 __all__ = [
+    "BusCounters",
     "Code",
     "Command",
     "CommandKind",
@@ -41,8 +49,12 @@ __all__ = [
     "Event",
     "JointLimits",
     "LoopMetrics",
+    "LoopbackDevice",
+    "LoopbackTransport",
+    "PyserialTransport",
     "ReflexLoop",
     "SafetySupervisor",
+    "SerialAdapter",
     "SimAdapter",
     "Verdict",
     "build_embodiment_tools",

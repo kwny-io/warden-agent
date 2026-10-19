@@ -205,7 +205,29 @@ def test_now跟着设备时钟走() -> None:
     adapter = SerialAdapter(LoopbackTransport(device), 2, clock=lambda: 1e6)
     adapter.connect()
     state = adapter.read_state()
-    assert adapter.now == pytest.approx(state.t)
+    assert adapter.now() == pytest.approx(state.t)
+
+
+def test_位置命令真的把关节推过去() -> None:
+    # 环回设备在小 P 控制器下把"下发位置"变成力矩：否则 --serial 演示只是发帧不发动作。
+    # damping ≈ 2√kp 才是临界阻尼：默认 0.8 会振铃（实测 300 拍在 0.19~0.69 之间来回摆）。
+    device = LoopbackDevice(2, kp=20.0, damping=9.0)
+    adapter = SerialAdapter(LoopbackTransport(device), 2)
+    adapter.connect()
+    adapter.send(Command(CommandKind.POSITIONS, (0.4, 0.0)))
+    for _ in range(300):
+        adapter.read_state()
+    assert adapter.positions[0] == pytest.approx(0.4, abs=0.03)
+
+
+def test_没有pyserial时报一条能照做的错(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "serial", None)      # 让 import serial 抛 ImportError
+    from warden_agent.embodiment.serial_adapter import PyserialTransport
+
+    with pytest.raises(RuntimeError, match="pip install pyserial"):
+        PyserialTransport("COM3")
 
 
 def test_ack帧不被当成状态帧() -> None:

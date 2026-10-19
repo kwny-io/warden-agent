@@ -22,3 +22,13 @@ def test_演示脚本跑通且拒绝次数对得上(capsys: pytest.CaptureFixtur
     assert "command/estop" in out
     assert "safety/estop" in out
     assert "急停状态：False" in out
+
+
+def test_串口后端也能跑通并且报总线计数(capsys: pytest.CaptureFixture[str]) -> None:
+    # 走的是同一套帧协议/CRC/重试，对端是环回设备：没有真机也能回归"总线"这条路。
+    assert main(["--serial"]) == 0
+    out = capsys.readouterr().out
+    assert "serial（帧协议" in out
+    assert "总线计数：发 " in out
+    assert "command/limit" in out
+    assert "CRC 坏 0" in out

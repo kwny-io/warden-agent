@@ -4,6 +4,7 @@
 
     python -m warden_agent.demo_robot            # 有 mujoco 就用真物理，没有就用内置仿真
     python -m warden_agent.demo_robot --sim      # 强制用手写仿真（零依赖）
+    python -m warden_agent.demo_robot --serial   # 走串口协议（对端是环回设备，不需要真机）
 
 它演示的不是"模型很聪明"，而是这个仓库真正的主张：**模型的输出是建议，不是命令**。
 同一次对话里会出现四种结果，每一种都可判、可审计：
@@ -75,13 +76,28 @@ def _script() -> list[ChatResponse]:
     ]
 
 
-def _make_adapter(force_sim: bool) -> tuple[Any, str, Any]:
+def _make_adapter(force_sim: bool, use_serial: bool = False) -> tuple[Any, str, Any]:
     """返回 (设备, 后端描述, 反射环该用的时钟)。
 
     时钟必须跟着后端走：mujoco 是实时步进的，用 monotonic；SimAdapter 的时间轴
     是**仿真时间**（从 0 起），配 monotonic 会让看门狗立刻判 stale 并锁存急停，
     后面该发生的越界拒绝就再也不会发生了（这个坑在测试里先踩到过一次）。
     """
+    if use_serial:
+        # 对端是**环回设备**：走的是与真机同一套帧协议/重试/seq 对号，只是最后一厘米
+        # 换成了内存里的假设备。所以下面每一拍都是"过了总线"的，不是直接调函数。
+        from warden_agent.embodiment.serial_adapter import (
+            LoopbackDevice,
+            LoopbackTransport,
+            SerialAdapter,
+        )
+
+        device = LoopbackDevice(joint_count=3, limits=JointLimits(position=(-1.4, 1.4)))
+        bus: Any = SerialAdapter(LoopbackTransport(device), 3,
+                                 limits=JointLimits(position=(-1.4, 1.4)),
+                                 timeout=0.02, max_retries=2)
+        bus.connect()
+        return bus, "serial（帧协议 + CRC + 重试；对端是环回设备，不是真机）", bus.now
     if not force_sim:
         try:
             from warden_agent.embodiment.mujoco_sim import MujocoAdapter
@@ -99,12 +115,13 @@ def _make_adapter(force_sim: bool) -> tuple[Any, str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     force_sim = "--sim" in args
+    use_serial = "--serial" in args
     events: list[str] = []
 
     print("=" * 78)
     print("第 1 步：装配（设备 → 安全裁决 → 200Hz 反射环 → 工具卡）")
     print("=" * 78)
-    adapter, backend, clock = _make_adapter(force_sim)
+    adapter, backend, clock = _make_adapter(force_sim, use_serial)
     supervisor = SafetySupervisor(
         JointLimits(position=(-1.4, 1.4), max_speed=50.0, max_step=0.5),
         adapter.joint_count,
@@ -124,12 +141,12 @@ def main(argv: list[str] | None = None) -> int:
     print("第 2 步：反射环真跑 1 秒（目标 0.3 rad，看它是不是真的动起来）")
     print("=" * 78)
     loop.set_target((0.3, 0.0, 0.0), why="演示：先让环自己把关节顶上去")
-    if backend.startswith("sim"):
+    if backend.startswith(("sim", "serial")):
         # 手写仿真的时间轴由**步进**决定（dt=0.005），配墙钟等待会变成忙转：
         # 实测开线程跑 1 秒墙钟 = 9 万拍 = 451 秒仿真时间，数字看着漂亮但毫无意义。
         for _ in range(200):
             loop.step()
-        print("  手工步进 200 拍（= 1.0 秒**仿真时间**；这套仿真的时间不由墙钟决定）")
+        print("  手工步进 200 拍（时间轴由设备回帧推进；这套后端的时间不由墙钟决定）")
     else:
         loop.start()
         time.sleep(1.0)
@@ -139,8 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  拍数 {metrics.ticks} / 下发 {metrics.sends} / 拒绝 {metrics.denies} / "
           f"力矩饱和 {metrics.saturations} / 超时拍 {metrics.deadline_misses} / "
           f"单拍 p99 {metrics.p99_ms * 1000:.0f}µs")
-    print("  注意：只有关节 0 有目标；其余关节在重力下自然下垂——这正是真物理与"
-          "手写仿真的区别，也是为什么不能拿漂亮的位置曲线当能力证明。")
+    if backend.startswith("mujoco"):
+        print("  注意：只有关节 0 有目标；其余关节在重力下自然下垂——这正是真物理与"
+              "手写仿真的区别，也是为什么不能拿漂亮的位置曲线当能力证明。")
+    else:
+        print("  注意：这套后端没有重力/摩擦；位置能跟上目标只说明**链路通**，不说明站得住。")
 
     print()
     print("=" * 78)
@@ -166,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
     for name in denials:
         print(f"    - {name}")
     print(f"  急停状态：{supervisor.stopped}（理由：{supervisor.stop_reason or '无'}）")
+    counters = getattr(adapter, "counters", None)
+    if counters is not None:
+        print(f"  总线计数：{counters.as_text()}")
     print()
     print("结论：越界与急停中的动作都没有到达设备——拒绝发生在下发之前，")
     print("      并且留在了事件流里。模型可以提出任何目标，能落地的只有过了裁决的那些。")
