@@ -283,8 +283,13 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     EnvSpec("WARDEN_STABILITY", "工具稳定性层（超时/重试/降级/熔断），0 关",
             "web/run_server.py", ("web/run_server.py",),
             default="1（产品入口默认开）", kind="bool"),
-    EnvSpec("WARDEN_PLANNER", "阶段规划（会多花一次模型调用，默认关）",
-            "web/run_server.py", ("web/run_server.py",), kind="bool"),
+    EnvSpec("WARDEN_PLANNER",
+            "阶段规划（默认开；**只对判定为复杂的任务**多发一次模型调用）",
+            "web/run_server.py", ("web/run_server.py",),
+            default="1（产品入口默认开）", kind="bool",
+            note="简单任务零成本：plan_with_model 先跑离线复杂度启发式，不复杂就直接返回、"
+                 "一次模型调用都不发（tests/test_planner_default.py 数调用次数钉住）。"
+                 "规划调用失败/返回非 JSON 时降级成模板，不崩。设 0 关闭"),
     EnvSpec("WARDEN_MAX_CONTEXT_CHARS", "上下文裁剪的字符上限（0 = 不裁剪）",
             "web/run_server.py", ("web/run_server.py",), kind="int"),
     EnvSpec("WARDEN_UNTRUSTED_FENCE",

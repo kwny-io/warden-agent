@@ -565,13 +565,17 @@ def _cognition_from_env(
       · **意图路由**：`ToolIntentRouter` 纯离线确定性、不让模型多跑一次 → **默认开**。
         调用前校验"该不该调"，疑似误调就提示模型而不是直接执行。
       - **上下文裁剪**：防长会话把上下文撑爆，纯收益 → **默认开**（阈值可覆盖）。
-      · **阶段规划**：`ModelPlanner` 会为复杂任务**多花一次模型调用** → **默认关**，
-        要开就设 `WARDEN_PLANNER=1`（值得，因为复杂任务本来就贵）。
+      · **阶段规划**：`ModelPlanner` 只在**判定为复杂**时才多花一次模型调用
+        （`plan_with_model` 先跑离线启发式，简单任务**一次调用都不发**，
+        由 `tests/test_planner_default.py` 数调用次数钉住）→ **默认开**；`WARDEN_PLANNER=0` 可关。
+        为什么改默认：原来"默认关"的理由是"怕多花钱"，但这个成本只落在复杂任务上——
+        而复杂任务本来就贵，多一次规划换来的是"不闷头一口气做完"。给简单任务加零成本、
+        给复杂任务加一次调用，这个默认值才站得住（第115 批改的口径，旧文档写的是"默认关"）。
     """
     intent = ToolIntentRouter(catalog)
     planner = (
         ModelPlanner(model)
-        if env_bool("WARDEN_PLANNER", False, env)
+        if env_bool("WARDEN_PLANNER", True, env)
         else None
     )
     limit = env_int("WARDEN_MAX_CONTEXT_CHARS", DEFAULT_MAX_CONTEXT_CHARS, env)
@@ -784,7 +788,7 @@ def main() -> None:
     logger.info(
         "认知能力：意图路由=%s｜阶段规划=%s｜上下文裁剪=%s 字符",
         "开" if intent is not None else "关",
-        "开" if planner is not None else "关（设 WARDEN_PLANNER=1 可开）",
+        "开" if planner is not None else "关（WARDEN_PLANNER=0）",
         ctx_chars or "不裁剪",
     )
     # 链路追踪出口：配了 OTLP endpoint 才会把 span 送出去（否则只打结构化日志）。
