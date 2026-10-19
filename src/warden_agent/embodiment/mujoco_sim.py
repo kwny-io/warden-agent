@@ -146,6 +146,10 @@ class MujocoAdapter:
     def positions(self) -> tuple[float, ...]:
         return tuple(float(self._data.qpos[i]) for i in range(self._joints))
 
+    def now(self) -> float:
+        """实时步进：设备时钟就是墙钟（`DeviceState.t` 同源，看门狗用它才一致）。"""
+        return time.monotonic()
+
     @property
     def limits(self) -> JointLimits:
         lo = min(float(self._model.jnt_range[i][0]) for i in range(self._joints))
