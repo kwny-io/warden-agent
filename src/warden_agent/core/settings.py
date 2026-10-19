@@ -301,6 +301,16 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
                  "读类工具**故意不在此列**——污染后连读都拦，会把正常排查也堵死"),
     EnvSpec("WARDEN_KNOWLEDGE", "RAG 知识来源：1 = 内置离线语料 / 目录路径",
             "web/run_server.py", ("web/run_server.py",), kind="text"),
+    EnvSpec(
+        "WARDEN_RAG_MODE",
+        "RAG 检索模式：`hybrid`（默认）/ `lexical` / `semantic`",
+        "rag/knowledge.py", ("rag/knowledge.py",),
+        default="hybrid",
+        note="hybrid = BM25 字面 + 向量两路 RRF 融合；lexical/semantic 是消融开关，"
+             "用来单独看一条腿的贡献。**离线词频嵌入下 semantic 与 lexical 几乎等价**"
+             "（词频哈希本身就是字面匹配），想看语义那一列的增益必须配 WARDEN_EMBED_*。"
+             "取值写错抛 ValueError（构造 VectorStore 时即失败，不静默退回默认）",
+    ),
     EnvSpec("WARDEN_WEB_FETCH", "开启真实联网抓取（默认离线 mock 不发请求）",
             "web/search.py", ("web/search.py",), kind="bool"),
     EnvSpec("WARDEN_SEARCH_PROVIDER",

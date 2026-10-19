@@ -23,7 +23,6 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
-import re
 import socket
 import sqlite3
 from collections.abc import Callable, Mapping
@@ -31,7 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from warden_agent.core.settings import env_opt
+from warden_agent.core.settings import env_opt, env_str
+from warden_agent.rag.hybrid import LexicalIndex, rrf_fuse
+from warden_agent.rag.tokens import terms
 from warden_agent.rag.vector_index import (
     LinearIndex,
     VectorIndex,
@@ -48,16 +49,8 @@ Embedder = Callable[[str], list[float]]
 
 # ---- 默认嵌入：词袋（term-frequency）向量。可靠、离线、零依赖 ----
 def _terms(text: str) -> list[str]:
-    """把文本切成词/词组。中文按字粒度切会太碎，这里按 2~4 字窗口做词元。"""
-    text = text.lower()
-    # 英文词 + 中文的 2,3,4 字窗口，模拟"词"
-    tokens: list[str] = re.findall(r"[a-z0-9]+", text)
-    cjk = re.findall(r"[\u4e00-\u9fff]+", text)
-    for seg in cjk:
-        for n in (2, 3, 4):
-            if len(seg) >= n:
-                tokens.extend(seg[i:i + n] for i in range(len(seg) - n + 1))
-    return tokens
+    """把文本切成词/词组（实现搬到 `rag/tokens.py`，BM25 与嵌入必须共用同一套切分）。"""
+    return terms(text)
 
 
 def _term_frequency_embedder(text: str, dim: int = 4096) -> list[float]:
@@ -241,9 +234,24 @@ class VectorStore:
     """
 
     def __init__(
-        self, embedder: Embedder | None = None, *, persist_path: str | Path | None = None
+        self,
+        embedder: Embedder | None = None,
+        *,
+        persist_path: str | Path | None = None,
+        mode: str | None = None,
     ) -> None:
+        # 检索模式：lexical（BM25 字面）/ semantic（向量）/ hybrid（两路 RRF 融合，默认）。
+        # 为什么要可切：换嵌入器时要能单独看"字面这条路"的贡献，否则调参全靠猜。
+        raw = mode if mode is not None else env_str("WARDEN_RAG_MODE", "hybrid")
+        chosen = raw.strip().lower()
+        if chosen not in {"lexical", "semantic", "hybrid"}:
+            raise ValueError(
+                f"WARDEN_RAG_MODE 只能是 lexical/semantic/hybrid，实际为 {chosen!r}"
+            )
+        self.mode = chosen
         self.embedder: Embedder = embedder or hash_embedder
+        # 字面索引与 _chunks 同序、同步增长（BM25 是增量统计，不需要重建）
+        self._lexical = LexicalIndex()
         self._chunks: list[str] = []
         self._vectors: list[list[float]] = []
         # 与 _chunks 一一对应的来源标注（为空表示该块无来源）
@@ -295,6 +303,9 @@ class VectorStore:
             self._source_ids.append(str(r[3]))
         self._vectors = vectors
         self._index = build_index(vectors)
+        # 字面索引不落盘：它由 chunk 文本现算（省一次迁移，代价是启动时多扫一遍）
+        for chunk in self._chunks:
+            self._lexical.add(chunk)
 
     def _persist(self, chunk: str, vector: list[float], source: str, source_id: str) -> None:
         if self._conn is None:
@@ -333,6 +344,7 @@ class VectorStore:
         self._sources.clear()
         self._source_ids.clear()
         self._index = LinearIndex()
+        self._lexical = LexicalIndex()
         if self._conn is not None:
             self._conn.execute("DELETE FROM rag_chunks")
             self._conn.commit()
@@ -372,6 +384,7 @@ class VectorStore:
             self._sources.append(src)
             self._source_ids.append(sid)
             self._index.add(vector)
+            self._lexical.add(chunk)
             self._persist(chunk, vector, src, sid)
 
     def search(self, query: str, top_k: int = 3) -> list[tuple[str, float]]:
@@ -382,12 +395,26 @@ class VectorStore:
         return [(h.text, h.score) for h in self.search_hits(query, top_k)]
 
     def search_hits(self, query: str, top_k: int = 3) -> list[SourceHit]:
-        """给定问题，返回最相关的 top_k 个命中，**带来源引用**（企业级可溯源）。"""
+        """给定问题，返回最相关的 top_k 个命中，**带来源引用**（企业级可溯源）。
+
+        `score` 的含义随 `mode` 变：semantic = 余弦相似度；lexical = BM25 分；
+        hybrid = RRF 融合分（**只表示名次，不是相关度**，不要当阈值用）。
+        """
         if not self._chunks:
             return []
-        qvec = self.embedder(query)
-        # 走索引：稀疏向量倒排剪枝（结果与全量扫描**一致**），稠密走线性
-        scored = self._index.search(qvec, top_k)
+        scavenge = max(top_k * 4, top_k)   # 融合前多取一些候选，否则两路各取 top_k 会漏掉交集
+        if self.mode == "lexical":
+            scored = self._lexical.top_k(query, top_k)
+        else:
+            qvec = self.embedder(query)
+            # 走索引：稀疏向量倒排剪枝（结果与全量扫描**一致**），稠密走线性
+            by_vector = self._index.search(qvec, scavenge)
+            if self.mode == "semantic":
+                scored = by_vector[:top_k]
+            else:
+                scored = rrf_fuse(
+                    [by_vector, self._lexical.top_k(query, scavenge)], top_k=top_k
+                )
         hits: list[SourceHit] = []
         for cidx, sim in scored[:top_k]:
             src = self._sources[cidx] if cidx < len(self._sources) else ""
