@@ -110,3 +110,19 @@ def test_文件名必须是_sha12(tmp_path):
     mod = _load(tmp_path)
     with pytest.raises(ValueError, match="evidence/matrix/"):
         mod.mutation_block(_write(tmp_path, GOOD, name="latest.log"), SHA)
+
+
+# ── 崩溃型缺陷：pytest 跑完但 stdout 是 None（2026-10-19 真撞到） ────────────────
+def test_pytest日志拼接到_None_不许崩():
+    """整整跑了十几分钟，`proc.stdout` 是 None ⇒ `stdout + stderr` 直接 TypeError。
+
+    那一刻回执本该由 junit 生成；因为「日志形状」把整条冻结链崩掉，是判据把自己当成了目标。
+    反向对照也在：真的拿到文本时，两路都得拼进去（别为了防崩把 stderr 丢了）。
+    """
+    import types
+
+    mod = _load(pathlib.Path("."))
+    assert mod._pytest_log(types.SimpleNamespace(stdout=None, stderr=None)) == ""
+    assert mod._pytest_log(types.SimpleNamespace(stdout="A", stderr=None)) == "A"
+    assert mod._pytest_log(types.SimpleNamespace(stdout=None, stderr="B")) == "B"
+    assert mod._pytest_log(types.SimpleNamespace(stdout="A", stderr="B")) == "AB"

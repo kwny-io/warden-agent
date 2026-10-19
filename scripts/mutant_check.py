@@ -241,7 +241,7 @@ CASES: list[tuple[str, str, str, str, str, str]] = [
      "    first_possible_fire: 2026-10-19", "    first_possible_fire: 2026-10-12", JOB_GATES_GUARD),
     (KILL, "永远不响这条规则整个摘掉（台账可以无限期地宣称「它就是不响」）",
      JOB_GATES_GUARD,
-     '        if str(entry.get("last_observed_fire")) == "never" and first <= today:',
+     '        if str(entry.get("last_observed_fire")) == "never" and first < today:',
      "        if False:", JOB_GATES_GUARD),
     (KILL, "只认 kind=schedule 的过滤反过来（真台账那条 schedule 反而被跳过）",
      JOB_GATES_GUARD,

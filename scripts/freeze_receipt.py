@@ -214,6 +214,18 @@ def mutation_block(path: Path, sha: str) -> dict[str, object]:
     }
 
 
+def _pytest_log(proc: subprocess.CompletedProcess[str]) -> str:
+    """pytest 子进程的输出文本。
+
+    为什么不是直接 `proc.stdout + proc.stderr`：这一次真实撞上了——整整跑了十几分钟的 pytest
+    结束后 `proc.stdout` 是 **None**，`+` 直接 TypeError，而那一刻回执本该已经由 junit 生成。
+    回执的四个来源（git / junit / 退出码 / 快照哈希）里，日志只用来抽覆盖率；
+    因日志形状把整个冻结代码崩掉，是判据把自己当成了目标。
+    所以这里退化成空串；调用方必须自己对「日志空白 ⇒ 抽不到覆盖率 ⇒ 拒写回执」负责。
+    """
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
 def _dump(receipt: dict[str, object]) -> str:
     head = (
         "# 交付回执 —— 由 scripts/freeze_receipt.py --run 机器生成。\n"
@@ -281,9 +293,20 @@ def main(argv: list[str] | None = None) -> int:
         f"--junitxml={junit}", "-o", "junit_family=xunit2",
     ] + (args.pytest_args.split() if args.pytest_args else [])
     print(f"跑：{' '.join(cmd[1:])}", flush=True)
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
-    log_text = proc.stdout + proc.stderr
-    log_path.write_text(log_text, encoding="utf-8")
+    # 直接写文件而不是走管道：① 管道那份全量日志会在内存里再存一份（九分钟的输出不小）；
+    # ② 管道这条路径真出过 `proc.stdout is None`（见 `_pytest_log` 的注释）。
+    # 写文件后运行时就能 tail 进度，冻结失败时也还有现场。
+    with log_path.open("w", encoding="utf-8", errors="replace") as fh:
+        proc = subprocess.run(
+            cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT, text=True, encoding="utf-8"
+        )
+    log_text = log_path.read_text(encoding="utf-8", errors="replace") or _pytest_log(proc)
+    if not log_text.strip():
+        print(
+            f"pytest 跑完了但日志是空的（rc={proc.returncode}）⇒ 抽不到覆盖率，拒写回执。",
+            file=sys.stderr,
+        )
+        return 2
 
     tree_after, shape_after, keys_after = (
         _git("rev-parse", f"{args.sha}^{{tree}}"), _shape(), _keys()
