@@ -4,7 +4,7 @@
 如果生成器只是把期望抄进 `OK` 列，那么守卫会看起来全绿、实际上什么都没核——那正是这一批要消灭的病。
 
 于是这里只核三件在最容易退化处的事：
-1. **格式即契约**：它写出来的头行/终值行/表格行必须能被 `tests/test_matrix_evidence.py` 的正则原样吃下去
+1. **格式即契约**：它写的头行/终值行/表格行必须被 `tests/test_matrix_evidence.py` 的正则原样吃下去
    （那边改了格式就要一起改；这里不过，说明证据根本进不了账）。
 2. **期望没满足的行不许写成 `OK`**：否则 `MATRIX PASS` 就是假的。
 3. **SKIP 行必须带原因**：`SKIP（）` 会被守卫判红，生成器不能产出这种行。
@@ -53,7 +53,12 @@ def test_写出来的文本能被守卫的正则原样吃下去(tmp_path):
     assert HDR.search(text).group(1) == SHA, "头行没绑定到被证明的提交"
     m = PASS.search(text)
     assert m and m.group(1) == "PASS"
-    assert (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))) == (total, total, pos, neg)
+    assert (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))) == (
+        total,
+        total,
+        pos,
+        neg,
+    )
     assert (total, pos, neg) == (3, 2, 1), f"计数不对：{(total, pos, neg)}"
     assert SHALLOW.search(text).group(1) == "1" and SHALLOW.search(text).group(2) == "3"
     assert len(ROW_M.findall(text)) == pos and len(ROW_R.findall(text)) == neg

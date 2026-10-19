@@ -529,9 +529,10 @@ def _trigger_rot(entries: list[dict[str, Any]], today: datetime.date) -> list[st
                 f"{where} 的 last_checked({checked}) 在未来（今天 {today}）—— 那是没发生过的复核"
             )
         # `first < today`（而不是 `<=`）：cron 带**时刻**，第一次交火的那天在当天早上还没到点。
-        # 2026-10-19 就是现场：`0 3 * * 1` 的首个交点就是当天 03:00Z，而 UTC 今天已是 10-19（01:03Z），
+        # 2026-10-19 就是现场：`0 3 * * 1` 的首个交点就是当天 03:00Z，
+        # 而 UTC 今天已是 10-19（01:03Z），
         # `<=` 会在事件**还没到点**时把守卫变红，让人跑去 `gh run list` 再发现“什么都没有”——
-        # 跟写满 “never” 一样是假信号，只不过方向反过来（假红）。越过一天后仍然 never 才是真的对不上。
+        # 跟写满 “never” 一样是假信号，只是方向反过来（假红）。越过一天后仍 never 才是真对不上。
         if str(entry.get("last_observed_fire")) == "never" and first < today:
             problems.append(
                 f"{where} 写着 first_possible_fire={first} 且 last_observed_fire=never，"

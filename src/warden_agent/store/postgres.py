@@ -724,15 +724,19 @@ class PostgresStore:
     def _decode_checkpoint(raw: object) -> object | None:
         from warden_agent.runtime.checkpoint import Checkpoint
 
+        # 与 sqlite 侧同一条道理：`from_dict` 字段不认识时（降级后读到新版写的 status）
+        # 会抛 `CheckpointDecodeError`。它必须在 try 里面，否则一条脏行就能让整张表读不出来。
         try:
             obj = decode_versioned(str(raw))
-        except (json.JSONDecodeError, KeyError):
+            if not isinstance(obj, dict):
+                return None
+            return Checkpoint.from_dict(obj)
+        except (ValueError, TypeError, KeyError):
             note(
                 PAYLOAD_DROPPED_METRIC,
                 "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
             )
             return None
-        return Checkpoint.from_dict(obj) if isinstance(obj, dict) else None
 
     # ---- 跨副本共享状态（幂等 / 事件流 / 限流计数）----
     @_reconnecting

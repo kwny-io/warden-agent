@@ -12,6 +12,15 @@
   动机是真实事故：2026-10-19 的 4 条 run 全红而**每个 job 的 steps 数都是 0**，
   报告却只说「核心 job 不绿」——看报告的人（作者本人）去扒了一棵根本没跑过的树。
   反向对照钉住：`steps` 里有东西的失败仍然是「核心 job 不绿」。
+- **降级后读不懂的存档点：只丢那一条，不再掀翻整张表**（审计里最像事故的一条的未修版本）
+  `Checkpoint.from_dict` 的 `RunStatus[...]` 与 `int(...)` 会抛，而两个 store 的
+  `_decode_checkpoint` 只把 `decode_versioned` 包在 try 里 ⇒ 一条脏行能让 `list_checkpoints()`
+  整体抛，恢复控制器一条都不做（故障半径被一条数据放大）。
+  现在 `from_dict` 抛领域异常 `CheckpointDecodeError`（带出读不懂的那个值），
+  两个 store 把它连同解码一起兜住：丢掉 + 计 `warden_store_payload_dropped_total`。
+  正反对照：坏行丢、好行照常读出来（防一刀切全丢）。
+- 顺手清掉 6 处 ruff 超长行（`E501`/`E741`，都在测试文件里）——`ruff check src tests` 现在全过。
+
 - **触发器腐烂守卫不再「首交火当天提前红」**：`first_possible_fire` 只到**日期**，而 cron 带**时刻**。
   2026-10-19 现场：`0 3 * * 1` 的首个交点就是当天 03:00Z，而 UTC 当天早上 01:03Z 台账已是 `never`
   ⇒ 旧写法 `first <= today` 在事件**还没到点**时就把守卫变红，把人赶去 `gh run list` 空跑一趟

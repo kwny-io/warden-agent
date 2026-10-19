@@ -26,7 +26,9 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 def _load(tmp_path: pathlib.Path):
-    spec = importlib.util.spec_from_file_location("freeze_receipt", ROOT / "scripts" / "freeze_receipt.py")
+    spec = importlib.util.spec_from_file_location(
+        "freeze_receipt", ROOT / "scripts" / "freeze_receipt.py"
+    )
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     sys.modules["freeze_receipt"] = mod
@@ -93,7 +95,7 @@ def test_浅检出全绿就拒(tmp_path):
 
 def test_缺浅检出那一行就拒(tmp_path):
     mod = _load(tmp_path)
-    bad = "\n".join(l for l in GOOD.splitlines() if not l.startswith("SHALLOW"))
+    bad = "\n".join(line for line in GOOD.splitlines() if not line.startswith("SHALLOW"))
     with pytest.raises(ValueError, match="SHALLOW"):
         mod.mutation_block(_write(tmp_path, bad), SHA)
 
