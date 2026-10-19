@@ -3,6 +3,38 @@
 > 本文件按**时间戳**记录每次提交改动的内容,以及**尚未实现**的待办(未实现/路线图)。
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
+## 2026-10-18（第九十九批：矩阵证据改成矩阵自己写，且必须带浅检出探针）
+
+第八十八批把“回执由脚本跑全套取数”做完了，但**矩阵那一层还是空的**：
+`tests/test_matrix_evidence.py` 要求一份仓内的 `evidence/matrix/<sha12>.log`，而仓里
+**没有任何脚本能生成它**——历史上是仓外的 `gen-receipt.py` 手写进去的。本批把生产者补齐：
+
+- `scripts/mutant_check.py` 新增 `--evidence-out <path>`（可选 `--evidence-head <sha>`）：
+  跑完一轮矩阵后，把**这一轮的判定**写成守卫认得的那份证据。三道反自证设计：
+  1. `OK` 列从 verdict 算（期望没满足写 `!!`），只要存在缺口/SKIP/基线不可用就**拒写文件**
+     （退出码 2）——`MATRIX FAIL` 不许当证据入库；
+  2. `SKIP` 行仍占编号、必须写原因，但**不计入** `positive`/`negative`（否则“没跑的臂被当成通过”）；
+  3. 证据里那行 `SHALLOW depth=1: rc=1 红 k 条` 是**真跑**出来的：`git init` + `fetch --depth 1 <sha>`
+     + `checkout`，只抓一个提交的克隆里跑回执/证据守卫，把失败条数记成 `k`；
+     若那里居然全绿（`rc=0`）⇒ 以 3 结束、拒写这种自我否定的证据。
+- `tests/test_mutant_evidence_gen.py`（新）：给**生产者**自己写判据——它写出来的文本必须能被
+  守卫的正则原样吃下去；期望没满足的行不许写成 `OK`；`SKIP` 行必须带原因。
+  （给生成器写测试的理由：如果 `OK` 列是抄的，守卫会全绿而什么都没核，那正是本批要消灭的病。）
+- `docs/mutation.md` 第八节：`--evidence-out` 的复现命令与三道设计的说明。
+- **CI 不许被第三方镜像一次 504 判死**（同一提交的另一条红是**基础设施**，不是代码）：
+  `dev@656029c` 的 quality job 死在「安装 ts 客户端依赖」这步，报
+  `npm error 504 Gateway Time-out - GET https://registry.npmmirror.com/zod-to-json-schema/-/zod-to-json-schema-3.25.2.tgz`
+  ——`ts/mcp-client/package-lock.json` 里 107 个 `resolved` 全指向那个镜像。
+  pytest 根本没跑起来，连 junit 都没产出，下游“跳过台账”判据拿不到真数据。
+  新增 `scripts/npm_ci.sh`：重试（指数退避 + 加大 fetch 超时；`web` 与 `ts/mcp-client` 两处都改用）。
+  重试用尽后换官方源再试一次，并带 `--replace-registry-host=always` 把 lockfile 里 `resolved`
+  的主机整体改写——**换源不降低校验强度**：内容完整性仍由 lockfile 的 `integrity`（sha512）保证。
+  守卫 `tests/test_ci_npm_resilience.py`：脚本真带两件手段、workflow 里**不许再出现裸 `npm ci`**、
+  两个装依赖的目录都必须接上加固版。
+
+顺手修掉一个实测出来的偏差：初版把 SKIP 行也算进了 `positive`/`negative`，于是
+`positive+negative ≠ total`——正好是“没跑的臂被当成通过”，已改成只数非 SKIP 行。
+
 ## 2026-10-18（第九十八批：判据说那份回执缺矩阵证据——那就不能算回执，降价不是降价）
 
 第97 批推上去 CI **红了两处**，两处都是判据在尽它的职：

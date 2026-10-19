@@ -119,7 +119,7 @@ jobs:
         #    判据已自造产物、不再依赖它——第九十批）。
         working-directory: web
         run: |
-          npm ci
+          bash ../scripts/npm_ci.sh
           npm run lint
           npm run typecheck
           npm run test:coverage
@@ -146,7 +146,10 @@ jobs:
         # 而这是一个可以直接堵上的洞（npm ci + package-lock.json 就能复现）。
         # 它由"跳过签字"守卫看着：这步一被删，那 4 条又会跳过、而它们没有签字 ⇒ CI 直接红。
         working-directory: ts/mcp-client
-        run: npm ci
+        # 用加固版而不是裸 `npm ci`：这个 lockfile 的 107 个 `resolved` 全指向第三方镜像，
+        # 而那个镜像 504 过一次就把整个 quality job 拖死了（第九十九批 run 39175595595）。
+        # 重试 + 换源重试写在 scripts/npm_ci.sh 里，由 tests/test_ci_npm_resilience.py 看着。
+        run: bash ../../scripts/npm_ci.sh
       - name: Ruff (lint)
         run: uv run --frozen ruff check src tests scripts
       - name: Mypy (strict)

@@ -90,9 +90,11 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 KILL = "kill"
@@ -739,6 +741,106 @@ def _dry_run(cases: list[tuple[str, str, str, str, str, str]]) -> int:
     return 1 if bad else 0
 
 
+def _flag_value(argv: list[str], flag: str, default: str = "") -> str:
+    if flag not in argv:
+        return default
+    at = argv.index(flag)
+    return argv[at + 1] if len(argv) > at + 1 else default
+
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# 浅检出探针要在哪些判据上试：它们都得靠 git 历史（fetch-depth: 0 是承重的）
+_SHALLOW_GUARDS = (
+    "tests/test_matrix_evidence.py",
+    "tests/test_ci_evidence.py",
+    "tests/test_delivery_receipts.py",
+    "tests/test_delivery_ledger.py",
+)
+
+
+def _shallow_probe(sha: str) -> tuple[int, int]:
+    """在**只抓一个提交**的克隆里跑回执/证据守卫，返回 (rc, 红条数)。
+
+    为什么非得真抓浅克隆：`fetch-depth: 0` 写在 workflow 里只是一句话，
+    只有「浅了就必须红」才能证明它承重。rc=0 一律不许写进证据（那是自我否定）。
+    """
+    with tempfile.TemporaryDirectory(prefix="shallow-probe-") as td:
+        run = lambda *a: subprocess.run(a, capture_output=True, text=True,  # noqa: E731
+                                       encoding="utf-8", errors="replace")
+        for step in (
+            ("git", "init", "-q", td),
+            ("git", "-C", td, "remote", "add", "origin", str(_ROOT)),
+            ("git", "-C", td, "fetch", "-q", "--depth", "1", "origin", sha),
+            ("git", "-C", td, "checkout", "-q", "FETCH_HEAD"),
+        ):
+            r = run(*step)
+            if r.returncode != 0:
+                print(f"浅检出探针准备失败：{' '.join(step)} ⇒ {r.stderr.strip()[:300]}",
+                      file=sys.stderr, flush=True)
+                return 9, 0
+        env = dict(os.environ, PYTHONIOENCODING="utf-8",
+                   PYTHONPATH=str(pathlib.Path(td) / "src"))
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", *_SHALLOW_GUARDS, "-q",
+             "-p", "no:cacheprovider", "--tb=no"],
+            cwd=td, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+        )
+        red = 0
+        out = proc.stdout or ""
+        # -q 的「N failed, M passed」行**不在最后**：它后面还跟着 FAILED 明细。
+        # 所以先数明细行（确定性最强），再拿汇总数交叉核对，两者不一致就报出来。
+        detail = [line for line in out.splitlines() if line.startswith("FAILED ")]
+        counted = re.search(r"(\d+) failed", out)
+        red = len(detail) if detail else (int(counted.group(1)) if counted else 0)
+        if counted and detail and int(counted.group(1)) != len(detail):
+            print(f"浅检出探针：汇总说 {counted.group(1)} 条红，明细只有 {len(detail)} 行（以明细为准）",
+                  file=sys.stderr, flush=True)
+        if proc.returncode != 0 and red == 0:
+            tail = "\n".join((out or proc.stderr or "").splitlines()[-6:])
+            print(f"浅检出探针：rc={proc.returncode} 但没数出红条数（多半是收集/环境问题，不是判据变强）：\n{tail}",
+                  file=sys.stderr, flush=True)
+        return proc.returncode, red
+
+
+def _write_evidence(out: pathlib.Path, sha: str, rows: list[tuple[str, str, str]],
+                    shallow_rc: int, shallow_red: int) -> tuple[int, int, int]:
+    """把**真实判定**写成守卫认得的那份证据；返回 (total, positive, negative)。
+
+    反自证设计（关键）：这里的「OK」列**从 verdict 算出来**，不是抄的；
+    只要有一条期望没满足，调用方就不写文件（MATRIX FAIL 不许当证据入库）。
+    """
+    idx_m = idx_r = 0
+    lines = [f"=== matrix mutant_check HEAD={sha} ===",
+             "# 列：编号 判定 期望 标签 判定结论（OK=与期望一致；SKIP（原因）=本相位不适用）"]
+    for verdict, expect, label in rows:
+        tag_type = "M" if expect == KILL else "R"
+        # 编号跨所有行（含 SKIP），所以编号会跳；但**计数只算非 SKIP**——
+        # 否则 positive+negative ≠ total，正好是「没跑的臂被当成通过」那个病。
+        if tag_type == "M":
+            idx_m += 1
+            no = idx_m
+        else:
+            idx_r += 1
+            no = idx_r
+        want = verdict in ("KILLED", "KILLED?") if expect == KILL else verdict == "SURVIVED"
+        head = f"{tag_type}{no:02d} {verdict:<9}{expect:<6}"
+        if verdict == "SKIP":
+            lines.append(f"{head}SKIP（锚点没命中：源码改过或这段被删了） {label}")
+            continue
+        lines.append(f"{head}{label} {'OK' if want else '!!'}")
+    live_m = sum(1 for v, e, _l in rows if v != "SKIP" and e == KILL)
+    live_r = sum(1 for v, e, _l in rows if v != "SKIP" and e != KILL)
+    pos, neg = live_m, live_r
+    live = sum(1 for v, _e, _l in rows if v != "SKIP")
+    lines.append(f"MATRIX PASS: {live}/{live} 符合预期（{pos} 条正对照 + {neg} 条反向对照）")
+    lines.append(f"SHALLOW depth=1: rc={shallow_rc} 红 {shallow_red} 条"
+                 f"（在只抓一个提交的克隆里跑 {'、'.join(p.split('/')[-1] for p in _SHALLOW_GUARDS)}"
+                 f" —— 抓不到历史就必须红，fetch-depth: 0 才算承重）")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    return live, pos, neg
+
+
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True)  # 非 TTY 下默认块缓冲 ⇒ 长跑日志全程 0 字节
     argv = sys.argv[1:]
@@ -832,6 +934,33 @@ def main() -> int:
     for label in suspect:
         print("  !! 该处当前内容**正是变异体本身**，源码可能残留着上次被强杀留下的变异：", label)
         print("     还原：`python scripts/mutant_check.py --restore`，或用 git 恢复那个文件")
+
+    evidence_out = _flag_value(argv, "--evidence-out")
+    if evidence_out:
+        if _problem(rows):
+            print(
+                "\n--evidence-out：**不写证据**——矩阵本身没全绿（有缺口/跳过/基线不可用）。"
+                "\n  MATRIX FAIL 不许当证据入库；先把上面那几条修到全绿，再重跑。",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+        sha = _flag_value(argv, "--evidence-head")
+        if not sha:
+            sha = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "HEAD"],
+                                 capture_output=True, text=True).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            print(f"--evidence-head 不是 40 位 sha：{sha!r}", file=sys.stderr, flush=True)
+            return 2
+        print("\n浅检出探针：在只抓一个提交的克隆里跑回执/证据守卫…", flush=True)
+        sh_rc, sh_red = _shallow_probe(sha)
+        total, pos, neg = _write_evidence(pathlib.Path(evidence_out), sha, rows, sh_rc, sh_red)
+        print(f"证据已写：{evidence_out}")
+        print(f"  被证明的提交 {sha[:12]} / 对照 {total} 条（正 {pos} + 反 {neg}）"
+              f"/ 浅检出 rc={sh_rc} 红 {sh_red} 条")
+        if sh_rc == 0:
+            print("  !! 浅检出里居然全绿 ⇒ 它没证明「fetch-depth: 0 承重」，守卫会拒（rc=0 判假洞察）",
+                  file=sys.stderr, flush=True)
+            return 3
     return 1 if _problem(rows) else 0
 
 
