@@ -316,6 +316,26 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
              "（词频哈希本身就是字面匹配），想看语义那一列的增益必须配 WARDEN_EMBED_*。"
              "取值写错抛 ValueError（构造 VectorStore 时即失败，不静默退回默认）",
     ),
+    EnvSpec(
+        "WARDEN_RUN_BUDGET_USD",
+        "单次 run 的模型花费上限（美元）；不设或 0 = 不限",
+        "loop/loop.py", ("loop/loop.py",), kind="text",
+        note="超过即抛 BudgetExceeded 停住（**硬预算**，不是告警后继续花）；"
+             "越界那一笔仍记账，便于对账。空值/写错退回「不限」，"
+             "不因一个坏配置停掉整个服务",
+    ),
+    EnvSpec(
+        "WARDEN_PRICE_INPUT_PER_M",
+        "覆盖输入单价（美元/百万 token），与 WARDEN_PRICE_OUTPUT_PER_M 成对生效",
+        "core/usage.py", ("core/usage.py",), kind="text",
+        note="常量表 PRICES 是快照会过期（见 core/usage.py）；两个都给才覆盖，"
+             "只给一个或写错都退回常量表——宁可用旧价，也不拿坏价去做预算判断",
+    ),
+    EnvSpec(
+        "WARDEN_PRICE_OUTPUT_PER_M",
+        "覆盖输出单价（美元/百万 token），与 WARDEN_PRICE_INPUT_PER_M 成对生效",
+        "core/usage.py", ("core/usage.py",), kind="text",
+    ),
     EnvSpec("WARDEN_WEB_FETCH", "开启真实联网抓取（默认离线 mock 不发请求）",
             "web/search.py", ("web/search.py",), kind="bool"),
     EnvSpec("WARDEN_SEARCH_PROVIDER",

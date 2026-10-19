@@ -3,6 +3,47 @@
 > 本文件按**时间戳**记录每次提交改动的内容,以及**尚未实现**的待办(未实现/路线图)。
 > 每次提交都同步更新本文件,保持「git 历史 ↔ 文档」一致。
 
+## 2026-10-19（第116 批：成本账——"这一跑花了多少"从黑箱变成可断言的事实）
+
+> 上一批把规划默认开，理由是"代价可量化"。这一批补上量化的**另一半**：
+> 此前 `ChatResponse.usage` 拿到 token 数之后**没有任何人去汇总**，
+> 于是"这个 run 花了多少 / 该在第几步拦住 / 换模型后是不是变贵了"三个问题都答不上来，
+> 只能看云厂商账单反推，粒度是整个账号。本批把"模型这一项"的账算清楚，并让它能**拦**。
+
+- **新增 `core/usage.py`（四件东西，刻意都做小）**：
+  · `CostMeter.record(model, usage)` —— 累加 prompt/completion token 与调用次数（`threading.Lock`，
+    因为 `AgentLoop` 会被 web 并发与多 Agent 共用）；
+  · `price_for(model, env)` —— 查单价，环境变量 `WARDEN_PRICE_INPUT_PER_M` + `_OUTPUT_PER_M`
+    **成对给才覆盖**，只给一个或写错都退回常量表（宁可用旧价，也不拿坏价去做预算判断）；
+  · `UsageTotals`（frozen）—— `snapshot()` 拿到就是那一瞬的事实，带 `as_dict()` 便于落审计；
+  · `BudgetExceeded` —— 带 `spent_usd`/`limit_usd` 字段，消息里直接给数字与放宽办法。
+- **三条语义边界写进代码而不是只写文档**：① 价格表是**快照会过期**（`PRICES` 只放四个常用模型，
+  其余靠覆盖）；② **未知模型记 `unpriced_calls` 而不是当 0 元**——"没定价"与"免费"必须分开，
+  否则换模型后成本账会静默失真（少算的钱最难发现）；③ **只统计模型调用**，工具/存储/网络出口不在内，
+  别拿这个数字对外说"总成本"。
+- **接进 `loop/loop.py`**：`AgentLoop(cost_meter=..., max_cost_usd=...)`，默认预算读
+  `WARDEN_RUN_BUDGET_USD`（空/写错退回"不限"，不因一个坏配置停掉服务）。每次模型响应后
+  **先记账、再判预算**——超预算那一笔也要记进去，否则抛异常时的用量永远缺最后一条，对账对不上。
+  预算越界是 **fail-closed**（停），不是"告警后继续花"：预算是硬约束，不是观测指标。
+- **`AgentReply` 新增 `usage` / `cost_usd` / `budget_hit`**：调用方不用去翻内部 meter 就能答
+  "这一跑多少钱"；`budget_hit` 让"花完了"与"卡住了"在返回值层面就分得开。
+- **`_model_name` 尽力取名字**（`.model` → `.model_name` → `.name` → 类名）：
+  查不到价只会进 `unpriced_calls`，**不会被当成免费**。
+- **新增 `tests/test_cost_meter.py`（13 条）**，钉语义而不只是算术：
+  计价 0.00082、未知模型 `unpriced_calls=1 && usd=0`、env 覆盖生效/只给一个不生效/写错退回常量表、
+  缺用量仍计一次调用、`reset()` 清空、**超预算抛出且模型只被调 1 次**（证明真停住了）、
+  env 预算生效、不设预算不拦、收敛时 `reply.usage.total_tokens==1500` 与 `cost_usd` 一致、
+  两个 run 各用各的账。
+- **登记三个环境变量**（`core/settings.py` 的 `ENV_SPECS`，91 → 92 条）：`WARDEN_RUN_BUDGET_USD` /
+  `WARDEN_PRICE_INPUT_PER_M` / `WARDEN_PRICE_OUTPUT_PER_M`；README 能力表加"成本账"一行、
+  "89 个环境变量"改 92。
+- **一处架构边界必须让路**：`core` 是 tier 0（最底层），直接 import `model.model.ModelUsage`
+  会被 `tests/test_architecture.py` 判成"低层反向依赖高层"（实测红）。改法不是放宽测试，
+  而是在 `core/usage.py` 里用 `TokenUsage` **Protocol** 描述"只认两个整数字段"的形状——
+  `ModelUsage` 天然满足它，两边互不认识，依赖方向保持单向。
+- **口径诚实**：本批不产生"省了多少钱"的数字——没有真模型跑过的账单基线，就不编。
+  它给的是"以后每一跑都能拿到数字"的能力，以及一条能被测试证明会拦住的硬预算。
+
 ## 2026-10-19（第115 批：阶段规划默认开——把"怕花钱"换成"数清楚花了多少"）
 
 > 这不是"加个功能"，是**改默认值**。改默认值的唯一正当理由是：原来的反对理由站不住，
