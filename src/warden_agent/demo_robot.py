@@ -125,6 +125,9 @@ def _report_target(args: list[str]) -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from warden_agent.core.console import force_utf8_stdio
+
+    force_utf8_stdio()
     args = list(sys.argv[1:] if argv is None else argv)
     force_sim = "--sim" in args
     use_serial = "--serial" in args

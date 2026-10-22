@@ -357,6 +357,11 @@ def _live_demo() -> None:
 
 
 def run_demo() -> None:
+    # README 把这条命令当「30 秒体验」，而它满屏都是 `✅`/`⇒`——中文 Windows 的 cp936
+    # 写不出这些字符，会在最后一行崩掉。必须在任何输出之前钉住编码。
+    from warden_agent.core.console import force_utf8_stdio
+
+    force_utf8_stdio()
     setup_logging()
     _section("Warden Agent · 端到端完整演示")
     if env_opt("DEEPSEEK_API_KEY"):

@@ -131,6 +131,9 @@ def _build(
 
 
 def main(argv: list[str] | None = None) -> int:
+    from warden_agent.core.console import force_utf8_stdio
+
+    force_utf8_stdio()
     adapter, supervisor, loop, args = _build(list(argv or []))
     report = run_soak(adapter, supervisor, loop, ticks=args.ticks)
     print("=" * 78)

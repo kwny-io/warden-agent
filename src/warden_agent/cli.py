@@ -964,6 +964,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # 审计/审批这些命令的成败是用 `✅`/`❌` 报的；中文 Windows 的 cp936 写不出它们，
+    # 会在 reporting 那一行崩掉（而不是在判断那一行）——取证装置不能死于打印。
+    from warden_agent.core.console import force_utf8_stdio
+
+    force_utf8_stdio()
     args = _build_parser().parse_args(argv)
     args.func(args)
 
