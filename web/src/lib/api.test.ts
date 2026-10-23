@@ -196,7 +196,35 @@ describe("request 请求封装", () => {
 
     fetchMock.mockResolvedValue(jsonResponse({ ok: true, current: "m" }));
     await api.selectModel("gpt", undefined);
-    expect(JSON.parse(fetchMock.mock.calls[1]![1].body)).toEqual({ id: "gpt", api_key: null });
+    // 没给 endpoint 时两个字段都发 null：后端把 null 当成"没给"，
+    // 而不是当成"把已存的地址清空"。
+    expect(JSON.parse(fetchMock.mock.calls[1]![1].body)).toEqual({
+      id: "gpt",
+      api_key: null,
+      base_url: null,
+      model: null,
+    });
+  });
+
+  it("probeModel 把**还没保存**的 key 一起发出去（否则先探通再保存是死路）", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ id: "custom", ok: true }));
+    await api.probeModel("custom", true, undefined, { base_url: "http://10.0.0.7:8000/v1" }, "not-needed");
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toEqual({
+      id: "custom",
+      force: true,
+      base_url: "http://10.0.0.7:8000/v1",
+      model: null,
+      api_key: "not-needed",
+    });
+  });
+
+  it("deleteRuns 打 DELETE /runs，id 放请求体（路径里装不下多个）", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true, deleted: ["r1", "r2"], count: 2 }));
+    await api.deleteRuns(["r1", "r2"]);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/runs");
+    expect(init.method).toBe("DELETE");
+    expect(JSON.parse(init.body)).toEqual({ run_ids: ["r1", "r2"] });
   });
 });
 

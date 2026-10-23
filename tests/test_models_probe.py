@@ -252,3 +252,66 @@ async def test_探测原因里不许带出自己的_key(db_path, key_material: s
     assert body["ok"] is False
     assert secret not in body["reason"], f"密钥漏进了探测原因：{body['reason']}"
     assert "ConnectionError" in body["reason"], "抹密钥不能把有用信息一起抹了"
+
+
+# ---------------------------------------------------------------------------
+# 探不通要**分档**：换 Key / 去充值 / 改地址 / 等一等，是四件不同的事
+# （2026-10-19：我自己就因为「余额不足」与「Key 无效」在界面上长得一样而反复换 Key）
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expect"),
+    [
+        (401, {"error": "invalid api key"}, "key_rejected"),
+        (403, {"error": "forbidden"}, "key_rejected"),
+        (402, {"error": "quota_exceeded: 余额不足"}, "quota_exhausted"),
+        (404, {"error": "model not found"}, "model_not_found"),
+        (429, {"error": "slow down"}, "rate_limited"),
+        (500, {"error": "boom"}, "upstream_error"),
+        (503, {"error": "unavailable"}, "upstream_error"),
+    ],
+)
+def test_真异常要分对档(status: int, body: dict, expect: str) -> None:
+    """用**真实 openai 异常**（MockTransport 造 HTTP 响应）验分档，不用假异常对象。
+
+    为什么不用假异常：假异常只能证明我的 if-else 认识我自己造的类名，
+    而真异常是 SDK 在真实响应上抛出来的——两者的类名/status_code 是否对得上，
+    只有这条能证明。
+    """
+    from warden_agent.model.deepseek import ModelCallError, probe_failure_code
+
+    model = OpenAiCompatibleModel(
+        api_key="sk-test-123", base_url="http://upstream.test/v1", max_retries=0
+    )
+    _scripted_client(model, lambda req: httpx.Response(status, json=body))
+
+    with pytest.raises(ModelCallError) as caught:
+        model.probe(timeout=0.1)
+    assert probe_failure_code(caught.value) == expect
+
+
+def test_连不上与超时要分得开() -> None:
+    """`APIConnectionError`（DNS/拒绝连接）≠ `APITimeoutError`：前者查网络，后者可能只是慢。"""
+    from warden_agent.model.deepseek import ModelCallError, probe_failure_code
+
+    def _raise(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("nodename nor servname provided", request=req)
+
+    model = OpenAiCompatibleModel(
+        api_key="sk-test-123", base_url="http://upstream.test/v1", max_retries=0
+    )
+    _scripted_client(model, _raise)
+    with pytest.raises(ModelCallError) as caught:
+        model.probe(timeout=0.1)
+    assert probe_failure_code(caught.value) == "unreachable"
+
+    def _slow(req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=req)
+
+    model2 = OpenAiCompatibleModel(
+        api_key="sk-test-123", base_url="http://upstream.test/v1", max_retries=0
+    )
+    _scripted_client(model2, _slow)
+    with pytest.raises(ModelCallError) as caught2:
+        model2.probe(timeout=0.1)
+    assert probe_failure_code(caught2.value) == "timeout"

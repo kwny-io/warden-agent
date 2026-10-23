@@ -80,6 +80,8 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/runs", Access.AUTHENTICATED, "自己的 Run 列表"),
     Route("POST", "/runs/{run_id}", Access.AUTHENTICATED, "取消 Run（与 CLI cancel 同一入口）"),
     Route("DELETE", "/runs/{run_id}", Access.AUTHENTICATED, "删除 Run"),
+    Route("DELETE", "/runs", Access.AUTHENTICATED,
+          "批量删除 Run（id 在请求体里，所以归属校验必须由端点逐个做）"),
     Route("GET", "/users", Access.AUTHENTICATED, "用户列表"),
     Route("POST", "/users", Access.AUTHENTICATED, "登记/切换用户"),
     Route("GET", "/messages/{run_id}", Access.AUTHENTICATED, "会话消息"),

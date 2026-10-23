@@ -178,13 +178,24 @@ export function toModelsInfo(v: unknown): ModelsInfo | null {
     id: str(m.id),
     name: str(m.name),
     needs_key: bool(m.needs_key),
+    // 这三项必须在这里逐字段搬运：后端加了字段而这里没同步 = 界面永远收不到
+    // “自建接入要填地址”，用户点了切换才吃 400（见 toModelProbe 上方那段注释）。
+    needs_endpoint: bool(m.needs_endpoint),
     configured: bool(m.configured),
+    base_url: typeof m.base_url === "string" ? m.base_url : null,
+    model: typeof m.model === "string" ? m.model : null,
     last_probe: toModelProbe(m.last_probe),
   }));
   return { current: str(v.current), models };
 }
 
-/** 探测结论：形状不对就当“没探过”（null），而不是编一个 ok 出来。 */
+/** 探测结论：形状不对就当“没探过”（null），而不是编一个 ok 出来。
+ *
+ * 这里是**逐字段重建**的，所以后端每加一个字段、而这里没同步，就会变成
+ * 「后端说了、前端看不见」的静默丢信息（2026-10-19 真阶：`code`/`hint` 就被吞了，
+ * 界面仍然只显示原始异常，用户还是分不清“换 Key / 去充值”）。
+ * 新增字段时两边一起改，并补一条 guards 的单测。
+ */
 export function toModelProbe(v: unknown): ModelProbe | null {
   if (!isRecord(v)) return null;
   if (typeof v.ok !== "boolean") return null;
@@ -192,6 +203,8 @@ export function toModelProbe(v: unknown): ModelProbe | null {
     id: str(v.id),
     ok: v.ok,
     reason: typeof v.reason === "string" ? v.reason : null,
+    code: typeof v.code === "string" ? v.code : undefined,
+    hint: typeof v.hint === "string" ? v.hint : null,
     latency_ms: typeof v.latency_ms === "number" ? v.latency_ms : undefined,
     checked_at: typeof v.checked_at === "string" ? v.checked_at : undefined,
     cached: typeof v.cached === "boolean" ? v.cached : undefined,

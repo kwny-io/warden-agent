@@ -171,7 +171,7 @@ describe("App 外壳：三栏布局", () => {
   it("外壳有可访问名：账号、密钥、拖拽条都不只靠 placeholder", async () => {
     render(<App />);
     await settle();
-    expect(screen.getByLabelText("访问密钥（API Key）")).toBeInTheDocument();
+    expect(screen.getByLabelText("访问密钥")).toBeInTheDocument();
     expect(screen.getByLabelText("切换对话列表")).toBeInTheDocument();
     expect(screen.getByLabelText("切换信息栏")).toBeInTheDocument();
   });
@@ -183,7 +183,7 @@ describe("App 外壳：密钥输入", () => {
     // key 落在 localStorage 就是跨浏览器重启长期待在一个 XSS 能读到的地方。
     render(<App />);
     await settle();
-    const key = screen.getByLabelText("访问密钥（API Key）");
+    const key = screen.getByLabelText("访问密钥");
     await userEvent.type(key, "sk-secret");
     fireEvent.blur(key);
     expect(sessionStorage.getItem("warden.apiKey")).toBe("sk-secret");
@@ -193,7 +193,7 @@ describe("App 外壳：密钥输入", () => {
   it("勾上「记住」后改存 localStorage，取消勾选又只留在 sessionStorage", async () => {
     render(<App />);
     await settle();
-    const key = screen.getByLabelText("访问密钥（API Key）");
+    const key = screen.getByLabelText("访问密钥");
     await userEvent.type(key, "sk-secret");
     fireEvent.blur(key);
 

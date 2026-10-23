@@ -10,14 +10,19 @@ from fastapi import FastAPI, HTTPException, Request
 from warden_agent.store.sqlite import SqliteStore
 from warden_agent.web.auth import TrustedCaller
 from warden_agent.web.http_kit import _serialize_messages
-from warden_agent.web.schemas import UserCreateIn
+from warden_agent.web.schemas import RunDeleteIn, UserCreateIn
 from warden_agent.web.session_registry import SessionRegistry
+
+# 单次批量删除的 id 上限：一次请求删除过多会话会把「逐个校验归属 + 逐个删五张表」
+# 变成一次长事务，而这条路由又落在限流桶里。200 足够覆盖「手删很累」的真实场景。
+MAX_BATCH_DELETE = 200
 
 
 def register(
     app: FastAPI,
     *,
     _identity: Callable[[Request, str | None], str],
+    _owner_of: Callable[[str], str | None],
     registry: SessionRegistry,
     store: SqliteStore,
 ) -> None:
@@ -91,6 +96,48 @@ def register(
         registry.remove(run_id)
         store.delete_run(run_id)
         return {"ok": True, "run_id": run_id}
+
+    @app.delete("/runs")
+    def delete_runs(body: RunDeleteIn, request: Request) -> dict[str, Any]:
+        """批量删除会话（左栏「勾选模式 + 全选 + 一次删掉」的后端）。
+
+        **归属必须在这里逐个校验**，不能指望网关：网关的归属授权靠
+        `_extract_run_id(path)` 从**路径**里取 run_id，而这条路由的 id 全在请求体里，
+        网关取到的是 `None` → `owner_authorizer` 直接放行。少了下面这个循环，
+        任何登录用户只要猜/知道别人的 run_id，就能把它连库带记忆一起删掉。
+
+        语义选择：**要么全删、要么一个都不删**。逐个删到一半失败（比如第 3 个是别人的）
+        会留下「一部分没了、一部分还在」且用户不知道哪些没删——批量操作的失败必须
+        是原子的，否则重试与对账都无解。
+        """
+        # 去重 + 去空：界面上全选后重复点几次不该变成重复删除
+        # （`delete_run` 是幂等的，但重复 id 会让返回的 deleted 列表误导调用方）。
+        ids = list(dict.fromkeys(x.strip() for x in body.run_ids if x and x.strip()))
+        if not ids:
+            raise HTTPException(status_code=400, detail="run_ids 不能为空")
+        if len(ids) > MAX_BATCH_DELETE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"一次最多删除 {MAX_BATCH_DELETE} 个会话（收到 {len(ids)} 个）",
+            )
+        caller: TrustedCaller | None = getattr(request.state, "caller", None)
+        if caller is not None:
+            # 先全部校验，再动手删：校验与删除分成两轮，才能保证原子性。
+            for run_id in ids:
+                owner = _owner_of(run_id)
+                # 无归属（不存在 / 还没落库归属）放行——与 owner_authorizer 同一口径，
+                # 否则「删掉一个刚建还没归属的会话」会被自己挡死。
+                if owner and owner != caller.user_id:
+                    # 不把归属者是谁写进错误信息：那是给攻击者的账号枚举情报
+                    # （同 owner_authorizer）。
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"无权操作会话 {run_id!r}：它不属于当前调用者",
+                    )
+        for run_id in ids:
+            registry.remove(run_id)
+            store.delete_run(run_id)
+        return {"ok": True, "deleted": ids, "count": len(ids)}
 
     @app.get("/messages/{run_id}")
     def messages(run_id: str) -> list[dict[str, Any]]:

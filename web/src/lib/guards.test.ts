@@ -178,3 +178,86 @@ describe("其余接口的收窄", () => {
     ]);
   });
 });
+
+describe("toModelsInfo 的 last_probe 不许静默丢字段", () => {
+  it("后端新加的 code / hint 必须原样穿过去（否则界面只剩一句原始异常）", () => {
+    const got = toModelsInfo({
+      current: "a",
+      models: [
+        {
+          id: "b",
+          name: "B",
+          needs_key: true,
+          configured: true,
+          last_probe: {
+            id: "b",
+            ok: false,
+            code: "quota_exhausted",
+            hint: "去上游充值",
+            reason: "AuthenticationError: Error code: 402",
+            latency_ms: 12,
+            cached: true,
+          },
+        },
+      ],
+    });
+    // 这条是**回归用例**：2026-10-19 真的发生过——后端加了 code/hint，
+    // 这个逐字段重建的收窄函数没同步，界面静默退回只显示原始异常，且没有任何报错。
+    expect(got?.models[0]?.last_probe).toMatchObject({
+      code: "quota_exhausted",
+      hint: "去上游充值",
+      reason: "AuthenticationError: Error code: 402",
+    });
+  });
+
+  it("hint/code 缺失或类型不对 → 不编造（hint=null、code=undefined）", () => {
+    const got = toModelsInfo({
+      current: "a",
+      models: [
+        {
+          id: "b",
+          name: "B",
+          needs_key: true,
+          configured: true,
+          last_probe: { id: "b", ok: false, code: 7, hint: {}, reason: null },
+        },
+      ],
+    });
+    expect(got?.models[0]?.last_probe).toMatchObject({ hint: null, code: undefined });
+  });
+});
+
+describe("toModelsInfo 的自建端点字段不许静默丢", () => {
+  it("needs_endpoint / base_url / model 原样穿过去", () => {
+    const got = toModelsInfo({
+      current: "fake",
+      models: [
+        {
+          id: "custom",
+          name: "自建 / 私有部署（OpenAI 兼容）",
+          needs_key: true,
+          needs_endpoint: true,
+          configured: true,
+          base_url: "http://10.0.0.7:8000/v1",
+          model: "qwen2.5-7b-instruct",
+          last_probe: null,
+        },
+      ],
+    });
+    // 丢掉 needs_endpoint 的后果不是"少个图标"：界面不会展开地址输入框，
+    // 用户点「切换」只会收到 400，而屏幕上没有一处能填 —— 死胡同。
+    expect(got?.models[0]).toMatchObject({
+      needs_endpoint: true,
+      base_url: "http://10.0.0.7:8000/v1",
+      model: "qwen2.5-7b-instruct",
+    });
+  });
+
+  it("内置模型没这三个字段 → needs_endpoint=false、地址为 null", () => {
+    const got = toModelsInfo({
+      current: "fake",
+      models: [{ id: "deepseek", name: "DeepSeek", needs_key: true, configured: false }],
+    });
+    expect(got?.models[0]).toMatchObject({ needs_endpoint: false, base_url: null, model: null });
+  });
+});

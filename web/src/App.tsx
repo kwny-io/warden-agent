@@ -18,7 +18,9 @@ export default function App() {
   const [userId, setUserId] = useState(() => localStorage.getItem("warden.userId") || "demo-user");
   const [userIdInput, setUserIdInput] = useState(userId);
   // 访问密钥：服务端设了 WARDEN_API_KEY 时业务接口都要带 Bearer，这里填。
-  // 存在 localStorage（只在本机浏览器），留空表示服务端未开鉴权。
+  // 它是**访问本服务的凭证**（相当于密码），与「模型面板里填的大模型 API Key」是两回事——
+  // 原来标签叫 KEY / API KEY，用户分不清该填哪个，所以改成「访问密钥」。
+  // 默认只存 sessionStorage，留空表示服务端未开鉴权。
   const [apiKeyInput, setApiKeyInput] = useState(() => getApiKey());
   // "记住密钥"：初始值取自当前存储位置（localStorage 里有东西就说明上次勾了）
   const [remember, setRemember] = useState(() => isApiKeyRemembered());
@@ -174,17 +176,17 @@ export default function App() {
             {/* 访问密钥：服务端设了 WARDEN_API_KEY 时必填；留空即"服务端没开鉴权"。
                 用 password 类型遮显；回车或失焦即写入，后续请求自动带 Bearer。
                 默认只存 sessionStorage（关标签页即失效）；要跨重启保留得勾"记住"。 */}
-            <span className="text-warden-fg/50 text-xs hidden sm:inline">KEY</span>
+            <span className="text-warden-fg/50 text-xs hidden sm:inline">访问密钥</span>
             <input
               type="password"
               value={apiKeyInput}
               onChange={(e) => setApiKeyInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && setApiKey(apiKeyInput, { remember })}
               onBlur={() => setApiKey(apiKeyInput, { remember })}
-              aria-label="访问密钥（API Key）"
-              title="服务端设了 WARDEN_API_KEY 时填这里；留空表示服务端未开鉴权"
+              aria-label="访问密钥"
+              title="服务端设了 WARDEN_API_KEY 时填这里；留空表示服务端未开鉴权。这是访问本服务的凭证，不是大模型的 API Key"
               className="w-28 sm:w-32 bg-black/30 border border-slate-600/50 rounded-full px-3 py-1.5 font-mono text-xs outline-none focus:border-warden-accent/70 transition"
-              placeholder="API KEY"
+              placeholder="访问密钥"
             />
             {/* "记住密钥"：勾上才落到 localStorage（跨浏览器重启有效），默认不勾。
                 明确不默认为勾：这把 key 是控制面全权凭证，而页面要渲染模型输出的 Markdown。 */}
@@ -296,9 +298,11 @@ export default function App() {
                 createOpen={createOpen}
                 onOpenCreate={openCreate}
                 onCreateDone={() => setCreateOpen(false)}
-                onDeleted={(deletedId, remaining) => {
-                  // 删掉的是当前会话 → 切到该账号剩下的第一个，没有就开个新 ID
-                  if (deletedId === runId) {
+                onDeleted={(deletedIds, remaining) => {
+                  // 删掉的**包含**当前会话 → 切到该账号剩下的第一个，没有就开个新 ID。
+                  // 判「包含」而不是「等于」：批量删里当前会话很可能也在其中，
+                  // 只判单个的话聊天区会停在一个已经被删掉的会话上（发消息就 404/重建空会话）。
+                  if (deletedIds.includes(runId)) {
                     switchRun(remaining[0]?.run_id ?? `run-${Date.now().toString(36)}`);
                   }
                 }}

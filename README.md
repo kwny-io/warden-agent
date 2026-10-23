@@ -371,6 +371,12 @@ WARDEN_MODEL=你的模型名
 > 本机网关 / Ollama 这类不校验密钥的端点，填非空占位串即可（如 `not-needed`）。
 > 另外 custom **不会**回落到 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`——否则等于把厂商密钥发给第三方。
 
+**自建接入不走系统代理**（三个入口都一样：`.env` 启动 / 界面切换 / `create_model("custom")`）。
+Windows 的系统代理**不认** `ProxyOverride` 里的 `localhost;127.*;10.*;…`，
+若让它接管，"内网端点"的对话会被静默转发到公网代理——现象是探不通或莫名 502，
+而这恰好违背了自建接入存在的理由。需要走代理访问**公网**兼容端点时，用内置四家即可
+（它们保留默认行为）。
+
 ```python
 agent = build_agent(provider="custom")
 ```
