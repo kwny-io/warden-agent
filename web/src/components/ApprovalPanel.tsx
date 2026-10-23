@@ -14,6 +14,9 @@ export default function ApprovalPanel({ onDecided }: { onDecided?: () => void } 
   // `git.apply_patch · run-e2e-app` 对非技术用户是一串无法判断的字母。
   // 为什么又要留开关：出了问题时要能对着日志/审计账本核名字，抹掉原文等于切断取证。
   const [showRaw, setShowRaw] = useState(false);
+  // 决策历史默认收起（见下方渲染处的理由）。与 showRaw 分开：一个管「藏不藏这块」，
+  // 一个管「藏不藏里面的原始标识」，两件事可以各自独立。
+  const [showHistory, setShowHistory] = useState(false);
   const { data: approvals, error, refresh } = usePolling<Approval[]>(
     // signal 必须透传：否则切面板/卸载时只丢结果不断连接，后端还在算
     (signal) => api.approvals({ signal }),
@@ -113,14 +116,29 @@ export default function ApprovalPanel({ onDecided }: { onDecided?: () => void } 
         </ul>
       )}
 
-      {/* 决策历史：已批准 / 已拒绝的记录（最新在前，最多显示 5 条） */}
+      {/* 决策历史：已批准 / 已拒绝的记录（最新在前，最多显示 5 条）。
+          **默认收起**：审批队列要回答的是「现在有什么等我批」，而决策历史是查账用的；
+          两者放一起时，历史会把真正要处理的那几条挤下去。收起后只留标题栏上的一行摘要，
+          想看再展开——展开状态是局部的，不写到任何存储里（刷新回默认收起）。 */}
       {historyError && (
         <p className="text-xs text-warden-danger">⚠️ 审批历史加载失败：{historyError}</p>
       )}
       {historyList.length > 0 && (
         <div className="mt-2 pt-2 border-t border-white/[0.06]">
-          <p className="text-[11px] text-warden-fg/50 mb-1">最近决策</p>
-          <ul className="flex flex-col gap-1">
+          <button
+            onClick={() => setShowHistory((v) => !v)}
+            aria-expanded={showHistory}
+            aria-controls="approval-history"
+            title={showHistory ? "收起决策历史" : "展开最近 5 条已验证的决策"}
+            className="w-full flex items-center gap-1 text-[11px] text-warden-fg/50 hover:text-warden-fg transition"
+          >
+            <span className="text-[9px]">{showHistory ? "▾" : "▸"}</span>
+            <span>最近决策</span>
+            {/* 收起时也要能看出「有几条」：否则「收起」等于「不知道有没有」 */}
+            <span className="text-warden-fg/35">（{historyList.length}）</span>
+          </button>
+          {showHistory && (
+          <ul id="approval-history" className="mt-1 flex flex-col gap-1">
             {historyList.slice(0, 5).map((h, i) => (
               <li key={i} className="text-[11px] text-zinc-400 truncate">
                 <span className={h.decision === "approved" ? "text-warden-ok" : "text-warden-danger"}>
@@ -135,6 +153,7 @@ export default function ApprovalPanel({ onDecided }: { onDecided?: () => void } 
               </li>
             ))}
           </ul>
+          )}
         </div>
       )}
     </div>

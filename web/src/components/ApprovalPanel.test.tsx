@@ -2,7 +2,7 @@
 // 断言的是**行为**：点批准/拒绝真的调后端对应接口并刷新队列、失败有兜底提示、
 // 后端返回缺字段的畸形审批记录时面板不会白屏。
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ApprovalPanel from "./ApprovalPanel";
 import { api } from "../lib/api";
@@ -152,15 +152,37 @@ describe("ApprovalPanel", () => {
     expect(screen.queryByText(/undefined/)).toBeNull();
   });
 
-  it("决策历史按 approved/rejected 分流显示，工具名默认中文", async () => {
+  it("决策历史默认收起：只留标题与条数，明细一个字都不渲染", async () => {
+    vi.spyOn(api, "approvalHistory").mockResolvedValue([
+      { run_id: "r1", approval_id: "a1", tool_name: "shell.run", decision: "approved", created_at: "" },
+    ]);
+    render(<ApprovalPanel />);
+    // 折叠标题出现，说明"有历史"这件事本身没被藏掉
+    const toggle = await screen.findByRole("button", { name: /最近决策/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("（1）")).toBeInTheDocument();
+    // 明细必须真的不在 DOM 里 —— 不是 display:none 那种"看得见的藏"
+    expect(screen.queryByText("✓已批准")).toBeNull();
+    expect(screen.queryByText("执行命令")).toBeNull();
+  });
+
+  it("点「最近决策」展开明细，再点一次收起；默认中文工具名", async () => {
     vi.spyOn(api, "approvalHistory").mockResolvedValue([
       { run_id: "r1", approval_id: "a1", tool_name: "shell.run", decision: "approved", created_at: "" },
       { run_id: "r2", approval_id: "a2", tool_name: "web.search", decision: "rejected", created_at: "" },
     ]);
     render(<ApprovalPanel />);
-    expect(await screen.findByText("✓已批准")).toBeInTheDocument();
+    const toggle = await screen.findByRole("button", { name: /最近决策/ });
+
+    fireEvent.click(toggle); // 真实点击，不绕过 onClick
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("✓已批准")).toBeInTheDocument();
     expect(screen.getByText("✗已拒绝")).toBeInTheDocument();
     expect(screen.getByText("执行命令")).toBeInTheDocument();
     expect(screen.getByText("联网搜索")).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("✓已批准")).toBeNull();
   });
 });
