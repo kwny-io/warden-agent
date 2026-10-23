@@ -61,7 +61,11 @@ from warden_agent.core.settings import (
 from warden_agent.execution.sandbox import sandbox_isolation_policy
 from warden_agent.loop.intent import ToolIntentRouter
 from warden_agent.loop.planner import ModelPlanner
-from warden_agent.model.deepseek import DeepSeekModel
+from warden_agent.model.deepseek import (
+    DeepSeekModel,
+    OpenAiCompatibleModel,
+    custom_endpoint_from_env,
+)
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel
 from warden_agent.policy.policy import PolicyEngine, ask_when_tool_not_pure
@@ -565,13 +569,17 @@ def _cognition_from_env(
       · **意图路由**：`ToolIntentRouter` 纯离线确定性、不让模型多跑一次 → **默认开**。
         调用前校验"该不该调"，疑似误调就提示模型而不是直接执行。
       - **上下文裁剪**：防长会话把上下文撑爆，纯收益 → **默认开**（阈值可覆盖）。
-      · **阶段规划**：`ModelPlanner` 会为复杂任务**多花一次模型调用** → **默认关**，
-        要开就设 `WARDEN_PLANNER=1`（值得，因为复杂任务本来就贵）。
+      · **阶段规划**：`ModelPlanner` 只在**判定为复杂**时才多花一次模型调用
+        （`plan_with_model` 先跑离线启发式，简单任务**一次调用都不发**，
+        由 `tests/test_planner_default.py` 数调用次数钉住）→ **默认开**；`WARDEN_PLANNER=0` 可关。
+        为什么改默认：原来"默认关"的理由是"怕多花钱"，但这个成本只落在复杂任务上——
+        而复杂任务本来就贵，多一次规划换来的是"不闷头一口气做完"。给简单任务加零成本、
+        给复杂任务加一次调用，这个默认值才站得住（第115 批改的口径，旧文档写的是"默认关"）。
     """
     intent = ToolIntentRouter(catalog)
     planner = (
         ModelPlanner(model)
-        if env_bool("WARDEN_PLANNER", False, env)
+        if env_bool("WARDEN_PLANNER", True, env)
         else None
     )
     limit = env_int("WARDEN_MAX_CONTEXT_CHARS", DEFAULT_MAX_CONTEXT_CHARS, env)
@@ -647,10 +655,40 @@ def main() -> None:
     # 模型：有真实凭据用真 DeepSeek，否则用假模型（离线可跑）。
     model: AgentChatModel
     api_key = env_opt("DEEPSEEK_API_KEY")
+    # 自建 / 私有部署的启动配置。读取本身归 `model/deepseek.py`（ENV_SPECS 登记的
+    # 归属模块），这里只做决策——同一份环境变量出现第二个读取方，就是"同名两用"
+    # bug 的形状，测试会拦。
+    custom = custom_endpoint_from_env()
+    # 顺序有讲究：**先 DeepSeek**。老部署的 .env 里已经有 DEEPSEEK_API_KEY，
+    # 若让自建端点插到前面，某天有人为了试一下而在同一个 .env 里加了 WARDEN_BASE_URL，
+    # 整站就会静默换模型——这不该由一条新增的环境变量决定。
     if api_key:
         model = DeepSeekModel(api_key=api_key)
         logger.info("使用真实 DeepSeek 模型")
+        if custom.base_url:
+            logger.warning(
+                "同时设了 DEEPSEEK_API_KEY 与 WARDEN_BASE_URL → 以 DeepSeek 为准。"
+                "要用自建端点请清掉 DEEPSEEK_API_KEY，或在界面上切到「自建 / 私有部署」。"
+            )
+    elif custom.ready:
+        # assert 只对类型收窄有用：ready 的定义就是这两者非空。
+        assert custom.base_url and custom.api_key
+        model = OpenAiCompatibleModel(
+            api_key=custom.api_key,
+            base_url=custom.base_url,
+            model=custom.model,
+            # 同 web/server.py 的 _custom_model：自建端点不许被系统代理转出去。
+            trust_env=False,
+        )
+        logger.info("使用自建 OpenAI 兼容端点：%s（模型 %s）", custom.base_url, custom.model)
     else:
+        if custom.base_url and not custom.api_key:
+            # 静默忽略是最难查的那种失败：配置写了、日志里没提、行为还是假模型。
+            logger.warning(
+                "已设 WARDEN_BASE_URL 但缺 WARDEN_MODEL_API_KEY → 自建端点未启用"
+                "（不校验密钥的本地端点请填任意占位串，如 not-needed）。"
+                "本次仍按现有凭据选择模型。"
+            )
         model = FakeModel()
         # 降级到 info 是错的：假模型的回复**看起来像真能力**（会选工具、会给答案），
         # 日志里必须留下明显的痕迹，而且非本机开发场景直接拒绝启动。
@@ -784,7 +822,7 @@ def main() -> None:
     logger.info(
         "认知能力：意图路由=%s｜阶段规划=%s｜上下文裁剪=%s 字符",
         "开" if intent is not None else "关",
-        "开" if planner is not None else "关（设 WARDEN_PLANNER=1 可开）",
+        "开" if planner is not None else "关（WARDEN_PLANNER=0）",
         ctx_chars or "不裁剪",
     )
     # 链路追踪出口：配了 OTLP endpoint 才会把 span 送出去（否则只打结构化日志）。
@@ -885,8 +923,10 @@ def main() -> None:
         git_workdir=env_opt("GIT_WORKDIR"),
         api_keys=api_keys,
         audit_store=audit_store,
-        model_id=("deepseek" if api_key else "fake"),
-        model_api_key=api_key,
+        model_id=("deepseek" if api_key else ("custom" if custom.ready else "fake")),
+        model_api_key=api_key or (custom.api_key if custom.ready else None),
+        model_base_url=custom.base_url if custom.ready else None,
+        model_name=custom.model if custom.ready else None,
         stability=_stability_from_env(os.environ),
         planner=planner,
         intent=intent,

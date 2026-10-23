@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from warden_agent.core.settings import env_opt, env_str
@@ -54,6 +55,67 @@ class ModelCallError(Exception):
 DeepSeekError = ModelCallError
 
 
+# 探不通的原因分档：**只许增加可操作的新档，不许把两件事合成一档**。
+# 为什么要有这一层（笔记 95，2026-10-19）：界面上原本一律显示
+# “探测失败：AuthenticationError: Error code: 401 …”，而用户真正要做的动作
+# 是“换 Key / 去充值 / 改地址 / 等一等”——这四件事在原始异常里长得一模一样。
+# 我自己今天就因为分不清「余额不足」和「Key 无效」而反复换 Key。
+PROBE_FAILURE_HINTS: dict[str, str] = {
+    "ok": "",
+    "key_rejected": "API Key 被拒（失效、抄错或没权限）——重新导入 Key",
+    "quota_exhausted": "账户余额不足或用额度用完（上游拒绝服务）——去上游充值",
+    "model_not_found": "上游没有这个模型——检查模型名或 base_url",
+    "rate_limited": "被上游限流——稍后重试",
+    "timeout": "超时——网络慢或上游卡住（钥匙可能没问题）",
+    "unreachable": "连不上上游（DNS / 网络 / 代理）——先查网络",
+    "upstream_error": "上游 5xx——供应商自己挂了，不是你的 Key 问题",
+    "unknown": "",
+}
+
+
+def _cause_chain(exc: BaseException) -> list[BaseException]:
+    """沿 `__cause__` / `__context__` 展开（`probe()` 会把真原因包一层 ModelCallError）。"""
+    seen: list[BaseException] = []
+    cur: BaseException | None = exc
+    while cur is not None and cur not in seen and len(seen) < 8:
+        seen.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    return seen
+
+
+def probe_failure_code(exc: BaseException) -> str:
+    """把探测失败归到一档**可操作**的原因上。
+
+    只用结构信息（状态码 / 异常类名），**不看错误串措辞**做主要判断：
+    OpenAI 兼容生态里字符串文案五花八门，而 `status_code` 是协议层的坑位。
+    最后那条文本兜底只为兼容「不返 402、只在 body 里写余额」的网关，
+    且它只在前面全部认不出时才生效。
+    """
+    for e in _cause_chain(exc):
+        status = getattr(e, "status_code", None)
+        name = type(e).__name__
+        if status in (401, 403) or name in ("AuthenticationError", "PermissionDeniedError"):
+            return "key_rejected"
+        if status == 402:
+            return "quota_exhausted"
+        if status == 404 or name == "NotFoundError":
+            return "model_not_found"
+        if status == 429 or name == "RateLimitError":
+            return "rate_limited"
+        if name in ("APITimeoutError", "TimeoutError", "TimeoutException"):
+            return "timeout"
+        if name in ("APIConnectionError", "ConnectError", "ConnectionError", "gaierror"):
+            return "unreachable"
+        if isinstance(status, int) and 500 <= status < 600:
+            return "upstream_error"
+    text = str(exc).lower()
+    if "quota" in text or "余额" in text or "insufficient" in text:
+        return "quota_exhausted"
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    return "unknown"
+
+
 class OpenAiCompatibleModel(AgentChatModel):
     """基于 OpenAI 官方 SDK 的兼容模型（DeepSeek / OpenAI 共用一份代码）。"""
 
@@ -67,6 +129,7 @@ class OpenAiCompatibleModel(AgentChatModel):
         timeout: float = 60.0,
         *,
         max_retries: int = 2,
+        trust_env: bool = True,
     ) -> None:
         # api_key 可显式传入；否则从环境变量取；SSO 厂商也可用无 key（走 AZURE）——这里只处理标准 key
         key = api_key or env_opt("OPENAI_API_KEY") or env_opt("DEEPSEEK_API_KEY")
@@ -76,13 +139,41 @@ class OpenAiCompatibleModel(AgentChatModel):
                 "或在构造时传入 api_key。"
             )
         # 官方 SDK 客户端：支持超时/重试/流式
-        from openai import OpenAI
+        from openai import DefaultHttpxClient, OpenAI
 
+        # `trust_env=False` 时不读系统代理。自建接入必须关掉它：那条路存在的理由就是
+        # 「对话不出你的网络」，而 Windows 的系统代理**不认** ProxyOverride 里的
+        # `localhost;127.*;10.*;…`，httpx 照样把 127.0.0.1 / 10.x 的请求塞给代理 ——
+        # 于是"内网端点"的对话被转发到了公网代理上（静默 502 只是它的表征）。
+        # 内置公网厂商保留默认（`trust_env=True`）：在代理后面访问 api.deepseek.com 正是需要它。
+        #
+        # 用 `openai.DefaultHttpxClient` 而不是自己 `import httpx`：openai 3.x 内嵌的是
+        # `httpx2`（发行包名不同、类也不同），拿顶层的 `httpx.Client` 传进去类型对不上
+        # （mypy 会拦），运行时也可能不是同一个 transport 实现。这个类是 SDK 自己导出的，
+        # 版本跟着 SDK 走。
+        http_client = None if trust_env else DefaultHttpxClient(
+            timeout=timeout, trust_env=False
+        )
         self._client = OpenAI(api_key=key, base_url=base_url,
-                              timeout=timeout, max_retries=max_retries)
+                              timeout=timeout, max_retries=max_retries,
+                              http_client=http_client)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+
+    def probe(self, timeout: float = 5.0) -> None:
+        """探一次「这个 provider 到底通不通」，失败就抛。
+
+        只调 `GET /models`（列模型目录，不消耗 token，也不走对话配额）：
+        它验证的正是网关里最容易单独坏掉的那一环——鉴权 + 网络 + base_url。
+
+        为什么需要它：`/models` 曾经只用「有没有 key」回答「能不能用」，
+        于是界面上写「可用」、用户发出第一条消息才被告知 provider 挂了（笔记 95）。
+        """
+        try:
+            self._client.with_options(timeout=timeout, max_retries=0).models.list()
+        except Exception as e:  # noqa: BLE001 —— 任何失败都是「探不通」，原因要原样带出去
+            raise ModelCallError(f"探测失败：{type(e).__name__}: {e}") from e
 
     # ================= 统一接口入口 =================
     def chat(self, request: ChatRequest) -> ChatResponse:
@@ -397,6 +488,44 @@ _PROVIDERS: dict[str, type[OpenAiCompatibleModel]] = {
 }
 
 
+@dataclass(frozen=True)
+class CustomEndpoint:
+    """自建端点的启动配置。**可能只有一半**（有地址缺 key），调用方要看得见。"""
+
+    base_url: str | None
+    api_key: str | None
+    model: str
+
+    @property
+    def ready(self) -> bool:
+        """三件套齐全才算能用。
+
+        只有地址没有 key 时若照样放行，空 key 会交给 SDK，而 `OpenAiCompatibleModel`
+        在 key 为空时会回落到 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` —— 等于把别家的
+        密钥发到你这个端点上。
+        """
+        return bool(self.base_url and self.api_key)
+
+
+def custom_endpoint_from_env() -> CustomEndpoint:
+    """读「要不要用自建端点」这份启动配置（未配置时各字段为 None / 默认模型名）。
+
+    为什么这份读取落在这里而不是 `web/run_server.py`：`WARDEN_BASE_URL` /
+    `WARDEN_MODEL_API_KEY` / `WARDEN_MODEL` 在 `core/settings.py` 的 ENV_SPECS 里
+    登记的归属模块就是本文件（`test_config_surface.py::test_只有授权模块能读某个变量`
+    会拦住第二个读取方——那是防"同名两用"的机制，不该绕过）。启动方只问
+    「配好了没有 / 是半截吗」，不自己再拼一遍。
+
+    返回值**不折叠成"是否就绪"**：启动日志要能说出「设了地址但缺 key」，
+    那是最难查的一类失败（配置写了、日志里没提、行为还是假模型）。
+    """
+    return CustomEndpoint(
+        base_url=env_opt("WARDEN_BASE_URL"),
+        api_key=env_opt("WARDEN_MODEL_API_KEY"),
+        model=env_str("WARDEN_MODEL", DEFAULT_DEEPSEEK_MODEL),
+    )
+
+
 def create_model(provider: str, api_key: str | None = None, **kwargs: Any) -> OpenAiCompatibleModel:
     """按厂商名创建一个模型实例。
 
@@ -443,6 +572,10 @@ def create_model(provider: str, api_key: str | None = None, **kwargs: Any) -> Op
                 "例如 WARDEN_MODEL_API_KEY=not-needed。"
             )
         # key 显式传入 → 基类不会再去回落 OPENAI_API_KEY/DEEPSEEK_API_KEY（防密钥外泄到第三方）
+        # 不走系统代理：custom 存在的理由就是"对话不出你的网络"，而 Windows 的系统代理
+        # 不认 ProxyOverride 里的 127.*/10.*（见本文件 OpenAiCompatibleModel 的注释），
+        # 走代理时内网端点的请求会被静默转发到公网。调用方显式传 trust_env 时以调用方为准。
+        kwargs.setdefault("trust_env", False)
         return OpenAiCompatibleModel(api_key=key, model=model, base_url=base_url, **kwargs)
     try:
         cls = _PROVIDERS[provider]

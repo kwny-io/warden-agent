@@ -1,0 +1,67 @@
+#!/bin/sh
+# 推之前把「这次 push 的形状」交给判据 —— 因为形状错了以后**不可逆**。
+#
+# 为什么必须卡在 push 这一刻（2026-10-19 的真实事故）：
+#   GitHub 只为 push 的 tip 建 run。一次推 3 个提交，中间两个永远拿不到 `head_sha == 自己`
+#   的 run ⇒ 它们的台账行永远拿不到 `evidence/ci/<sha12>.json`（判据只认精确匹配的那一份）
+#   ⇒ 要么留一个永久红账，要么改写历史重来一遍。
+#   `scripts/check_delivery_push.py` 早就能判出这件事，但它只在**人主动跑**时才说话；
+#   事故当天它是事后才被想起的。所以把闸门挪到 git 自己的必经之路上。
+#
+# 约定（git 的 pre-push 协议）：stdin 每行 `<本地 ref> <本地 sha> <远端 ref> <远端 sha>`。
+# 想绕过（如灾难恢复）用 `git push --no-verify`，但那样得在回执里写清为什么。
+set -eu
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+
+python="$repo/.venv/Scripts/python.exe"
+if [ ! -x "$python" ]; then
+    python="$(command -v python3 || command -v python || true)"
+fi
+if [ -z "$python" ]; then
+    echo "pre-push：找不到 python，无法校验推送形状（拒绝推送更安全）" >&2
+    exit 1
+fi
+
+# 判据脚本可被替换：测试用它注入「必红」的假守卫来证明闸门真的会拦。
+guard="${WARDEN_PUSH_GUARD:-scripts/check_delivery_push.py}"
+
+zero="0000000000000000000000000000000000000000"
+status=0
+
+# Windows 上 git 递进来的行可能带 CR（CRLF），字段尾部会残留 \r ⇒ 比较全部失效、闸门静默放行。
+# 所以每个字段都显式去 CR。
+strip_cr() {
+    printf '%s' "$1" | tr -d '\r'
+}
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    local_sha=$(strip_cr "${local_sha:-}")
+    remote_sha=$(strip_cr "${remote_sha:-}")
+    [ -n "$local_sha" ] || continue
+    case "$local_sha" in "$zero") continue ;; esac
+
+    if [ "$remote_sha" = "$zero" ] || [ -z "$remote_sha" ]; then
+        # 新分支：没有远端起点可比，形状判据在这里没有依据 —— 说清楚，别假装校验过。
+        echo "pre-push：新分支（$local_sha），跳过推送形状校验（无远端起点）" >&2
+        continue
+    fi
+
+    if ! PYTHONIOENCODING=utf-8 "$python" -X utf8 "$guard" \
+        "--base=$remote_sha" "--tip=$local_sha" >&2; then
+        status=1
+    fi
+done
+
+if [ "$status" -ne 0 ]; then
+    cat >&2 <<'EOF'
+
+推送被拦住：上面这些提交一旦推上去就拿不到自己的 CI run，台账也就永远取不了证。
+修法：把中间的改动并进下一个交付提交，一次只推一个提交（不是把判据关掉）。
+灾难恢复可 `git push --no-verify`，但必须在回执里写明为什么。
+EOF
+    exit 1
+fi
+
+exit 0

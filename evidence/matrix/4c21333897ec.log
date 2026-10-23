@@ -1,0 +1,81 @@
+=== matrix mutant_check HEAD=4c21333897ec4557e30424b4c57e92d16436c061 ===
+# 列：编号 判定 期望 标签 判定结论（OK=与期望一致；SKIP（原因）=本相位不适用）
+M01 KILLED   kill  起点核不动时整条收摊（第八十六批 CI 上真实发生过的行为：rc=2） OK
+M02 KILLED   kill  退回说了但不说没核到什么（静默：读者会以为形状已经核完了） OK
+R01 SURVIVED equiv sha256 的 utf-8 换成 UTF-8（codec 别名，编码结果逐字节相同） OK
+R02 SURVIVED equiv bytes 解码的 utf-8 换成 UTF-8（同上） OK
+R03 SURVIVED equiv redact_text 的 group == 0 换成 == 1（_sub 未传 _g，两分支产出相同） OK
+R04 SURVIVED equiv str 键判定恒假（str(k) == k，两分支结果一样） OK
+R05 SURVIVED equiv path 默认值换成 None（str(None) 不在任何受保护前缀下，仍然不拦） OK
+R06 SURVIVED equiv path 默认值直接省掉（同上，默认 None） OK
+R07 SURVIVED equiv path 默认值换成 XXXX（同样不落在受保护前缀下） OK
+R08 SURVIVED equiv pure 置成 None（None 也是假值，仍走 ASK，fail-closed 不变） OK
+R09 SURVIVED equiv DENY 的排序权重 2 换成 3（仍是最严，取最大值的结果不变） OK
+M03 KILLED   kill  os.name 换成永远不等的字符串（Windows 大小写不敏感失效） OK
+M04 KILLED   kill  os.name 的 nt 写成大写 NT（同上，Windows 语义失效） OK
+R10 SURVIVED equiv 报错文案加 XX 前后缀（断言的是“文案含关键词”，加前后缀不改变契约） OK
+R11 SURVIVED equiv partition 换成 rpartition（≥2 个 / 时两侧必有一侧含 /，int() 都会失败） OK
+M05 KILLED   kill  随机后缀 4 字节换成 5 字节（后缀长度变了——owner 格式是排查契约） OK
+M06 KILLED   kill  随机后缀 4 换成 None（token_hex(None) 直接抛错，取锁路径炸） OK
+M07 KILLED   kill  过期判定 > 换成 >=（恰好到期的那一刻别人就抢不到，多占一个 TTL） OK
+M08 KILLED   kill  续租判定 <= 换成 <（恰好到期的那一刻还以为能续） OK
+M09 KILLED   kill  stop 里不看心跳线程（不 join）——可观测差异=stop 是否等心跳让开；
+            这条曾经被记为等价，是**理由错了**：join 上限只是上界，下界必须自己断言 OK
+M10 KILLED   kill  丢锁告警加 XX 前后缀（日志/告警规则按子串匹配→以前抓不到，现在按首尾断言）
+            同上：过去把它当等价变异是**断言太松**，不是真没差异 OK
+M11 KILLED   kill  丢锁告警里 Run 变小写（同一条告警的**逐字**首尾也是运维契约） OK
+M12 KILLED   kill  回落锁不把 store 交下去（SqlRunLock(None)：多副本下等于锁在不存在的表上） OK
+M13 KILLED   kill  回落告警不带存储类型（看到告警也不知道该换哪个存储） OK
+M14 KILLED   kill  回落告警直接省掉类型参数（%s 没东西可填，格式化直接报错） OK
+M15 KILLED   kill  回落告警打在 root logger 上（按模块名过滤告警就失效了） OK
+M16 KILLED   kill  回落告警加 XX 前后缀（同丢锁告警：首尾逐字是契约） OK
+M17 KILLED   kill  回落告警的类型名取成 NoneType（拿到的是 None 类型，仍然是在说瞎话） OK
+M18 KILLED?  kill  承认「还没轮到」的日子被改成过去（never 就不再是有期限的断言） OK
+M19 KILLED?  kill  永远不响这条规则整个摘掉（台账可以无限期地宣称「它就是不响」） OK
+M20 KILLED?  kill  只认 kind=schedule 的过滤反过来（真台账那条 schedule 反而被跳过） OK
+M21 KILLED?  kill  复核日期在将来不再报（可以写一个没发生过的复核） OK
+M22 KILLED?  kill  日期边界从 > 改成 >=（今天复核过的条目会立刻红） OK
+M23 KILLED   kill  「成本数字必须同段指名尺子」被短路 ⇒ 数字又能不指名尺子（成本断言不可重放） OK
+M24 KILLED   kill  树锚豁免被拆 ⇒ 带日期的历史数字被当成当下事实（判据开始说假红） OK
+M25 KILLED   kill  条数核对被短路 ⇒ 「本文件 N 条用例」写错也没人管（本批第一步抓到的就是这个） OK
+M26 KILLED   kill  命中统计恒 0 ⇒ 「判据不是空转」那条自己变成空转 OK
+M27 KILLED   kill  尺子失聪：计数点被拆掉 ⇒ 「N 次」永远回到没人数过的状态（尺子自己会量的那两条钉住） OK
+R12 SURVIVED equiv 成本数字本身改错 ⇒ 判据不管量级（它只管引用与条数，量级由尺子重放来核）；登记这一条是为了把边界写清楚，免得下一个人以为「改了数字会被判据抓到」 OK
+M28 KILLED   kill  行数预算默认值 200_000 → 200001（多一行被静默放行；反射断言杀不掉它） OK
+M29 KILLED   kill  读旧内容 encoding=None（跟随本机 locale：非 UTF-8 机器上解非 ASCII 直接崩） OK
+M30 KILLED   kill  写回 encoding=None（同上，落盘编码跟着本机跑） OK
+M31 KILLED   kill  写回 newline=None（Windows 上落盘变 CRLF：同一份补丁在不同机器改出不同字节） OK
+M32 KILLED   kill  写回省掉 encoding（跟随本机 locale） OK
+M33 KILLED   kill  写回省掉 newline（跟随平台换行符） OK
+M34 KILLED   kill  参数层直连真实探测（resolve_isolation_tier 吞掉注入） OK
+M35 KILLED   kill  合并层只给部署级声明注入（参数层那半边被吞） OK
+M36 KILLED   kill  broker 吞掉注入（静默退回真实探测：测试看到的是本机能力） OK
+M37 KILLED   kill  台账行与回执的 keys/tree 不对账（真正的树指纹没人核） OK
+M38 KILLED   kill  仓外日志名不对账（行上写另一个 log 也放行） OK
+M39 KILLED   kill  回执路径不设限（绝对路径与 .. 能把手伸到仓外） OK
+M40 KILLED   kill  git-only 允许自报数字（回退到「没有回执也能写 shape/keys/receipt」） OK
+M41 KILLED   kill  多提交判据整个没接进去（一次推 N 个照样放行——本批的现场就是这样漏的） OK
+M42 KILLED   kill  中间提交与 tip 不分（中间那条「永远拿不到 run」不再单独说） OK
+M43 KILLED   kill  缺行判定反过来（携带了也接着往下报 ⇒ 正对照立刻变红） OK
+M44 KILLED?  kill  覆盖连续性判据整个没接进 _violations（链中间的洞重新变得没有任何判据） OK
+M45 KILLED?  kill  缺 coverage_from 声明时 fail-open（「没写」被读成「都放行」） OK
+M46 KILLED?  kill  只核 HEAD^ 那一跳（判据 7 就是为了修这个洞而补的） OK
+M47 KILLED?  kill  范围外的行不报（抬高 coverage_from 就能把范围偷偷往上缩） OK
+M48 KILLED   kill  基线跑不起来时不再算 BROKEN（假证据：collection ERROR 被读成强杀死） OK
+M49 KILLED   kill  基线本来就红时不再降档（弱证据被抬成强证据） OK
+M50 KILLED?  kill  例外清单的豁免被放宽成「任何行都可以没证据」（切点之后的证据要求空转） OK
+M51 KILLED?  kill  例外行藏回执不再被点名（拿 git-only 盖住一份回执） OK
+M52 KILLED?  kill  例外清单涨过上限不再报（新交付的提交可以永久躲证据） OK
+M53 KILLED?  kill  例外行已经有了证据还留在清单里不再报（例外被滥用没人管） OK
+M54 KILLED?  kill  红账可以不写期限（空洞从「在途」变成「永久」） OK
+M55 KILLED?  kill  红账期限已过期不再报（空洞过期了没人重新表态） OK
+M56 KILLED   kill  共享状态开关的判定被短路 => 启动即拒永不触发（文档禁令又回到只写在文档里） OK
+M57 KILLED   kill  存储类型判定被短路 => 任何存储都拒（PostgreSQL 也被拦，多副本彻底不可用） OK
+M58 KILLED   kill  超时不再算 504（供应商没回结果又被报成用户输错） OK
+M59 KILLED   kill  没料到的异常退回 400（第四十七批之前的老毛病：错误率面板又能恒为 0） OK
+M60 KILLED   kill  降级守卫恒假 => 库比代码新时继续跑（版本号被改写、payload 静默丢弃） OK
+M61 KILLED   kill  审批事件退回 tool_name 字符串（断线续读的卡片全空，而页面不报错） OK
+M62 KILLED   kill  审批队列退回手写五个字段（与 to_dict 只是碰巧一样；源码级判据必须报） OK
+M63 KILLED   kill  审批队列不供 to_dict（队列形状与 `/chat` 不同源，前端静默少一层信息） OK
+MATRIX PASS: 75/75 符合预期（63 条正对照 + 12 条反向对照）
+SHALLOW depth=1: rc=1 红 73 条（在只抓一个提交的克隆里跑 test_matrix_evidence.py、test_ci_evidence.py、test_delivery_receipts.py、test_delivery_ledger.py —— 抓不到历史就必须红，fetch-depth: 0 才算承重）

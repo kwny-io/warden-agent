@@ -202,6 +202,20 @@ def evidence_problems(commits: list[Commit]) -> list[str]:
     return []
 
 
+def empty_range_verdict(base_sha: str, tip: str) -> str:
+    """空 push 范围的两种含义（混成一种 = 一次静默放行）。
+
+    实测（2026-10-19）：`--base <下游 sha> --tip <上游 sha>`（也就是非快进/回退/force push
+    那种极性）时 `rev-list base..tip` 返回 0 个提交，而 main() 把这个 0 当成「形状对」
+    并印出「本次 push 只推一个交付提交」——**0 个提交却说推了一个**，而且 force push
+    会丢弃远端已有的提交（连它们的台账行与 CI 证据一起丢），恰恰是最该喊的那一种。
+
+    - `noop`：起点就是 tip，本地与远端同一提交，真没东西可推（放行，但要说实话）；
+    - `force`：起点不是 tip 却核不出提交 ⇒ 历史被改写/回退，几何无法评估（**核不动**）。
+    """
+    return "noop" if base_sha == tip else "force"
+
+
 def _say_what_was_not_checked(commits: list[Commit]) -> None:
     """把「本条判据到底核了什么、没核什么」明说出来。
 
@@ -272,6 +286,22 @@ def main(argv: list[str] | None = None) -> int:
             base_sha = fallback
         raw = _git("rev-list", "--first-parent", "--reverse", f"{base_sha}..{tip}")
         shas = raw.split()
+        if not shas:
+            # 空范围不是「形状对」：它要么是 no-op，要么是改写/回退（见 empty_range_verdict）。
+            verdict = empty_range_verdict(base_sha, tip)
+            if verdict == "noop":
+                print(f"这次 push 没有任何提交：本地与远端都是 {tip[:7]}（no-op，无需校验）。")
+                return 0
+            print(
+                f"核不动：push 范围 {base_sha[:7]}..{tip[:7]} 为空，但起点不是 tip —— "
+                "起点比 tip 新，这是非快进（force / 回退）推送。\n"
+                "  它会丢弃远端已有的提交，同时丢掉那些提交的台账行与 CI 证据，\n"
+                "  而「这次到底推了几个提交」在改写后的树里无法评估。\n"
+                "⇒ 这不是「形状对」：先把要保留的历史重新并进本地，再按一次一个交付提交推；\n"
+                "  确实要改写时，也必须让被改写后的那个交付提交带上台账行与回执。",
+                file=sys.stderr,
+            )
+            return 2
         commits = [Commit(sha=s, first_parent=_first_parent(s)) for s in shas]
         rows_at = {c.sha: _rows_at(c.sha) for c in commits}
         problems = check_push(commits=commits, rows_at=rows_at) + evidence_problems(commits)

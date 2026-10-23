@@ -42,7 +42,17 @@ RETRIEVAL_CASES: tuple[tuple[str, str], ...] = (
     ("跨城出差坐高铁还是飞机", "高铁"),
     ("几点上下班", "9:00"),
     ("能不能把客户的合同金额告诉媒体", "不得对外披露"),
+    # 下面两条是**纯换说法**：与文档几乎没有共同词，字面检索必掉。
+    # 它们的作用不是"凑数"，而是把"字面 vs 语义"的差距固定成回归项：
+    # 换真语义嵌入后这两条应当上升，否则说明嵌入没生效。
+    ("请年假要提前多久说", "提前一周申请"),
+    ("客户的资料能不能发给外面的人", "不得对外披露"),
 )
+
+# 三种检索模式：同一套用例、同一个库，只换排序依据。
+# 为什么必须并排看：单独看 hybrid 的数字无法判断"融合有没有用"，
+# 只有把 lexical / semantic 两条腿的分数摆在一起，才知道增益来自哪一路。
+MODES: tuple[str, ...] = ("lexical", "semantic", "hybrid")
 
 
 def build_corpus_store(embedder_name_hint: str = "") -> tuple[VectorStore, str]:
@@ -168,6 +178,29 @@ def format_report(report: RetrievalReport) -> str:
     return "\n".join(lines)
 
 
+def compare_modes(store: VectorStore, k: int = 3, embedder_name: str = "") -> str:
+    """同一库、同一套用例，把三种模式的指标并排打出来。
+
+    **离线嵌入下 semantic 与 lexical 会几乎相同**——因为词频哈希本身就是字面匹配。
+    这不是 bug，是这套实现的诚实边界：想看到语义那一列的增益，必须配
+    `WARDEN_EMBED_BASE_URL`/`_API_KEY`/`_MODEL` 换成真嵌入。
+    """
+    original = store.mode
+    rows: list[str] = []
+    try:
+        for mode in MODES:
+            store.mode = mode
+            report = evaluate(store, k=k, embedder_name=embedder_name or original)
+            rows.append(
+                f"  {mode:<9} top-1 {report.top1:>6.1%}   MRR {report.mrr:>6.3f}   "
+                f"未命中 {len(report.misses())}"
+            )
+    finally:
+        store.mode = original
+    head = f"三种模式对比（同一库 {len(store)} 块 / k={k}；嵌入器：{embedder_name or '未标注'}）"
+    return "\n".join([head, *rows])
+
+
 def main() -> None:
     # Windows 控制台默认可能不是 UTF-8（GBK 下非 GBK 字符会 UnicodeEncodeError）；
     # 把 stdout 切成 UTF-8 并对无法编码的字符退成代替符——报告里有中文与符号，
@@ -177,6 +210,8 @@ def main() -> None:
     store, name = build_corpus_store()
     report = evaluate(store, embedder_name=name)
     print(format_report(report))
+    print()
+    print(compare_modes(store, embedder_name=name))
 
 
 if __name__ == "__main__":

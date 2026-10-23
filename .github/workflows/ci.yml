@@ -1,8 +1,16 @@
 name: CI
 
 on:
+  # 只在这些分支上因 **push** 触发。别写成 `["**"]`：那等于「任何分支的任何一次推送
+  # 都跑一整套 16 分钟的 CI」，而私有仓的 Actions 分钟数是**硬上限**（本仓 2026-10-19
+  # 撞上的就是它：2000 分钟/月用尽后所有 job 直接不启动，报的却是「CI 红」）。
+  # 连带后果：手边的工作分支每推一次都在替别人烧配额。
+  #
+  # 开发分支要靠 `pull_request` 那条路获得 CI，不是靠 push——开 PR 时照样跑全套，
+  # 而且跑完的结果会挂在 PR 上，比 push run 更容易找。feat/** 与 fix/** 保留 push
+  # 触发是为了「分支还没开 PR 就想验一次」的场景。
   push:
-    branches: ["**"]
+    branches: [master, dev, "feat/**", "fix/**"]
   pull_request:
   # 手动触发：发布链路的"能不能真跑一次"不该只有"推一个公开 tag"这一条路。
   # 没有这个入口时，想验证签名链路就必须先对外发布——等于用"发布"换"验证"，
@@ -18,6 +26,20 @@ on:
   # 只在 push/PR 上扫描的话，"没人提交"就等于"没人检查"。
   schedule:
     - cron: "0 3 * * 1"   # 每周一 03:00 UTC
+
+# 同一分支上连推两次时，把上一轮**取消掉**。
+#
+# 这不是优化，是止损：一整套 CI 约 16 计费分钟（实测 2026-10-18 那次 dev run：
+# container 5.1 + quality 7.0 + sbom 4.8 + security 0.6 + migration 0.6 + evals-real 0.2）。
+# 不取消的话，修一个 typo 推三次 = 三个满编 run = 48 分钟，而前两次的结论从第二次推送起
+# 就已经没有意义了。分组键带上 ref：不同分支之间互不干扰（dev 的红不该取消 master 的跑）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # 发布路径不许被取消：`image-signing` 只在 push tag / workflow_dispatch 上跑，
+  # 而"取消"恰好会把推了一半的镜像与签名截断成「有产物、无签名」这种最难查的状态。
+  # 用 `github.ref` 前缀判断，不依赖具体事件名 —— tag 推送与手动触发都落在非分支 ref 上，
+  # 但手动触发走的是分支 ref，所以两种都要显式放过。
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/v') }}
 
 # 最小权限：workflow 默认只需读代码。需要写权限的 job（镜像签名推 GHCR + OIDC）
 # 在 job 级单独声明、覆盖这里——不给全 workflow 开大权限。
@@ -119,7 +141,7 @@ jobs:
         #    判据已自造产物、不再依赖它——第九十批）。
         working-directory: web
         run: |
-          npm ci
+          bash ../scripts/npm_ci.sh
           npm run lint
           npm run typecheck
           npm run test:coverage
@@ -146,7 +168,10 @@ jobs:
         # 而这是一个可以直接堵上的洞（npm ci + package-lock.json 就能复现）。
         # 它由"跳过签字"守卫看着：这步一被删，那 4 条又会跳过、而它们没有签字 ⇒ CI 直接红。
         working-directory: ts/mcp-client
-        run: npm ci
+        # 用加固版而不是裸 `npm ci`：这个 lockfile 的 107 个 `resolved` 全指向第三方镜像，
+        # 而那个镜像 504 过一次就把整个 quality job 拖死了（第九十九批 run 39175595595）。
+        # 重试 + 换源重试写在 scripts/npm_ci.sh 里，由 tests/test_ci_npm_resilience.py 看着。
+        run: bash ../../scripts/npm_ci.sh
       - name: Ruff (lint)
         run: uv run --frozen ruff check src tests scripts
       - name: Mypy (strict)

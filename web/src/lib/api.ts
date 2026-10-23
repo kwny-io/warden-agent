@@ -10,6 +10,8 @@ import type {
   HealthResult,
   MemoryCandidate,
   MemoryItem,
+  ModelEndpoint,
+  ModelProbe,
   ModelsInfo,
   RunInfo,
   StreamEvent,
@@ -365,20 +367,77 @@ export const api = {
     return request(`/runs/${encodeURIComponent(runId)}`, { method: "DELETE" }, opts);
   },
 
+  /**
+   * 批量删除会话：DELETE /runs，body `{ run_ids }`。
+   *
+   * 后端语义是**要么全删要么一个都不删**：有一项不归自己就整批 403，不会删掉一半。
+   * 所以这里不拆成 N 次单删——拆开就失去了原子性，而且 N 次请求会撞限流。
+   */
+  deleteRuns(
+    runIds: string[],
+    opts?: RequestOpts,
+  ): Promise<{ ok: boolean; deleted: string[]; count: number }> {
+    return request(
+      "/runs",
+      { method: "DELETE", body: JSON.stringify({ run_ids: runIds }) },
+      opts,
+    );
+  },
+
   /** 可用模型列表 + 当前模型：GET /models */
   models(opts?: RequestOpts): Promise<ModelsInfo> {
     return request("/models", undefined, opts);
   },
 
   /** 切换 / 导入模型：POST /models/select */
+  /** `endpoint` 只对「自建 / 私有部署」有意义：OpenAI 兼容端点与模型名。
+   *  给空对象即可（内置四家的端点在服务端写死，传了也会被忽略）。 */
   selectModel(
     id: string,
     apiKey?: string,
     opts?: RequestOpts,
+    endpoint?: ModelEndpoint,
   ): Promise<{ ok: boolean; current: string }> {
     return request(
       "/models/select",
-      { method: "POST", body: JSON.stringify({ id, api_key: apiKey || null }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          id,
+          api_key: apiKey || null,
+          base_url: endpoint?.base_url || null,
+          model: endpoint?.model || null,
+        }),
+      },
+      opts,
+    );
+  },
+
+  /** 主动探一次 provider 通不通：POST /models/probe（只调 GET /models，不花 token）。
+   *
+   * 带上 `endpoint` + `apiKey` 是为了**先探通再保存**：用户在地址栏里敲完就想知道通不通，
+   * 不该被迫先把一份可能写错的配置存进去（存错了还得再改一次）。
+   * 没保存过的模型一把已登记的 key 都没有，不带 `apiKey` 就只会回一句「需要先导入」
+   * ——那正好把"先探通再保存"堵死。探针不落库，这把 key 用完即弃。 */
+  probeModel(
+    id: string,
+    force = false,
+    opts?: RequestOpts,
+    endpoint?: ModelEndpoint,
+    apiKey?: string,
+  ): Promise<ModelProbe> {
+    return request(
+      "/models/probe",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          id,
+          force,
+          base_url: endpoint?.base_url || null,
+          model: endpoint?.model || null,
+          api_key: apiKey || null,
+        }),
+      },
       opts,
     );
   },

@@ -246,3 +246,28 @@ def test_本仓_能核动_不是2():
         assert "@{u}" in done.stderr, (done.returncode, done.stdout, done.stderr)
     else:
         assert done.returncode in (0, 1), (done.returncode, done.stdout, done.stderr)
+
+
+# ---------- 空范围：no-op 与「改写/回退」必须分开（2026-10-19 实测的静默放行） ----------
+
+
+def test_空范围判据_同提交是noop_起点比tip新是改写():
+    """纯判据：空范围有两种含义，混成一种就是一次静默放行。"""
+    assert push.empty_range_verdict(A, A) == "noop"
+    # 起点比 tip 新（非快进/回退/force push 的极性）
+    assert push.empty_range_verdict(B, A) == "force"
+
+
+def test_真仓_起点比tip新时不许谎称只推了一个(repo: pathlib.Path):
+    """现场（2026-10-19）：`--base <新> --tip <旧>` 时 rev-list 返回 0 个提交，
+    它却打印「本次 push 只推一个交付提交」并返回 0 —— **0 个提交却说推了一个**。
+
+    注意这条和「起点不在树里」是**两种不同**的空范围：`_upstream()` 取不到起点时会退回核
+    父提交（第四种结局，有测试覆盖）；而这里起点**在**树里、只是比 tip 新 ⇒ 必须核不动。
+    """
+    a = _commit(repo, "起点：台账空", [])
+    b = _commit(repo, "交付提交：携带 a 的行", [a])
+    # a..a：本地与远端同一提交 ⇒ 真没东西推，放行但要说实话
+    assert push.main(["--base", a, "--tip", a]) == 0
+    # b 做起点、a 做 tip：起点比 tip 新 ⇒ 丢弃远端已有提交，几何无从评估
+    assert push.main(["--base", b, "--tip", a]) == 2

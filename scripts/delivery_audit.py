@@ -95,7 +95,22 @@ def _job_findings(where: str, jobs: Sequence[dict[str, Any]], event_is_push: boo
         if conclusion == "skipped":
             out.append(Finding(where, "核心 job 被跳过", f"{name}：这次绿灯没覆盖它"))
         elif conclusion != "success":
-            out.append(Finding(where, "核心 job 不绿", f"{name} conclusion={conclusion!r}"))
+            steps = job.get("steps")
+            if isinstance(steps, list) and not steps:
+                # 零个 step 就结帐 ⇒ **job 根本没被启动**，代码一行都没跑。
+                # 这种事真实发生过两次：账户账单/额度问题、runner 标签打不到。
+                # 如果当「代码红」去查，会去扒根本没跑过的一棵树（我亲身干过）。
+                out.append(
+                    Finding(
+                        where,
+                        "job 没跑起来（不是代码红）",
+                        f"{name} conclusion={conclusion!r} 但 steps=0 ⇒ 启动前就被平台拒了；"
+                        "先看 `gh api repos/<repo>/check-runs/<job id>/annotations`"
+                        "（常见原因：账单/额度、runner 标签），别当缺陷来查",
+                    )
+                )
+            else:
+                out.append(Finding(where, "核心 job 不绿", f"{name} conclusion={conclusion!r}"))
     return out
 
 
@@ -105,7 +120,11 @@ def audit_run(where: str, run: dict[str, Any], jobs: Sequence[dict[str, Any]]) -
         return [Finding(where, "run 还没跑完", f"status={run.get('status')!r}")]
     out: list[Finding] = []
     if run.get("conclusion") != "success":
-        out.append(Finding(where, "整个 run 不绿", f"conclusion={run.get('conclusion')!r}"))
+        detail = f"conclusion={run.get('conclusion')!r}"
+        attempted = [j for j in jobs if j.get("conclusion") != "skipped"]
+        if attempted and all(not (j.get("steps") or []) for j in attempted):
+            detail += "（每个 job 的 steps 都是空的 ⇒ 平台侧没启动，先排除账单/额度/标签）"
+        out.append(Finding(where, "整个 run 不绿", detail))
     out.extend(_job_findings(where, jobs, str(run.get("event")) == "push"))
     return out
 

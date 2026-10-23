@@ -18,17 +18,40 @@ beforeEach(() => {
   vi.spyOn(api, "memory").mockResolvedValue([]);
   vi.spyOn(api, "memoryCandidates").mockResolvedValue([]);
   vi.spyOn(api, "capabilities").mockResolvedValue(caps);
+  // 标题查询：默认没有命中（面板退回显示 run_id）
+  vi.spyOn(api, "runs").mockResolvedValue([]);
 });
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("InfoPanel", () => {
-  it("展示 run 状态和 runId，点「刷新」会再拉一次状态", async () => {
+  it("展示 run 状态（中文）与 runId，点「刷新」会再拉一次状态", async () => {
     render(<InfoPanel runId="run-1" />);
-    expect(await screen.findByText("COMPLETED")).toBeInTheDocument();
+    // 状态显示中文，原始枚举名留在 title 上供技术用户核对
+    const st = await screen.findByText("已完成");
+    expect(st).toBeInTheDocument();
+    expect(st).toHaveAttribute("title", "原始状态：COMPLETED");
     expect(screen.getByText("run-1")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "刷新" }));
     expect((api.status as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("拿得到对话标题时显示标题，run_id 退到悬停提示里", async () => {
+    vi.spyOn(api, "runs").mockResolvedValue([
+      { run_id: "run-1", status: "COMPLETED", msg_count: 2, title: "帮我查天气", updated_at: null },
+    ]);
+    render(<InfoPanel runId="run-1" />);
+    const name = await screen.findByText("帮我查天气");
+    expect(name).toHaveAttribute("title", "会话 ID：run-1");
+    // 标题在，ID 就不该再以正文形式出现（那正是用户抱怨的「影响美观」）
+    expect(screen.queryByText("run-1")).toBeNull();
+  });
+
+  it("标题拉取失败时如实退回 run_id，不把面板弄成报错", async () => {
+    vi.spyOn(api, "runs").mockRejectedValue(new Error("500 boom"));
+    render(<InfoPanel runId="run-1" />);
+    expect(await screen.findByText("run-1")).toBeInTheDocument();
+    expect(screen.queryByText(/加载失败/)).toBeNull(); // 标题只是锦上添花
   });
 
   it("状态拉取失败时显示占位「…」而不是崩溃", async () => {

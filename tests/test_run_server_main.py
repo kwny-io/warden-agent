@@ -390,3 +390,61 @@ def test_main_单副本时sqlite照常启动(tmp_path: Path, monkeypatch) -> Non
     assert "app" in captured
     created["store"].close()
     created["memory_repository"].close()
+
+
+# ---------------------------------------------------------------------------
+# 自建端点走环境变量启动：这条路上模型也要关系统代理
+# ---------------------------------------------------------------------------
+# 「自建接入」有三个构造入口（`create_model('custom')` / 界面切换 / 本文件这条启动路），
+# 漏掉任何一个都让"对话不出你的网络"在那条路上变成假的。这条测的是**启动装配**
+# 真的把 `trust_env=False` 传下去了——回环端点 + 坏代理，能探通才算过。
+
+def test_main_自建端点启动时不走系统代理(tmp_path: Path, monkeypatch) -> None:
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from warden_agent.model.deepseek import ModelCallError
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"object": "list", "data": []}).encode())
+
+        def log_message(self, *args: object) -> None:
+            return
+
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base_url = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+    try:
+        captured, created = _patch_common(monkeypatch, tmp_path)
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        monkeypatch.setenv("WARDEN_BASE_URL", base_url)
+        monkeypatch.setenv("WARDEN_MODEL_API_KEY", "not-needed")
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
+
+        run_server.main()
+
+        # 启动装配的结果就是 build_app 收到的 model：不是另建一个来冒充。
+        from warden_agent.model.deepseek import OpenAiCompatibleModel
+
+        model = created["model"]
+        assert isinstance(model, OpenAiCompatibleModel), (
+            f"设了自建端点却没构造自建模型，实际是 {type(model).__name__}"
+        )
+        try:
+            model.probe()
+        except ModelCallError as exc:
+            raise AssertionError(
+                f"启动路径构造的自建模型走了系统代理，回环端点被转发到公网：{exc}"
+            ) from exc
+        created["store"].close()
+        created["memory_repository"].close()
+    finally:
+        srv.shutdown()
+        srv.server_close()

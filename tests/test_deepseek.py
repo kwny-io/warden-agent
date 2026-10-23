@@ -4,6 +4,7 @@
 "假客户端"（stub），它的 chat.completions.create 返回我们写好的形状，从而
 验证我们的翻译逻辑（消息映射 / 工具解析 / 流式参数分片累加 / 结构化输出 / usage）。
 """
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from warden_agent.model.deepseek import (
     BailianModel,
     DeepSeekError,
     DeepSeekModel,
+    ModelCallError,
     OpenAiCompatibleModel,
     OpenAIModel,
     ZhipuModel,
@@ -225,6 +227,60 @@ def test_create_model_custom_读环境变量(monkeypatch) -> None:
     assert isinstance(m, OpenAiCompatibleModel)
     assert m.model == "my-llama"
     assert "11434" in str(m._client.base_url)
+
+
+# 三个入口都要关代理：`create_model("custom")`（本文件）、`web/server.py::_custom_model`
+# （界面切换）、`web/run_server.py`（环境变量启动）。漏掉任意一个，"对话不出你的网络"
+# 就在那条路上是假的。下面这条钉住第一个入口，另两个由各自的测试负责。
+_DEAD_PROXY = "http://127.0.0.1:9"  # 9 = discard 端口，本机必定拒连
+
+
+@contextmanager
+def _loopback_openai_endpoint():
+    """起一个只回 `GET /models` 的回环端点，yield base_url。"""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 —— http.server 的命名约定
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"object": "list", "data": []}).encode())
+
+        def log_message(self, *args: object) -> None:
+            return
+
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/v1"
+    finally:
+        srv.shutdown()
+        srv.server_close()  # shutdown() 只停 serve_forever，不关监听 socket
+
+
+def test_create_model_custom_不许走系统代理(monkeypatch) -> None:
+    """行为级守卫：环境里有坏代理时，custom 的请求仍必须直达回环端点。
+
+    Windows 的系统代理**不认** `ProxyOverride` 里的 `localhost;127.*;10.*;…`，
+    httpx 的 `trust_env=True` 照样把回环/内网请求塞给代理。断言流量真的没去代理，
+    而不是断言某个属性值——属性可以留着好看，流量才是最诚实的。
+    """
+    with _loopback_openai_endpoint() as base_url:
+        monkeypatch.setenv("WARDEN_MODEL_API_KEY", "not-needed")
+        monkeypatch.setenv("WARDEN_BASE_URL", base_url)
+        monkeypatch.setenv("HTTP_PROXY", _DEAD_PROXY)
+        monkeypatch.setenv("HTTPS_PROXY", _DEAD_PROXY)
+        monkeypatch.setenv("ALL_PROXY", _DEAD_PROXY)
+        m = create_model("custom")
+        try:
+            m.probe()  # 不抛 = 请求真的到了回环端点
+        except ModelCallError as exc:
+            raise AssertionError(
+                f"create_model('custom') 走了系统代理，回环端点被转发到公网：{exc}"
+            ) from exc
 
 
 def test_create_model_custom_不读服务端鉴权密钥(monkeypatch) -> None:

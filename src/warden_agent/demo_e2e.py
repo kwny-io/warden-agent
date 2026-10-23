@@ -34,6 +34,7 @@ from warden_agent.model.deepseek import DeepSeekModel
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel, ChatRequest, ChatResponse, ToolCall
 from warden_agent.multiagent.supervisor import build_supervisor, make_handoff
+from warden_agent.policy.injection import unwrap
 from warden_agent.rag.corpus import POLICY_CORPUS
 from warden_agent.rag.knowledge import VectorStore, embedder_from_env, make_knowledge_tool
 from warden_agent.skill import SkillCatalog, SkillPackageParser
@@ -335,6 +336,14 @@ def _autonomous_demo() -> None:
     for m in reply.messages:
         role = _labels.get(m.role, m.role)
         content = m.content or ""
+        if m.role == "tool":
+            # 围栏声明是给模型读的；人只要知道这是工具数据，正文要看得见。
+            fence_mark, body = unwrap(content)
+            _line(f"  [{role}] {fence_mark}")
+            for ln in body.splitlines():
+                if ln.strip():
+                    _line(f"        {ln}")
+            continue
         line = f"[{role}] {content}"
         shown = line if len(line) <= 90 else line[:90] + "…"
         _line("  " + shown)
@@ -357,6 +366,11 @@ def _live_demo() -> None:
 
 
 def run_demo() -> None:
+    # README 把这条命令当「30 秒体验」，而它满屏都是 `✅`/`⇒`——中文 Windows 的 cp936
+    # 写不出这些字符，会在最后一行崩掉。必须在任何输出之前钉住编码。
+    from warden_agent.core.console import force_utf8_stdio
+
+    force_utf8_stdio()
     setup_logging()
     _section("Warden Agent · 端到端完整演示")
     if env_opt("DEEPSEEK_API_KEY"):
