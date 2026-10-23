@@ -138,7 +138,7 @@ class AwsKmsKeyProvider:
                 "生成方式见 docs/operations.md）"
             )
         try:
-            import boto3  # type: ignore[import-not-found]
+            import boto3
         except ModuleNotFoundError as e:
             raise KeyProviderError(
                 "aws-kms 模式需要可选依赖 boto3（pip install 'warden-agent[aws]'）"

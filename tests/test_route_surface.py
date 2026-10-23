@@ -71,6 +71,8 @@ ROUTES: tuple[Route, ...] = (
     # ---- 认证即可（数据按调用者收敛）----
     Route("GET", "/models", Access.AUTHENTICATED, "看自己可选模型"),
     Route("POST", "/models/select", Access.AUTHENTICATED, "默认只切自己的（scope=self）"),
+    Route("POST", "/models/probe", Access.AUTHENTICATED,
+          "实测自己配置的上游通不通（只调上游 GET /models，不烧 token）；只探自己的 key"),
     Route("POST", "/chat/{run_id}", Access.AUTHENTICATED, "发起/续跑对话"),
     Route("POST", "/chat/stream/{run_id}", Access.AUTHENTICATED, "流式对话"),
     Route("GET", "/events/{run_id}", Access.AUTHENTICATED, "SSE 事件流"),
@@ -78,6 +80,8 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/runs", Access.AUTHENTICATED, "自己的 Run 列表"),
     Route("POST", "/runs/{run_id}", Access.AUTHENTICATED, "取消 Run（与 CLI cancel 同一入口）"),
     Route("DELETE", "/runs/{run_id}", Access.AUTHENTICATED, "删除 Run"),
+    Route("DELETE", "/runs", Access.AUTHENTICATED,
+          "批量删除 Run（id 在请求体里，所以归属校验必须由端点逐个做）"),
     Route("GET", "/users", Access.AUTHENTICATED, "用户列表"),
     Route("POST", "/users", Access.AUTHENTICATED, "登记/切换用户"),
     Route("GET", "/messages/{run_id}", Access.AUTHENTICATED, "会话消息"),
@@ -109,7 +113,6 @@ ADMIN_BRANCHES: tuple[tuple[str, str, dict[str, object]], ...] = (
         {"id": "fake", "scope": "deployment"},
     ),
 )
-
 # 静态资源挂载（SPA）。它不是 API 路由，但必须排在最后：否则会遮住 API 路径。
 STATIC_MOUNT = "/assets"
 

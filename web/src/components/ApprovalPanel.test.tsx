@@ -2,7 +2,7 @@
 // 断言的是**行为**：点批准/拒绝真的调后端对应接口并刷新队列、失败有兜底提示、
 // 后端返回缺字段的畸形审批记录时面板不会白屏。
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import ApprovalPanel from "./ApprovalPanel";
 import { api } from "../lib/api";
@@ -12,8 +12,8 @@ const pending: Approval[] = [
   {
     approval_id: "ap-1",
     run_id: "run-1",
-    tool_name: "shell.exec",
-    arguments: { cmd: "rm -rf /tmp/x" },
+    tool_name: "git.apply_patch",
+    arguments: { patch: "..." },
     reason: "高危命令",
   },
 ];
@@ -29,11 +29,23 @@ afterEach(() => {
 });
 
 describe("ApprovalPanel", () => {
-  it("展示待审批的工具名与原因", async () => {
+  it("默认展示中文操作名（不是原始工具名）与原因", async () => {
     render(<ApprovalPanel />);
-    expect(await screen.findByText("shell.exec")).toBeInTheDocument();
+    // 默认人话：`git.apply_patch` → 「应用代码补丁」
+    expect(await screen.findByText("应用代码补丁")).toBeInTheDocument();
+    expect(screen.queryByText("git.apply_patch")).toBeNull();
     expect(screen.getByText(/高危命令/)).toBeInTheDocument();
     expect(screen.getByText(/run-1/)).toBeInTheDocument();
+  });
+
+  it("点「原始」切回工具名与原始标识，再点「通俗」切回来", async () => {
+    render(<ApprovalPanel />);
+    await screen.findByText("应用代码补丁");
+    await userEvent.click(screen.getByRole("button", { name: "显示原始标识" }));
+    expect(screen.getByText("git.apply_patch")).toBeInTheDocument();
+    expect(screen.queryByText("应用代码补丁")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "隐藏原始标识" }));
+    expect(screen.getByText("应用代码补丁")).toBeInTheDocument();
   });
 
   it("/approvals 拉取失败：报错且**不**说「暂无待审批」（队列里也许有人等着批）", async () => {
@@ -62,7 +74,7 @@ describe("ApprovalPanel", () => {
       kind: "final",
     });
     render(<ApprovalPanel />);
-    await screen.findByText("shell.exec");
+    await screen.findByText("应用代码补丁");
     const before = (api.approvals as ReturnType<typeof vi.fn>).mock.calls.length;
 
     await userEvent.click(screen.getByRole("button", { name: "批准" }));
@@ -81,7 +93,7 @@ describe("ApprovalPanel", () => {
     });
     const onDecided = vi.fn();
     render(<ApprovalPanel onDecided={onDecided} />);
-    await screen.findByText("shell.exec");
+    await screen.findByText("应用代码补丁");
 
     await userEvent.click(screen.getByRole("button", { name: "批准" }));
 
@@ -92,7 +104,7 @@ describe("ApprovalPanel", () => {
     vi.spyOn(api, "approve").mockRejectedValue(new Error("没有等待审批的请求"));
     const onDecided = vi.fn();
     render(<ApprovalPanel onDecided={onDecided} />);
-    await screen.findByText("shell.exec");
+    await screen.findByText("应用代码补丁");
 
     await userEvent.click(screen.getByRole("button", { name: "批准" }));
 
@@ -106,7 +118,7 @@ describe("ApprovalPanel", () => {
       kind: "final",
     });
     render(<ApprovalPanel />);
-    await screen.findByText("shell.exec");
+    await screen.findByText("应用代码补丁");
     await userEvent.click(screen.getByRole("button", { name: "拒绝" }));
     expect(reject).toHaveBeenCalledWith("run-1");
   });
@@ -114,7 +126,7 @@ describe("ApprovalPanel", () => {
   it("批准接口失败时走兜底提示，不抛未捕获异常", async () => {
     vi.spyOn(api, "approve").mockRejectedValue(new Error("409: 没有等待审批的记录"));
     render(<ApprovalPanel />);
-    await screen.findByText("shell.exec");
+    await screen.findByText("应用代码补丁");
     await userEvent.click(screen.getByRole("button", { name: "批准" }));
     await waitFor(() => expect(window.alert).toHaveBeenCalledWith("409: 没有等待审批的记录"));
   });
@@ -134,18 +146,43 @@ describe("ApprovalPanel", () => {
       { approval_id: "x", tool_name: "no.runid" } as unknown as Approval,
     ]);
     render(<ApprovalPanel />);
+    // 未登记的名字**原样显示**（不猜成「未知操作」：猜错比不猜更危险）
     expect(await screen.findByText("no.runid")).toBeInTheDocument();
     // 缺 reason 时不会渲染 undefined
     expect(screen.queryByText(/undefined/)).toBeNull();
   });
 
-  it("决策历史按 approved/rejected 分流显示", async () => {
+  it("决策历史默认收起：只留标题与条数，明细一个字都不渲染", async () => {
     vi.spyOn(api, "approvalHistory").mockResolvedValue([
-      { run_id: "r1", approval_id: "a1", tool_name: "shell.exec", decision: "approved", created_at: "" },
+      { run_id: "r1", approval_id: "a1", tool_name: "shell.run", decision: "approved", created_at: "" },
+    ]);
+    render(<ApprovalPanel />);
+    // 折叠标题出现，说明"有历史"这件事本身没被藏掉
+    const toggle = await screen.findByRole("button", { name: /最近决策/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("（1）")).toBeInTheDocument();
+    // 明细必须真的不在 DOM 里 —— 不是 display:none 那种"看得见的藏"
+    expect(screen.queryByText("✓已批准")).toBeNull();
+    expect(screen.queryByText("执行命令")).toBeNull();
+  });
+
+  it("点「最近决策」展开明细，再点一次收起；默认中文工具名", async () => {
+    vi.spyOn(api, "approvalHistory").mockResolvedValue([
+      { run_id: "r1", approval_id: "a1", tool_name: "shell.run", decision: "approved", created_at: "" },
       { run_id: "r2", approval_id: "a2", tool_name: "web.search", decision: "rejected", created_at: "" },
     ]);
     render(<ApprovalPanel />);
-    expect(await screen.findByText("✓已批准")).toBeInTheDocument();
+    const toggle = await screen.findByRole("button", { name: /最近决策/ });
+
+    fireEvent.click(toggle); // 真实点击，不绕过 onClick
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("✓已批准")).toBeInTheDocument();
     expect(screen.getByText("✗已拒绝")).toBeInTheDocument();
+    expect(screen.getByText("执行命令")).toBeInTheDocument();
+    expect(screen.getByText("联网搜索")).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("✓已批准")).toBeNull();
   });
 });

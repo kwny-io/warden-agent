@@ -5,13 +5,16 @@
 > 智能循环（规划 / 路由 / 自愈）× 多 Agent 协作 × RAG 溯源 × 执行治理与稳定性工程。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kwny-io/warden-agent/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kwny-io/warden-agent/actions)
-[![Tests](https://img.shields.io/badge/tests-2004%20passed-2ea44f?logo=pytest&logoColor=white)](https://github.com/kwny-io/warden-agent/actions)
+[![Tests](https://img.shields.io/badge/tests-2031%20passed%20%40%2082f2-2ea44f?logo=pytest&logoColor=white)](./receipts/17cd5e5c26c2.yaml)
 [![Type Check](https://img.shields.io/badge/mypy-strict-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12%2B-2a6db2?logo=python&logoColor=white)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 ⚡ **30 秒体验**：`pip install -e . && python -m warden_agent.demo_e2e`
 ——**无需任何 API Key**，离线自主闭环：多 Agent 派工、知识检索、结构化交接，全程轨迹打印。
+
+> 上面的 `pip install -e .` 只装运行时依赖，够跑这条 demo。**要跑测试**得带 dev 依赖：
+> `uv sync --frozen --extra dev`（推荐，按 `uv.lock` 可复现）或 `pip install -e ".[dev]"`。
 
 <!-- TODO(演示图): 录制 React 控制台或 demo_e2e 的 GIF，放到 docs/demo.gif 后取消下行注释
 ![Warden Agent 演示](docs/demo.gif)
@@ -297,8 +300,9 @@ flowchart TB
 上下文裁剪四项在产品路径（HTTP / CLI / 流式）上**同样生效**，不再只属于 demo：
 - **意图路由**：`ToolIntentRouter` 纯离线确定性 → 产品入口**默认开启**（调用前校验"该不该调"）
 - **上下文裁剪**：防长会话撑爆上下文 → **默认开启**（`WARDEN_MAX_CONTEXT_CHARS` 可调）
-- **阶段规划**：`ModelPlanner` 会为复杂任务多花一次模型调用 → **默认关闭**（`WARDEN_PLANNER=1` 开）
+- **阶段规划**：`ModelPlanner` 只在**判定为复杂**时才多花一次模型调用（简单任务**零成本**，`plan_with_model` 先跑离线启发式就返回）→ **默认开启**（`WARDEN_PLANNER=0` 关）；"简单任务一次调用都不发"由 `tests/test_planner_default.py` 数调用次数钉住，不靠注释自证
 - **记忆按需取用**：按关键词重叠只注入相关记忆，且**每次请求临时注入、不写进存档**
+- **成本账**：`core/usage.py` 的 `CostMeter` 把每次模型调用的 token 折成美元，`AgentReply.cost_usd` 直接给出"这一跑花了多少"；`WARDEN_RUN_BUDGET_USD` 是**硬预算**（超了抛 `BudgetExceeded` 停住，越界那一笔仍记账）。**未知模型记 `unpriced_calls` 而不是当 0 元**——"没定价"和"免费"必须分开，否则换模型后成本账静默失真。价格表是快照，可用 `WARDEN_PRICE_INPUT_PER_M` / `_OUTPUT_PER_M` 覆盖；**只统计模型调用**，工具/存储/网络不在内
 
 **工具稳定性层（超时 / 退避 / 降级 / 熔断）已接入工具执行链**：`build_agent` 与
 `build_app` 都可传 `stability`，产品入口 `run_server` **默认开启**（`WARDEN_STABILITY=0` 可关）。
@@ -369,6 +373,12 @@ WARDEN_MODEL=你的模型名
 > （曾经同名，会导致模型把你的服务端鉴权密钥发给第三方网关，已修）。
 > 本机网关 / Ollama 这类不校验密钥的端点，填非空占位串即可（如 `not-needed`）。
 > 另外 custom **不会**回落到 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`——否则等于把厂商密钥发给第三方。
+
+**自建接入不走系统代理**（三个入口都一样：`.env` 启动 / 界面切换 / `create_model("custom")`）。
+Windows 的系统代理**不认** `ProxyOverride` 里的 `localhost;127.*;10.*;…`，
+若让它接管，"内网端点"的对话会被静默转发到公网代理——现象是探不通或莫名 502，
+而这恰好违背了自建接入存在的理由。需要走代理访问**公网**兼容端点时，用内置四家即可
+（它们保留默认行为）。
 
 ```python
 agent = build_agent(provider="custom")
@@ -532,6 +542,7 @@ python -m warden_agent.demo_e2e                                                 
 | 技能触发 | 按任务意图评分选择技能，信号与意图路由同源；**已接线**：`build_agent`/`build_app` 装配技能时同步注册 `skill.trigger.pick`（以前只在 demo/评测注册） | 已实现 |
 | 记忆（`memory/`） | 多作用域（RUN / SESSION / USER / WORKSPACE）、候选确认、冲突消解、审计；**已接线**：`build_agent(memory=True)` / HTTP 默认开启，产品入口用 `SqliteMemoryStore` **落盘**（`USER` 作用域跨会话才真的记得住），不传则用进程内实现 | 已实现 |
 | MCP 客户端（`mcp/` + `ts/mcp-client`） | TypeScript SDK 连接 MCP，工具先行审查再导入 | 已实现 |
+| **MCP 服务端（`mcp/server.py`，第117 批）** | 把本仓工具**反方向**暴露给别的 Agent（stdio + 换行 JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`）。**不绕开门禁**：每次调用先过 `PolicyEngine`（DENY 拒、ASK 因 stdio 无人工通道**按拒绝处理**）；工具失败走 `isError` 结果而非协议错误；只暴露已注册工具。未实现 `resources/*`、`prompts/*`、SSE、批处理——半吊子实现比不实现更误导 | 已实现 |
 | Web 搜索 / 抓取（`web/search.py`） | 多 provider 可插拔，URL 策略管控。`web.fetch` 提供**真实联网抓取**（`HttpFetchProvider`，`WARDEN_WEB_FETCH=1` 开启）：**每一跳重定向都重新过 URL 策略**（拒内网/环回/云元数据，防 SSRF 绕过）、只吃文本类响应、超时/响应体/跳转次数都有界。**出站总量另有闸门**（`web/outbound.py`：全局速率 + 单 host 速率 + 并发上限 + 日配额，默认开；URL 策略先于闸门，被拒的 URL 不占配额）。**搜索也可真实联网**：`WARDEN_SEARCH_PROVIDER=tavily\|brave\|custom` 走 `HttpSearchProvider`（tavily/brave 配 `WARDEN_SEARCH_API_KEY`、custom 配 `WARDEN_SEARCH_ENDPOINT`）——端点先过 URL 策略（不把 key 发向内网）、并计入出站配额；**配不全就如实退回离线 mock 并告警**（不假装能搜）。不设该变量时默认仍是离线 mock | 已实现 |
 | Git 集成（`git/`） | revision 探测、unified-diff 应用、合并门禁 | 已实现 |
 | Coding Agent（`coding_agent/`） | 需求 → 读代码 → 生成 diff → 门禁落地 | 已实现 |
@@ -543,7 +554,7 @@ python -m warden_agent.demo_e2e                                                 
 | **Run 级分布式锁（`runtime/locking.py`）** | 多副本下同一个 `run_id` 只被一方驱动（否则**后写覆盖前写**且不报错）。**租约式**（带 TTL）：持有者崩了不必人工解锁，到期即可被别的副本接管。取锁是单条原子 UPSERT，SQLite / PostgreSQL 都已验证；真库上做过 **8 个副本并发抢占、恰好一个赢家**的测试。自动恢复（`RecoveryWorker`）与 **HTTP 的对话/审批路径**都已接锁：抢不到回 **423** 让客户端重试，流式请求整段 SSE 走完才释放；`/capabilities` 会报出当前用的是哪种锁。**带后台心跳续租**（每 TTL/3 续一次），所以「单次驱动比 TTL 还长」也不会中途被接管；续租失败会报出来（不假装还持有） | 已实现 |
 | **审计链 / 密钥轮换 / 低延迟事件总线（第 6 项）** | ① **审计链（防篡改）**：每条落盘记录带 HMAC 链哈希（`prev_hash`→`hash`，覆盖内容+前驱+行号）——改字段/删中间行/重排都会断链；`warden audit-verify` 被动过则退出码 4。**必须配 `WARDEN_AUDIT_KEY`**：无密钥时挡不住「改完重算整链」（测试里有对照证明这一点）。② **凭证密钥轮换**：历史密钥只用于解密兜底 + `warden rotate-credentials` 把存量密文重加密（幂等；解不开的原样保留并报出，退出码 5）。③ **低延迟事件总线**：`WARDEN_EVENT_BUS=notify` 用 LISTEN/NOTIFY 唤醒，实测发布→唤醒 **47ms**（同场景轮询 110ms，最坏 250ms）；通知只是提示，丢了不丢事件 | 已实现 |
 | **运维面（`runtime/backup.py` · `runtime/alerting.py` · `docs/operations.md`）** | ① **挂起告警**：找出「等人工处理超时」的 Run（`warden stuck`，**退出码 3** 便于接 cron，`--notify` 投递到 `WARDEN_ALERT_WEBHOOK_URL`；投递失败时**明说未投递**并给**退出码 6**，不再把“找到了几个 Run”显示成“已投递”；`GET /alerts/stuck` 按归属收敛）——此前 Run 进了 `WAITING_APPROVAL` 就一直挂着、没人知道；② **备份/恢复**：`warden backup` / `warden restore`，SQLite 在线备份 API 做一致性快照 + 备份后立刻完整性校验 + 恢复默认拒绝覆盖（破坏性操作），**带恢复演练测试**；③ **运维手册**：巡检清单 / 告警接法 / 恢复顺序 / 升级回滚 / 多副本检查清单 / 已知边界表 | 已实现（**告警规则库 `deploy/observability/alerts/warden.rules.yml` + SLO `warden.slo.yml` + 灰度脚本 `scripts/canary_rollout.sh`** 都已存在）。⚠️ 交付面仍缺的是**发布工程本身**：0 tag / 0 release、发布与回滚流水线从未运行过；Prometheus 实集群未设 `retention`（SLO 用 `rate(...[30d])`）。见 `CHANGELOG.md` 「已知」块 |
-| **配置面单一事实源（`core/settings.py`）** | 全部 **85 个环境变量**登记在一张表里（以 `ENV_SPECS` 为准）（用途 / 归属模块 / **允许读它的模块** / 默认值 / 是否敏感）；启动时**校验格式**（写错拒绝启动）+ **对拼错的 `WARDEN_*` 告警**；`tests/test_config_surface.py` 用 AST 强制「代码读的每个变量都已登记、且没被越权读」——**这条守卫实测能拦住同名两用**（把 `cli.py` 改成读模型的 `WARDEN_BASE_URL`，测试立刻红并指出越权模块）。守卫**还会解析模块级字符串常量**（`ENV_X = "WARDEN_X"` 再 `env_bool(ENV_X)`），所以"把变量名写成常量再传"绕不过去：原先的盲区（`web/server.py:627` 的 `env_bool(ENV_APPROVAL_ALLOW_SELF)`）**已封**——读取点随 `server.py` 拆分搬到 `web/http_kit.py`，登记表的 owner + consumers 同步改到新模块；并有回归 `tests/test_config_surface.py::test_本仓实际读到的审批逃生门已登记` 钉住"读取点搬走而登记表没跟着改"（拆分时它确实红过） | 已实现（读取仍各自 `env.get`，未统一改走类型化访问器） |
+| **配置面单一事实源（`core/settings.py`）** | 全部 **92 个环境变量**登记在一张表里（以 `ENV_SPECS` 为准）（用途 / 归属模块 / **允许读它的模块** / 默认值 / 是否敏感）；启动时**校验格式**（写错拒绝启动）+ **对拼错的 `WARDEN_*` 告警**；`tests/test_config_surface.py` 用 AST 强制「代码读的每个变量都已登记、且没被越权读」——**这条守卫实测能拦住同名两用**（把 `cli.py` 改成读模型的 `WARDEN_BASE_URL`，测试立刻红并指出越权模块）。守卫**还会解析模块级字符串常量**（`ENV_X = "WARDEN_X"` 再 `env_bool(ENV_X)`），所以"把变量名写成常量再传"绕不过去：原先的盲区（`web/server.py:627` 的 `env_bool(ENV_APPROVAL_ALLOW_SELF)`）**已封**——读取点随 `server.py` 拆分搬到 `web/http_kit.py`，登记表的 owner + consumers 同步改到新模块；并有回归 `tests/test_config_surface.py::test_本仓实际读到的审批逃生门已登记` 钉住"读取点搬走而登记表没跟着改"（拆分时它确实红过） | 已实现（读取仍各自 `env.get`，未统一改走类型化访问器） |
 | 工具稳定性层（`tool/stability.py`） | 超时护栏 / 指数退避 / 降级兜底 / 熔断；**已接线**：`build_agent` / `build_app` 均可传，产品入口默认开启（`WARDEN_STABILITY=0` 关）。按 `pure` 判定，非纯工具只对瞬时错误重试 | 已实现 |
 | 凭证加密 + 租约（`credential/`） | AES-GCM 加密、短租约、脱敏；**已接线且落库**：模型的 API Key 经 `CredentialBroker` 加密后写进 `credentials` 表（重启仍在），租约元数据写进 `credential_leases` 表（过期惰性清理），按调用者身份分作用域；`SecretRedactor` 对网关异常日志脱敏 | 已实现 |
 | Checkpoint / 恢复（`runtime/`） | 会话在 `model_call` / `tool_exec` / `awaiting_approval` / `done` 落存档点；`RecoveryController` 分组为 resume / retry / await_human / terminal；**`RecoveryWorker` 真正执行续跑**（`attempts` 递增、超上限不再试、**等人工的绝不自动续**）；入口 `GET /recovery/plan` 与 `warden recover --apply` | 已实现 |
@@ -616,7 +627,9 @@ python -m warden_agent.demo_e2e                                                 
 - **Agent 评测**：内置黄金评测集（**35 例四类**），两套口径分开跑：`--mode scripted`（默认，确定性，能当硬门禁）
   与 `--mode real`（真实模型的注入/幻觉/指令遵循，需凭据，阈值可调）。CI 的 `evals-real` job
   **配了 `DEEPSEEK_API_KEY` 才真跑**，否则日志里显式写「跳过」——不假装跑过，也不让 fork 的 PR 无故变红
-- **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告，并**逐条打印首现排名**（离线词频嵌入实测 **top-1 85.7% / MRR 0.905**）。⚠️ 报告里的 `recall@3 = 100%` **被小语料抬高**——7 块库、k=3 一次返回 43% 的库，命中几乎是必然的，**该数字不代表检索器强**；报告在 k 覆盖率 ≥25% 时会主动提示。换真语义嵌入只需配三个环境变量，同一套标注集可对比相对提升
+- **检索质量**：`python -m warden_agent.rag.eval` 出 top-1 / recall@k / MRR 报告，**逐条打印首现排名**，并把 `lexical / semantic / hybrid` **三种模式并排打出来**（离线词频嵌入、9 条问法实测：**top-1 77.8% / MRR 0.815 / 未命中 1 条**；三模式 `lexical` MRR 0.778 vs `semantic`/`hybrid` 0.815）。
+  ⚠️ 两条口径必须一起说：① `recall@3` **被小语料抬高**——7 块库、k=3 一次返回 43% 的库，命中几乎是必然的，**该数字不代表检索器强**（报告在 k 覆盖率 ≥25% 时主动提示）；② **离线嵌入下 `semantic` 与 `hybrid` 的指标相同**，因为词频哈希本身就是字面匹配——hybrid 的**融合机制**由 `tests/test_rag_hybrid.py` 用确定性假语义嵌入器钉住，**质量增益只能配 `WARDEN_EMBED_BASE_URL`/`_API_KEY`/`_MODEL` 换真嵌入后实测**，不要拿离线的绿当"检索变强了"。
+  模式开关：`WARDEN_RAG_MODE`（默认 `hybrid`；`lexical`/`semantic` 是消融开关，写错构造即抛 `ValueError`、不静默退回默认）
 - **类型检查**：`mypy --strict` 零错误（**115** 个源文件；裸 `mypy` 也真检查——`py.typed` 已在位）
 - **真浏览器 e2e**：Playwright + 真 chromium，**16 条用例覆盖七条关键路径**——安全策略（CSP 在真浏览器里一次违规都没有）、
   对话（连发两条）、**登录**（没密钥逐条 401 且不白屏 / 填对密钥后读接口与 SSE 流都恢复 / 密钥只进 `sessionStorage`）、

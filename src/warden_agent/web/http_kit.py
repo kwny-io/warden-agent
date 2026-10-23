@@ -11,6 +11,7 @@ import json
 import threading
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -313,6 +314,84 @@ def _plan_to_dict(plan: Any, owner: str | None, owner_of: Any) -> dict[str, Any]
 def _model_key_name(model_id: str) -> str:
     """模型 API Key 在凭证 broker 里的登记名。"""
     return f"model:{model_id}"
+
+
+#: 自建端点的三件套存在**同一条**凭证里（名字仍叫 `model:custom`）。
+#: 为什么不是三张凭证：它们描述的是同一个"我要连哪儿"的决定，拆开存会出现
+#: 「换了 base_url 却还留着旧 model 名」这种半更新状态。broker 的 fields 本来就是
+#: 一个字符串字典，天然适合放一组配套参数。
+CUSTOM_BASE_URL_FIELD = "base_url"
+CUSTOM_MODEL_FIELD = "model"
+
+
+def _check_custom_base_url(raw: str) -> str:
+    """校验并规范化自建模型的 base_url；不合法就抛 400。
+
+    **有意放行内网与回环地址**（`127.0.0.1` / `10.x` / `192.168.x` / 容器服务名）：
+    这个功能存在的理由就是"公司不愿把对话发到公网大模型，自己起一个 OpenAI 兼容
+    端点"。若照 `rag/knowledge.py` 那条 SSRF 规则去拦私有地址，功能当场失效。
+
+    反过来，这里**只**挡两件事：
+      1. 非 http/https（`file://` 读本地文件、`ftp://`、瞎写的字符串）；
+      2. 没有主机名（`http://`、`http:///v1`）。
+    其余的 URL 合法性交给 `urlparse` 与真正发请求时的 SDK。
+
+    代价要说清：任何登录用户都能让服务端向一个自己指定的地址发请求（含内网地址）。
+    这与"每用户自己配、只影响自己"是一体两面——不给出站就等于没有这个功能；
+    要限制，应当在网络层（出站白名单）做，而不是把它藏进一个假装能防住的字符串检查。
+    """
+    url = (raw or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="自建接入需要 base_url（OpenAI 兼容端点）")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"base_url 必须是 http/https 地址，收到的是 {parsed.scheme or '空'}：{url!r}",
+        )
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail=f"base_url 缺少主机名：{url!r}")
+    return url.rstrip("/")
+
+
+def _custom_fields(
+    model_id: str, extra: dict[str, str], base_url: str | None, model_name: str | None
+) -> dict[str, str]:
+    """组出要交给 broker 的那份 fields（key 之外要不要再带上端点）。
+
+    只有 `custom` 才把端点并进去：内置四家的端点由代码固定，允许请求体覆盖
+    等于让用户把 DeepSeek 的 key 发到任意地址——正好是 custom 那条注释里
+    明令禁止的密钥外泄路径。
+    """
+    fields = dict(extra)
+    if model_id == "custom":
+        if base_url:
+            fields[CUSTOM_BASE_URL_FIELD] = base_url
+        if model_name:
+            fields[CUSTOM_MODEL_FIELD] = model_name
+    return fields
+
+
+def _custom_endpoint_or_none(
+    broker: CredentialBroker, scope: str
+) -> tuple[str, str] | None:
+    """取回某作用域已登记的 `(base_url, model)`；没有登记就返回 None。
+
+    沿用 `_registered_model_key` 的两级查找：先看自己的，再回落到部署级。
+    两件都在同一条凭证里，所以要么都拿到、要么都拿不到——不会出现
+    「有地址没模型名」的半张配置。
+    """
+    name = _model_key_name("custom")
+    for candidate in (scope, DEPLOYMENT_SCOPE):
+        if not broker.has(name, candidate):
+            continue
+        lease = broker.issue(name, scope=candidate)
+        fields = lease.value.fields
+        base_url = fields.get(CUSTOM_BASE_URL_FIELD)
+        model = fields.get(CUSTOM_MODEL_FIELD)
+        if base_url:
+            return base_url, model or ""
+    return None
 
 
 def _credential_scope(request: Request) -> str:

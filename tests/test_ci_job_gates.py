@@ -528,7 +528,12 @@ def _trigger_rot(entries: list[dict[str, Any]], today: datetime.date) -> list[st
             problems.append(
                 f"{where} 的 last_checked({checked}) 在未来（今天 {today}）—— 那是没发生过的复核"
             )
-        if str(entry.get("last_observed_fire")) == "never" and first <= today:
+        # `first < today`（而不是 `<=`）：cron 带**时刻**，第一次交火的那天在当天早上还没到点。
+        # 2026-10-19 就是现场：`0 3 * * 1` 的首个交点就是当天 03:00Z，
+        # 而 UTC 今天已是 10-19（01:03Z），
+        # `<=` 会在事件**还没到点**时把守卫变红，让人跑去 `gh run list` 再发现“什么都没有”——
+        # 跟写满 “never” 一样是假信号，只是方向反过来（假红）。越过一天后仍 never 才是真对不上。
+        if str(entry.get("last_observed_fire")) == "never" and first < today:
             problems.append(
                 f"{where} 写着 first_possible_fire={first} 且 last_observed_fire=never，"
                 f"而今天已是 {today}：第一次可能响的日子过去了，回去看它到底响没响"
@@ -901,3 +906,28 @@ def test_每个守卫脚本都必须被_ci_真的调用() -> None:
     )
     stale = sorted(name for name in _NOT_IN_CI if name not in scripts)
     assert not stale, f"_NOT_IN_CI 里的这些脚本已经不存在了：{stale}"
+
+
+def test_触发器腐烂判据_在首交火当天不提前红() -> None:
+    """`first == today` 不红，`first == today - 1` 且仍 never 就红。
+
+    2026-10-19 现场：`0 3 * * 1` 的首个交点就是当天 03:00Z，而 UTC 当天早上还是 01:03Z。
+    旧写法 `first <= today` 会在事件**还没到点**时变红，把「回去看它响没响」变成一次空跑——
+    和写满 `never` 一样是假信号，只是方向反过来（假红）。
+    """
+    from datetime import date
+
+    today = date(2026, 10, 19)
+    base = {
+        "workflow": "ci.yml",
+        "kind": "schedule",
+        "cron": "0 3 * * 1",
+        "last_observed_fire": "never",
+        "review_by": "2026-10-26",
+    }
+    same_day = [dict(base, last_checked=today, first_possible_fire=today)]
+    assert _trigger_rot(same_day, today) == [], "首交火当天不许提前红"
+
+    next_day = [dict(base, last_checked=today, first_possible_fire=date(2026, 10, 18))]
+    problems = _trigger_rot(next_day, today)
+    assert problems, "越过一天还写着 never 就必须红"

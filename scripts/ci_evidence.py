@@ -44,6 +44,38 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 RUN_LIST_JSON = "databaseId,headBranch,headSha,status,conclusion,url,event,createdAt,workflowName"
 
 
+BILLING_HINT = "was not started because recent account payments have failed"
+# 退出码 3：CI 根本没跑起来（job 0 个 step / 账单）。既不是绿，也不是代码红。
+NOT_STARTED_RC = 3
+
+
+def _not_started_reason(jobs: list[dict]) -> str | None:
+    """job 一个 step 都没跑时，去问一下原因（账单？额度？）。
+
+    为什么必须单独认这一种（2026-10-19 实锤）：`gh api .../check-runs/<job>/annotations` 的原文是
+    「The job was not started because recent account payments have failed or your spending limit
+    needs to be increased.」——job 的 `conclusion` 却写作 `failure`、且 `steps` 为空。
+    如果取证只记 conclusion，这种「根本没跑」就会被当成「代码跑挂了」写进台账：
+    既误拆了同事的活，又让「逐 job 全绿」的判据把一个从未执行过的 run 接纳成证据。
+    """
+    for job in jobs:
+        if job.get("steps"):
+            continue
+        jid = job.get("databaseId")
+        if not jid:
+            continue
+        try:
+            annotations = json.loads(
+                gh("api", f"repos/{REPO}/check-runs/{jid}/annotations"))
+        except SystemExit:
+            continue
+        for a in annotations if isinstance(annotations, list) else []:
+            msg = str(a.get("message") or "")
+            if BILLING_HINT in msg or "spending limit" in msg:
+                return msg
+    return None
+
+
 def gh(*args: str) -> str:
     r = subprocess.run(["gh", *args], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
@@ -96,8 +128,14 @@ def fetch(sha: str, force: bool, out: pathlib.Path) -> int:
                              "--json", "jobs,headSha,status,conclusion,event,url,createdAt,"
                                        "headBranch,workflowName"))
         jobs = sorted(({"name": j["name"], "conclusion": j.get("conclusion"),
-                        "status": j.get("status")} for j in view["jobs"]),
+                        "status": j.get("status"),
+                        # steps 的**条数**才是「到底跑没跑」的可机械判定的事实：
+                        # conclusion=failure 但 steps=0 讲的是「没启动」，不是「跑挂了」。
+                        "steps": len(j.get("steps") or []),
+                        "databaseId": j.get("databaseId")} for j in view["jobs"]),
                       key=lambda j: j["name"])
+        started = any(j["steps"] for j in jobs)
+        not_started_reason = None if started else _not_started_reason(jobs)
         doc["branches"][b] = {
             "run_id": run["databaseId"],
             "picked_run_id": run["databaseId"],
@@ -111,6 +149,8 @@ def fetch(sha: str, force: bool, out: pathlib.Path) -> int:
             "created_at": view.get("createdAt"),
             "workflow": view.get("workflowName"),
             "jobs": jobs,
+            "started": started,
+            "not_started_reason": not_started_reason,
         }
 
     text = json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -123,7 +163,19 @@ def fetch(sha: str, force: bool, out: pathlib.Path) -> int:
     for b, d in sorted(doc["branches"].items()):
         print(f"  {b}: run {d['run_id']} {d['conclusion']} head_sha={str(d['head_sha'])[:12]}")
         for j in d["jobs"]:
-            print(f"    {j['name']} :: {j['conclusion']}")
+            print(f"    {j['name']} :: {j['conclusion']}（{j['steps']} 个 step）")
+    dead = {b: d for b, d in doc["branches"].items() if not d.get("started")}
+    if dead:
+        print(
+            "✗ 这次 CI 根本没跑起来（job 一个 step 都没执行）——它既不是绿，也不是代码红：",
+            file=sys.stderr,
+        )
+        for b, d in sorted(dead.items()):
+            print(f"  {b}: run {d['run_id']}；原因：{d.get('not_started_reason') or '未知'}",
+                  file=sys.stderr)
+        print("⇒ 这份产物不能证明代码健康，也不该被当成「代码跑挂了」写进台账。"
+              "先修账单/额度，再重跑这个提交。", file=sys.stderr)
+        return NOT_STARTED_RC
     return check([out])
 
 
@@ -163,6 +215,11 @@ def check(paths: list[pathlib.Path]) -> int:
             if info.get("conclusion") != "success":
                 problems.append(
                     f"{tag}：{b} 的 conclusion={info.get('conclusion')!r}，期望 success")
+            # 「没跑起来」不能被当成证据：记在产物里、并在核的时候点名（否则账单红会冒充代码红）。
+            if info.get("started") is False:
+                problems.append(
+                    f"{tag}：{b} 的 job 一个 step 都没跑（原因："
+                    f"{info.get('not_started_reason') or '未知'}）⇒ 这份证据不成立")
             if info.get("head_branch") != b:
                 problems.append(f"{tag}：{b} 的记录里 head_branch={info.get('head_branch')!r}")
             if not isinstance(info.get("run_id"), int) or info["run_id"] <= 0:
@@ -206,6 +263,15 @@ def check(paths: list[pathlib.Path]) -> int:
             if unreg:
                 problems.append(f"{tag}：{b} 出现未登记的新 job {unreg} ⇒ 先明确它该是什么结论，"
                                 f"再把它登记进 CORE/EXPECT_SKIP")
+            # 逐 job 的「到底跑没跑」：conclusion=success 也可能是缓存命中，真正跑过的证据
+            # 是 steps ≥ 1。写进产物的是条数（可机械判定），这里就核条数。
+            dead = [(j.get("name"), j.get("steps")) for j in jobs
+                    if isinstance(j, dict) and j.get("steps") is not None
+                    and int(j["steps"]) == 0
+                    and not any(str(j.get("name")).startswith(pre) for pre in EXPECT_SKIP)]
+            if dead:
+                problems.append(f"{tag}：{b} 的 {dead} 一个 step 都没执行 ⇒ 这份证据不成立"
+                                f"（账单/额度？见分支级 not_started_reason）")
     for x in problems:
         print(f"✗ {x}")
     tail = "全部核过 ✅" if not problems else f"{len(problems)} 处问题 ⛔"

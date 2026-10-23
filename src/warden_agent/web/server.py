@@ -96,6 +96,7 @@ from warden_agent.web.http_kit import (
 )
 from warden_agent.web.http_kit import (
     _checkpoint_store_for,
+    _custom_fields,
     _drain_and_rebuild,
     _extract_run_id,
     _idem_response_from_store,
@@ -212,6 +213,10 @@ def build_app(
     audit_store: AuditStore | None = None,
     model_id: str = "custom",
     model_api_key: str | None = None,
+    # 自建端点：`model_id="custom"` 时从这里取地址与模型名，作为**部署级**配置登记。
+    # 不设就只能由用户在界面上填（每用户自己那份）。
+    model_base_url: str | None = None,
+    model_name: str | None = None,
     stability: Any = None,
     planner: Any = None,
     intent: Any = None,
@@ -406,31 +411,69 @@ def build_app(
     # ---- 模型切换：傻瓜式接入的模型目录，/models 查询、/models/select 切换/导入 ----
     from warden_agent.model import deepseek as _ds
 
+    # 目录条目的 `make` / `probe` 统一收三个参数：`(key, base_url, model)`。
+    # 内置四家忽略后两个（各自绑定端点），只有 `custom` 用它们。
+    # 为什么不给 custom 单独一个分支：调用方（routes/models.py）有三处要构造模型
+    # （列表、探针、切换），分支越多越容易漏掉其中一处。
+    def _custom_model(key: str | None, base_url: str | None, model: str | None) -> Any:
+        # base_url 已在路由层校验过（http/https + 有主机名）；这里只兜住"没给"的情况。
+        if not base_url:
+            raise _ds.ModelCallError("自建接入需要 base_url（OpenAI 兼容端点）")
+        return _ds.OpenAiCompatibleModel(
+            api_key=key,
+            base_url=base_url,
+            model=model or _ds.DEFAULT_DEEPSEEK_MODEL,
+            # 不走系统代理：自建端点的卖点就是"对话不出你的网络"，走代理就自相矛盾了
+            # （Windows 系统代理不认 ProxyOverride 里的内网/回环地址，见 deepseek.py）。
+            trust_env=False,
+        )
+
     model_catalog: dict[str, dict[str, Any]] = {
         "fake": {
             "name": "离线假模型（免费）",
             "needs_key": False,
-            "make": lambda key=None: FakeModel(),
+            "make": lambda key=None, base_url=None, model=None: FakeModel(),
+            # 离线假模型不联网，「探通」= 永远通（它自己就是替代品）
+            "probe": lambda key=None, base_url=None, model=None: None,
         },
         "deepseek": {
             "name": "DeepSeek",
             "needs_key": True,
-            "make": lambda key: _ds.DeepSeekModel(api_key=key),
+            "make": lambda key, base_url=None, model=None: _ds.DeepSeekModel(api_key=key),
+            "probe": lambda key, base_url=None, model=None: _ds.DeepSeekModel(api_key=key).probe(),
         },
         "openai": {
             "name": "OpenAI",
             "needs_key": True,
-            "make": lambda key: _ds.OpenAIModel(api_key=key),
+            "make": lambda key, base_url=None, model=None: _ds.OpenAIModel(api_key=key),
+            "probe": lambda key, base_url=None, model=None: _ds.OpenAIModel(api_key=key).probe(),
         },
         "zhipu": {
             "name": "智谱 GLM",
             "needs_key": True,
-            "make": lambda key: _ds.ZhipuModel(api_key=key),
+            "make": lambda key, base_url=None, model=None: _ds.ZhipuModel(api_key=key),
+            "probe": lambda key, base_url=None, model=None: _ds.ZhipuModel(api_key=key).probe(),
         },
         "bailian": {
             "name": "阿里百炼",
             "needs_key": True,
-            "make": lambda key: _ds.BailianModel(api_key=key),
+            "make": lambda key, base_url=None, model=None: _ds.BailianModel(api_key=key),
+            "probe": lambda key, base_url=None, model=None: _ds.BailianModel(api_key=key).probe(),
+        },
+        "custom": {
+            # 「不愿把对话发到公网」是这一项存在的全部理由：用户可以指向公司内网
+            # 自建的 OpenAI 兼容端点（vLLM / Ollama / One-API / LiteLLM…）。
+            # `needs_key` 仍为 True——**不是**苛求，而是防线：OpenAiCompatibleModel
+            # 在 key 为空时会回落到 OPENAI_API_KEY / DEEPSEEK_API_KEY，
+            # 那等于把别的厂商的 key 发给你指定的地址（密钥外泄）。
+            # 不校验密钥的本地端点照 create_model 的既有约定填占位串（如 not-needed）。
+            "name": "自建 / 私有部署（OpenAI 兼容）",
+            "needs_key": True,
+            "needs_endpoint": True,
+            "make": _custom_model,
+            "probe": lambda key, base_url=None, model=None: _custom_model(
+                key, base_url, model
+            ).probe(),
         },
     }
     # 已导入的模型 API Key 由凭证 broker 保管：**加密落库 + 短租约**，不再明文躺在
@@ -441,7 +484,14 @@ def build_app(
     if model_api_key and model_id in model_catalog:
         # 启动配置的 key 记为**部署级**：全体调用者共用（它由部署者提供，不属于某个用户）。
         broker.register(
-            _model_key_name(model_id), {"api_key": model_api_key}, DEPLOYMENT_SCOPE
+            _model_key_name(model_id),
+            _custom_fields(
+                model_id,
+                {"api_key": model_api_key},
+                model_base_url,
+                model_name,
+            ),
+            DEPLOYMENT_SCOPE,
         )
         redactor.add(model_api_key)
     current_model_id = model_id
@@ -783,6 +833,8 @@ def build_app(
     _routes_runs.register(
         app,
         _identity=_identity,
+        # 批量删除的归属校验只能由端点自己做：网关按路径取 run_id，取不到请求体里的 id
+        _owner_of=_owner_of,
         registry=registry,
         store=store,
     )

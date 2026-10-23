@@ -39,6 +39,8 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 COVERAGE_RE = re.compile(r"Total coverage:\s*([0-9]+(?:\.[0-9]+)?)%")
 # 干净树的 `git status --porcelain` 指纹：sha256("") 的前 16 位。
@@ -151,9 +153,80 @@ def build_receipt(
     }
 
 
-def _dump(receipt: dict[str, object]) -> str:
-    import yaml
+# 矩阵证据的三种行（与 `tests/test_matrix_evidence.py` 里的守卫正则同源）。
+# 这里不是「重新发明一套格式」，而是把生产者侧也写成可校验的：写不对就拒写回执。
+M_HDR = re.compile(r"^=== matrix\S* \S+ HEAD=([0-9a-f]{40}) ===$", re.M)
+M_PASS = re.compile(
+    r"^MATRIX (PASS|FAIL): (\d+)/(\d+) 符合预期"
+    r"（(\d+) 条正对照 \+ (\d+) 条反向对照(?:；[^）]*)?）$", re.M)
+M_SHALLOW = re.compile(r"^SHALLOW depth=1: rc=(\d+) 红 (\d+) 条", re.M)
+M_ROW_M = re.compile(r"^M\d+ .*$", re.M)
+M_ROW_R = re.compile(r"^R\d+ .*$", re.M)
+M_SKIP = "SKIP（"
 
+
+def mutation_block(path: Path, sha: str) -> dict[str, object]:
+    """把矩阵证据日志解析成回执的 `mutation` 字段；任何不自信的地方都抛 ValueError。
+
+    这里故意把「不老实」全当成错误而不是警告：回执是拿来背书的，宁可不写。
+    """
+    if not path.is_file():
+        raise ValueError(f"证据文件不存在：{path}")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    hdr = M_HDR.search(text)
+    if hdr is None:
+        raise ValueError("没有 `=== matrix… HEAD=<40 位 sha> ===` 头行")
+    if hdr.group(1) != sha:
+        raise ValueError(f"证据自称跑在 {hdr.group(1)[:12]}，而回执要背书 {sha[:12]}")
+    pm = M_PASS.search(text)
+    if pm is None:
+        raise ValueError("没有 `MATRIX PASS/FAIL: n/m 符合预期` 汇总行")
+    if pm.group(1) != "PASS":
+        raise ValueError("MATRIX FAIL 不许进回执（有缺口就不是证据）")
+    matched, total = int(pm.group(2)), int(pm.group(3))
+    positive, negative = int(pm.group(4)), int(pm.group(5))
+    rows = M_ROW_M.findall(text) + M_ROW_R.findall(text)
+    live = [r for r in rows if M_SKIP not in r]
+    if matched != total:
+        raise ValueError(f"matched={matched} ≠ total={total}")
+    if positive + negative != total:
+        raise ValueError(f"正 {positive} + 反 {negative} ≠ 总 {total}（有臂没跑却算进通过了）")
+    if len(live) != total:
+        raise ValueError(f"非 SKIP 的行 {len(live)} 条 ≠ 总数 {total}（SKIP 不计入，也不许白占）")
+    sh = M_SHALLOW.search(text)
+    if sh is None:
+        raise ValueError("没有 `SHALLOW depth=1: rc=N 红 K 条` 行 ⇒ 没证明 fetch-depth: 0 承重")
+    if int(sh.group(1)) != 1:
+        raise ValueError(f"浅检出 rc={sh.group(1)}（期望 1）⇒ 判据在浅克隆里不承重")
+    if int(sh.group(2)) < 1:
+        raise ValueError("浅检出红条数为 0 ⇒ 自我否定的证据")
+    rel = path.resolve().relative_to(ROOT.resolve()).as_posix()
+    if rel != f"evidence/matrix/{sha[:12]}.log":
+        raise ValueError(f"证据得叫 evidence/matrix/{sha[:12]}.log，而不是 {rel}")
+    return {
+        "evidence": rel,
+        "evidence_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "total": total,
+        "matched": matched,
+        "positive": positive,
+        "negative": negative,
+        "shallow_red": int(sh.group(2)),
+    }
+
+
+def _pytest_log(proc: subprocess.CompletedProcess[str]) -> str:
+    """pytest 子进程的输出文本。
+
+    为什么不是直接 `proc.stdout + proc.stderr`：这一次真实撞上了——整整跑了十几分钟的 pytest
+    结束后 `proc.stdout` 是 **None**，`+` 直接 TypeError，而那一刻回执本该已经由 junit 生成。
+    回执的四个来源（git / junit / 退出码 / 快照哈希）里，日志只用来抽覆盖率；
+    因日志形状把整个冻结代码崩掉，是判据把自己当成了目标。
+    所以这里退化成空串；调用方必须自己对「日志空白 ⇒ 抽不到覆盖率 ⇒ 拒写回执」负责。
+    """
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def _dump(receipt: dict[str, object]) -> str:
     head = (
         "# 交付回执 —— 由 scripts/freeze_receipt.py --run 机器生成。\n"
         "# 这里每个数字都从产物推出（git / junit / 子进程退出码 / 快照哈希），作者不写数字。\n"
@@ -174,6 +247,12 @@ def main(argv: list[str] | None = None) -> int:
         help="允许工作区有未跟踪文件（会写进回执的 freeze.workspace_untracked，不是静默放过）",
     )
     parser.add_argument("--pytest-args", default="", help="附加给 pytest 的参数（分片用）")
+    parser.add_argument(
+        "--mutation-evidence",
+        default="",
+        help=("矩阵证据日志（evidence/matrix/<sha12>.log）；"
+              "给了就写进回执的 mutation 字段，不合格则拒写"),
+    )
     args = parser.parse_args(argv)
 
     if not args.run:
@@ -215,9 +294,20 @@ def main(argv: list[str] | None = None) -> int:
         f"--junitxml={junit}", "-o", "junit_family=xunit2",
     ] + (args.pytest_args.split() if args.pytest_args else [])
     print(f"跑：{' '.join(cmd[1:])}", flush=True)
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
-    log_text = proc.stdout + proc.stderr
-    log_path.write_text(log_text, encoding="utf-8")
+    # 直接写文件而不是走管道：① 管道那份全量日志会在内存里再存一份（九分钟的输出不小）；
+    # ② 管道这条路径真出过 `proc.stdout is None`（见 `_pytest_log` 的注释）。
+    # 写文件后运行时就能 tail 进度，冻结失败时也还有现场。
+    with log_path.open("w", encoding="utf-8", errors="replace") as fh:
+        proc = subprocess.run(
+            cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT, text=True, encoding="utf-8"
+        )
+    log_text = log_path.read_text(encoding="utf-8", errors="replace") or _pytest_log(proc)
+    if not log_text.strip():
+        print(
+            f"pytest 跑完了但日志是空的（rc={proc.returncode}）⇒ 抽不到覆盖率，拒写回执。",
+            file=sys.stderr,
+        )
+        return 2
 
     tree_after, shape_after, keys_after = (
         _git("rev-parse", f"{args.sha}^{{tree}}"), _shape(), _keys()
@@ -247,6 +337,13 @@ def main(argv: list[str] | None = None) -> int:
         workspace_untracked=untracked_at_freeze,
         pytest_args=CI_PYTEST_FLAGS,
     )
+    if args.mutation_evidence:
+        try:
+            receipt["mutation"] = mutation_block(Path(args.mutation_evidence), sha)
+        except ValueError as exc:
+            print(f"--mutation-evidence 不合格 ⇒ 拒绝写回执：{exc}", file=sys.stderr)
+            return 2
+
     out.write_text(_dump(receipt), encoding="utf-8")
     print(f"回执：{out.relative_to(ROOT)}  verdict={receipt['verdict']}  "
           f"tests={counts['tests']} passed={counts['passed']} skipped={counts['skipped']} "

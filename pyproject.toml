@@ -99,6 +99,16 @@ python_version = "3.12"
 packages = ["warden_agent"]
 strict = true
 
+# 可选依赖（boto3 / pyserial / mujoco）只在用到时才装，CI 与本地装的东西不一样。
+# 后果：同一行 import 在"装了"的环境里报 import-untyped，在"没装"的环境里报
+# import-not-found——**两种错误码互斥**，用 inline `# type: ignore[...]` 钉死任何一种，
+# 都会在另一半环境里变成 unused-ignore 而失败（实测：本地装了 boto3，kms.py 的
+# [import-not-found] 立刻红；CI 没装 mujoco，mujoco_sim.py 的 [import-untyped] 立刻红）。
+# 所以按模块统一在配置层关掉缺失导入检查，源码里不再写 inline ignore。
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore", "serial", "mujoco"]
+ignore_missing_imports = true
+
 [tool.coverage.run]
 source = ["warden_agent"]
 # 分支覆盖也计入：只测"行执行过"会漏掉"if 的另一半从没走过"这类空洞。

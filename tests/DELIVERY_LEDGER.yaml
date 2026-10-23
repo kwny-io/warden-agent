@@ -504,7 +504,30 @@ rows:
       修法不是给它签字（那是把可核的声明变成不核），而是把声明写成它认得的形状（见 f32eed5）。
       matrix_evidence 与 gitleaks 两项已在这棵树上转绿（本地实跑：跳签判据由 skipped 变 passed）。
     review_by: 2026-10-25
-    fixed_by: 未修          # 结清它的是下一个交付提交；它的行由再下一个提交带进来
+    fixed_by: 656029c8cea20a9b50ea47fa63268ff5be297de8   # 656029c 那一行带进来时结清（跳签红转绿）
+    # 说明：结清它的是 656029c；按「回填由下一个提交背书」的规则，这条 fixed_by 是在 656029c 那行之后补写的一次对账，
+    # 目的只是让「红账只能挂在最新一处」这条判据不再把已结清的旧红账当成在途。
+
+
+# 第九十八批第二步的落地树（656029c）：把「可核的声明不许靠 skip 混过去」补上，双分支绿。
+  - sha: 656029c8cea20a9b50ea47fa63268ff5be297de8
+    tree: 0d7c1a341097f787cd4dbe2dfb03b95d07307953
+    attestation: git-only
+    frozen_proof: none
+    run: 39175595595        # dev 的 push run
+    # master run = 39175598542（绿，同 sha）—— 锚短语写成判据认得的形状，别只写在 note 里。
+    ci_evidence: evidence/ci/656029c8cea2.json
+    note: >-
+      本条结清 6c8bd4d1d668：它那条跳签红（`未签字的跳过：test_散文里写的_master_run_号也必须是真的[c299ef6d3c6f]`）
+      的根因是 c299ef6 那行的 note 写法没命中判据的锚短语 ⇒ 判据一直 skip ⇒ 跳签守卫红。
+      修法两层：① 把声明写成 `master run = <数字>`（判据于是真跑并拿证据核）；
+      ② 顺带修正 `tests/test_ci_evidence.py` 的 `RED_MAX` 语义——原实现把**已结清**的红账也
+      计入上限，实际含义变成「本仓历史上只允许红一次」，与「红要记账」自相矛盾；
+      改成只数在途红账，并用一对正/反向用例把这条宽松铉住。
+      本条首轮 CI 红了一次，但**不是代码**：`ts/mcp-client` 的 107 个 `resolved` 全指向第三方镜像
+      `registry.npmmirror.com`，它回了 `504 Gateway Time-out`，quality job 死在「安装 ts 客户端依赖」，
+      pytest 根本没跑、junit 也没产出。重跑后双绿（run 号不变、attempt 递增），
+      镜像脆性由**同一个提交**里的 `scripts/npm_ci.sh`（重试 + 换源重试）与 `tests/test_ci_npm_resilience.py` 堵上。
 
 
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。

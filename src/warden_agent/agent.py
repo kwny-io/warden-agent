@@ -333,6 +333,7 @@ def augment_catalog(
     multiagent: bool = False,
     multiagent_model: Any = None,
     policy_engine: Any = None,
+    embodiment: Any = None,
 ) -> Any:
     """把 Memory / RAG / Skill / Web / MCP 的能力工具注册进目录（可复用给 HTTP 层）。
 
@@ -478,6 +479,16 @@ def augment_catalog(
         extra["sandbox_isolation_available"] = tier.available
         extra["sandbox_isolation_note"] = tier.describe()
 
+    # 6.5 具身工具族（robot.state/move/stop/reset）
+    #     传进来的是一整套 EmbodimentStack：设备、裁决、反射环已经接好，这里只把
+    #     「慢脑入口」暴露成工具。没有 stack 就不注册——绝不造一台假机器人。
+    if embodiment is not None:
+        from warden_agent.embodiment.tools import build_embodiment_tools
+
+        for spec in build_embodiment_tools(embodiment):
+            catalog.register(spec)
+        extra["embodiment"] = True
+
     # 7. RAG 知识库（检索 + 来源引用）
     #    此前 rag/ 只被 demo 与评测引用，产品路径从不构造 VectorStore ——
     #    所以模型手里根本没有 knowledge.search。这里把它接上。
@@ -540,6 +551,7 @@ def build_agent(
     max_context_chars: int = 0,
     outbound_limiter: Any = None,
     multiagent: bool = False,
+    embodiment: Any = None,
 ) -> Agent:
     """一键装配一个 Agent：模型 + 工具 + 策略 + 存储 +（可选）能力。
 
@@ -566,6 +578,9 @@ def build_agent(
       mcp_server     MCP server 启动命令（有 node 则导入其工具）。
       sandbox        True=暴露受沙箱管控的 shell.run 工具（只读工作区副本 +
                      默认禁网 + 超时/输出预算约束）；sandbox_spec 可自定义 SandboxSpec。
+      embodiment    EmbodimentStack（设备 + 安全裁决 + 反射环）：传了就注册
+                      robot.state / robot.move / robot.stop / robot.reset 四张卡，
+                      所有动作都过安全裁决，被拒时目标不变。不传则不注册。
       multiagent    True=加上"主管 + 子 Agent"卡（research / write）。默认关：
                      子 Agent 会真的多花模型调用。子 Agent 只拿只读工具。
     """
@@ -594,6 +609,7 @@ def build_agent(
         sandbox=sandbox, sandbox_spec=sandbox_spec,
         outbound_limiter=outbound_limiter,
         multiagent=multiagent, multiagent_model=model if multiagent else None,
+        embodiment=embodiment,
     )
 
     # 策略与存储

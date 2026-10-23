@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api } from "../lib/api";
-import { toCapabilities, toMemoryCandidates, toMemoryItems } from "../lib/guards";
+import { toCapabilities, toMemoryCandidates, toMemoryItems, toRunInfos } from "../lib/guards";
+import { runDisplayName, statusLabel } from "../lib/labels";
 import type { Capabilities, HealthResult, MemoryCandidate, MemoryItem } from "../lib/types";
 import { usePolling } from "../lib/usePolling";
 
@@ -11,6 +12,29 @@ export default function InfoPanel({ runId }: { runId: string }) {
   const [capsError, setCapsError] = useState<string | null>(null);
   const [capsTick, setCapsTick] = useState(0); // 点「重试」+1，触发重新加载
   const [toolsOpen, setToolsOpen] = useState(false);
+  // 对话标题：界面上要显示"用户认得出的那句话"，而不是 `run-mvjzgmos`。
+  // 只在本 runId 变化时拉一次（不轮询）：标题来自首条用户消息，落库后不会变。
+  const [runTitle, setRunTitle] = useState("");
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    let cancelled = false;
+    setRunTitle("");
+    api
+      .runs(undefined, { signal: ctrl.signal })
+      .then((raw) => {
+        if (cancelled) return;
+        const hit = toRunInfos(raw).find((r) => r.run_id === runId);
+        setRunTitle(hit?.title ?? "");
+      })
+      .catch(() => {
+        /* 拿不到标题就退回显示 run_id：标题只是锦上添花，不该让整个面板报错 */
+      });
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
+  }, [runId]);
 
   // 健康检查轮询
   const { data: health, error: healthError } = usePolling<HealthResult>(
@@ -140,13 +164,19 @@ export default function InfoPanel({ runId }: { runId: string }) {
           </button>
         </div>
         <div className="mt-1 flex items-center gap-2">
-          <span className={`text-sm font-medium ${statusColor}`}>{runStatus || "…"}</span>
+          <span className={`text-sm font-medium ${statusColor}`} title={`原始状态：${runStatus || "未知"}`}>
+            {statusLabel(runStatus) || "…"}
+          </span>
         </div>
         {/* 拉状态失败与"真未知"要能区分开，否则用户只看到永远的「…」 */}
         {runStatusError && (
           <p className="mt-1 text-[11px] text-warden-danger">⚠️ 状态获取失败：{runStatusError}</p>
         )}
-        <div className="mt-1 text-xs text-warden-fg/80 font-mono break-all">{runId}</div>
+        {/* 显示对话标题而不是 `run-xxx`：标题是用户自己写的第一句话，他找得到；
+            原始 ID 移进 title 属性，悬停仍可看到（技术用户不会失去它）。 */}
+        <div className="mt-1 text-xs text-warden-fg/80 break-all" title={`会话 ID：${runId}`}>
+          {runDisplayName(runId, runTitle)}
+        </div>
       </div>
 
       {/* 能力 */}
