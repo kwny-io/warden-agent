@@ -16,7 +16,7 @@ dependencies = [
     "uvicorn>=0.29",
     "openai>=1.30",
     "pydantic>=2.0",
-    "cryptography>=42",
+    "cryptography>=50.0.2",
     # Windows 沙箱的资源限制走 Windows Job Object（见 execution/_platform.py 的
     # _make_win32_limiter），需要 pywin32 提供的 win32job。此前没声明——
     # 系统里恰好装着才没暴露；照 lock 从零装的环境里会直接 ModuleNotFoundError。
