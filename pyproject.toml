@@ -36,7 +36,7 @@ dev = [
     # 阈值与方法见 `[tool.pytest.ini_options]` 里的 `timeout` / `timeout_method`。
     "pytest-timeout>=2.3",
     "ruff>=0.5",
-    "mypy>=1.10",
+    "mypy>=2.4.0",
     "pyright",
     "psycopg[binary]",
     # 依赖漏洞扫描（CI 里对 lock 固定的运行依赖做门禁；见 .github/workflows/ci.yml）
