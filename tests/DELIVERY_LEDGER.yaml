@@ -530,6 +530,31 @@ rows:
       镜像脆性由**同一个提交**里的 `scripts/npm_ci.sh`（重试 + 换源重试）与 `tests/test_ci_npm_resilience.py` 堵上。
 
 
+# 第99–117 批的压平交付树（aa2b840）：25 个提交压成一个，并把它的 CI 修到绿。
+  - sha: aa2b840c33626c19973a48fdf72fa4ab334dd219
+    tree: 0fa7d68b9c47531442ace77c65d4418565bf61ce
+    attestation: git-only
+    frozen_proof: none
+    run: 40068230647        # dev 的 push run
+    # master run = 40068230612（绿，同 sha）—— 锚短语写成判据认得的形状，别只写在 note 里。
+    ci_evidence: evidence/ci/aa2b840c3362.json
+    note: >-
+      本条是第99–117 批（25 个提交）的压平交付树，父改到 656029c：
+      中间那 25 个提交分多次推上去，各自的 run 从未拿到证据（私有仓额度硬顶），
+      `test_ci_evidence.py` 判据 7 报「覆盖范围内有洞」；而 GitHub 只为一次 push 的 tip 建 run，
+      所以多提交推送在结构上不可满足（`scripts/check_delivery_push.py` 的判据 1）。
+      压平后本树 = ce4de3f 的树 + 围栏 unwrap + 三条回归修复（e2e aria-label / 收起态 / 可选依赖 ignore 码）。
+      本轮推上去后 CI **红着**：那是三个星期没跑的门禁一次性照出的真缺陷，不是压平噪声。
+      第118 批在**同一个提交**里修到绿，没有一条靠签字放行：
+      ① `--extra embodiment` 把整模块跳过的 5 条物理用例捞回 CI（CI junit 实物：5 条全 RAN，非 SKIPPED）；
+      ② `scripts/verify_local.py` 的 `EXEMPT` 跟上 CI 步骤改名（双向对账：旧键 stale 与新步骤 missing 同时撞）；
+      ③ `tests/test_embodiment_soak.py` 的墙钟断言从「钉 0」改成「没有系统性阻塞」（p99 < 周期 且
+      超时拍 ≤1%），并配一条走**同一条判据函数**的反证——把 `_PERIOD_MS` 改成 5000.0 重跑，
+      反证用例的 `len(violations) == 2` 立刻掉成 1 条而变红（实测）。
+      CI 实测（这两个 run 的 junit 产物，不是本地推断）：2453 条、2451 passed、2 skipped、
+      0 failed；两条跳过都是 `allowed_in: [local]` 的环境性条目。ruff/mypy/e2e 各 job 全绿。
+
+
 # 第八十一批：历史上才补的回执必须显式声明（守卫 tests/test_delivery_receipts.py 会核）。
 # 声明了也不是白名单——切点（第一份 backfill 之外回执的入库提交）之后的回执不许走回填。
 backfill_receipts:

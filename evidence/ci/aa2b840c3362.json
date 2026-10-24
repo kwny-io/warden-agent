@@ -1,0 +1,173 @@
+{
+  "branches": {
+    "dev": {
+      "conclusion": "success",
+      "created_at": "2026-10-24T05:56:41Z",
+      "event": "push",
+      "head_branch": "dev",
+      "head_sha": "aa2b840c33626c19973a48fdf72fa4ab334dd219",
+      "jobs": [
+        {
+          "conclusion": "success",
+          "databaseId": 120795868169,
+          "name": "container",
+          "status": "completed",
+          "steps": 7
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868485,
+          "name": "evals-real",
+          "status": "completed",
+          "steps": 9
+        },
+        {
+          "conclusion": "skipped",
+          "databaseId": 120795869326,
+          "name": "image-signing",
+          "status": "completed",
+          "steps": 0
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868364,
+          "name": "migration",
+          "status": "completed",
+          "steps": 11
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868461,
+          "name": "quality",
+          "status": "completed",
+          "steps": 27
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868389,
+          "name": "sbom",
+          "status": "completed",
+          "steps": 6
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868438,
+          "name": "security",
+          "status": "completed",
+          "steps": 13
+        },
+        {
+          "conclusion": "skipped",
+          "databaseId": 120795869241,
+          "name": "变异测试（${{ matrix.shard }}）",
+          "status": "completed",
+          "steps": 0
+        }
+      ],
+      "not_started_reason": null,
+      "picked_run_id": 40068230647,
+      "run_id": 40068230647,
+      "runs": [
+        {
+          "conclusion": "success",
+          "created_at": "2026-10-24T05:56:41Z",
+          "event": "push",
+          "run_id": 40068230647,
+          "status": "completed",
+          "url": "https://github.com/kwny-io/warden-agent/actions/runs/40068230647"
+        }
+      ],
+      "started": true,
+      "status": "completed",
+      "url": "https://github.com/kwny-io/warden-agent/actions/runs/40068230647",
+      "workflow": "CI"
+    },
+    "master": {
+      "conclusion": "success",
+      "created_at": "2026-10-24T05:56:41Z",
+      "event": "push",
+      "head_branch": "master",
+      "head_sha": "aa2b840c33626c19973a48fdf72fa4ab334dd219",
+      "jobs": [
+        {
+          "conclusion": "success",
+          "databaseId": 120795868105,
+          "name": "container",
+          "status": "completed",
+          "steps": 7
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868555,
+          "name": "evals-real",
+          "status": "completed",
+          "steps": 9
+        },
+        {
+          "conclusion": "skipped",
+          "databaseId": 120795868992,
+          "name": "image-signing",
+          "status": "completed",
+          "steps": 0
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868000,
+          "name": "migration",
+          "status": "completed",
+          "steps": 11
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868078,
+          "name": "quality",
+          "status": "completed",
+          "steps": 27
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868095,
+          "name": "sbom",
+          "status": "completed",
+          "steps": 6
+        },
+        {
+          "conclusion": "success",
+          "databaseId": 120795868309,
+          "name": "security",
+          "status": "completed",
+          "steps": 13
+        },
+        {
+          "conclusion": "skipped",
+          "databaseId": 120795868975,
+          "name": "变异测试（${{ matrix.shard }}）",
+          "status": "completed",
+          "steps": 0
+        }
+      ],
+      "not_started_reason": null,
+      "picked_run_id": 40068230612,
+      "run_id": 40068230612,
+      "runs": [
+        {
+          "conclusion": "success",
+          "created_at": "2026-10-24T05:56:41Z",
+          "event": "push",
+          "run_id": 40068230612,
+          "status": "completed",
+          "url": "https://github.com/kwny-io/warden-agent/actions/runs/40068230612"
+        }
+      ],
+      "started": true,
+      "status": "completed",
+      "url": "https://github.com/kwny-io/warden-agent/actions/runs/40068230612",
+      "workflow": "CI"
+    }
+  },
+  "fetched_at": "2026-10-24T06:05:50Z",
+  "repo": "kwny-io/warden-agent",
+  "schema": "warden-ci-evidence/1",
+  "sha": "aa2b840c33626c19973a48fdf72fa4ab334dd219",
+  "source": "gh run list/view --json 的机械摘录（勿手改；重取用 scripts/ci_evidence.py fetch）"
+}
