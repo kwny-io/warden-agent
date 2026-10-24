@@ -113,11 +113,44 @@ export interface RunInfo {
 }
 
 // GET /models 模型信息
+export interface ModelProbe {
+  id: string;
+  ok: boolean;
+  /** 探不通的**可操作分档**（换 Key / 去充值 / 改地址 / 等一等） */
+  code?: string;
+  /** 给用户看的动作句（服务端给，前端不再自己编） */
+  hint?: string | null;
+  reason: string | null;
+  latency_ms?: number;
+  checked_at?: string;
+  cached?: boolean;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
   needs_key: boolean;
+  /**
+   * 除 key 之外还要填端点（地址 + 模型名）。目前只有「自建 / 私有部署」是 true。
+   *
+   * 为什么要让界面知道这件事：不告诉它，用户点「切换」才收到 400，
+   * 而界面上没有任何可填的地方——那是个死胡同。
+   */
+  needs_endpoint?: boolean;
+  /** 有 key（不等于能用：provider 可能宕机/网络不通/key 被吐回） */
   configured: boolean;
+  /** 已登记的自建端点地址（不是秘密，回显才能让用户改错字；**key 永不回显**） */
+  base_url?: string | null;
+  /** 已登记的自建模型名（如 qwen2.5-7b-instruct） */
+  model?: string | null;
+  /** 上次主动探测的结论；从没探过就是 null（不许编一个“可用”出来） */
+  last_probe?: ModelProbe | null;
+}
+
+/** 自建接入的端点两件套（POST /models/select 与 /models/probe 共用）。 */
+export interface ModelEndpoint {
+  base_url?: string | null;
+  model?: string | null;
 }
 
 export interface ModelsInfo {

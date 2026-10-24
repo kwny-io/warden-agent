@@ -449,6 +449,11 @@ bash scripts/mutation.sh --docker --shard=ratelimit
 #     重跑会自动收拾残局；也可以手动还原（同一件事，退出码 0 = 收拾干净）
 ./.venv/Scripts/python.exe scripts/mutant_check.py --restore
 
+# 3c. 让矩阵自己产出可以入账的证据（交付回执的 `mutation` 字段就指向它）
+#     全绿才写文件；有缺口 / 有跳过 / 基线不可用 ⇒ 拒写并以 2 结束；
+#     浅检出（depth=1）里居然全绿 ⇒ 以 3 结束（那说明 fetch-depth: 0 不承重）
+./.venv/Scripts/python.exe scripts/mutant_check.py --evidence-out evidence/matrix/<sha12>.log
+
 # 4. 分片表与 pyproject 是否一致 + 门禁/分片脚本自身的单测
 ./.venv/Scripts/python.exe scripts/mutation_shards.py verify-config
 ./.venv/Scripts/python.exe -m pytest tests/test_mutation_gate.py tests/test_mutation_shards.py -q
@@ -457,6 +462,21 @@ bash scripts/mutation.sh --docker --shard=ratelimit
 容器里跑一片大约 10 分钟（宿主 `docker logs -f warden-mutmut-<片名>` 能看到进度，结束时
 统计落在 `mutants/mutmut-cicd-stats.json`）。`mutants/` 下的清单与 diff 都是**产物**，
 不进版本库。
+
+### `--evidence-out`：为什么证据必须是它自己写、而且必须带浅检出探针
+
+交付回执里那组 `mutation: {total, matched, positive, negative, shallow_red}` 数字，
+以前是仓外的 `gen-receipt.py` 抄进回执的——抄，就等于给了自己一个改数字的机会。
+现在由 `scripts/mutant_check.py --evidence-out` 直接从**这一轮的判定**写出来，三道反自证设计：
+
+1. **`OK` 列从 verdict 算，不抄期望。** 期望没满足的行写 `!!`；只要存在这种行（或有 `SKIP`、
+   `BROKEN`），脚本根本不写文件（退出码 2）——`MATRIX FAIL` 不许当证据入库。
+2. **`SKIP` 不计入对照数。** 本相位不适用的行仍占一个编号、但必须写明原因，
+   且不进制 `positive`/`negative`——否则"没跑的臂"会被当成通过。
+3. **浅检出必须红。** 证据里那行 `SHALLOW depth=1: rc=1 红 k 条` 是真跑出来的：
+   脚本 `git init` + `fetch --depth 1 <sha>` + `checkout`，在**只有一个提交**的克隆里跑
+   回执/证据守卫，把这些守卫的失败条数记成 `k`。只有这样，`fetch-depth: 0` 才是被证明的承重项
+   而不是 workflow 里的一句注释（`rc=0` 时脚本以 3 结束，拒绝写这种自我否定的证据）。
 
 ---
 

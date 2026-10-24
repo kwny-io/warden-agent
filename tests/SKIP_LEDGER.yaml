@@ -121,3 +121,14 @@ entries:
     allowed_in: [local]
     added: 2026-10-05
     reason: 同上（文件级 PG 门控，PG 轴那 40 条的主要来源）。
+  # ---- 整模块跳过（可选重依赖）----
+  - id: tests/test_embodiment_mujoco.py
+    allowed_in: [local]
+    added: 2026-10-24
+    reason: >
+      模块级 `pytest.importorskip("mujoco")`：mujoco 是 26.7MB 的可选物理引擎
+      （`--extra embodiment`），本机没装就在 collection 阶段整模块跳过。
+      **CI 不许跳**——`.github/workflows/ci.yml` 的 quality job 现在装
+      `--extra dev --extra embodiment`。这 5 条是整套测试里唯一证明「真物理引擎下
+      这条链真被重力影响过」的用例（还有「限位是弧度不是度」那条回归），
+      跳过等于门禁里这块是空的。若哪天那步被删，本条目会让守卫在 CI 里变红。

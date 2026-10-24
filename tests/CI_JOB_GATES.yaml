@@ -64,13 +64,16 @@ entries:
   - workflow: ci.yml
     job: mutation
     gate: "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
-    runs_on: [workflow_dispatch]
+    runs_on: [schedule, workflow_dispatch]
     runs_on_note: >
       第七十一批修正：原来这里写 `[schedule, workflow_dispatch]`——但“写在 `if:` 里”不等于“会发生”。
-      本仓的 cron 从未被求值（默认分支不是 `dev`；见末尾 `triggers:` 段的 `ci.yml / schedule`），
-      所以事实口径只有 `workflow_dispatch` 一条。`if:` 里的 `schedule` 仍然留着（那一天它会跑 4 个分片），
-      等 trigger 修好（`review_by` 2026-11-07）再把 `schedule` 加回这一行——加回来之前，
-      守卫 `test_声明在_schedule_上跑的条目必须对应一个真的会响的触发器` 会拦住这次漂移。
+      那时本仓的 cron 从未被求值（默认分支不是 `dev`），所以事实口径只有 `workflow_dispatch` 一条。
+      **2026-10-22 订正**：cron 真的响了 —— run `39220656143`（`2026-10-19T08:08:31Z`，`ci.yml` 的
+      `0 3 * * 1`）。按本条 `runs_on_note` 原先自己写下的条件（「等 trigger 修好再把 `schedule`
+      加回这一行」），现在加回。⚠️ 但这次**响的是 cron 的调度，不是那 4 个分片**：所有 job
+      `steps=0`，被 GitHub 计费拦下（配额用尽），所以「`schedule` 上跑过变异测试」这件事
+      **仍然没有任何一次成功证据**——`min_score` 至今只在 2026-09-29/30 的本机/容器实测过。
+      这一行的 `runs_on` 现在记的是「事件会到达」，不是「结论可信」。
     not_run_on: [push, pull_request]
     why: >
       变异测试要跑 4 个分片、每个分片都要把源码逐个突变后重跑测试——放每次 push 上会把
@@ -186,8 +189,15 @@ triggers:
       所以：修好默认分支只能让 `mutation` 真正开始响，`image-signing` 在 push 上依旧 skipped；
       那句错话的实质危害是——它会让人以为“签名链路现在每周自己验一次了”。
     expected_cadence_days: 7
-    last_observed_fire: never
-    last_checked: 2026-10-16
+    # 2026-10-22 订正：它**已经响过**了。`first_possible_fire` 那套「还没轮到」的说法到此为止。
+    # 第一次求值 = 2026-10-19（周一）03:00 UTC 的 cron，落到 run `39220656143`（`2026-10-19T08:08:31Z`，
+    # 是 GitHub 侧延迟后的实际开跑时间）。**它红了，但不是代码红**：所有 job 的 `steps=0`，
+    # annotation 写的是 `The job was not started because recent account payments have failed
+    # or your spending limit needs to be increased`——私有仓 2000 分钟/月的配额用尽。
+    # 这条要留的原样事实是：**cron 会被求值 ≠ cron 的结论可信**。原先 `last_observed_fire: never`
+    # 会让下一个人以为「还没等到机会」，于是往默认分支上再修一遍——白做。
+    last_observed_fire: 2026-10-19
+    last_checked: 2026-10-22
     first_possible_fire: 2026-10-19
     root_cause: >
       第八十五批订正（2026-10-15 实测）：**原来那句「永远不会被求值」已不成立，不要照着它动手。**
@@ -200,6 +210,12 @@ triggers:
       ⇒ **这条 cron 会被求值**：第一次机会就是 2026-10-19（周一）03:00 UTC。
       这也说明「一个事件会不会发生」这类断言没有本地痕迹能推翻它——所以本层新增了 `first_possible_fire`：
       声明「还没轮到」必须带一个日子，日子过了守卫就红（见 `tests/test_ci_job_gates.py::test_触发器台账的_never_不能越过第一次可能响的日子`）。
+      **2026-10-19 复核（第101 批）**：到点的那天早上（UTC 01:03Z）查过，`gh run list --event schedule`
+      只有交付面审计的两条（`39023515046`、`39118706841`，都是它自己报交付面红），
+      `ci.yml` 的 `0 3 * * 1` 要到当天 03:00Z 才到点 ⇒ 仍然是 `never`，**且这时不能算“对不上”**。
+      顺手订正一条**判据自身的缺陷**：腐烂守卫原来用 `first <= today`，会在首交火当天、
+      事件还没到点时就把台账变红，把人赶去 `gh run list` 空跑一趟——假信号只是换了方向。
+      已改成 `first < today`（越过一天才算真的对不上），并用同日/隔日两个合成用例钉住。
     unblock: >
       原来的两条路（改默认分支为 `dev` / 手工把 `schedule:` 同步到 master）**都已经不需要了**：默认分支上
       现在就是最新版 CI（只差 4 个提交，都是台账/文档层的改动），两个分支也无分叉。

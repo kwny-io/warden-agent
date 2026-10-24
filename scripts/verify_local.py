@@ -48,8 +48,9 @@ _SHAPE_STEP = "推前形状守卫（这次交付范围的形状）"
 # CI quality job 的命名步骤 → 为什么本地不跑。键必须与 ci.yml 的 `- name:` 逐字一致。
 # 这些不是「不重要」，而是「本机不是那些步骤的环境」——权威口径是 CI。
 EXEMPT: dict[str, str] = {
-    "Install (按 uv.lock 固定版本)":
-        "CI 用它固定依赖版本；本机已有 .venv，版本一致性由 uv.lock 保证",
+    "Install (按 uv.lock 固定版本，含 embodiment 可选依赖)":
+        "CI 用它把依赖钉到 uv.lock 并装上 mujoco；本机 .venv 由同一条 uv sync 对齐过"
+        "（含 embodiment），所以本地会真的跑那 5 条物理用例——这里的差异只剩「谁执行安装」",
     "安装 postgresql-client（让 pg_dump 端到端测试真的跑）":
         "需要 apt 装 pg 客户端；本机没有 ⇒ 本机 PG 用例按台账跳过，CI 才是权威",
     "预热规则求值镜像（让 promtool 真值求值真的跑）":

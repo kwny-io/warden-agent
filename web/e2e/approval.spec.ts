@@ -48,6 +48,23 @@ function pendingRow(page: Page, runId: string) {
   })
 }
 
+/**
+ * 展开「最近决策」。
+ *
+ * 这一块自 ce4de3f 起**默认收起**——收起时明细行不在 DOM 里（不是 display:none），
+ * 所以拿 `li` 直接去找历史行的断言会「元素不存在」。那不是产品缺陷，是本套用例
+ * 还停在「历史一直可见」的旧界面上。断言历史前先点开，等于照着真实用户的操作走。
+ */
+async function expandHistory(page: Page): Promise<void> {
+  const toggle = page.getByRole('button', { name: /最近决策/ })
+  await expect(toggle).toBeVisible({ timeout: 20_000 })
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') {
+    await toggle.click()
+  }
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.locator('#approval-history')).toBeVisible()
+}
+
 /** 「最近决策」里这个 run 的那一行（历史列表最多显示 5 条，所以不能用行数做断言）。 */
 function historyRow(page: Page, runId: string) {
   return page.locator('li').filter({ hasText: runId }).filter({ hasText: '已批准' })
@@ -91,7 +108,8 @@ test('批准：队列里的待审批能把这一轮接着跑完（真浏览器�
 
   // 1) 这一单从**待审批**里消失（不是“页面上再也找不到这个 run_id”——历史里还会有）
   await expect(queueItem).toHaveCount(0, { timeout: 20_000 })
-  // 2) 决策历史里留下"已批准"
+  // 2) 决策历史里留下"已批准"（历史默认收起，先展开）
+  await expandHistory(page)
   const decidedRow = historyRow(page, APPROVE_RUN)
   await expect(decidedRow.first()).toContainText('已批准', { timeout: 20_000 })
   // 3) 这一轮**真的跑完了**：假模型看到工具结果后给出结论
@@ -134,6 +152,8 @@ test('拒绝：工具**绝不执行**，只留一条拒绝记录（安全语义�
   await queueItem.getByRole('button', { name: '拒绝' }).click()
 
   await expect(queueItem).toHaveCount(0, { timeout: 20_000 })
+  // 历史默认收起，先展开才能看到拒绝记录
+  await expandHistory(page)
   await expect(
     page.locator('li').filter({ hasText: REJECT_RUN }).filter({ hasText: '已拒绝' }).first(),
   ).toContainText('已拒绝', { timeout: 20_000 })

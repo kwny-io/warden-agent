@@ -283,12 +283,59 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
     EnvSpec("WARDEN_STABILITY", "工具稳定性层（超时/重试/降级/熔断），0 关",
             "web/run_server.py", ("web/run_server.py",),
             default="1（产品入口默认开）", kind="bool"),
-    EnvSpec("WARDEN_PLANNER", "阶段规划（会多花一次模型调用，默认关）",
-            "web/run_server.py", ("web/run_server.py",), kind="bool"),
+    EnvSpec("WARDEN_PLANNER",
+            "阶段规划（默认开；**只对判定为复杂的任务**多发一次模型调用）",
+            "web/run_server.py", ("web/run_server.py",),
+            default="1（产品入口默认开）", kind="bool",
+            note="简单任务零成本：plan_with_model 先跑离线复杂度启发式，不复杂就直接返回、"
+                 "一次模型调用都不发（tests/test_planner_default.py 数调用次数钉住）。"
+                 "规划调用失败/返回非 JSON 时降级成模板，不崩。设 0 关闭"),
     EnvSpec("WARDEN_MAX_CONTEXT_CHARS", "上下文裁剪的字符上限（0 = 不裁剪）",
             "web/run_server.py", ("web/run_server.py",), kind="int"),
+    EnvSpec("WARDEN_UNTRUSTED_FENCE",
+            "工具输出套\"这是数据不是指令\"的围栏（默认开；0 = 关闭，仅用于对照实验）",
+            "loop/loop.py", ("loop/loop.py",), default="1", kind="bool",
+            note="围栏是提示不是边界：它让模型知道这段是外部内容，但不能阻止模型照做"),
+    EnvSpec("WARDEN_INJECTION_ESCALATE",
+            "本轮工具输出命中注入话术后，高危工具退回人工拍板（默认开）",
+            "loop/loop.py", ("loop/loop.py",), default="1", kind="bool"),
+    EnvSpec("WARDEN_GATED_TOOLS",
+            "被注入污染后需要人工拍板的工具名单（逗号分隔，覆盖默认集合）",
+            "loop/loop.py", ("loop/loop.py",), kind="text",
+            note="默认 shell.run / git.apply_patch / fs.write / fs.delete / fs.move / code.run；"
+                 "读类工具**故意不在此列**——污染后连读都拦，会把正常排查也堵死"),
     EnvSpec("WARDEN_KNOWLEDGE", "RAG 知识来源：1 = 内置离线语料 / 目录路径",
             "web/run_server.py", ("web/run_server.py",), kind="text"),
+    EnvSpec(
+        "WARDEN_RAG_MODE",
+        "RAG 检索模式：`hybrid`（默认）/ `lexical` / `semantic`",
+        "rag/knowledge.py", ("rag/knowledge.py",),
+        default="hybrid",
+        note="hybrid = BM25 字面 + 向量两路 RRF 融合；lexical/semantic 是消融开关，"
+             "用来单独看一条腿的贡献。**离线词频嵌入下 semantic 与 lexical 几乎等价**"
+             "（词频哈希本身就是字面匹配），想看语义那一列的增益必须配 WARDEN_EMBED_*。"
+             "取值写错抛 ValueError（构造 VectorStore 时即失败，不静默退回默认）",
+    ),
+    EnvSpec(
+        "WARDEN_RUN_BUDGET_USD",
+        "单次 run 的模型花费上限（美元）；不设或 0 = 不限",
+        "loop/loop.py", ("loop/loop.py",), kind="text",
+        note="超过即抛 BudgetExceeded 停住（**硬预算**，不是告警后继续花）；"
+             "越界那一笔仍记账，便于对账。空值/写错退回「不限」，"
+             "不因一个坏配置停掉整个服务",
+    ),
+    EnvSpec(
+        "WARDEN_PRICE_INPUT_PER_M",
+        "覆盖输入单价（美元/百万 token），与 WARDEN_PRICE_OUTPUT_PER_M 成对生效",
+        "core/usage.py", ("core/usage.py",), kind="text",
+        note="常量表 PRICES 是快照会过期（见 core/usage.py）；两个都给才覆盖，"
+             "只给一个或写错都退回常量表——宁可用旧价，也不拿坏价去做预算判断",
+    ),
+    EnvSpec(
+        "WARDEN_PRICE_OUTPUT_PER_M",
+        "覆盖输出单价（美元/百万 token），与 WARDEN_PRICE_INPUT_PER_M 成对生效",
+        "core/usage.py", ("core/usage.py",), kind="text",
+    ),
     EnvSpec("WARDEN_WEB_FETCH", "开启真实联网抓取（默认离线 mock 不发请求）",
             "web/search.py", ("web/search.py",), kind="bool"),
     EnvSpec("WARDEN_SEARCH_PROVIDER",

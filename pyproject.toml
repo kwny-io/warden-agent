@@ -56,6 +56,10 @@ dev = [
 postgres = ["psycopg[binary]"]
 # 密钥托管（KMS/HSM）：aws-kms 模式需要 boto3。vault-transit 走 httpx（已在依赖里），无需额外包。
 aws = ["boto3>=1.34"]
+# 真物理引擎：tests/test_embodiment_mujoco.py 靠它证"单位是弧度不是度""重力真的拉过"。
+# 之前 CI 从不装，那 5 条在 collection 阶段整模块跳过、CI 每天绿——跳过台账第 3 条
+# （能补好的前置条件就不要签字）就是为这种情况写的，所以 CI 的 quality job 现在会装它。
+embodiment = ["mujoco>=3.17"]
 
 [project.scripts]
 warden = "warden_agent.cli:main"
@@ -98,6 +102,16 @@ ignore = ["B008"]
 python_version = "3.12"
 packages = ["warden_agent"]
 strict = true
+
+# 可选依赖（boto3 / pyserial / mujoco）只在用到时才装，CI 与本地装的东西不一样。
+# 后果：同一行 import 在"装了"的环境里报 import-untyped，在"没装"的环境里报
+# import-not-found——**两种错误码互斥**，用 inline `# type: ignore[...]` 钉死任何一种，
+# 都会在另一半环境里变成 unused-ignore 而失败（实测：本地装了 boto3，kms.py 的
+# [import-not-found] 立刻红；CI 没装 mujoco，mujoco_sim.py 的 [import-untyped] 立刻红）。
+# 所以按模块统一在配置层关掉缺失导入检查，源码里不再写 inline ignore。
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore", "serial", "mujoco"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["warden_agent"]

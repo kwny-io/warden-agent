@@ -618,20 +618,26 @@ class SqliteStore:
         return out
 
     def _decode_checkpoint(self, raw: str) -> object | None:
-        """按版本前缀解码一条 checkpoint；损坏/旧版本兜底返回 None。"""
+        """按版本前缀解码一条 checkpoint；损坏/旧版本/字段不认识都兜底返回 None。
+
+        `Checkpoint.from_dict` 必须待在 try **里面**：降级后读到新版写的 `status` 时，
+        它会抛（`CheckpointDecodeError`）。以前它在 try 外面 ⇒ 一条脏行能让
+        `list_checkpoints()` 整张表都读不出来，恢复控制器一条都不做——
+        一条数据的问题被放大成了整次恢复失败。
+        """
         from warden_agent.runtime.checkpoint import Checkpoint
 
         try:
             obj = decode_versioned(raw, self._codec)
-        except (json.JSONDecodeError, KeyError):
+            if not isinstance(obj, dict):
+                return None
+            return Checkpoint.from_dict(obj)
+        except (ValueError, TypeError, KeyError):
             note(
                 PAYLOAD_DROPPED_METRIC,
                 "历史行 payload 无法解码而被丢弃的条数（版本不认识或数据损坏）",
             )
             return None
-        if isinstance(obj, dict):
-            return Checkpoint.from_dict(obj)
-        return None
 
     # ---- 跨副本共享状态（幂等 / 事件流 / 限流计数）----
     @_locked

@@ -36,7 +36,7 @@ test('没密钥：后端逐条 401，页面不白屏，并把原因原样显示�
   await page.goto('/', { waitUntil: 'load' })
   // 页面本身是公开的（否则你连填密钥的地方都没有）
   await expect(page.getByRole('heading', { name: 'Warden Agent' })).toBeVisible()
-  await expect(page.getByLabel('访问密钥（API Key）')).toBeVisible()
+  await expect(page.getByLabel('访问密钥')).toBeVisible()
   // 但数据面板要如实报出 401，而不是假装"暂无数据"
   await expect(page.getByText(/状态获取失败/).first()).toBeVisible({ timeout: 20_000 })
   await expect(page.getByText(/401/).first()).toBeVisible({ timeout: 20_000 })
@@ -49,7 +49,7 @@ test('填对密钥：轮询错误消失，SSE 流也真的带上了密钥（不�
   // 先制造"确实被挡住"的状态，后面才谈得上"恢复"（否则断言可能落在从未出现的文本上）
   await expect(page.getByText(/状态获取失败/).first()).toBeVisible({ timeout: 20_000 })
 
-  await page.getByLabel('访问密钥（API Key）').fill(AUTH_API_KEY)
+  await page.getByLabel('访问密钥').fill(AUTH_API_KEY)
   await page.keyboard.press('Enter')
 
   // 状态面板是 3s 轮询：错误横幅该自己消失
@@ -72,7 +72,7 @@ test('密钥存储：不勾"记住"只进 sessionStorage，勾了才进 localSto
   await page.goto('/', { waitUntil: 'load' })
 
   // 默认不勾：只存 session（关掉标签页就失效）
-  await page.getByLabel('访问密钥（API Key）').fill(AUTH_API_KEY)
+  await page.getByLabel('访问密钥').fill(AUTH_API_KEY)
   await page.keyboard.press('Enter')
   const plain = await page.evaluate(
     (k) => ({
@@ -87,11 +87,11 @@ test('密钥存储：不勾"记住"只进 sessionStorage，勾了才进 localSto
   // 刷新后仍然可用（sessionStorage 活得比刷新长）
   await page.reload({ waitUntil: 'load' })
   await expect(page.getByText(/状态获取失败/)).toHaveCount(0, { timeout: 20_000 })
-  await expect(page.getByLabel('访问密钥（API Key）')).toHaveValue(AUTH_API_KEY)
+  await expect(page.getByLabel('访问密钥')).toHaveValue(AUTH_API_KEY)
 
   // 勾上"记住密钥"再填一次：这次落 local
   await page.getByLabel('记住密钥').check()
-  await page.getByLabel('访问密钥（API Key）').fill(`${AUTH_API_KEY}-2`)
+  await page.getByLabel('访问密钥').fill(`${AUTH_API_KEY}-2`)
   await page.keyboard.press('Enter')
   const remembered = await page.evaluate(
     (k) => ({

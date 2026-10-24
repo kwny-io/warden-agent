@@ -213,3 +213,40 @@ def test_报告_红时列出红点_绿时明说没有() -> None:
     finding = audit.Finding("dev@aaaaaaa", "整个 run 不绿", "conclusion='failure'")
     red = audit.render_report([finding], ["dev@aaaaaaa: 1 项红"])
     assert "conclusion='failure'" in red and "dev@aaaaaaa" in red
+
+
+# ── 10. 平台侧没启动 ≠ 代码红（真发生过：账单/额度，2026-10-19） ────────────────
+def test_job的steps为空_判成平台侧而不是代码红() -> None:
+    """每个 job 的 steps 都是空数组 ⇒ job 在启动前就被拒了，代码一行都没跑。
+
+    这时若仍报「核心 job 不绿」，看报告的人会去扒一棵根本没跑过的树——
+    我自己就这么干过：花半小时查「是不是我改坏了 workflow」。
+    """
+    jobs = [{"name": n, "conclusion": "failure", "status": "completed", "steps": []}
+            for n in audit.CORE]
+    found = audit.audit_run("dev@aaaaaaa", _push_run(conclusion="failure"), jobs)
+    text = "\n".join(f.line() for f in found)
+    assert "job 没跑起来" in text
+    assert "平台" in text or "启动前就被平台拒了" in text
+    assert "核心 job 不绿" not in text, "零 step 的 job 不许当成代码红"
+
+
+def test_run级别也点名平台侧() -> None:
+    jobs = [{"name": n, "conclusion": "failure", "steps": []} for n in audit.CORE]
+    found = audit.audit_run("dev@aaaaaaa", _push_run(conclusion="failure"), jobs)
+    run_finding = next(f for f in found if f.criterion == "整个 run 不绿")
+    assert "steps 都是空的" in run_finding.detail
+
+
+def test_有steps的失败仍然是代码红() -> None:
+    """反向对照：steps 里有东西 ⇒ 真跑过 ⇒ 就还是「核心 job 不绿」，不能被上一条洗白。"""
+    jobs = [{"name": n, "conclusion": "success", "status": "completed",
+             "steps": [{"name": "Run pytest", "conclusion": "success"}]} for n in audit.CORE]
+    for job in jobs:
+        if job["name"] == "quality":
+            job["conclusion"] = "failure"
+            job["steps"] = [{"name": "Run pytest", "conclusion": "failure"}]
+    found = audit.audit_run("dev@aaaaaaa", _push_run(conclusion="failure"), jobs)
+    text = "\n".join(f.line() for f in found)
+    assert "核心 job 不绿" in text
+    assert "job 没跑起来" not in text

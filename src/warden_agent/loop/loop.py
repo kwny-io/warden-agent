@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +28,8 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Any
 
+from warden_agent.core.settings import env_bool, env_str
+from warden_agent.core.usage import BudgetExceeded, CostMeter, UsageTotals
 from warden_agent.loop.cognition import (
     intent_hint,
     manage_context,
@@ -35,6 +38,12 @@ from warden_agent.loop.cognition import (
 from warden_agent.loop.planner import PlanState, make_plan_state
 from warden_agent.model.fake import FakeModel
 from warden_agent.model.model import AgentChatModel, ChatRequest, Message
+from warden_agent.policy.injection import (
+    DEFAULT_GATED,
+    Hit,
+    InjectionGuard,
+    escalate_after_taint,
+)
 from warden_agent.policy.policy import ApprovalRequired, Decision, PolicyDenied, PolicyEngine
 from warden_agent.tool.catalog import ToolCatalog
 
@@ -90,9 +99,40 @@ class AgentReply:
     messages: list[Message]  # 完整对话历史（可用于持久化/审计）
     # 【loop 深度③】规划进度快照（可观察/可持久化）；无规划时为 None
     plan: PlanState | None = None
+    # 【提示注入】本轮命中的可疑话术（已留痕，不代表已阻止）；无命中即空
+    injections: tuple[Hit, ...] = ()
+    # 【成本账】本次 run 的模型用量与折算美元；拿不到用量时为 None / 0.0
+    usage: UsageTotals | None = None
+    cost_usd: float = 0.0
+    # 撞到预算上限时的用量快照（正常收敛时为 None）——调用方据此区分"花完了"与"卡住了"
+    budget_hit: bool = False
 
 
 # PolicyDenied 统一在 policy/policy.py 定义（loop 与 session 共用），此处不再重复定义。
+
+
+def _to_float(raw: str, default: float = 0.0) -> float:
+    """把环境变量的**字符串值**转成浮点；空值/写错都退回默认（不因一个坏配置停掉服务）。"""
+    text = (raw or "").strip()
+    if not text:
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+def _model_name(model: Any) -> str:
+    """尽力拿到"价格表里能查到的模型名"。
+
+    各家客户端把它放在不同属性上（DeepSeekClient 用 `.model`，有些用 `.name`），
+    拿不到就退回类名——查不到价只会进 unpriced_calls，不会被当成免费。
+    """
+    for attr in ("model", "model_name", "name"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(model).__name__
 
 
 class AgentLoop:
@@ -123,6 +163,9 @@ class AgentLoop:
         stability: Any = None,
         timeout: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        injection_guard: InjectionGuard | None = None,
+        cost_meter: CostMeter | None = None,
+        max_cost_usd: float | None = None,
     ) -> None:
         self.model = model
         self.catalog = catalog
@@ -136,6 +179,19 @@ class AgentLoop:
         self.should_cancel = should_cancel
         # 没给就建一个空的安全判定器（默认全部放行）
         self.policy = policy_engine or PolicyEngine()
+        # 【提示注入】工具返回一律当**数据**：围栏 + 留痕 + 被污染后高危动作降权。
+        # 这不是"防护"，是下限——能降低成功率，挡不住决心（见 policy/injection.py 抬头）。
+        fence_default = env_bool("WARDEN_UNTRUSTED_FENCE", True)
+        self.injection = injection_guard or InjectionGuard(enabled=fence_default)
+        if self.injection.enabled and env_bool("WARDEN_INJECTION_ESCALATE", True):
+            gated = _gated_tools()
+            self.policy.add(escalate_after_taint(lambda: self.injection.tainted, gated))
+        # 【成本账】meter 记录每次模型调用的 token 与美元；max_cost_usd>0 时是**硬预算**，
+        # 超了立刻抛 BudgetExceeded 停住（不是告警后继续花）。0/None=不限。
+        self.cost_meter = cost_meter or CostMeter()
+        limit = (max_cost_usd if max_cost_usd is not None
+                 else _to_float(env_str("WARDEN_RUN_BUDGET_USD", "")))
+        self.max_cost_usd = limit if limit and limit > 0 else None
         self.memory = memory  # 可选：记忆中枢(见 loop 深度②)
         from warden_agent.memory import MemoryScope
         self._memory_scope = memory_scope or MemoryScope.SESSION
@@ -152,6 +208,8 @@ class AgentLoop:
 
     def run(self, user_text: str) -> AgentReply:
         """处理一句用户指令，返回最终回答。"""
+        # 污染状态是**按轮**的：上一次 run 读到的可疑内容不该牵连这一次。
+        self.injection.hits.clear()
         # 1. 组装对话：系统指令 + 用户这句话 + 可用的技能卡（+ 相关记忆上下文）
         messages: list[Message] = [Message(role="system", content=self.system_prompt)]
         # 【loop 深度②③】记忆按需取用 + 阶段规划。
@@ -191,6 +249,11 @@ class AgentLoop:
                     self.model.chat, ChatRequest(messages=managed, tools=tools)),
                 deadline, what="模型调用",
             )
+            # 【成本账】先记账再判断预算：超预算也要把"已经花掉的钱"记进去，
+            # 否则抛异常时的用量会永远缺最后那一笔（对账时对不上）。
+            self.cost_meter.record(_model_name(self.model), response.usage)
+            if self.max_cost_usd is not None and self.cost_meter.usd > self.max_cost_usd:
+                raise BudgetExceeded(self.cost_meter.usd, self.max_cost_usd)
 
             # 情况A：模型想调用工具
             if response.tool_calls:
@@ -281,7 +344,11 @@ class AgentLoop:
                     round_ok = True
                     # 成功：把工具结果放回对话，让模型"看到"结果后再决定下一步。
                     # 必须携带 call 引用使 tool_call_id 与 assistant 一致，否则真实 API 报 400。
-                    messages.append(Message(role="tool", content=str(result), tool_call=call))
+                    messages.append(Message(
+                        role="tool",
+                        content=self.injection.observe(call.name, str(result)),
+                        tool_call=call,
+                    ))
                 # 【loop 深度③】推进阶段：本轮有成功执行才前进；只有失败则冻结并标记，
                 # 后续阶段绝不被静默标为已完成；重复调用/意图提示不算进展也不推进。
                 if plan_state is not None:
@@ -296,7 +363,10 @@ class AgentLoop:
             # 情况B：模型直接给出了最终回答
             if response.content is not None:
                 messages.append(Message(role="assistant", content=response.content))
-                return AgentReply(text=response.content, messages=messages, plan=plan_state)
+                totals = self.cost_meter.snapshot()
+                return AgentReply(text=response.content, messages=messages, plan=plan_state,
+                                  injections=tuple(self.injection.hits),
+                                  usage=totals, cost_usd=round(totals.usd, 6))
 
         # 3. 循环次数用尽还没结束 = 视为异常，防止死循环
         raise RuntimeError("AgentLoop 迭代超过上限，任务未收敛（可能模型一直在调用工具）")
@@ -423,3 +493,11 @@ def _text_content(text: str) -> Any:
     """把文本包成 MemoryContent（延迟导入，避免顶层循环导入）。"""
     from warden_agent.memory import MemoryContent
     return MemoryContent(text=text)
+
+
+def _gated_tools() -> frozenset[str]:
+    """被污染后需要人工拍板的高危工具集合（可用 `WARDEN_GATED_TOOLS` 覆盖，逗号分隔）。"""
+    raw = os.environ.get("WARDEN_GATED_TOOLS", "").strip()
+    if not raw:
+        return DEFAULT_GATED
+    return frozenset(x.strip() for x in raw.split(",") if x.strip())

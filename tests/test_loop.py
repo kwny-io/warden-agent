@@ -235,9 +235,12 @@ def test_同一工具重复调用_被意图判断拦下() -> None:
     hints = [m for m in reply.messages if m.role == "tool" and "已调用过" in m.content]
     assert len(hints) == 1
     # 且 weather 工具实际执行只有 1 次(第二次被拦下)
+    # 注意：工具输出默认带"这是数据"的围栏（第113 批），所以断言用包含而不是相等——
+    # 断言原文完整出现在消息里，同时证明**围栏没有改写内容**。
     tool_msgs = [m for m in reply.messages
-                 if m.role == "tool" and m.content == "上海: 晴, 25度"]
+                 if m.role == "tool" and "上海: 晴, 25度" in m.content]
     assert len(tool_msgs) == 1
+    assert "UNTRUSTED_TOOL_OUTPUT" in tool_msgs[0].content
 
 
 # ---- 重试计数用稳定身份（工具名+归一化参数），而不是会变的 call.id ----

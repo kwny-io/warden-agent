@@ -105,17 +105,26 @@ def test_知识库开关_支持开关与目录() -> None:
     assert _knowledge_from_env({"WARDEN_KNOWLEDGE": "./docs"}) == "./docs"
 
 
-def test_认知开关_默认关_上下文上限默认值() -> None:
+def test_认知开关_默认值_上下文上限默认值() -> None:
+    """第115 批把规划的默认值从"关"翻成"开"——翻转的理由是成本只落在复杂任务上。
+
+    这条断言就是那个决定的可执行版本：默认必须挂上规划器；
+    而"简单任务到底花不花调用"另由 tests/test_planner_default.py 数调用次数钉住，
+    不靠这条注释自证。
+    """
     planner, intent, limit = _cognition_from_env({}, ToolCatalog(), model=object())  # type: ignore[arg-type]
-    assert planner is None            # 默认不开规划（会多花一次模型调用）
+    assert planner is not None        # 默认开规划（只对复杂任务多花一次调用）
     assert intent is not None         # 意图路由是纯本地规则，默认开
     assert isinstance(limit, int) and limit > 0
 
-    planner_on, _i, _l = _cognition_from_env(
-        {"WARDEN_PLANNER": "1", "WARDEN_MAX_CONTEXT_CHARS": "1234"},
+    planner_off, _i2, _l2 = _cognition_from_env(
+        {"WARDEN_PLANNER": "0", "WARDEN_MAX_CONTEXT_CHARS": "1234"},
         ToolCatalog(), model=object(),  # type: ignore[arg-type]
     )
-    assert planner_on is not None
+    assert planner_off is None        # 显式关掉仍然有效
+    assert _cognition_from_env(
+        {"WARDEN_MAX_CONTEXT_CHARS": "1234"}, ToolCatalog(), model=object(),  # type: ignore[arg-type]
+    )[2] == 1234
     assert _cognition_from_env(
         {"WARDEN_MAX_CONTEXT_CHARS": "1234"}, ToolCatalog(), model=object(),  # type: ignore[arg-type]
     )[2] == 1234

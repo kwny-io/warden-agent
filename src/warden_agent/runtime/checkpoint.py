@@ -35,6 +35,16 @@ from warden_agent.core.run.status import AgentRun, RunStatus
 # ---------------------------------------------------------------------------
 # Checkpoint
 # ---------------------------------------------------------------------------
+class CheckpointDecodeError(ValueError):
+    """存档点字段不认识或不可解释（例如降级后读到新版写下的 run 状态）。
+
+    为什么要有这个类型：`from_dict` 原来让 `RunStatus[...]` 的 KeyError 和 int() 的
+    ValueError 直接漏出去，而存储层的 `except (json.JSONDecodeError, KeyError)` 只包住解码那一步
+    ⇒ 一条坏行能让 `list_checkpoints()` 整张表都读不出来，恢复控制器跟着挂。
+    本该是「丢掉这一条、继续走」，实际变成「一条都不做」——故障半径被一条脏数据放大了。
+    """
+
+
 @dataclass
 class Checkpoint:
     """一次运行中某个时刻的"存档点"。"""
@@ -62,15 +72,20 @@ class Checkpoint:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Checkpoint:
-        return cls(
-            run_id=str(data.get("run_id", "")),
-            status=RunStatus[str(data.get("status", "PENDING"))],
-            iteration=int(data.get("iteration", 0)),
-            step=str(data.get("step", "init")),
-            usage_tokens=int(data.get("usage_tokens", 0)),
-            attempts=int(data.get("attempts", 1)),
-            retryable=bool(data.get("retryable", True)),
-        )
+        try:
+            return cls(
+                run_id=str(data.get("run_id", "")),
+                status=RunStatus[str(data.get("status", "PENDING"))],
+                iteration=int(data.get("iteration", 0)),
+                step=str(data.get("step", "init")),
+                usage_tokens=int(data.get("usage_tokens", 0)),
+                attempts=int(data.get("attempts", 1)),
+                retryable=bool(data.get("retryable", True)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CheckpointDecodeError(
+                f"存档点字段不可解释（status={data.get('status')!r}）：{exc}"
+            ) from exc
 
 
 class CheckpointManager:
